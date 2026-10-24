@@ -3,7 +3,8 @@
 //! only (no template, payout policy or network), and repeated in
 //! docs/merge-mining.md so another implementation (BCH P2Pool's) can check
 //! itself: a two-token tree, a whole `AuxProof` v2 for one leaf with its
-//! verification, and the empty commitment.
+//! verification, the empty commitment, and a whole split leaf with its
+//! claim outputs (the share vectors are in `split`).
 //! Look here if: any v2 layout changes; the docs' vectors must change too.
 
 use super::{
@@ -197,4 +198,93 @@ fn the_empty_commitment() {
             "0000000000"
         )
     );
+}
+
+/// P2PKH to twenty `byte` bytes.
+fn p2pkh(byte: u8) -> Vec<u8> {
+    let mut script = vec![0x76, 0xa9, 0x14];
+    script.extend([byte; 20]);
+    script.extend([0x88, 0xac]);
+    script
+}
+
+const SPLIT_PREIMAGE: &str = concat!(
+    "0364008bc613f574964583c7b08b7925373515b513ed15b372bc727599c16434",
+    "254d1c6400543bb5ec93f33a1c27a5822e4c638e9ab1e90e44c094fd7aaba51e",
+    "fc4e554c50",
+);
+const SPLIT_EXT: &str = "79f31f395015b16c76e12673ec8f58329d81f1884d76a0d210d1f3158a8faa85";
+const SPLIT_LEAF: &str = concat!(
+    "43544d4c02111111111111111111111111111111111111111111111111111111",
+    "1111111111953ccfa596a6c6d39e5980194539124fdcff116a571455a212baed",
+    "811f585ee0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaa22650758a42ebfd7306e771ad24c442cad795ed9e549392233729f",
+    "647a2b1be5ffff7f2079f31f395015b16c76e12673ec8f58329d81f1884d76a0",
+    "d210d1f3158a8faa85",
+);
+const SPLIT_LEAF_HASH: &str = "c40271368b4287df8fe3430e1bc3f9410b554874de698144fa04fe5df7033e41";
+
+// #### merge-mining v2: a whole split leaf and its claim outputs
+// What: token A with a 1% donation to P2PKH(d0 x 20) and a 1% fee to
+// P2PKH(fe x 20): its split preimage, ext, 169-byte leaf and leaf hash, and
+// the claim outputs of 1,000,000 tokens at one satoshi per token (all
+// shares kept) and of 50,000 (both split shares under 1,000 satoshis).
+#[test]
+fn a_whole_split_leaf_and_its_claim_outputs() {
+    use super::split::{expected_outputs, Amm, Role, Shares, Slot, Split};
+    let split = Split::new(
+        Slot::new(100, &p2pkh(0xd0)).unwrap(),
+        Slot::new(100, &p2pkh(0xfe)).unwrap(),
+    );
+    let leaf = Leaf::new(
+        [0x11; 32],
+        lock_hash(&[0x51]),
+        [0xaa; 32],
+        &payout(),
+        0x207f_ffff,
+        split.ext(),
+    );
+    assert_eq!(hex::encode(split.preimage()), SPLIT_PREIMAGE);
+    assert_eq!(hex::encode(split.ext()), SPLIT_EXT);
+    assert_eq!(hex::encode(leaf.preimage()), SPLIT_LEAF);
+    assert_eq!(hex::encode(leaf.hash()), SPLIT_LEAF_HASH);
+    assert_eq!(Split::parse(&split.preimage()), Ok(split));
+    let amm = Amm {
+        cash: 600_000,
+        virtual_sats: 400_000,
+        tokens: 1_000_000,
+    };
+    let kept = split.claim_shares(1_000_000, &amm);
+    assert_eq!(
+        kept,
+        Shares {
+            miner: 980_100,
+            donation: 10_000,
+            fee: 9_900
+        }
+    );
+    let outputs = expected_outputs(&split, leaf.payout_hash, &kept);
+    assert_eq!(
+        outputs
+            .iter()
+            .map(|output| (output.role, output.script_hash, output.amount))
+            .collect::<Vec<_>>(),
+        [
+            (Role::Miner, double_sha256(&payout()), 980_100),
+            (Role::Donation, double_sha256(&p2pkh(0xd0)), 10_000),
+            (Role::Fee, double_sha256(&p2pkh(0xfe)), 9_900),
+        ]
+    );
+    // 500 and 495 tokens are worth under 1,000 satoshis: the miner keeps
+    // them, and the claim has the miner's output alone.
+    let small = split.claim_shares(50_000, &amm);
+    assert_eq!(
+        small,
+        Shares {
+            miner: 50_000,
+            donation: 0,
+            fee: 0
+        }
+    );
+    assert_eq!(expected_outputs(&split, leaf.payout_hash, &small).len(), 1);
 }
