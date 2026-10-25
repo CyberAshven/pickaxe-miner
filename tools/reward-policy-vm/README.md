@@ -17,6 +17,14 @@ proofs, including payout/donation commitments and tampering. This is a small
 offline check of existing adapters; it registers no token, adds no claim
 contract, and does not establish compatibility with an unspecified future token.
 
+`electric-v2-reference.mjs` runs the author's pinned future-token v2 artifact in
+both BCH 2026 VMs: 14 intended spends and 32 rejected mutations. It checks the
+full-state proof, incompatible v1 proofs, an actual same-height successor,
+recipient binding, nonce length, transaction shape and counter/height limits.
+The [reference notes](../../reference/electric-v2/README.md) explain why this is
+not an upgrade to existing ELECTRIC. The live v1 miner and its GPU hash format
+remain unchanged.
+
 It is intentionally offline: no Fulcrum or node connection, production key, external funding, or broadcast is used. The test checks consensus and standard-mode validity, CashToken conservation, covenant-preserving state, adversarial mutations, and an exact serialization fingerprint shared with the Rust settlement regression.
 
 Run:
