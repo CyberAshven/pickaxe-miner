@@ -2485,10 +2485,10 @@ pub struct RuntimeSnapshot {
     pub state: SupervisorState,
     pub network: MiningNetwork,
     pub fee_scheme: crate::donation::Scheme,
-    /// #### PR #32: the token donation in effect and its minimum, for
+    /// #### PR #32: the token donation in effect and its default, for
     /// Advanced settings.
     pub token_donation: crate::donation::TokenDonation,
-    pub donation_minimum: crate::donation::TokenDonation,
+    pub donation_default: crate::donation::TokenDonation,
     /// The first mining GPU; `gpus` lists every one.
     pub gpu_backend: String,
     pub gpu_device: u32,
@@ -2771,7 +2771,7 @@ impl RuntimeSupervisor {
             gpu_telemetry: telemetry.snapshot(),
             rigs: rigs.as_ref().map(RigHub::summary),
             token_donation: cfg.token_donation(),
-            donation_minimum: cfg.token.donation_minimum(),
+            donation_default: cfg.token.donation_default(),
             job_source: if session.is_node() {
                 crate::job_source::JobSourceStatus::Node
             } else {
@@ -3047,7 +3047,7 @@ fn run_supervisor(
                 }
                 Ok(SupervisorCommand::SetDonation(value, reply)) => {
                     let mut next = cfg.clone();
-                    next.token_donation = Some(value.at_least(next.token.donation_minimum()));
+                    next.token_donation = Some(value);
                     let result = search.set_work_fee(next.fee_policy()).map(|()| {
                         cfg.token_donation = next.token_donation;
                         if let Some(rigs) = rigs.as_ref() {

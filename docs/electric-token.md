@@ -26,6 +26,27 @@ the payout wallet's key in Pickaxe. A separate pot-only key protects claims
 and refunds. Document its replay weakness, never use it, and keep the
 deployment as data so a fixed contract is one new `Contract` variant.
 
+## Author's v2 is a reference for new tokens
+
+#### PR #71
+
+The author added `PoWMineStatefulV2` for future deployments and explicitly says
+that existing ELECTRIC stays on its original v1 covenant and category. Pickaxe
+therefore keeps mining the existing v1 deployments on Mainnet and Chipnet.
+
+V2 binds PoW to the full previous 16-byte commitment (44 bytes including recipient
+and nonce), requires an eight-byte nonce, narrows the claim to two or three
+inputs, checks difficulty/height/counter bounds and explicitly preserves the
+mutable continuation NFT. Those consensus rules cannot be added to the deployed
+v1 covenant by changing a miner. A network switch is still only a network switch;
+it does not migrate tokens, deploy a covenant or move funded pots.
+
+The pinned [v2 reference](../reference/electric-v2/README.md) includes the author's
+source and compiled artifact, their provenance, and independent executable VM
+vectors. It is not a live mining backend or a mainnet ELECTRIC upgrade. Existing
+proof verification, donation routing and signed claim/recovery journals remain
+the application safeguards for v1.
+
 ## Node or Fulcrum source
 
 #### PR #65

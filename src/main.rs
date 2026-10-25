@@ -1206,7 +1206,7 @@ fn run_headless_mining(
             intensity: final_snapshot.search.intensity,
             // #### PR #32: a donation raised in Advanced settings is saved;
             // the token's minimum is not, so a later minimum applies.
-            token_donation: (final_snapshot.token_donation != final_snapshot.donation_minimum)
+            token_donation: (final_snapshot.token_donation != final_snapshot.donation_default)
                 .then_some(final_snapshot.token_donation),
             address: final_snapshot.payout_address,
         }));
@@ -2551,7 +2551,7 @@ mod tests {
             job_source: Default::default(),
             started_at: 0,
             token_donation: pickaxe_miner::donation::TokenDonation::from_bps(400),
-            donation_minimum: pickaxe_miner::donation::TokenDonation::from_bps(400),
+            donation_default: pickaxe_miner::donation::TokenDonation::from_bps(400),
         };
 
         let status = runtime_snapshot_json(&snapshot);

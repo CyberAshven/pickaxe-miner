@@ -33,7 +33,7 @@ fn save_token_session(
     let donation = cfg
         .token_donations
         .get(cfg.token.as_str())
-        .map(|donation| (*donation != cfg.token.donation_minimum()).then_some(*donation));
+        .map(|donation| (*donation != cfg.token.donation_default()).then_some(*donation));
     let launched = crate::session_control::active_profile().and_then(|name| {
         profiles
             .profiles
