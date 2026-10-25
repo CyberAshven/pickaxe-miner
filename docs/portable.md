@@ -46,9 +46,9 @@ these shaders. `PICKAXE_WGPU_API=vulkan`, or no variable, keeps Vulkan.
 ## Apple Silicon
 
 The **CI** workflow builds Windows, Linux, macOS and the browser from the same
-commit. Its reusable portable jobs create a `pickaxe-miner-v0.0.3-macos-arm64.tar.gz`
-archive on each pull request and master/dev update. Extract it, verify its
-checksum and source commit, then run:
+commit. Its reusable portable jobs create a macOS ARM64 archive on each pull
+request and master/dev update. Extract it, verify its checksum and source
+commit, then run:
 
 ```sh
 ./pickaxe mine --network mainnet --backend wgpu
@@ -181,9 +181,11 @@ the browser's hot path stale. Developers update them with
 arithmetic still use the established portable implementation; their migration
 to the native source remains separate work.
 
-This workflow does not create tags or publish releases. Package version remains
-0.0.3. The Mac archive can be attached to the existing release after merge;
-tested Windows/Linux downloads do not need replacement for this change.
+Package names and versions come from `Cargo.toml`. The portable workflow uploads
+CI artifacts; the release workflow collects the packages from the same validated
+commit. Download published packages from the
+[latest release](https://github.com/CyberAshven/pickaxe-miner/releases/latest).
+Pull requests and dev merges do not create tags or publish releases.
 
 Source is available at <https://github.com/CyberAshven/pickaxe-miner>. Distributors
 must provide the corresponding source under AGPL-3.0; modified hosts must offer

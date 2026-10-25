@@ -2,17 +2,69 @@
 
 ![Pickaxe Miner](docs/assets/pickaxe-miner-logo.png)
 
-Rust-first, GPU-only miner for CashTokens on Bitcoin Cash.
+Rust miner for Bitcoin Cash and CashTokens: GPU token mining, BCH ASIC mining,
+and pool or farm operation from one terminal application. A browser WebGPU miner
+is also available for PHOTON.
 
-## Scope
+[Download the latest release](https://github.com/CyberAshven/pickaxe-miner/releases/latest)
+ · [Guides](docs/README.md) · [Development and releases](docs/development.md)
 
-Pickaxe Miner first candidate is PHOTON which is live covenant and CashToken baton it is the first minable CashToken in the BCH network: the baton outpoint, NFT commitment, token amount, and PHOTON target. BCH `getblocktemplate` and `getblocktemplatelight` are not a mining job source.
+This README describes the current branch. For a downloaded build, its release
+notes describe the features included in that package.
 
-With a BCH node in your settings, PHOTON jobs come from your own node: it finds the baton in its UTXO set (a one-time scan, a minute or two on mainnet), follows it through its mempool and blocks, and sends your claims; no transaction index is needed and a pruned node works. Without a node, or when it cannot give the PHOTON state, the public Fulcrum servers do the same. BCH (ASIC) mining always needs a node: Fulcrum cannot build or submit blocks.
+## What to mine
 
-Mainnet and Chipnet run the PHOTON v3.2 contract (mainnet category `53bd86e3f123918d2d7040449f88f7ed1bbddc309b66f2ac67cd429278f5ea58`). The retired PHOTON v0 is no longer mined; releases before v0.0.3 mine only v0.
+| Asset or mode | Hardware | Networks | Getting started |
+| --- | --- | --- | --- |
+| PHOTON | Native GPUs; browser WebGPU | Mainnet and Chipnet | Direct token rewards; no funded fee pot. [Quick start](#quick-start-mainnet-tui), [protocol](docs/protocol-profile.md) |
+| ELECTRIC | Native GPUs using CUDA or the portable engine | Mainnet and Chipnet | Fund its fee pot using the setup's QR code, then mine. [ELECTRIC guide](docs/electric-token.md) |
+| PHOTON + ELECTRIC hash split | Native GPUs | Mainnet and Chipnet | Choose each token's share of the GPUs in one session. [Hash split](docs/hash-split.md) |
+| Bitcoin Cash (BCH) | ASICs over Stratum V1 or V2 | Mainnet and Chipnet | Solo mining, upstream pools or managed P2Pool. [ASIC guide](docs/stratum-v2.md), [P2Pool](docs/p2pool.md) |
 
-PHOTON uses a **4% mining-work donation**: 96% of completed candidate hashes mine for your wallet. Each win pays directly. There is no additional reward split, minimum withdrawal, or deposit required. The donation is based on work, not guaranteed rewards: short sessions can have different outcomes because wins are random.
+PHOTON uses its live v3.2 covenant; the retired v0 contract is no longer mined.
+ELECTRIC continues to use its existing v1 covenant. The author's ELECTRIC v2 is
+a [reference for future tokens](reference/electric-v2/README.md), not a migration
+of the current token.
+
+ELECTRIC's fee pot pays the transaction fee and the BCH attached to each token
+reward. That attached BCH arrives with the tokens at the reward recipient.
+Pickaxe calculates fees from transaction size and the node/server's reported
+rate. Setup shows its funding QR, balance and recovery-key location. The
+owner-pot dashboard also offers Max/send controls; see the
+[pot guide](docs/electric-token.md#signed-fee-pot-claims).
+
+### Upcoming ASIC tokens
+
+SAFA production mining is upcoming. The production ASIC-token registries are
+currently empty. The merge-mining
+format v2 and Chipnet test hooks are implemented, including tSAFA from an
+explicit deployment file; tSAFA is not offered in the normal token selector.
+See [BCH merge-mining](docs/merge-mining.md),
+[tSAFA on Chipnet](docs/merge-mining.md#tsafa-on-chipnet) and
+[ASIC-exclusive token proposals](docs/asic-tokens.md) for their separate status
+and remaining deployment checks.
+
+## Chain connections
+
+PHOTON and ELECTRIC can discover state and submit claims through your BCH node
+or through Electrum/Fulcrum. A configured node is tried first; the ordinary mode
+can fall back to public Fulcrum servers. `--source node` requires the node to
+work. Native discovery needs no transaction index and supports a pruned node
+that retains the blocks being followed.
+
+BCH solo mining and embedded P2Pool require your own BCH node. When joining a
+public pool or public P2Pool with its jobs, the upstream supplies the templates.
+Using your own templates at a compatible SV2 pool requires your node and Job
+Declaration. Fulcrum supplies indexed token state, not BCH block templates.
+See [template sources](docs/stratum-v2.md#template-sources).
+
+## Donations
+
+PHOTON and ELECTRIC each default to a **4% mining-work donation**, adjustable
+per token in Advanced settings, including 0%. At the default, 96% of completed
+candidate hashes mine for your wallet; each win pays its selected recipient
+directly. The donation is based on work, not guaranteed rewards, so short
+sessions can have different outcomes because wins are random.
 
 The BCH ASIC server has its own **1.5% donation** by default: 0.5% of mining
 work and 1% of each block reward. Set it anywhere from 0% to 100%, in 0.5%
@@ -21,6 +73,8 @@ steps, with `stratum-v2 serve --donation <percent>` or in the dashboard's
 up to two decimals. Other assets keep their own donation policies. Actual
 rewards depend on which work wins.
 
+## ASICs and pools
+
 The ASIC server's workers page shows each device's own report, and Enter opens
 the highlighted row's Device panel, online or offline, with confirmed controls
 (restart, pause, resume, blink its light to find it, Avalon work levels) for
@@ -28,14 +82,6 @@ most makes, through [asic-rs](https://github.com/256foundation/asic-rs).
 With `--upstream`, it sends SV1 devices to a remote Stratum V2 pool instead of
 your own node, with backup pools in order; there the pool builds the blocks,
 so the donation is that share of mining work at the pool. See [docs/stratum-v2.md](docs/stratum-v2.md).
-
-In ASIC mode, devices mine BCH together with every merge-mined token: each
-share is also checked against each token's lower target, so a token can be
-won without a BCH block, or with one for a token that needs it, and BCH loses
-no hashrate ([docs/merge-mining.md](docs/merge-mining.md)). An ASIC-exclusive
-token (SAFA-style) can be mined instead of BCH
-([docs/asic-tokens.md](docs/asic-tokens.md)). Both lists fill as tokens are
-registered; Chipnet has test tokens for trying them with real devices.
 
 ### For pool operators
 
@@ -57,6 +103,8 @@ Run `pickaxe` for the setup, or use the command line.
 | To | In the setup (`pickaxe`) | On the command line | Guide |
 |---|---|---|---|
 | Mine PHOTON on your GPUs | GPU mining | `pickaxe mine --address <yours>` | [Quick start](#quick-start-mainnet-tui) |
+| Mine ELECTRIC on your GPUs | GPU mining, ELECTRIC; fund its fee pot | `pickaxe electric mine --address <yours>` | [docs/electric-token.md](docs/electric-token.md) |
+| Split your GPUs between both tokens | GPU mining, Hash split | `pickaxe split --share photon=80 --share electric=20 --address <yours>` | [docs/hash-split.md](docs/hash-split.md) |
 | Mine with GPUs on many machines | GPU mining; rigs: Join a GPU pool or farm | coordinator `--rigs-listen 0.0.0.0:3340`, rigs `--coordinator HOST:3340 --coordinator-key KEY` | [docs/farm.md](docs/farm.md) |
 | Join someone's GPU pool | GPU mining, Join a GPU pool or farm | `pickaxe mine --coordinator HOST:3340 --coordinator-key KEY --address <yours>` | [docs/farm.md](docs/farm.md) |
 | Mine on HiveOS, mmpOS or RaveOS | – | the release's custom-miner package for your system | [docs/farm-os.md](docs/farm-os.md) |
@@ -69,9 +117,9 @@ Run `pickaxe` for the setup, or use the command line.
 
 A server or coordinator shows where devices and rigs connect on its
 dashboard (`i` or `I`, Connection info), ready to copy, for your network and,
-with [Tailscale](https://tailscale.com), from anywhere. Mining BCH needs a
-BCH node (Fulcrum cannot build blocks); PHOTON uses yours when you have one
-and public Fulcrum servers when you do not.
+with [Tailscale](https://tailscale.com), from anywhere. Choose your node or pool
+connection for BCH, and your node or Fulcrum connection for GPU tokens, as
+described under [Chain connections](#chain-connections).
 
 ## Supported platforms
 
@@ -88,7 +136,10 @@ Linux and Windows ARM64 (for example Raspberry Pi 5, Ampere servers and Snapdrag
 | Other NVIDIA GPUs | Portable engine on Vulkan, chosen automatically (the CUDA kernels target `sm_120` only) |
 | Apple Silicon (M1 and later) | Portable engine on Metal |
 | GPUs no other engine finds: older integrated GPUs without Vulkan or DirectX 12, ARM GPUs (Mali, Adreno) with only an OpenCL driver | OpenCL engine, used only when no other engine finds a GPU, or with `--backend opencl` |
-| Browser miner: browsers with WebGPU (Chrome, Edge, Firefox, Safari) | Portable engine in WebAssembly on browser WebGPU |
+| Browser miner: browsers with WebGPU enabled (Chrome, Edge, Firefox, Safari on supported systems) | PHOTON on the portable engine in WebAssembly |
+
+PHOTON supports the engines above. ELECTRIC currently supports CUDA and the
+portable engine; use `--backend wgpu` on systems without CUDA.
 
 The engine is selected automatically, and one miner mines on every discrete GPU of the machine, each on its best engine ([several GPUs](#several-gpus)). An integrated GPU mines automatically only when no discrete GPU is present. `devices` lists every GPU with its engine. HIP runs C++ kernels by default; `PICKAXE_HIP_KERNELS=rust` selects the kernels built from the shared Rust engine. Which kernels each GPU runs, how they are built and how to switch: [GPU code map](docs/gpu-sources.md). All documentation: [docs](docs/README.md).
 
@@ -98,15 +149,24 @@ From the extracted download folder, run the command for your platform:
 
 | Platform | Command |
 | --- | --- |
-| Windows PowerShell | `.\pickaxe.exe mine --network mainnet` |
-| Linux | `./pickaxe mine --network mainnet` |
-| Apple Silicon Mac | `./pickaxe mine --network mainnet --backend wgpu` |
+| Windows PowerShell | `.\pickaxe.exe` |
+| Linux | `./pickaxe` |
+| Apple Silicon Mac | `./pickaxe` |
 
 Double-clicking the executable opens the same setup. The interactive setup opens with Mainnet selected. Enter your payout address
 and choose **Start mining**. Saved profiles keep your settings for next time.
-To skip setup and start directly in the mining TUI, append
-`--address "YOUR_MAINNET_PAYOUT_ADDRESS"`, replacing the placeholder with your
-valid payout CashAddr. Servers are selected automatically.
+To start PHOTON directly in the mining TUI, use
+`pickaxe mine --address "YOUR_MAINNET_PAYOUT_ADDRESS"`, replacing the placeholder
+with your valid payout CashAddr. Choose ELECTRIC, Hash split
+or ASIC mining in setup for the other modes. Servers are selected automatically
+for GPU tokens; BCH setup asks for the node or pool its mode needs.
+
+PHOTON, ELECTRIC and hash-split sessions share a dashboard with per-token rates,
+wins and work, plus shared GPU utilization, temperature and power. Select a
+token for its own details. `G` shows charts (hidden initially), `A` opens
+Advanced settings, `F` opens ELECTRIC's pot details, and `B` safely returns to
+profiles after pending claims or sends are settled. See
+[dashboard controls](docs/hash-split.md#pr-65-the-shared-mining-dashboard).
 
 ### Portable engine in the TUI
 
@@ -145,32 +205,39 @@ The coordinator prints its key when it starts and shows it on the dashboard with
 
 ### Browser miner
 
-The browser miner is the same portable engine compiled to WebAssembly, mining on browser WebGPU in Chrome, Edge, Firefox or Safari. In the extracted `-browser.tar.gz` download, run this one command (Python required), then open `http://127.0.0.1:8080`, enter your payout address and press **Start mining**:
+The PHOTON browser miner uses the portable engine compiled to WebAssembly.
+Choose a browser with WebGPU enabled on your system. In the extracted browser
+download, run this command (Python required), then open `http://127.0.0.1:8080`,
+choose Mainnet or Chipnet, enter your payout address and press **Start mining**:
 
 ```sh
 python -m http.server 8080 --bind 127.0.0.1 --directory web
 ```
 
-Keep the tab open while mining. Names: `wgpu` is the Rust GPU library inside Pickaxe (the `--backend wgpu` option), and browser WebGPU is the browser's GPU API that the browser miner runs on ([names](docs/gpu-sources.md#names), [portable builds](docs/portable.md)).
+Browser intensity defaults to 50% and changes in Advanced apply after the
+current batch. Pause native GPU mining before using the browser miner. Keep
+the tab open while mining. Names: `wgpu` is the Rust GPU library inside Pickaxe
+(the `--backend wgpu` option), and WebGPU is the browser API
+([names](docs/gpu-sources.md#names), [portable builds](docs/portable.md)).
 
 ## Install
 
-Download the archive for your operating system from the [v0.0.4 release](https://github.com/CyberAshven/pickaxe-miner/releases/tag/pickaxe-miner-v0.0.4). The release includes `SHA256SUMS.txt` to verify your download. Extract the archive and start mining:
+Download the archive for your operating system and architecture from the
+[latest release](https://github.com/CyberAshven/pickaxe-miner/releases/latest).
+Use the release's `SHA256SUMS.txt` to verify the download, then extract the
+archive and open a terminal in its extracted folder. Keep the executable and
+its bundled GPU files together.
 
 Linux:
 
 ```bash
-tar -xzf pickaxe-miner-v0.0.4-linux-x86_64.tar.gz
-cd pickaxe-miner-v0.0.4-linux-x86_64
-./pickaxe mine
+./pickaxe
 ```
 
 Windows PowerShell:
 
 ```powershell
-Expand-Archive pickaxe-miner-v0.0.4-windows-x86_64.zip -DestinationPath pickaxe-miner-v0.0.4-windows-x86_64
-cd pickaxe-miner-v0.0.4-windows-x86_64
-.\pickaxe.exe mine
+.\pickaxe.exe
 ```
 
 Headless, from the same directory:
@@ -195,23 +262,26 @@ Without `--no-tui`, the miner opens a short setup:
 
 Fulcrum servers and nodes you add are saved once per network in `config.sources.json`, next to `config.profiles.json`, and shared by every profile on that network. Servers you add that are not built in are tried first; built-in servers, including ones you also saved, are ranked by health. Servers and nodes saved inside older profiles move there automatically. Press `S` while mining to change the address or intensity, or to use another server for the session; `A` opens Advanced settings.
 
-## Chipnet PHOTON test
+## Mainnet and Chipnet
 
-Use v0.0.3 or newer, which includes Chipnet support. After building this branch, run from the project root with the GPU files in place:
+Choose the network in setup or pass `--network mainnet` or `--network chipnet`.
+Mainnet is the default. Saved sources are separate for each network.
+
+From an extracted native package, PHOTON test mining starts with:
 
 ```bash
-./target/release/pickaxe_miner mine --chipnet --backend cuda --address 'bchtest:YOUR_TOKEN_AWARE_P2PKH_ADDRESS'
+./pickaxe --network chipnet mine --address 'bchtest:YOUR_TOKEN_AWARE_P2PKH_ADDRESS'
 ```
 
-Replace the quoted address with your valid Chipnet P2PKH or token-aware P2PKH payout CashAddr. Mainnet requires `bitcoincash:` addresses and Chipnet requires `bchtest:` addresses; mismatched networks are rejected, never converted. It uses the Chipnet PHOTON contract and Chipnet Fulcrum endpoints; mainnet remains the default without `--chipnet`.
+For ELECTRIC, use the same network selection with `electric mine`, and fund
+the Chipnet pot shown by setup. BCH ASIC mining also uses the network selected
+in setup; its node or upstream pool must serve that network. See the
+[ELECTRIC](docs/electric-token.md#chipnet) and [ASIC](docs/stratum-v2.md) guides.
 
-New Chipnet wins pay the selected wallet directly, using the same donation policy. No local reward wallet or payout batching is created for new mining.
-
-The earlier Chipnet batch-payout preview is no longer supported. Rewards it held under `chipnet-funding.key` are Chipnet test coins and are not recovered; you can delete that file. If the preview left a pending `pending-reward-chipnet.json`, the miner says so and asks you to delete it.
-
-In the Chipnet TUI, `now` is the recent effective rate, `active GPU` is the last completed GPU batch rate, and `wall avg` averages candidates over all elapsed time, including reward handling pauses. A paused miner shows `now` as zero while retaining the last `active GPU` rate.
-
-After a verified direct win, the GPU mines the baton that win creates while the claim is broadcast, instead of waiting for Fulcrum to list the unconfirmed claim. A new claim is broadcast before any further state check, and also sent in the background to up to two other configured Fulcrum servers so it reaches more of the network at once. If the claim turns out stale, or another transaction already spent its baton, that work is discarded and mining continues on the baton Fulcrum reports. A direct claim pays its reward inside the claim transaction, so if a claim recorded as stale still confirms, the recipient is paid.
+Replace the placeholder with your valid payout CashAddr. Mainnet requires
+`bitcoincash:` and Chipnet requires `bchtest:`; mismatched addresses are rejected,
+never converted. Chipnet and other BCH test networks share the address prefix,
+so the prefix alone cannot distinguish those networks.
 
 ## Diagnostic logging
 
@@ -273,7 +343,10 @@ The legacy CUDA C++ backend remains available with
 `cargo build --release --locked --no-default-features --features tail-grind`.
 Use a separate output directory when comparing the two builds.
 
-The binary is `target/release/pickaxe_miner` (`pickaxe_miner.exe` on Windows). `--version` prints `pickaxe 0.0.4`. Keep the supplied `cuda/build` directory beside the executable. The release archives include the required GPU files.
+The source-build binary is `target/release/pickaxe_miner` (`pickaxe_miner.exe`
+on Windows); release archives name it `pickaxe` or `pickaxe.exe`. Run
+`--version` to see the version of your build. Keep the supplied `cuda/build`
+directory beside the executable. Release archives include the required GPU files.
 
 The release CUDA files target NVIDIA `sm_120`. AMD HIP retains its existing backend. Other NVIDIA architectures require compatible CUDA files and separate validation.
 
@@ -302,14 +375,17 @@ cargo run --release -- benchmark
 ```
 ## Limitations
 
-- There is no CPU mining fallback.
+- GPU token mining needs a GPU; there is no CPU mining fallback. An ASIC server or rigs-only coordinator can run on a host without a mining GPU.
 - CUDA performance was measured on the local NVIDIA GPU; HIP artifacts are build-verified, without a physical AMD performance claim.
 
 ## Features
 
 - High-performance native GPU mining
 - Every GPU of a machine in one miner, with per-GPU status
-- Live PHOTON CashToken baton discovery
+- PHOTON and ELECTRIC GPU mining on Mainnet and Chipnet
+- Hash split between GPU tokens in one session
+- ELECTRIC funding QR, signed fee-pot claims and owner-controlled recovery
+- BCH ASIC mining over SV1/SV2, managed P2Pool and pool Job Declaration
 - Automatic winner verification and submission
 - Runtime intensity control from 10% to 100%
 - Safe live payout-address switching
@@ -321,7 +397,11 @@ cargo run --release -- benchmark
 - Stale-job and generation protection
 - Device discovery and benchmark tools
 
-The `reference/` directory contains PHOTON reference material used for implementation and correctness testing. Its `shared-t2/` and `shared-stages/` folders are different: they hold the portable engine's WGSL, generated from `rust-engine/` by `tools/shared-gpu-proof/sync_filter.py` and never edited by hand.
+The `reference/` directory contains PHOTON and ELECTRIC material used for
+implementation and correctness testing, including future-contract references.
+Its `shared-t2/` and `shared-stages/` folders hold the portable engine's WGSL,
+generated from `rust-engine/` by `tools/shared-gpu-proof/sync_filter.py` and never
+edited by hand.
 
 ## Development
 
