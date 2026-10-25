@@ -67,8 +67,9 @@ pub const POT_MIN_CHANGE_SATS: u64 = 1_000;
 /// A claim needs a non-final input for the contract's locktime guard.
 const CLAIM_SEQUENCE: u32 = 0xffff_fffe;
 
-/// The least anyone donates to mine ELECTRIC: PHOTON's 4% work share.
-pub const DONATION_MINIMUM: TokenDonation = TokenDonation::from_bps(400);
+/// ELECTRIC's donation unless the miner changes it: PHOTON's 4% work share.
+/// A miner can lower it to 0% or raise it.
+pub const DONATION_DEFAULT: TokenDonation = TokenDonation::from_bps(400);
 
 /// A contract a deployment runs. The published one hashes only the baton's
 /// height, the recipient and the nonce, so a proof can be spent again while
@@ -194,20 +195,17 @@ impl Deployment {
     }
 
     /// The donation's work share at the miner's setting: PHOTON's policy,
-    /// with anything above the minimum going to the project address.
+    /// with anything above the default going to the project address and
+    /// anything below it shrinking every share (`TokenDonation::work_shares`).
     pub fn donation_policy(&self, donation: Option<TokenDonation>) -> Policy {
-        let extra = donation
-            .unwrap_or(DONATION_MINIMUM)
-            .at_least(DONATION_MINIMUM)
-            .bps()
-            - DONATION_MINIMUM.bps();
+        let donation = donation.unwrap_or(DONATION_DEFAULT);
         match self.network {
             MiningNetwork::Mainnet => Policy {
-                scheme: Scheme::Work([200 + extra, 200]),
+                scheme: Scheme::Work(donation.work_shares(DONATION_DEFAULT, [200, 200])),
                 addresses: [DONATION_ADDRESS, SHREC_DONATION_ADDRESS],
             },
             MiningNetwork::Chipnet => Policy {
-                scheme: Scheme::Work([400 + extra, 0]),
+                scheme: Scheme::Work(donation.work_shares(DONATION_DEFAULT, [400, 0])),
                 addresses: [CHIPNET_DONATION_ADDRESS, CHIPNET_DONATION_ADDRESS],
             },
         }
@@ -1205,7 +1203,7 @@ mod tests {
     }
 
     #[test]
-    fn donation_is_four_percent_of_the_work_with_extra_to_the_project() {
+    fn donation_is_four_percent_of_the_work_by_default_and_can_go_to_zero() {
         let mainnet = Deployment::mainnet();
         assert_eq!(
             mainnet.donation_policy(None).scheme,
@@ -1215,7 +1213,13 @@ mod tests {
             mainnet
                 .donation_policy(Some(TokenDonation::from_bps(150)))
                 .scheme,
-            Scheme::Work([200, 200])
+            Scheme::Work([75, 75])
+        );
+        assert_eq!(
+            mainnet
+                .donation_policy(Some(TokenDonation::from_bps(0)))
+                .scheme,
+            Scheme::Work([0, 0])
         );
         assert_eq!(
             mainnet

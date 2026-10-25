@@ -528,11 +528,11 @@ pub fn run(
         }),
         declaring: job_declaration.filter(|_| !pools.is_empty()),
         token: header_work.as_ref().map(|work| {
-            let minimum = work.token().donation_minimum;
+            let default = work.token().donation_default;
             (
                 work.token().name,
-                config.token_donation.unwrap_or(minimum).at_least(minimum),
-                minimum,
+                config.token_donation.unwrap_or(default),
+                default,
             )
         }),
     });
@@ -646,13 +646,11 @@ pub fn run(
                 declarator: declarator.clone(),
                 uplink: uplink_handle.clone(),
                 preferred: preferred.clone(),
-                // #### PR #42: the token's donation, never below its
-                // minimum.
+                // #### PR #42: the token's donation, or its default.
                 token_donation: header_work.as_ref().map(|work| {
                     config
                         .token_donation
-                        .unwrap_or(work.token().donation_minimum)
-                        .at_least(work.token().donation_minimum)
+                        .unwrap_or(work.token().donation_default)
                 }),
                 header_work: header_work.clone(),
                 node_zmq: node_zmq.clone(),
@@ -1338,7 +1336,7 @@ struct Started {
     /// first pool, when it does.
     declaring: Option<crate::cli::JobDeclarationMode>,
     /// #### PR #42: the ASIC-exclusive token mined instead of BCH, its
-    /// donation and that donation's minimum.
+    /// donation and that donation's default.
     token: Option<(
         &'static str,
         crate::donation::TokenDonation,
@@ -1403,11 +1401,11 @@ fn started_text(started: &Started) -> String {
              come back 30 seconds after it answers again\n"
         ));
     }
-    if let Some((token, donation, minimum)) = started.token {
+    if let Some((token, donation, default)) = started.token {
         text.push_str(&format!(
-            "Token  {token} instead of BCH; its donation is {donation} of the mining work (at \
-             least {minimum}), set in the setup or with --token-donation. The BCH donation \
-             above applies to BCH mining only.\n"
+            "Token  {token} instead of BCH; its donation is {donation} of the mining work \
+             (default {default}, can be 0%), set in the setup or with --token-donation. The \
+             BCH donation above applies to BCH mining only.\n"
         ));
     }
     if let Some(mode) = started.declaring {
@@ -4550,7 +4548,7 @@ mod tests {
         assert!(
             solo.contains(
                 "Token  Pickaxe ASIC test token instead of BCH; its donation is 2.00% of the \
-                 mining work (at least 1.50%)"
+                 mining work (default 1.50%, can be 0%)"
             ),
             "{solo}"
         );
