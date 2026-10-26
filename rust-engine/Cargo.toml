@@ -15,7 +15,7 @@ upstream-rust = ["dep:ufsecp-core"]
 ufsecp-core = { git = "https://github.com/CyberAshven/UltrafastSecp256k1.git", rev = "e346efe3239175ef5d8dc97ca6e46920658bdf97", optional = true }
 # Exact pin: PHOTON's photon_rust.ptx must stay byte-identical to the GPU-validated
 # baseline (sha2 0.11.1 changes 16 signing kernels). Bump only after a GPU test.
-sha2 = { version = "=0.11.0", default-features = false }
+sha2 = { version = "=0.11.1", default-features = false }
 hmac = { version = "0.13", default-features = false }
 
 [dev-dependencies]
