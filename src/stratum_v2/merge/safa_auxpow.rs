@@ -2483,25 +2483,25 @@ pub(crate) mod tests {
     }
 
     // #### merge-mining v2: P2Pool's covenant, read by Pickaxe's loader
-    // What: from the fixture's redeem script (1,366 bytes) the loader
-    // derives P2Pool's K (1,946), lock, lock_hash and token-aware P2SH32
+    // What: from the fixture's redeem script (1,364 bytes) the loader
+    // derives P2Pool's K (1,944), lock, lock_hash and token-aware P2SH32
     // vault address, and accepts the fixture's own copies of them.
     // Look here if: Deployment::from_json or CLAIM_FIXED_BYTES changes.
     #[test]
     fn the_loader_reproduces_p2pools_fixture() {
         let fixture: serde_json::Value = serde_json::from_str(P2POOL_FIXTURE).unwrap();
         let deployment = fixture_deployment();
-        assert_eq!(deployment.redeem_script.len(), 1_366);
+        assert_eq!(deployment.redeem_script.len(), 1_364);
         assert!(hex::encode(&deployment.redeem_script).starts_with("45557f7c0543544d50"));
         assert!(hex::encode(&deployment.redeem_script).ends_with("6c6ea2695395a169756851"));
-        assert_eq!(deployment.fee_k, 1_946);
+        assert_eq!(deployment.fee_k, 1_944);
         assert_eq!(
             hex::encode(&deployment.locking_bytecode),
-            "aa2031973ed4278dbf3c8fdc3aa98599ca0adb2557a6a048b9ff0b2245626901646e87"
+            "aa20af6a8469e4d1cfca20761a9c3127b5e562d67b7156ad2b72e2919673b9f4de0787"
         );
         assert_eq!(
             hex::encode(deployment.lock_hash),
-            "ffced6fb23ce80f020f9a70b709cf85ae3273a6cadf57bd30cf57982ef4a7a57"
+            "f1a16f57915e458318d4bb0078c7b1f3b753b9770ea3848437eae4abd1135caf"
         );
         assert_eq!(deployment.threads, 4);
         assert_eq!(deployment.virtual_sats, 84_000_000_000);
@@ -2518,7 +2518,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             address,
-            "bchtest:rvcew0k5y7xm70y0msa2npveeg9dkf2h56sy3w0lpv3y2cnfq9jxu6cwnmemh"
+            "bchtest:rwhk4prfungulj3qwcdfcvf8khjk94nmw9t262mju2gevuae7n0qwnf98a02d"
         );
     }
 
@@ -2605,11 +2605,16 @@ pub(crate) mod tests {
             );
         }
         let slot: serde_json::Value = serde_json::from_str(P2POOL_CLAIM).unwrap();
-        // BCH P2Pool's `cli.mjs claim` built the same transaction.
-        let theirs = slot["p2pool_claim_hex"]
+        // BCH P2Pool's `cli.mjs claim` built the same transaction: the same
+        // txid, which commits to every byte (and the same hex, where the
+        // slot holds it).
+        let txid = slot["p2pool_claim_txid"]
             .as_str()
-            .expect("P2Pool's claim hex for the fixture");
-        assert_eq!(hex::encode(&claim.raw), theirs);
+            .expect("P2Pool's claim txid for the fixture");
+        assert_eq!(claim.txid, txid);
+        if let Some(theirs) = slot["p2pool_claim_hex"].as_str() {
+            assert_eq!(hex::encode(&claim.raw), theirs);
+        }
     }
 
     // #### merge-mining v2: the ASERT band's edges (P2Pool's vectors)

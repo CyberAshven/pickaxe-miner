@@ -872,15 +872,17 @@ Every claim the builder makes passes it before it is broadcast.
 
 - `src/stratum_v2/merge/test_data/tsafa-chipnet-fixture.json` is BCH
   P2Pool's fixture, copied verbatim from its
-  `tools/safa-auxpow/test_data`. It is what P2Pool's `cli.mjs params`
-  prints for a fake Chipnet deployment: funding outpoint `11…11:0`, 4
-  threads, 84,000,000,000 virtual satoshis, never broadcast.
+  `tools/safa-auxpow/test_data` (its covenant as of P2Pool commit
+  88b696e8, with the test-network band and thread bound). It is what
+  P2Pool's `cli.mjs params` prints for a fake Chipnet deployment: funding
+  outpoint `11…11:0`, 4 threads, 84,000,000,000 virtual satoshis, never
+  broadcast.
 - Pickaxe's loader reproduces P2Pool's values from that file's redeem
-  script (1,366 bytes):
-  - `K` 1,946;
-  - the lock `aa2031973ed4…646e87`;
-  - `lock_hash` `ffced6fb…ef4a7a57`;
-  - the vault address `bchtest:rvcew0k5…`.
+  script (1,364 bytes):
+  - `K` 1,944;
+  - the lock `aa20af6a8469…de0787`;
+  - `lock_hash` `f1a16f57…d1135caf`;
+  - the vault address `bchtest:rwhk4prf…`.
 - `safa_auxpow::tests::the_fixture_claim_matches_p2pools` builds a claim for
   it from fixed inputs. With `PICKAXE_SAFA_EXPORT=DIR`, it writes P2Pool's
   `cli.mjs claim` inputs there (`deployment.json`, `claim.json`) beside
