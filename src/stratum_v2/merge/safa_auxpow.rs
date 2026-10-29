@@ -79,7 +79,11 @@ const MAX_AUX_HEIGHT: u8 = 16;
 /// `GetCompact` of the proof-of-work limit, 2^224 - 1.
 const POW_LIMIT_BITS: u32 = 0x1d00_ffff;
 const MAX_VIRTUAL_SATS: u64 = 1 << 62;
-const MAX_THREADS: u64 = 0x7fff_ffff;
+// #### At most 63 threads, as BCH P2Pool's deployment tooling allows: well
+// under 288, where even the longest wait (Δh 288) cannot ease a thread's
+// target (`⌊288 × 5000 / threads⌋ + 5000 <= 10000`) and the vault freezes.
+// A tooling check on both sides, not a covenant rule.
+const MAX_THREADS: u64 = 63;
 const MAX_DEPLOYMENT_FILE: u64 = 1 << 20;
 /// A mutable NFT's capability byte.
 const MUTABLE: u8 = 0x01;
@@ -94,6 +98,8 @@ struct Band {
     half_life: i64,
     allow_pow_limit: bool,
     hard_divisor: u32,
+    /// The easy side, `computed × easy.0 / easy.1`.
+    easy: (u32, u32),
 }
 
 fn band_of(network: MiningNetwork) -> Band {
@@ -105,6 +111,7 @@ fn band_of(network: MiningNetwork) -> Band {
             half_life: 172_800,
             allow_pow_limit: false,
             hard_divisor: 2,
+            easy: (105, 100),
         },
         MiningNetwork::Chipnet => Band {
             anchor_height: 16_844,
@@ -113,6 +120,7 @@ fn band_of(network: MiningNetwork) -> Band {
             half_life: 3_600,
             allow_pow_limit: true,
             hard_divisor: 8,
+            easy: (8, 1),
         },
     }
 }
@@ -231,7 +239,11 @@ fn asert_target(reference: &BigUint, time_diff: i64, height_diff: i64, half_life
 // What: a claim's header nBits must sit in the ASERT band at its coinbase
 // height (its own time standing in for its parent's): mainnet
 // `computed / 2 <= target <= computed × 1.05`, Chipnet `computed / 8` to
-// `computed × 1.05` or exactly the limit's bits. After 4,032 blocks without
+// `computed × 8` or exactly the limit's bits. (On a test network a header
+// may be dated up to 2 hours before its parent, which moves ASERT's target
+// far more than on mainnet, where 2 hours is only × 1.029: × 1.05 refused
+// Chipnet headers dated over about 253 seconds before their parent.) After
+// 4,032 blocks without
 // a claim a header outside it may still pass the fallback band around the
 // state's `ref_bits`: `ref >> 4 <= target <= ref × 1.1`.
 // Why: so only BCH-shaped headers mine a thread, while a change to BCH's
@@ -257,7 +269,7 @@ pub fn asert_band(network: MiningNetwork, bits: u32, time: u32, height: u32) -> 
         height_diff,
         band.half_life,
     );
-    Some(target >= &computed / band.hard_divisor && target * 100u32 <= computed * 105u32)
+    Some(target >= &computed / band.hard_divisor && target * band.easy.1 <= computed * band.easy.0)
 }
 
 /// The DAA-change fallback band, which applies from 4,032 blocks without a
@@ -465,7 +477,7 @@ impl Deployment {
             .get("threads")
             .and_then(Value::as_u64)
             .filter(|threads| (1..=MAX_THREADS).contains(threads))
-            .ok_or("the SAFA deployment's threads must be from 1 to 2^31 - 1")?;
+            .ok_or("the SAFA deployment's threads must be from 1 to 63")?;
         let virtual_sats = match object.get("virtual_sats") {
             Some(Value::Number(number)) => number.as_u64(),
             Some(Value::String(text)) if text.bytes().all(|byte| byte.is_ascii_digit()) => {
@@ -2471,25 +2483,25 @@ pub(crate) mod tests {
     }
 
     // #### merge-mining v2: P2Pool's covenant, read by Pickaxe's loader
-    // What: from the fixture's redeem script (1,366 bytes) the loader
-    // derives P2Pool's K (1,946), lock, lock_hash and token-aware P2SH32
+    // What: from the fixture's redeem script (1,364 bytes) the loader
+    // derives P2Pool's K (1,944), lock, lock_hash and token-aware P2SH32
     // vault address, and accepts the fixture's own copies of them.
     // Look here if: Deployment::from_json or CLAIM_FIXED_BYTES changes.
     #[test]
     fn the_loader_reproduces_p2pools_fixture() {
         let fixture: serde_json::Value = serde_json::from_str(P2POOL_FIXTURE).unwrap();
         let deployment = fixture_deployment();
-        assert_eq!(deployment.redeem_script.len(), 1_366);
+        assert_eq!(deployment.redeem_script.len(), 1_364);
         assert!(hex::encode(&deployment.redeem_script).starts_with("45557f7c0543544d50"));
         assert!(hex::encode(&deployment.redeem_script).ends_with("6c6ea2695395a169756851"));
-        assert_eq!(deployment.fee_k, 1_946);
+        assert_eq!(deployment.fee_k, 1_944);
         assert_eq!(
             hex::encode(&deployment.locking_bytecode),
-            "aa2031973ed4278dbf3c8fdc3aa98599ca0adb2557a6a048b9ff0b2245626901646e87"
+            "aa20af6a8469e4d1cfca20761a9c3127b5e562d67b7156ad2b72e2919673b9f4de0787"
         );
         assert_eq!(
             hex::encode(deployment.lock_hash),
-            "ffced6fb23ce80f020f9a70b709cf85ae3273a6cadf57bd30cf57982ef4a7a57"
+            "f1a16f57915e458318d4bb0078c7b1f3b753b9770ea3848437eae4abd1135caf"
         );
         assert_eq!(deployment.threads, 4);
         assert_eq!(deployment.virtual_sats, 84_000_000_000);
@@ -2506,7 +2518,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             address,
-            "bchtest:rvcew0k5y7xm70y0msa2npveeg9dkf2h56sy3w0lpv3y2cnfq9jxu6cwnmemh"
+            "bchtest:rwhk4prfungulj3qwcdfcvf8khjk94nmw9t262mju2gevuae7n0qwnf98a02d"
         );
     }
 
@@ -2593,11 +2605,16 @@ pub(crate) mod tests {
             );
         }
         let slot: serde_json::Value = serde_json::from_str(P2POOL_CLAIM).unwrap();
-        // BCH P2Pool's `cli.mjs claim` built the same transaction.
-        let theirs = slot["p2pool_claim_hex"]
+        // BCH P2Pool's `cli.mjs claim` built the same transaction: the same
+        // txid, which commits to every byte (and the same hex, where the
+        // slot holds it).
+        let txid = slot["p2pool_claim_txid"]
             .as_str()
-            .expect("P2Pool's claim hex for the fixture");
-        assert_eq!(hex::encode(&claim.raw), theirs);
+            .expect("P2Pool's claim txid for the fixture");
+        assert_eq!(claim.txid, txid);
+        if let Some(theirs) = slot["p2pool_claim_hex"].as_str() {
+            assert_eq!(hex::encode(&claim.raw), theirs);
+        }
     }
 
     // #### merge-mining v2: the ASERT band's edges (P2Pool's vectors)
@@ -2632,7 +2649,10 @@ pub(crate) mod tests {
         assert_eq!(at(computed.clone()), Some(true));
         assert_eq!(at(&computed / 8u32), Some(true));
         assert_eq!(at(&computed / 16u32), Some(false));
-        assert_eq!(at(&computed * 2u32), Some(false));
+        // #### P2Pool's test-network fix: the easy side is × 8.
+        assert_eq!(at(&computed * 2u32), Some(true));
+        assert_eq!(at(&computed * 8u32), Some(true));
+        assert_eq!(at(&computed * 9u32), Some(false));
         assert_eq!(
             asert_band(MiningNetwork::Chipnet, POW_LIMIT_BITS, time, height),
             Some(true)
@@ -2643,6 +2663,16 @@ pub(crate) mod tests {
             asert_band(MiningNetwork::Chipnet, bits, time, 329_001),
             Some(true)
         );
+        // #### P2Pool's test-network fix: Chipnet block 329,001 still
+        // passes when dated up to 2 hours earlier (BCHN accepts a parent
+        // dated up to 2 hours ahead); × 1.05 refused it from 260 seconds.
+        for earlier in [200, 260, 600, 3_600, 7_200] {
+            assert_eq!(
+                asert_band(MiningNetwork::Chipnet, bits, time - earlier, 329_001),
+                Some(true),
+                "{earlier} s earlier"
+            );
+        }
         let (time, bits) = time_and_bits(MAINNET_974001);
         assert_eq!(
             asert_band(MiningNetwork::Mainnet, bits, time, 974_001),
@@ -2813,6 +2843,7 @@ pub(crate) mod tests {
         )
         .is_ok());
         assert!(with("lock_hash", hex::encode(deployment.lock_hash).into()).is_ok());
+        assert!(with("threads", 63.into()).is_ok());
         assert!(with("network", "mainnet".into())
             .unwrap_err()
             .contains("Chipnet only"));
@@ -2822,6 +2853,8 @@ pub(crate) mod tests {
             ("category", "00".repeat(32).into()),
             ("category", "zz".into()),
             ("threads", 0.into()),
+            // #### At most 63 threads, as P2Pool's tooling allows.
+            ("threads", 64.into()),
             ("virtual_sats", "4611686018427387905".into()),
             ("virtual_sats", "-1".into()),
             ("redeem_script", "".into()),

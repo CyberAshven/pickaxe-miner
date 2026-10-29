@@ -5131,10 +5131,14 @@ mod tests {
         )
         .serialize();
         let mining_payout = reward::p2pkh_cashaddr_from_public_key(&reward_public).unwrap();
+        // A random part too: a later test process (the release-profile run
+        // in the same CI job) can get the same process id and would find
+        // files an earlier one left in the shared temp directory.
         let unique = format!(
-            "pickaxe-preflight-{}-{}.json",
+            "pickaxe-preflight-{}-{}-{:016x}.json",
             std::process::id(),
-            PREFLIGHT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
+            PREFLIGHT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed),
+            rand::random::<u64>()
         );
         let journal = std::env::temp_dir().join(unique);
         (
