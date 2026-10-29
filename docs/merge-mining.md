@@ -373,7 +373,10 @@ token authors. The format above does not depend on them.
   blocks since the last claim, `target × (⌊min(Δh, 288) × 5000 / threads⌋ +
   5000) / 10000`, clamped to 1 and `0x7fffff << 232` and rounded down to
   canonical token bits, with `Δh = cb_height − state_height`. The leaf
-  commits these bits, and they become the next state's.
+  commits these bits, and they become the next state's. A deployment has
+  fewer than 288 threads: at 288 or more even the longest wait cannot ease
+  a target, and the vault freezes (the covenant and Pickaxe's deployment
+  loader both refuse more).
 - **BCH only.** The covenant checks the header's nBits against ASERT at the
   coinbase's BIP34 height:
   - Per-network parameters, from BCHN's chainparams: `half_life` 172,800 s on
@@ -398,9 +401,14 @@ token authors. The format above does not depend on them.
   - Mainnet: `computed/2 ≤ header_target ≤ computed × 1.05` (asymmetric).
     Multi-hour gaps happen, and the header's time is only a stand-in for the
     parent's, hence the room on the hard side.
-  - Test networks accept `computed/8 ≤ header_target ≤ computed × 1.05`, or
+  - Test networks accept `computed/8 ≤ header_target ≤ computed × 8`, or
     nBits equal to the network's powLimit (`allow_pow_limit`), with their own
-    `half_life` and anchor.
+    `half_life` and anchor. The easy side is wide because BCHN accepts a
+    parent dated up to 2 hours ahead of its child: with chipnet's 3,600 s
+    half-life, `× 1.05` refused real headers dated more than about 253 s
+    before their parent (BCH P2Pool's review, checked with chipnet block
+    329,001). On mainnet 2 hours moves the target only × 1.029, so its band
+    is unchanged.
   - After `Δh ≥ 4,032` blocks without a claim, the covenant also accepts the
     fallback band around `ref`, the last claim header's nBits kept in the
     state: `ref >> 4 ≤ target ≤ ref × 1.1`, so a future change to BCH's

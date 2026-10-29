@@ -79,7 +79,10 @@ const MAX_AUX_HEIGHT: u8 = 16;
 /// `GetCompact` of the proof-of-work limit, 2^224 - 1.
 const POW_LIMIT_BITS: u32 = 0x1d00_ffff;
 const MAX_VIRTUAL_SATS: u64 = 1 << 62;
-const MAX_THREADS: u64 = 0x7fff_ffff;
+// #### P2Pool's covenant caps threads below 288: at 288 or more even the
+// longest wait (Δh 288) cannot ease a thread's target
+// (`⌊288 × 5000 / threads⌋ + 5000 <= 10000`), and the vault freezes.
+const MAX_THREADS: u64 = 287;
 const MAX_DEPLOYMENT_FILE: u64 = 1 << 20;
 /// A mutable NFT's capability byte.
 const MUTABLE: u8 = 0x01;
@@ -94,6 +97,8 @@ struct Band {
     half_life: i64,
     allow_pow_limit: bool,
     hard_divisor: u32,
+    /// The easy side, `computed × easy.0 / easy.1`.
+    easy: (u32, u32),
 }
 
 fn band_of(network: MiningNetwork) -> Band {
@@ -105,6 +110,7 @@ fn band_of(network: MiningNetwork) -> Band {
             half_life: 172_800,
             allow_pow_limit: false,
             hard_divisor: 2,
+            easy: (105, 100),
         },
         MiningNetwork::Chipnet => Band {
             anchor_height: 16_844,
@@ -113,6 +119,7 @@ fn band_of(network: MiningNetwork) -> Band {
             half_life: 3_600,
             allow_pow_limit: true,
             hard_divisor: 8,
+            easy: (8, 1),
         },
     }
 }
@@ -231,7 +238,11 @@ fn asert_target(reference: &BigUint, time_diff: i64, height_diff: i64, half_life
 // What: a claim's header nBits must sit in the ASERT band at its coinbase
 // height (its own time standing in for its parent's): mainnet
 // `computed / 2 <= target <= computed × 1.05`, Chipnet `computed / 8` to
-// `computed × 1.05` or exactly the limit's bits. After 4,032 blocks without
+// `computed × 8` or exactly the limit's bits. (On a test network a header
+// may be dated up to 2 hours before its parent, which moves ASERT's target
+// far more than on mainnet, where 2 hours is only × 1.029: × 1.05 refused
+// Chipnet headers dated over about 253 seconds before their parent.) After
+// 4,032 blocks without
 // a claim a header outside it may still pass the fallback band around the
 // state's `ref_bits`: `ref >> 4 <= target <= ref × 1.1`.
 // Why: so only BCH-shaped headers mine a thread, while a change to BCH's
@@ -257,7 +268,7 @@ pub fn asert_band(network: MiningNetwork, bits: u32, time: u32, height: u32) -> 
         height_diff,
         band.half_life,
     );
-    Some(target >= &computed / band.hard_divisor && target * 100u32 <= computed * 105u32)
+    Some(target >= &computed / band.hard_divisor && target * band.easy.1 <= computed * band.easy.0)
 }
 
 /// The DAA-change fallback band, which applies from 4,032 blocks without a
@@ -465,7 +476,7 @@ impl Deployment {
             .get("threads")
             .and_then(Value::as_u64)
             .filter(|threads| (1..=MAX_THREADS).contains(threads))
-            .ok_or("the SAFA deployment's threads must be from 1 to 2^31 - 1")?;
+            .ok_or("the SAFA deployment's threads must be from 1 to 287")?;
         let virtual_sats = match object.get("virtual_sats") {
             Some(Value::Number(number)) => number.as_u64(),
             Some(Value::String(text)) if text.bytes().all(|byte| byte.is_ascii_digit()) => {
@@ -2632,7 +2643,10 @@ pub(crate) mod tests {
         assert_eq!(at(computed.clone()), Some(true));
         assert_eq!(at(&computed / 8u32), Some(true));
         assert_eq!(at(&computed / 16u32), Some(false));
-        assert_eq!(at(&computed * 2u32), Some(false));
+        // #### P2Pool's test-network fix: the easy side is × 8.
+        assert_eq!(at(&computed * 2u32), Some(true));
+        assert_eq!(at(&computed * 8u32), Some(true));
+        assert_eq!(at(&computed * 9u32), Some(false));
         assert_eq!(
             asert_band(MiningNetwork::Chipnet, POW_LIMIT_BITS, time, height),
             Some(true)
@@ -2643,6 +2657,16 @@ pub(crate) mod tests {
             asert_band(MiningNetwork::Chipnet, bits, time, 329_001),
             Some(true)
         );
+        // #### P2Pool's test-network fix: Chipnet block 329,001 still
+        // passes when dated up to 2 hours earlier (BCHN accepts a parent
+        // dated up to 2 hours ahead); × 1.05 refused it from 260 seconds.
+        for earlier in [200, 260, 600, 3_600, 7_200] {
+            assert_eq!(
+                asert_band(MiningNetwork::Chipnet, bits, time - earlier, 329_001),
+                Some(true),
+                "{earlier} s earlier"
+            );
+        }
         let (time, bits) = time_and_bits(MAINNET_974001);
         assert_eq!(
             asert_band(MiningNetwork::Mainnet, bits, time, 974_001),
@@ -2813,6 +2837,7 @@ pub(crate) mod tests {
         )
         .is_ok());
         assert!(with("lock_hash", hex::encode(deployment.lock_hash).into()).is_ok());
+        assert!(with("threads", 287.into()).is_ok());
         assert!(with("network", "mainnet".into())
             .unwrap_err()
             .contains("Chipnet only"));
@@ -2822,6 +2847,8 @@ pub(crate) mod tests {
             ("category", "00".repeat(32).into()),
             ("category", "zz".into()),
             ("threads", 0.into()),
+            // #### P2Pool's covenant caps threads below 288.
+            ("threads", 288.into()),
             ("virtual_sats", "4611686018427387905".into()),
             ("virtual_sats", "-1".into()),
             ("redeem_script", "".into()),
