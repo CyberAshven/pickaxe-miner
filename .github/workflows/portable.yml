@@ -35,7 +35,7 @@ jobs:
           cargo +nightly-2026-04-11 run --locked --manifest-path tools/shared-gpu-proof/Cargo.toml --release -p pickaxe-shared-hash-builder
           # Rebuild the production filters from native Rust and reject drift.
           python3 tools/shared-gpu-proof/sync_filter.py
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: pickaxe-shared-gpu-${{ inputs.source-ref }}
           path: |
@@ -44,6 +44,8 @@ jobs:
             artifacts/shared-gpu-proof/filter/*.spv
             artifacts/shared-gpu-proof/stages/*.metal
             artifacts/shared-gpu-proof/stages/*.spv
+            artifacts/shared-gpu-proof/electric/*.metal
+            artifacts/shared-gpu-proof/electric/*.spv
           if-no-files-found: error
 
   software-vulkan:
@@ -73,6 +75,7 @@ jobs:
           cargo test --locked --release --lib --no-default-features --features portable-wgpu wgpu_photon::tests::t2_gpu_end_to_end_boundaries_and_rotations -- --ignored --exact --test-threads=1 --nocapture
           # #### PR #22: the same oracle with the original hand-written WGSL stages.
           PICKAXE_WGPU_STAGES=wgsl cargo test --locked --release --lib --no-default-features --features portable-wgpu wgpu_photon::tests::t2_gpu_end_to_end_boundaries_and_rotations -- --ignored --exact --test-threads=1 --nocapture
+          cargo test --locked --release --lib --no-default-features --features portable-wgpu electric::gpu::tests::electric_portable_matches_independent_hashes_if_wgpu_present -- --ignored --exact --test-threads=1 --nocapture
 
   apple-silicon:
     name: macOS ARM64
@@ -86,14 +89,14 @@ jobs:
           persist-credentials: false
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --component clippy
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: pickaxe-shared-gpu-${{ inputs.source-ref }}
           path: artifacts/shared-gpu-proof
       - name: Compile generated shared Rust shader with Apple Metal
         run: |
           xcrun -sdk macosx metal -c artifacts/shared-gpu-proof/shared-t2-hash.metal -o artifacts/shared-gpu-proof/shared-t2-hash.air
-          for shader in artifacts/shared-gpu-proof/filter/*.metal artifacts/shared-gpu-proof/stages/*.metal; do
+          for shader in artifacts/shared-gpu-proof/filter/*.metal artifacts/shared-gpu-proof/stages/*.metal artifacts/shared-gpu-proof/electric/*.metal; do
             xcrun -sdk macosx metal -c "$shader" -o "${shader%.metal}.air"
           done
       - name: Check shared application and Metal backend
@@ -115,7 +118,7 @@ jobs:
           git rev-parse HEAD > "dist/$archive/SOURCE_COMMIT.txt"
           tar -czf "dist/$archive.tar.gz" -C dist "$archive"
           (cd dist && shasum -a 256 *.tar.gz > SHA256SUMS.txt)
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: pickaxe-macos-arm64-${{ inputs.source-ref }}
           path: |
@@ -132,7 +135,7 @@ jobs:
         with:
           ref: ${{ inputs.source-ref }}
           persist-credentials: false
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
       - name: Install build tools
@@ -156,7 +159,7 @@ jobs:
           cp docs/portable.md dist/web/README.md
           tar -czf dist/pickaxe-browser.tar.gz -C dist web
           (cd dist && sha256sum *.tar.gz > SHA256SUMS.txt)
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: pickaxe-browser-${{ inputs.source-ref }}
           path: |

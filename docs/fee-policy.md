@@ -10,8 +10,17 @@ Older Fulcrum servers without `mempool.get_info` fall back to their advertised
 relay minimum; they cannot expose a changing mempool floor through that method.
 
 Edit `MiningToken::fee_policy` in `src/config.rs` to select a token's mode,
-fee shares and payout addresses. This is compiled policy, not a
-user preference. Saved profiles and command-line arguments cannot change it.
+fee shares and payout addresses. This compiled policy is each token's
+default: PHOTON's and ELECTRIC's 4% work share, and 1.5% for every token
+added later (`donation::NEW_TOKEN_DONATION`). A miner can raise or lower it,
+down to 0%, in 0.5% steps in the mining dashboard's Advanced settings (`a`),
+with `--token-donation PERCENT`, or in a saved profile. Anything above the
+default is more of the work for the project's donation address; below it,
+the project's and the collaborator's shares shrink in proportion, to none at
+0% (`TokenDonation::work_shares`, `fee_policy_at`). A change applies to every
+GPU at its next batch and to every rig of a coordinator at once. BCH and its
+merge-mined tokens keep their own policy (`donation/bch.rs`), which a miner
+can also set down to 0%.
 Addresses are validated before mining; each network may use different recipients.
 Do not edit the historical address/percentage constants used by legacy recovery.
 
@@ -28,6 +37,8 @@ it does not silently request a deposit, batch rewards, or ignore the split.
 Future tokens may select any supported mode independently. BCH coinbase payouts
 and token claims remain different transaction builders. No ASIC proxy or new
 token is enabled by selecting a fee mode.
+ELECTRIC uses PHOTON's 4% work share and addresses; the hybrid proposed
+for it first, and why it is not used, is in [electric-token.md](electric-token.md).
 
 The work scheduler counts completed candidate hashes, not uptime, wins or peak
 hashrate. It keeps its position across pauses, intensity changes, job updates and

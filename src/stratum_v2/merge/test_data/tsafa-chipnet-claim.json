@@ -1,0 +1,5 @@
+{
+  "note": "Pickaxe's claim for BCH P2Pool's Chipnet tSAFA fixture (tsafa-chipnet-fixture.json, copied from P2Pool). p2pool_claim_txid is the txid BCH P2Pool's `cli.mjs claim` (commit 88b696e8) printed for the inputs safa_auxpow::tests::the_fixture_claim_matches_p2pools exports with PICKAXE_SAFA_EXPORT=DIR, after verifying the claim in Libauth's 2026 VM; a txid commits to every byte, so the test's equal txid means an identical transaction. p2pool_claim_hex, when set, is compared too.",
+  "p2pool_claim_txid": "89771ec35e517ee27478de8a4639c8847dffbcff5a44db0c5156d180e1274c09",
+  "p2pool_claim_hex": null
+}

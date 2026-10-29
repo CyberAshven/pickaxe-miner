@@ -9,3 +9,8 @@ cuda/build/*.ptx -text
 reference/shared-t2/** linguist-generated text eol=lf
 # Preserve Naga's exact compiler output, including spaces after attributes.
 reference/shared-t2/*.wgsl whitespace=-blank-at-eol
+
+# #### PR #42: farm-OS package scripts run on Linux; keep them LF everywhere.
+packaging/farm-os/** text eol=lf
+tools/farm-os/** text eol=lf
+tools/test_farm_os_packages.py text eol=lf

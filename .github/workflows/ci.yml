@@ -68,7 +68,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           cache: npm
@@ -140,7 +140,7 @@ jobs:
           cat hip/build/gfx1036/SHA256SUMS.txt
 
       - name: Upload verified gfx1036 code objects
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: hip-gfx1036-${{ github.sha }}
           path: hip/build/gfx1036/
@@ -200,12 +200,59 @@ jobs:
           cat "hip/build/${{ matrix.arch }}/SHA256SUMS.txt"
 
       - name: Upload verified ${{ matrix.arch }} code objects
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: hip-${{ matrix.arch }}-${{ github.sha }}
           path: hip/build/${{ matrix.arch }}/
           if-no-files-found: error
           retention-days: 14
+
+  # #### PR #38
+  # Exercise the wire with an unmodified, pinned independent client. Synthetic
+  # BCH templates and one throttled CPU thread need neither a node nor a GPU.
+  sv2-reference:
+    name: Independent SV2 reference device
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.1
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_BUILD_JOBS: 2
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/sv2-reference
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Checkout pinned SRI client
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: stratum-mining/sv2-apps
+          ref: 3772e9d890dc7ec23bc82bcead41879542902402
+          path: .reference/sv2-apps
+          persist-credentials: false
+      - name: Install reference build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends capnproto libcapnp-dev libssl-dev pkg-config
+          rustup toolchain install 1.98.1 --profile minimal
+      - name: Build unmodified reference device
+        run: |
+          cargo build --locked --manifest-path .reference/sv2-apps/Cargo.toml -p integration_tests_sv2 --bin mining_device
+          sha256sum .reference/sv2-apps/Cargo.lock "$CARGO_TARGET_DIR/debug/mining_device"
+      - name: Verify pinned identity and successor blocks
+        env:
+          PICKAXE_SV2_REFERENCE_DEVICE: ${{ github.workspace }}/target/sv2-reference/debug/mining_device
+        run: cargo test --locked --no-default-features --features stratum-v2 --lib upstream_reference_device_authenticates_and_mines_successor_blocks -- --ignored --test-threads=1
+      # #### PR #48: the same pinned source's translator opens an extended channel.
+      - name: Build unmodified reference translator
+        run: |
+          cargo build --locked --manifest-path .reference/sv2-apps/Cargo.toml -p translator_sv2 --bin translator_sv2
+          sha256sum "$CARGO_TARGET_DIR/debug/translator_sv2"
+      - name: Verify an extended channel through the reference translator
+        env:
+          PICKAXE_SV2_REFERENCE_TRANSLATOR: ${{ github.workspace }}/target/sv2-reference/debug/translator_sv2
+        run: cargo test --locked --no-default-features --features stratum-v2 --lib upstream_reference_translator_mines_successor_blocks_on_an_extended_channel -- --ignored --test-threads=1
 
   rust:
     name: ${{ matrix.name }}
@@ -217,14 +264,37 @@ jobs:
             os: ubuntu-latest
           - name: Windows x86_64
             os: windows-latest
+          # #### PR #32: native ARM64 builds on GitHub's ARM64 runners, for
+          # ARM boards and laptops (Raspberry Pi 5, Ampere, Snapdragon); the
+          # portable engine mines there. Their binaries are uploaded below.
+          - name: Linux ARM64
+            os: ubuntu-24.04-arm
+          - name: Windows ARM64
+            os: windows-11-arm
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+
+      - name: Install rustup where the ARM64 image lacks it
+        if: runner.arch == 'ARM64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            if [[ "${RUNNER_OS}" == "Windows" ]]; then
+              curl -sSfL -o rustup-init.exe https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe
+              ./rustup-init.exe -y --profile minimal --default-toolchain none
+              echo "${USERPROFILE}\.cargo\bin" >> "${GITHUB_PATH}"
+            else
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+              echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+            fi
+          fi
 
       - name: Install Rust stable
         run: |
@@ -237,8 +307,18 @@ jobs:
           cargo --version
 
       - name: Test release channel policy
+        if: runner.arch == 'X64'
         shell: bash
         run: python -m unittest discover -s tools -p 'test_release_channel.py' -v
+
+      # #### PR #42: the HiveOS, mmpOS and RaveOS package scripts.
+      - name: Test farm OS packages
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shellcheck packaging/farm-os/*/*.sh tools/farm-os/build.sh
+          python -m unittest discover -s tools -p 'test_farm_os_packages.py' -v
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -264,7 +344,7 @@ jobs:
           cargo clippy --locked --manifest-path rust-engine/Cargo.toml --all-targets -- -D warnings
 
       - name: Rust dependency security policy
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && runner.arch == 'X64'
         shell: bash
         run: bash tools/check-rust-deps.sh
 
@@ -287,3 +367,12 @@ jobs:
           printf '%s\n' "${help}" | grep -q -- '--intensity'
           printf '%s\n' "${help}" | grep -q 'mine'
           test "$(${bin} --version | tr -d '\r')" = "pickaxe ${version}"
+
+      - name: Upload ARM64 binary for testers
+        if: runner.arch == 'ARM64'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: pickaxe-${{ runner.os == 'Windows' && 'windows' || 'linux' }}-arm64-${{ github.sha }}
+          path: target/release/pickaxe_miner${{ runner.os == 'Windows' && '.exe' || '' }}
+          if-no-files-found: error
+          retention-days: 14

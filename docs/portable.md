@@ -22,8 +22,13 @@ promise CUDA T2 performance.
 
 ## DirectX 12 on Windows (optional)
 
-On Windows the portable engine uses Vulkan. For a GPU whose Vulkan driver fails
-but whose DirectX 12 driver works, set `PICKAXE_WGPU_API=dx12`:
+On Windows the portable engine uses Vulkan. Older Vulkan drivers, such as
+Intel's for HD 520 and UHD 630, used to crash with an access violation in
+`igvk64.dll` before printing anything: wgpu 30 created a descriptor pool with
+no pool sizes, which Vulkan allowed only from 1.3.215. Pickaxe builds with
+wgpu's upstream fix for this (`third_party/wgpu-hal`, gfx-rs/wgpu#10124), so
+those GPUs run on Vulkan again. For a GPU whose Vulkan driver still fails but
+whose DirectX 12 driver works, set `PICKAXE_WGPU_API=dx12`:
 
 ```powershell
 $env:PICKAXE_WGPU_API = 'dx12'
@@ -41,9 +46,9 @@ these shaders. `PICKAXE_WGPU_API=vulkan`, or no variable, keeps Vulkan.
 ## Apple Silicon
 
 The **CI** workflow builds Windows, Linux, macOS and the browser from the same
-commit. Its reusable portable jobs create a `pickaxe-miner-v0.0.3-macos-arm64.tar.gz`
-archive on each pull request and master/dev update. Extract it, verify its
-checksum and source commit, then run:
+commit. Its reusable portable jobs create a macOS ARM64 archive on each pull
+request and master/dev update. Extract it, verify its checksum and source
+commit, then run:
 
 ```sh
 ./pickaxe mine --network mainnet --backend wgpu
@@ -176,9 +181,11 @@ the browser's hot path stale. Developers update them with
 arithmetic still use the established portable implementation; their migration
 to the native source remains separate work.
 
-This workflow does not create tags or publish releases. Package version remains
-0.0.3. The Mac archive can be attached to the existing release after merge;
-tested Windows/Linux downloads do not need replacement for this change.
+Package names and versions come from `Cargo.toml`. The portable workflow uploads
+CI artifacts; the release workflow collects the packages from the same validated
+commit. Download published packages from the
+[latest release](https://github.com/CyberAshven/pickaxe-miner/releases/latest).
+Pull requests and dev merges do not create tags or publish releases.
 
 Source is available at <https://github.com/CyberAshven/pickaxe-miner>. Distributors
 must provide the corresponding source under AGPL-3.0; modified hosts must offer
