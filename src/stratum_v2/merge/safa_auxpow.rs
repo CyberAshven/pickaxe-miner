@@ -79,10 +79,11 @@ const MAX_AUX_HEIGHT: u8 = 16;
 /// `GetCompact` of the proof-of-work limit, 2^224 - 1.
 const POW_LIMIT_BITS: u32 = 0x1d00_ffff;
 const MAX_VIRTUAL_SATS: u64 = 1 << 62;
-// #### P2Pool's covenant caps threads below 288: at 288 or more even the
-// longest wait (Δh 288) cannot ease a thread's target
-// (`⌊288 × 5000 / threads⌋ + 5000 <= 10000`), and the vault freezes.
-const MAX_THREADS: u64 = 287;
+// #### At most 63 threads, as BCH P2Pool's deployment tooling allows: well
+// under 288, where even the longest wait (Δh 288) cannot ease a thread's
+// target (`⌊288 × 5000 / threads⌋ + 5000 <= 10000`) and the vault freezes.
+// A tooling check on both sides, not a covenant rule.
+const MAX_THREADS: u64 = 63;
 const MAX_DEPLOYMENT_FILE: u64 = 1 << 20;
 /// A mutable NFT's capability byte.
 const MUTABLE: u8 = 0x01;
@@ -476,7 +477,7 @@ impl Deployment {
             .get("threads")
             .and_then(Value::as_u64)
             .filter(|threads| (1..=MAX_THREADS).contains(threads))
-            .ok_or("the SAFA deployment's threads must be from 1 to 287")?;
+            .ok_or("the SAFA deployment's threads must be from 1 to 63")?;
         let virtual_sats = match object.get("virtual_sats") {
             Some(Value::Number(number)) => number.as_u64(),
             Some(Value::String(text)) if text.bytes().all(|byte| byte.is_ascii_digit()) => {
@@ -2837,7 +2838,7 @@ pub(crate) mod tests {
         )
         .is_ok());
         assert!(with("lock_hash", hex::encode(deployment.lock_hash).into()).is_ok());
-        assert!(with("threads", 287.into()).is_ok());
+        assert!(with("threads", 63.into()).is_ok());
         assert!(with("network", "mainnet".into())
             .unwrap_err()
             .contains("Chipnet only"));
@@ -2847,8 +2848,8 @@ pub(crate) mod tests {
             ("category", "00".repeat(32).into()),
             ("category", "zz".into()),
             ("threads", 0.into()),
-            // #### P2Pool's covenant caps threads below 288.
-            ("threads", 288.into()),
+            // #### At most 63 threads, as P2Pool's tooling allows.
+            ("threads", 64.into()),
             ("virtual_sats", "4611686018427387905".into()),
             ("virtual_sats", "-1".into()),
             ("redeem_script", "".into()),

@@ -374,9 +374,9 @@ token authors. The format above does not depend on them.
   5000) / 10000`, clamped to 1 and `0x7fffff << 232` and rounded down to
   canonical token bits, with `Δh = cb_height − state_height`. The leaf
   commits these bits, and they become the next state's. A deployment has
-  fewer than 288 threads: at 288 or more even the longest wait cannot ease
-  a target, and the vault freezes (the covenant and Pickaxe's deployment
-  loader both refuse more).
+  at most 63 threads, as BCH P2Pool's tooling and Pickaxe's deployment
+  loader both check (not a covenant rule): well under 288, where even the
+  longest wait cannot ease a target and the vault freezes.
 - **BCH only.** The covenant checks the header's nBits against ASERT at the
   coinbase's BIP34 height:
   - Per-network parameters, from BCHN's chainparams: `half_life` 172,800 s on
