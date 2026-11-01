@@ -1,5 +1,115 @@
 //! Token-selected fee policy; a work recipient is fixed before hashing.
 use crate::config::{self, MiningNetwork};
+use serde::{Deserialize, Serialize};
+use std::{fmt, str::FromStr};
+
+pub mod bch;
+
+/// #### PR #32
+/// What: a token's donation, as a share of the mining work itself in
+/// hundredths of a percent. Each token has a default a miner can raise or
+/// lower, down to 0%, in Advanced settings: 4% for PHOTON and ELECTRIC, and
+/// 1.5% for every token added later. BCH and its merge-mined tokens keep
+/// their own policy (`bch::BchDonation`), which can go down to 0% too.
+/// Why: the operator's rule (2026-10-08); since 2026-10-24 every donation
+/// can go to 0% if the miner chooses.
+/// Check: raising it moves only the project's share; lowering it below the
+/// default shrinks every share in proportion (`work_shares`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "u16", into = "u16")]
+pub struct TokenDonation(u16);
+
+/// The default of every token added after PHOTON and ELECTRIC.
+pub const NEW_TOKEN_DONATION: TokenDonation = TokenDonation(150);
+/// The most a miner can donate: the miner keeps a share of the work.
+const MAX_TOKEN_DONATION_BPS: u16 = 9_950;
+/// Steps of the Advanced setting: 0.5%.
+const TOKEN_DONATION_STEP_BPS: u16 = 50;
+
+impl TokenDonation {
+    pub const fn from_bps(bps: u16) -> Self {
+        Self(if bps > MAX_TOKEN_DONATION_BPS {
+            MAX_TOKEN_DONATION_BPS
+        } else {
+            bps
+        })
+    }
+
+    pub const fn bps(self) -> u16 {
+        self.0
+    }
+
+    /// The next 0.5% step up or down, down to 0%.
+    pub fn adjusted(self, increase: bool) -> Self {
+        let next = if increase {
+            (self.0 / TOKEN_DONATION_STEP_BPS + 1).saturating_mul(TOKEN_DONATION_STEP_BPS)
+        } else {
+            self.0.div_ceil(TOKEN_DONATION_STEP_BPS).saturating_sub(1) * TOKEN_DONATION_STEP_BPS
+        };
+        Self::from_bps(next)
+    }
+
+    /// The work shares `[project, collaborator]` of this donation, for a
+    /// token whose `default` donation takes `shares`: at or above the
+    /// default the rest goes to the project; below it both shrink in
+    /// proportion, to none at 0%.
+    pub fn work_shares(self, default: Self, shares: [u16; 2]) -> [u16; 2] {
+        if self >= default {
+            return [shares[0].saturating_add(self.0 - default.0), shares[1]];
+        }
+        let collaborator =
+            (u32::from(shares[1]) * u32::from(self.0) / u32::from(default.0.max(1))) as u16;
+        [self.0 - collaborator, collaborator]
+    }
+}
+
+impl TryFrom<u16> for TokenDonation {
+    type Error = String;
+    fn try_from(bps: u16) -> Result<Self, String> {
+        if bps > MAX_TOKEN_DONATION_BPS {
+            return Err("a token donation must be below 100%".into());
+        }
+        Ok(Self(bps))
+    }
+}
+
+impl From<TokenDonation> for u16 {
+    fn from(value: TokenDonation) -> Self {
+        value.0
+    }
+}
+
+impl FromStr for TokenDonation {
+    type Err = String;
+    /// A percentage such as "4", "4.5" or "6.25".
+    fn from_str(value: &str) -> Result<Self, String> {
+        let invalid = || "use a donation percentage with at most two decimal places".to_owned();
+        let (whole, fraction) = value.trim().split_once('.').unwrap_or((value.trim(), ""));
+        if whole.is_empty()
+            || whole.len() > 3
+            || fraction.len() > 2
+            || !whole
+                .bytes()
+                .chain(fraction.bytes())
+                .all(|b| b.is_ascii_digit())
+        {
+            return Err(invalid());
+        }
+        let whole: u16 = whole.parse().map_err(|_| invalid())?;
+        let fraction: u16 = format!("{fraction:0<2}").parse().map_err(|_| invalid())?;
+        let bps = whole
+            .checked_mul(100)
+            .and_then(|bps| bps.checked_add(fraction))
+            .ok_or_else(invalid)?;
+        Self::try_from(bps)
+    }
+}
+
+impl fmt::Display for TokenDonation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{:02}%", self.0 / 100, self.0 % 100)
+    }
+}
 
 /// Basis points for project and collaborator. A hybrid's reward split applies
 /// only to personal work, never to developer wins.
@@ -85,7 +195,7 @@ impl Policy {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Recipient {
     Miner,
     Project,
@@ -102,6 +212,20 @@ pub struct Schedule {
     position: u64,
 }
 impl Schedule {
+    /// #### PR #65: change future work without resetting the nonce allocation
+    /// or changing the recipient of an already reserved GPU batch.
+    pub fn set_scheme(&mut self, scheme: Scheme) -> Result<(), String> {
+        let old_cycle = self.weights.iter().sum::<u64>() * self.unit;
+        let mut next = Self::new(scheme, self.unit, 0)?;
+        let new_cycle = next.weights.iter().sum::<u64>() * next.unit;
+        // Preserve progress through the cycle when a different GCD changes
+        // its length; toggling rates must not restart the personal-work part.
+        next.position =
+            (u128::from(self.position) * u128::from(new_cycle) / u128::from(old_cycle)) as u64;
+        *self = next;
+        Ok(())
+    }
+
     pub fn new(scheme: Scheme, unit: u64, random: u64) -> Result<Self, String> {
         scheme.validate()?;
         let [a, b] = scheme.work().map(u64::from);
@@ -164,6 +288,57 @@ pub(crate) fn require_direct_reward_policy(scheme: crate::donation::Scheme) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #### PR #32
+    #[test]
+    fn a_token_donation_moves_in_half_percent_steps_down_to_zero() {
+        let photon = TokenDonation::from_bps(400);
+        assert_eq!("4".parse::<TokenDonation>().unwrap(), photon);
+        assert_eq!("4.5".parse::<TokenDonation>().unwrap().bps(), 450);
+        assert_eq!("6.25".parse::<TokenDonation>().unwrap().bps(), 625);
+        for bad in ["", "-1", "4.555", "100", "1e2", "4,5", "1000"] {
+            assert!(bad.parse::<TokenDonation>().is_err(), "{bad}");
+        }
+        assert_eq!(photon.to_string(), "4.00%");
+        assert_eq!(photon.adjusted(true).bps(), 450);
+        assert_eq!(photon.adjusted(false).bps(), 350);
+        assert_eq!(TokenDonation::from_bps(475).adjusted(false).bps(), 450);
+        assert_eq!(TokenDonation::from_bps(9_950).adjusted(true).bps(), 9_950);
+        assert_eq!(NEW_TOKEN_DONATION.to_string(), "1.50%");
+        // #### 2026-10-24: down to 0%, and no lower.
+        assert_eq!(TokenDonation::from_bps(50).adjusted(false).bps(), 0);
+        assert_eq!(TokenDonation::from_bps(0).adjusted(false).bps(), 0);
+        assert_eq!("0".parse::<TokenDonation>().unwrap().bps(), 0);
+        // Shares: the rest to the project above the default, in proportion
+        // below it.
+        let split = [200, 200];
+        assert_eq!(photon.work_shares(photon, split), [200, 200]);
+        assert_eq!(
+            TokenDonation::from_bps(600).work_shares(photon, split),
+            [400, 200]
+        );
+        assert_eq!(
+            TokenDonation::from_bps(150).work_shares(photon, split),
+            [75, 75]
+        );
+        assert_eq!(
+            TokenDonation::from_bps(75).work_shares(photon, split),
+            [38, 37]
+        );
+        assert_eq!(
+            TokenDonation::from_bps(0).work_shares(photon, split),
+            [0, 0]
+        );
+        assert_eq!(
+            TokenDonation::from_bps(150).work_shares(photon, [400, 0]),
+            [150, 0]
+        );
+        let schedule = Schedule::new(Scheme::Work([0, 0]), 7, 3).unwrap();
+        assert_eq!(schedule.recipient(), Recipient::Miner);
+        assert!(serde_json::from_str::<TokenDonation>("10000").is_err());
+        assert_eq!(serde_json::to_string(&photon).unwrap(), "400");
+    }
+
     #[test]
     fn fee_description_reports_only_totals() {
         assert_eq!(Scheme::Work([200, 200]).description(), "Donation: 4%");

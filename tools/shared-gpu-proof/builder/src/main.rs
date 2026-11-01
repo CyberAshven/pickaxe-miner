@@ -5,6 +5,39 @@ fn main() -> Result<(), Box<dyn Error>> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let output = root.join("artifacts/shared-gpu-proof");
     fs::create_dir_all(&output)?;
+    if std::env::var_os("PICKAXE_BUILD_SHARED_ELECTRIC").is_some() {
+        let result = spirv_builder::SpirvBuilder::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../electric"),
+            "spirv-unknown-vulkan1.1",
+        )
+        .build()?;
+        let path = result.module.unwrap_single();
+        let module = naga::front::spv::parse_u8_slice(&fs::read(path)?, &Default::default())?;
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)?;
+        let directory = output.join("electric");
+        fs::create_dir_all(&directory)?;
+        fs::write(
+            directory.join("pickaxe_electric.wgsl"),
+            naga::back::wgsl::write_string(
+                &module,
+                &info,
+                naga::back::wgsl::WriterFlags::EXPLICIT_TYPES,
+            )?,
+        )?;
+        let (metal, _) = naga::back::msl::write_string(
+            &module,
+            &info,
+            &Default::default(),
+            &Default::default(),
+        )?;
+        fs::write(directory.join("pickaxe_electric.metal"), metal)?;
+        fs::copy(path, directory.join("pickaxe_electric.spv"))?;
+        return Ok(());
+    }
     // #### PR #22: the portable shared stages, one module.
     // PICKAXE_BUILD_SHARED_STAGES=debug adds a development-only arithmetic entry.
     if let Some(mode) = std::env::var_os("PICKAXE_BUILD_SHARED_STAGES") {
@@ -32,8 +65,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 naga::back::wgsl::WriterFlags::EXPLICIT_TYPES,
             )?,
         )?;
-        let (metal, _) =
-            naga::back::msl::write_string(&module, &info, &Default::default(), &Default::default())?;
+        let (metal, _) = naga::back::msl::write_string(
+            &module,
+            &info,
+            &Default::default(),
+            &Default::default(),
+        )?;
         fs::write(directory.join("pickaxe_shared_stages.metal"), metal)?;
         fs::copy(path, directory.join("pickaxe_shared_stages.spv"))?;
         println!("Shared stages generated in {}", directory.display());

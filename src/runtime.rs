@@ -11,6 +11,7 @@ use crate::backend::{BackendKind, GpuDevice};
 use crate::config::{JobSource, MiningNetwork, RuntimeConfig};
 use crate::electrum::{ElectrumSession, LiveJob, LiveStateSnapshot};
 use crate::reward;
+use crate::rigs::{RigHub, RigSummary};
 use crate::search::VerifiedWinner;
 use crate::search::{
     MiningState, RuntimeCommand as SearchCommand, SearchHandle, SearchPauseHandle, SearchStats,
@@ -34,6 +35,10 @@ mod source_pool;
 use self::source_pool::{
     SourceCapability, SourceCatalog, SourceKind, AUTO_PROBE_LIMIT, DEFAULT_CAPABILITY_TTL_MS,
 };
+
+/// #### PR #32
+/// The backend name a coordinator with no GPU of its own shows: its rigs mine.
+pub const RIGS_ONLY: &str = "rigs only";
 
 const COMMAND_CAP: usize = 16;
 const EVENT_CAP: usize = 32;
@@ -1484,7 +1489,7 @@ fn read_compact_size(bytes: &[u8], offset: &mut usize) -> Result<u64, String> {
 }
 
 /// Extracts the first input outpoint from a raw transaction.
-fn first_input_outpoint(raw_tx_hex: &str) -> Result<(String, u32), String> {
+pub(crate) fn first_input_outpoint(raw_tx_hex: &str) -> Result<(String, u32), String> {
     let raw = hex::decode(raw_tx_hex.trim())
         .map_err(|error| format!("decode PHOTON lineage transaction: {error}"))?;
     if raw.len() < 5 {
@@ -1715,10 +1720,13 @@ fn broadcast_pending_transaction(
     cfg: &RuntimeConfig,
     raw_tx_hex: &str,
 ) -> Result<String, String> {
-    if cfg.network == MiningNetwork::Chipnet {
-        // The active Fulcrum session is bound to the chipnet deployment.
-        return session.broadcast_raw(raw_tx_hex);
-    }
+    // #### PR #42
+    // What: a Chipnet claim is broadcast as a mainnet one: Fulcrum or the
+    // miner's node by the source preference, falling back to the other.
+    // Why: the Chipnet-only shortcut was left from the retired Chipnet
+    // batch-payout preview; Chipnet and mainnet are one code path.
+    // Look here if: a Chipnet claim goes to a different place than a
+    // mainnet one would.
     let node_endpoints = cfg.node_endpoints();
     let node_configured = !node_endpoints.is_empty();
     broadcast_with_preference(
@@ -1767,9 +1775,13 @@ fn preflight_pending_transaction(
     expected_txid: &str,
     raw_tx_hex: &str,
 ) -> Result<(), String> {
-    if cfg.network == MiningNetwork::Chipnet {
-        return Ok(());
-    }
+    // #### PR #42
+    // What: a Chipnet claim takes the same node mempool gate as a mainnet
+    // one when the miner saved a node.
+    // Why: the Chipnet-only skip was left from the retired Chipnet
+    // batch-payout preview; Chipnet and mainnet are one code path.
+    // Look here if: a Chipnet miner with a saved node now waits on
+    // testmempoolaccept.
     // Bootstrap node RPCs stay off this gate. A public node that lacks
     // testmempoolaccept, or rejects a valid PHOTON tx, must not block the
     // Fulcrum broadcast the miner already uses.
@@ -2050,9 +2062,12 @@ fn prepare_submission_for_network(
         return Err("verified winner is stale before direct reward preparation".into());
     }
     settlement.ensure_current(cfg.generation_id, live)?;
-    let policy = cfg.token.fee_policy(cfg.network);
+    let policy = cfg.fee_policy();
     require_direct_reward_policy(policy.scheme)?;
-    let payouts = policy.payouts(cfg.network, &cfg.payout_address)?;
+    // #### PR #32: a public GPU pool's winner pays the rig it came from (or
+    // the operator in a fee window); the coordinator checked that address.
+    let miner = winner.payout.as_deref().unwrap_or(&cfg.payout_address);
+    let payouts = policy.payouts(cfg.network, miner)?;
     let deployment = cfg.token.photon_deployment(cfg.network);
     let mut accepted = None;
     for (recipient, payout) in crate::donation::Recipient::ALL.into_iter().zip(payouts) {
@@ -2302,7 +2317,7 @@ fn preflight_live_job(
     }
     tx::cashaddr_to_p2pkh_locking(&cfg.payout_address)
         .map_err(|error| format!("production payout validation failed: {error}"))?;
-    let policy = cfg.token.fee_policy(cfg.network);
+    let policy = cfg.fee_policy();
     require_direct_reward_policy(policy.scheme)?;
     for payout in policy.payouts(cfg.network, &cfg.payout_address)? {
         tx::cashaddr_to_p2pkh_locking(&payout)?;
@@ -2461,6 +2476,8 @@ pub struct RuntimeGpu {
     pub device: u32,
     pub name: String,
     pub telemetry: GpuTelemetry,
+    /// #### PR #42: the GPU's PCI location, which farm systems match by.
+    pub pci: Option<crate::backend::PciAddress>,
 }
 
 #[derive(Debug, Clone)]
@@ -2468,6 +2485,10 @@ pub struct RuntimeSnapshot {
     pub state: SupervisorState,
     pub network: MiningNetwork,
     pub fee_scheme: crate::donation::Scheme,
+    /// #### PR #32: the token donation in effect and its default, for
+    /// Advanced settings.
+    pub token_donation: crate::donation::TokenDonation,
+    pub donation_default: crate::donation::TokenDonation,
     /// The first mining GPU; `gpus` lists every one.
     pub gpu_backend: String,
     pub gpu_device: u32,
@@ -2496,6 +2517,13 @@ pub struct RuntimeSnapshot {
     pub search: SearchStats,
     /// Telemetry of all mining GPUs together; each GPU's is in `gpus`.
     pub gpu_telemetry: GpuTelemetry,
+    /// The rigs this miner coordinates, when it runs with --rigs-listen.
+    pub rigs: Option<RigSummary>,
+    /// #### PR #42: where jobs come from now: the miner's node, Fulcrum,
+    /// or Fulcrum while the node is down.
+    pub job_source: crate::job_source::JobSourceStatus,
+    /// #### PR #42: when mining started, in unix seconds.
+    pub started_at: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -2530,11 +2558,24 @@ pub enum RuntimeEvent {
         recipient: String,
     },
     Error(String),
+    /// #### PR #42: the job source fell back to Fulcrum while a node is
+    /// configured, and why.
+    NodeDown {
+        reason: String,
+    },
+    /// The miner's node is the job source again (its address redacted).
+    NodeBack {
+        endpoint: String,
+    },
 }
 
 #[allow(dead_code)]
 enum SupervisorCommand {
     SetIntensity(u8, SyncSender<Result<(), String>>),
+    SetDonation(
+        crate::donation::TokenDonation,
+        SyncSender<Result<(), String>>,
+    ),
     Pause(SyncSender<Result<(), String>>),
     Resume(SyncSender<Result<(), String>>),
     SetPayout(String, SyncSender<Result<(), String>>),
@@ -2570,6 +2611,24 @@ impl ShutdownSignal {
     }
 }
 
+/// #### PR #61: a runtime's GPUs' hashes a second while each mines (not
+/// while held), in the order the GPUs were chosen; 0 before one measured.
+#[derive(Clone)]
+pub struct GpuRates(Arc<Mutex<RuntimeSnapshot>>);
+
+impl GpuRates {
+    pub fn rates(&self) -> Vec<f64> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .search
+            .gpus
+            .iter()
+            .map(|gpu| gpu.active_rate)
+            .collect()
+    }
+}
+
 pub struct RuntimeSupervisor {
     command_tx: SyncSender<SupervisorCommand>,
     event_rx: Receiver<RuntimeEvent>,
@@ -2577,15 +2636,34 @@ pub struct RuntimeSupervisor {
     shutdown: ShutdownSignal,
     worker: Option<JoinHandle<()>>,
     telemetry: LiveTelemetrySampler,
+    /// #### PR #53: the hash split's hold on this miner's GPU search.
+    hold: crate::search::SearchHold,
 }
 
 impl RuntimeSupervisor {
     /// Starts supervised GPU search on every selected GPU after runtime
     /// preflight. The GPUs share one job, pause together on a winner and
     /// claim through this one supervisor.
-    pub fn start_on_gpus(mut cfg: RuntimeConfig, gpus: &[GpuDevice]) -> Result<Self, String> {
+    pub fn start_on_gpus(cfg: RuntimeConfig, gpus: &[GpuDevice]) -> Result<Self, String> {
+        Self::start_on_gpus_with_rigs(cfg, gpus, None)
+    }
+
+    /// #### PR #32
+    /// As `start_on_gpus`, also coordinating GPU rigs: every job this miner
+    /// mines is shared with them, and their checked winners join its own at
+    /// the claim path. With no GPUs, the rigs do all the mining.
+    pub fn start_on_gpus_with_rigs(
+        mut cfg: RuntimeConfig,
+        gpus: &[GpuDevice],
+        rigs: Option<RigHub>,
+    ) -> Result<Self, String> {
         cfg.ensure_mining_supported()?;
-        let first = gpus.first().ok_or("no GPU selected for mining")?;
+        // #### PR #32
+        // With no GPU here, a coordinator mines through its rigs only
+        // (`--rigs-only`); without rigs there is nothing to mine with.
+        if gpus.is_empty() && rigs.is_none() {
+            return Err("no GPU selected for mining".into());
+        }
         for gpu in gpus {
             crate::backend::require_production_mining_backend(gpu.backend)?;
         }
@@ -2603,10 +2681,10 @@ impl RuntimeSupervisor {
             None,
             ReconnectPreference::RotateAway,
         );
-        let mut session = ElectrumSession::connect_failover_for_deployment(
-            &endpoints,
-            cfg.token.photon_deployment(cfg.network),
-        )?;
+        let JobSourceConnection {
+            mut session,
+            node_error,
+        } = connect_job_source(&cfg, &endpoints, None)?;
         let journal_path = submission_journal_path(cfg.network);
         resolve_pending_before_search(&mut session, &cfg, &journal_path)?;
         let mut initial = session.fetch_live_job()?;
@@ -2629,25 +2707,37 @@ impl RuntimeSupervisor {
 
         let initial_job =
             initial.to_mining_job_for_network(cfg.generation_id, &cfg.payout_address, cfg.network);
+        if let Some(rigs) = rigs.as_ref() {
+            rigs.set_donation(cfg.token_donation());
+            rigs.publish(initial_job.clone());
+        }
         let devices: Vec<(BackendKind, usize)> = gpus
             .iter()
             .map(|gpu| (gpu.backend, gpu.index as usize))
             .collect();
-        let search = SearchHandle::start_devices_with_work_fee(
-            &devices,
-            cfg.intensity,
-            initial_job,
-            cfg.token.fee_policy(cfg.network),
-        )?;
+        let search = if devices.is_empty() {
+            SearchHandle::start_without_gpus(cfg.intensity, initial_job, cfg.fee_policy())?
+        } else {
+            SearchHandle::start_devices_with_work_fee(
+                &devices,
+                cfg.intensity,
+                initial_job,
+                cfg.fee_policy(),
+            )?
+        };
         let initial_search = search.snapshot();
+        let hold = search.hold_handle();
         let telemetry = LiveTelemetrySampler::start(crate::telemetry::telemetry_sources(gpus));
         let shutdown = ShutdownSignal::new(search.pause_handle());
         let initial_snapshot = RuntimeSnapshot {
             state: SupervisorState::Mining,
             network: cfg.network,
-            fee_scheme: cfg.token.fee_policy(cfg.network).scheme,
-            gpu_backend: first.backend.as_str().into(),
-            gpu_device: first.index,
+            fee_scheme: cfg.fee_policy().scheme,
+            gpu_backend: gpus
+                .first()
+                .map_or(RIGS_ONLY, |gpu| gpu.backend.as_str())
+                .into(),
+            gpu_device: gpus.first().map_or(0, |gpu| gpu.index),
             gpus: gpus
                 .iter()
                 .map(|gpu| RuntimeGpu {
@@ -2655,6 +2745,7 @@ impl RuntimeSupervisor {
                     device: gpu.index,
                     name: gpu.name.clone(),
                     telemetry: GpuTelemetry::default(),
+                    pci: gpu.pci,
                 })
                 .collect(),
             generation_id: cfg.generation_id,
@@ -2678,6 +2769,17 @@ impl RuntimeSupervisor {
             last_error: None,
             search: initial_search,
             gpu_telemetry: telemetry.snapshot(),
+            rigs: rigs.as_ref().map(RigHub::summary),
+            token_donation: cfg.token_donation(),
+            donation_default: cfg.token.donation_default(),
+            job_source: if session.is_node() {
+                crate::job_source::JobSourceStatus::Node
+            } else {
+                crate::job_source::JobSourceStatus::Fulcrum
+            },
+            started_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs()),
         };
 
         let snapshot = Arc::new(Mutex::new(initial_snapshot));
@@ -2695,6 +2797,7 @@ impl RuntimeSupervisor {
                     sources,
                     initial,
                     session,
+                    node_error,
                     None,
                     Instant::now(),
                     search,
@@ -2705,6 +2808,7 @@ impl RuntimeSupervisor {
                     event_tx,
                     worker_snapshot,
                     worker_shutdown,
+                    rigs,
                 )
             })
             .map_err(|error| format!("start live PHOTON supervisor: {error}"))?;
@@ -2716,7 +2820,19 @@ impl RuntimeSupervisor {
             shutdown,
             worker: Some(worker),
             telemetry,
+            hold,
         })
+    }
+
+    /// #### PR #53: the hash split's hold on this miner's GPU search.
+    pub fn hold_handle(&self) -> crate::search::SearchHold {
+        self.hold.clone()
+    }
+
+    /// #### PR #61: each GPU's rate, readable from the hash split's
+    /// scheduler.
+    pub fn gpu_rates(&self) -> GpuRates {
+        GpuRates(Arc::clone(&self.snapshot))
     }
 
     /// Captures the current state of the live mining runtime.
@@ -2743,6 +2859,13 @@ impl RuntimeSupervisor {
     /// Requests an updated GPU work intensity.
     pub fn set_intensity(&self, value: u8) -> Result<(), String> {
         self.request(|reply| SupervisorCommand::SetIntensity(value, reply))
+    }
+
+    /// #### PR #32
+    /// Changes the token donation from Advanced settings; it is never lower
+    /// than the token's minimum and reaches every GPU and rig at once.
+    pub fn set_donation(&self, value: crate::donation::TokenDonation) -> Result<(), String> {
+        self.request(|reply| SupervisorCommand::SetDonation(value, reply))
     }
 
     #[allow(dead_code)]
@@ -2828,6 +2951,7 @@ fn run_supervisor(
     mut sources: SourceCatalog,
     mut live: LiveJob,
     initial_session: ElectrumSession,
+    initial_node_error: Option<String>,
     mut native_photon_session: Option<crate::node::NativePhotonSession>,
     source_capability_epoch: Instant,
     search: SearchHandle,
@@ -2838,8 +2962,30 @@ fn run_supervisor(
     event_tx: SyncSender<RuntimeEvent>,
     shared_snapshot: Arc<Mutex<RuntimeSnapshot>>,
     shutdown: ShutdownSignal,
+    rigs: Option<RigHub>,
 ) {
     let mut active_fulcrum_endpoint = initial_session.url.clone();
+    // #### PR #42: back to the miner's own node
+    // What: when the job source falls back to Fulcrum while a node is
+    // configured, a watch asks the node again on its own thread (15 s, then
+    // doubling to 300 s; a syncing node 2 min, a setting to fix 30 min) and,
+    // once the node follows the mined baton, hands it over at a moment with
+    // no winner, claim or winner refresh in flight; the reconnect path
+    // installs it as it installs any source. While the node is down, no node
+    // call runs on this thread (`skip_native`).
+    // Why: the session never went back to the node, and probing it here (an
+    // 8 s connect, a scan of up to 180 s) blocked refreshes and claims.
+    // Look here if: a miner never returns to its node, or a refresh stalls
+    // while the node is down.
+    let has_node = !cfg.custom_node_endpoints().is_empty();
+    let mut node_watch = crate::job_source::NodeWatch::<(ElectrumSession, LiveJob)>::default();
+    let mut node_ready: Option<(ElectrumSession, LiveJob)> = None;
+    if has_node && !initial_session.is_node() {
+        let reason =
+            initial_node_error.unwrap_or_else(|| "the node gave no PHOTON state".to_owned());
+        node_watch.down(Instant::now(), &reason);
+        emit(&event_tx, RuntimeEvent::NodeDown { reason });
+    }
     let mut session = Some(initial_session);
     let mut state = if pending_submission.is_some() {
         SupervisorState::Paused
@@ -2897,6 +3043,17 @@ fn run_supervisor(
                     let result = cfg
                         .set_intensity(value)
                         .and_then(|()| search.set_intensity(value));
+                    let _ = reply.send(result);
+                }
+                Ok(SupervisorCommand::SetDonation(value, reply)) => {
+                    let mut next = cfg.clone();
+                    next.token_donation = Some(value);
+                    let result = search.set_work_fee(next.fee_policy()).map(|()| {
+                        cfg.token_donation = next.token_donation;
+                        if let Some(rigs) = rigs.as_ref() {
+                            rigs.set_donation(cfg.token_donation());
+                        }
+                    });
                     let _ = reply.send(result);
                 }
                 Ok(SupervisorCommand::Pause(reply)) => {
@@ -3020,6 +3177,7 @@ fn run_supervisor(
                         last_error = None;
                         reconnect_backoff = RECONNECT_MIN;
                         next_reconnect = Instant::now();
+                        node_watch.try_now(Instant::now());
                         emit(
                             &event_tx,
                             RuntimeEvent::Reconnecting("manual Fulcrum reconnect requested".into()),
@@ -3038,16 +3196,23 @@ fn run_supervisor(
                 Err(TryRecvError::Empty) => break,
             }
         }
+        // #### PR #32
+        // A checked winner from a rig starts the same claim as a local one.
+        let rig_winner = rigs.as_ref().is_some_and(RigHub::has_winner);
         if should_begin_winner_refresh(
             winner_refresh_pending,
             pending_winner.is_some(),
             pending_submission.is_some(),
             observed_search_winners,
             search.snapshot().winners,
-        ) {
+        ) || (rig_winner
+            && !winner_refresh_pending
+            && pending_winner.is_none()
+            && pending_submission.is_none())
+        {
             // Stop new launches as soon as a host-verified GPU winner is
-            // queued. Any batch already in flight is allowed to finish before
-            // the authoritative live-state check below.
+            // queued. Batches other GPUs still have in flight finish in the
+            // background; the claim does not wait for them.
             winner_refresh_pending = true;
             pending_winners = 1;
             let _ = search.apply_control(SearchCommand::Pause);
@@ -3064,16 +3229,41 @@ fn run_supervisor(
         if stop {
             break;
         }
-        let force_winner_refresh = winner_refresh_ready(
-            winner_refresh_pending,
-            search.batch_in_flight(),
-            session.is_some(),
-        );
+        let force_winner_refresh = winner_refresh_ready(winner_refresh_pending, session.is_some());
         if force_winner_refresh {
-            // The worker is now at a safe boundary. Run the existing
-            // authoritative refresh immediately rather than waiting for the
-            // next 500 ms periodic deadline.
+            // The winning GPU's batch has ended, since a winner is queued only
+            // after its batch. Run the existing authoritative refresh
+            // immediately rather than waiting for the next 500 ms deadline.
             next_state_refresh = Instant::now();
+        }
+        // #### PR #42: a ready node takes over through the reconnect path.
+        let safe = session.is_some()
+            && pending_winners == 0
+            && pending_winner.is_none()
+            && pending_submission.is_none()
+            && !winner_refresh_pending;
+        if let crate::job_source::Poll::Ready(ready) = node_watch.poll(Instant::now(), safe, || {
+            let nodes: Vec<String> = cfg
+                .custom_node_endpoints()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            let deployment = cfg.token.photon_deployment(cfg.network);
+            let network = cfg.network;
+            let mined = live.clone();
+            let (send, receive) = mpsc::sync_channel(1);
+            let _ = thread::Builder::new()
+                .name("pickaxe-node-return".into())
+                .spawn(move || {
+                    let _ = send.send(crate::job_source::try_node_return(
+                        &nodes, deployment, network, &mined,
+                    ));
+                });
+            receive
+        }) {
+            node_ready = Some(ready);
+            session = None;
+            next_reconnect = Instant::now();
         }
         if session.is_none() {
             if Instant::now() >= next_reconnect {
@@ -3091,20 +3281,42 @@ fn run_supervisor(
                     Some(&active_fulcrum_endpoint),
                     reconnect_preference,
                 );
-                let reconnect_result = if endpoints.is_empty() {
+                let mut node_error = None;
+                let reconnect_result = if let Some(ready) = node_ready.take() {
+                    Ok(ready)
+                } else if endpoints.is_empty() && cfg.custom_node_endpoints().is_empty() {
                     Err(
                         "no eligible Fulcrum source is currently available under source policy"
                             .to_string(),
                     )
                 } else {
-                    ElectrumSession::connect_failover_for_deployment(
-                        &endpoints,
-                        cfg.token.photon_deployment(cfg.network),
-                    )
-                    .and_then(|mut next| next.fetch_live_job().map(|job| (next, job)))
+                    connect_job_source(&cfg, &endpoints, Some(&live)).and_then(|connection| {
+                        node_error = connection.node_error;
+                        let mut next = connection.session;
+                        next.fetch_live_job().map(|job| (next, job))
+                    })
                 };
                 match reconnect_result {
                     Ok((next_session, next_job)) => {
+                        // #### PR #42: the watch follows the installed source.
+                        if next_session.is_node() {
+                            if node_watch.is_down() {
+                                emit(
+                                    &event_tx,
+                                    RuntimeEvent::NodeBack {
+                                        endpoint: next_session.url.clone(),
+                                    },
+                                );
+                            }
+                            node_watch.up();
+                        } else if has_node {
+                            let reason = node_error
+                                .take()
+                                .unwrap_or_else(|| "the node gave no PHOTON state".to_owned());
+                            if node_watch.down(Instant::now(), &reason) {
+                                emit(&event_tx, RuntimeEvent::NodeDown { reason });
+                            }
+                        }
                         let connected_endpoint = next_session.url.clone();
                         let rotated =
                             !connected_endpoint.eq_ignore_ascii_case(&active_fulcrum_endpoint);
@@ -3475,6 +3687,7 @@ fn run_supervisor(
                     &mut sources,
                     &mut native_photon_session,
                     source_capability_epoch,
+                    node_watch.is_down(),
                 )
             };
             next_state_refresh = next_periodic_deadline(
@@ -3521,7 +3734,11 @@ fn run_supervisor(
                             );
 
                             if force_winner_refresh {
-                                for winner in search.drain_winners() {
+                                let drained = search.drain_winners();
+                                let drained_count = drained.len();
+                                let from_rigs =
+                                    rigs.as_ref().map(RigHub::take_winners).unwrap_or_default();
+                                for winner in drained.into_iter().chain(from_rigs) {
                                     if winner_matches_live(&winner, cfg.generation_id, &live) {
                                         verified_winners = verified_winners.saturating_add(1);
                                         pending_winners = 1;
@@ -3577,10 +3794,8 @@ fn run_supervisor(
                                         );
                                     }
                                 }
-                                // The worker pauses after a verified winning
-                                // batch, so this snapshot acknowledges every
-                                // bounded winner queued through that boundary.
-                                observed_search_winners = search.snapshot().winners;
+                                observed_search_winners =
+                                    acknowledge_drained(observed_search_winners, drained_count);
                                 winner_refresh_pending = false;
                                 if pending_winner.is_none() && pending_submission.is_none() {
                                     pending_winners = 0;
@@ -3680,6 +3895,17 @@ fn run_supervisor(
             }
         }
 
+        // #### PR #32
+        // Rigs mine whatever this miner mines: share each new generation.
+        if let Some(rigs) = rigs.as_ref() {
+            if rigs.published_generation() != Some(cfg.generation_id) {
+                rigs.publish(live.to_mining_job_for_network(
+                    cfg.generation_id,
+                    &cfg.payout_address,
+                    cfg.network,
+                ));
+            }
+        }
         write_snapshot(
             &shared_snapshot,
             state,
@@ -3696,7 +3922,17 @@ fn run_supervisor(
             pending_winners,
             last_error.clone(),
             &mut throughput,
+            node_watch.status(
+                Instant::now(),
+                session.as_ref().is_some_and(ElectrumSession::is_node),
+            ),
         );
+        if let Some(rigs) = rigs.as_ref() {
+            shared_snapshot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .rigs = Some(rigs.summary());
+        }
         thread::sleep(SUPERVISOR_POLL);
     }
 
@@ -3868,14 +4104,117 @@ fn refresh_native_with_current_proof(
     }
 }
 
-/// Refreshes the PHOTON job on the periodic source cadence.
+/// #### PR #40
+/// What: the PHOTON job source. With a BCH node configured, the miner's own
+/// node comes first: it finds the baton in its UTXO set, follows it through
+/// its mempool and blocks, and sends the claims. The Fulcrum servers are used
+/// when no node is configured or none can give the PHOTON state.
+/// Why: mining is for nodes. Before, a node was trusted only after Fulcrum
+/// confirmed its view, so mining needed Fulcrum to start and stopped after a
+/// claim whenever Fulcrum was unreachable.
+/// Look here if: a miner with a node mines from Fulcrum (its node failed the
+/// scan or the RPC login; the error names it), or a node mines a stale baton.
+fn connect_job_source(
+    cfg: &RuntimeConfig,
+    fulcrum: &[String],
+    mining: Option<&LiveJob>,
+) -> Result<JobSourceConnection, String> {
+    let deployment = cfg.token.photon_deployment(cfg.network);
+    let nodes: Vec<String> = cfg
+        .custom_node_endpoints()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    if nodes.is_empty() {
+        return ElectrumSession::connect_failover_for_deployment(fulcrum, deployment).map(
+            |session| JobSourceConnection {
+                session,
+                node_error: None,
+            },
+        );
+    }
+    // A baton to start from: the job being mined on a reconnect, or at start
+    // a Fulcrum server's answer, which the node checks for itself; without
+    // either the node scans its UTXO set.
+    let mut fallback = None;
+    let known = match mining {
+        Some(job) => Some(job.clone()),
+        None if fulcrum.is_empty() => None,
+        None => match ElectrumSession::connect_failover_for_deployment(fulcrum, deployment) {
+            Ok(mut session) => {
+                let job = session.fetch_live_job().ok();
+                fallback = Some(session);
+                job
+            }
+            Err(_) => None,
+        },
+    };
+    match ElectrumSession::connect_node_failover(&nodes, deployment, known.as_ref()) {
+        Ok(session) => Ok(JobSourceConnection {
+            session,
+            node_error: None,
+        }),
+        Err(node_error) => match fallback {
+            Some(session) => Ok(JobSourceConnection {
+                session,
+                node_error: Some(node_error),
+            }),
+            None => ElectrumSession::connect_failover_for_deployment(fulcrum, deployment)
+                .map(|session| JobSourceConnection {
+                    session,
+                    node_error: Some(node_error.clone()),
+                })
+                .map_err(|error| format!("{node_error}\n{error}")),
+        },
+    }
+}
+
+/// #### PR #42: the job source connected, and why the node was skipped
+/// when a node is configured and the source is Fulcrum.
+struct JobSourceConnection {
+    session: ElectrumSession,
+    node_error: Option<String>,
+}
+
+/// Refreshes the PHOTON job on the periodic source cadence; #### PR #42:
+/// with `skip_native` (the node is down) no node call runs.
 fn refresh_photon_job_on_cadence(
     cfg: &RuntimeConfig,
     canonical: &mut ElectrumSession,
     sources: &mut SourceCatalog,
     native_session: &mut Option<crate::node::NativePhotonSession>,
     epoch: Instant,
+    skip_native: bool,
 ) -> Result<PhotonBoundaryRefresh, String> {
+    // #### PR #40: on the miner's own node, its state is the job.
+    if canonical.is_node() {
+        *native_session = None;
+        return canonical
+            .fetch_live_snapshot()
+            .map(|snapshot| PhotonBoundaryRefresh {
+                job: snapshot.job,
+                route_warning: None,
+            });
+    }
+    // #### PR #42: skip_native
+    // What: while the node is down, the refresh asks Fulcrum alone: no node
+    // connect, scan or proof runs on the loop thread; the node watch asks
+    // the node on its own thread.
+    // Why: an 8 s connect or a scan of up to 180 s here blocked claims.
+    // Look here if: a miner never returns to its node, or Fulcrum refreshes
+    // stall while the node is down.
+    if skip_native {
+        *native_session = None;
+        let now_ms = source_capability_now_ms(epoch);
+        let started = Instant::now();
+        let snapshot = canonical.fetch_live_snapshot()?;
+        let latency_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+        record_canonical_fulcrum_probe(sources, &snapshot, now_ms, latency_ms)?;
+        return Ok(PhotonBoundaryRefresh {
+            job: snapshot.job,
+            route_warning: None,
+        });
+    }
     let now_ms = source_capability_now_ms(epoch);
     let canonical_started = Instant::now();
     let canonical_result = canonical.fetch_live_snapshot();
@@ -4142,14 +4481,29 @@ fn winner_matches_live(winner: &VerifiedWinner, generation_id: u64, live: &LiveJ
         && winner.baton_vout == live.baton_vout
 }
 
+// #### PR #35: claim a winner without waiting for other GPUs ####
+// What: once a GPU queues a host-verified winner, the claim starts at once.
+// It no longer waits until every GPU has finished its current batch, and a
+// drain acknowledges exactly the winners it took from the queue.
+// Why: with several GPUs the claim waited for the slowest GPU's batch (up to
+// about 350 ms on wgpu) before it could be broadcast.
+// Safe because: a winner is queued only after its own batch ends, so the
+// winning work is complete; the shared pause stops every other GPU at its next
+// boundary. Counting drained winners, not a counter snapshot, keeps a winner
+// that another GPU queues during the claim from being acknowledged unseen: it
+// raises the counter above the acknowledged count and triggers its own check.
+// Check: `stale_winners` or a winner that is found but never claimed on a rig.
 /// Reports whether a pending winner can be reconciled with fresh state.
-fn winner_refresh_ready(
-    winner_refresh_pending: bool,
-    batch_in_flight: bool,
-    session_connected: bool,
-) -> bool {
-    winner_refresh_pending && !batch_in_flight && session_connected
+fn winner_refresh_ready(winner_refresh_pending: bool, session_connected: bool) -> bool {
+    winner_refresh_pending && session_connected
 }
+
+/// The winner count acknowledged after a drain: exactly the winners taken
+/// from the queue.
+fn acknowledge_drained(observed: u64, drained: usize) -> u64 {
+    observed.saturating_add(drained as u64)
+}
+// #### end PR #35 ####
 
 /// Checks whether winner recovery needs an immediate job refresh.
 fn should_begin_winner_refresh(
@@ -4222,6 +4576,9 @@ struct ThroughputTracker {
     current_rate: f64,
     peak_rate: f64,
     was_mining: bool,
+    /// When a pause began whose history is still kept. A claim pauses the GPU
+    /// for a moment while the next baton loads; that should not read 0.
+    paused_since: Option<Instant>,
 }
 
 impl ThroughputTracker {
@@ -4237,6 +4594,7 @@ impl ThroughputTracker {
             current_rate: 0.0,
             peak_rate: 0.0,
             was_mining: mining,
+            paused_since: None,
         }
     }
 
@@ -4244,18 +4602,34 @@ impl ThroughputTracker {
     fn observe(&mut self, stats: &mut SearchStats, now: Instant) {
         let mining = stats.state == MiningState::Mining;
         if !mining {
-            self.samples.clear();
-            self.samples.push_back((now, stats.candidates));
-            self.last_sample = now;
-            self.last_progress_at = now;
-            self.last_progress_candidates = stats.candidates;
-            self.current_rate = 0.0;
-            self.was_mining = false;
-            stats.current_rate = 0.0;
+            if self.was_mining {
+                self.paused_since = Some(now);
+                self.was_mining = false;
+            }
+            // Hold the last rate through a short pause such as a claim, and
+            // read 0 once the pause lasts the whole current window.
+            let short = self.paused_since.is_some_and(|since| {
+                now.saturating_duration_since(since) < THROUGHPUT_CURRENT_WINDOW
+            });
+            if !short {
+                self.samples.clear();
+                self.samples.push_back((now, stats.candidates));
+                self.last_sample = now;
+                self.last_progress_at = now;
+                self.last_progress_candidates = stats.candidates;
+                self.current_rate = 0.0;
+                self.paused_since = None;
+            }
+            stats.current_rate = self.current_rate;
             stats.peak_rate = self.peak_rate;
             return;
         }
 
+        if !self.was_mining && self.paused_since.take().is_some() {
+            // Back from a short pause: keep the history, so the rate dips by
+            // the time the GPU lost instead of starting again from 0.
+            self.was_mining = true;
+        }
         if !self.was_mining {
             self.samples.clear();
             self.samples.push_back((now, stats.candidates));
@@ -4324,6 +4698,7 @@ fn write_snapshot(
     pending_winners: u64,
     last_error: Option<String>,
     throughput: &mut ThroughputTracker,
+    job_source: crate::job_source::JobSourceStatus,
 ) {
     let mut search_stats = search.snapshot();
     throughput.observe(&mut search_stats, Instant::now());
@@ -4338,7 +4713,8 @@ fn write_snapshot(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     snapshot.state = state;
     snapshot.network = cfg.network;
-    snapshot.fee_scheme = cfg.token.fee_policy(cfg.network).scheme;
+    snapshot.fee_scheme = cfg.fee_policy().scheme;
+    snapshot.token_donation = cfg.token_donation();
     snapshot.generation_id = cfg.generation_id;
     snapshot.payout_address.clone_from(&cfg.payout_address);
     snapshot.endpoint.clone_from(&live.url);
@@ -4359,6 +4735,7 @@ fn write_snapshot(
     snapshot.pending_winners = pending_winners;
     snapshot.last_error = last_error;
     snapshot.search = search_stats;
+    snapshot.job_source = job_source;
 }
 
 fn present_runtime_status(
@@ -4466,8 +4843,8 @@ mod tests {
     }
 
     #[test]
-    /// Checks that shared throughput tracks current average peak and resets after pause.
-    fn shared_throughput_tracks_current_average_peak_and_resets_after_pause() {
+    /// Checks that shared throughput tracks current average peak and resets after a long pause.
+    fn shared_throughput_tracks_current_average_peak_and_resets_after_a_long_pause() {
         let start = Instant::now();
         let mut tracker = ThroughputTracker::new(start, 0, true);
 
@@ -4484,17 +4861,51 @@ mod tests {
 
         let mut paused = throughput_stats(3_000, MiningState::Paused, 1_200.0);
         tracker.observe(&mut paused, start + Duration::from_millis(2_100));
+        assert!((paused.current_rate - 1_500.0).abs() < 0.01);
+
+        tracker.observe(&mut paused, start + Duration::from_millis(4_100));
         assert_eq!(paused.current_rate, 0.0);
         assert!((paused.peak_rate - 1_500.0).abs() < 0.01);
 
         let mut resumed = throughput_stats(3_000, MiningState::Mining, 1_100.0);
-        tracker.observe(&mut resumed, start + Duration::from_secs(3));
+        tracker.observe(&mut resumed, start + Duration::from_secs(5));
         assert_eq!(resumed.current_rate, 0.0);
 
         resumed.candidates = 4_000;
-        tracker.observe(&mut resumed, start + Duration::from_secs(4));
+        tracker.observe(&mut resumed, start + Duration::from_secs(6));
         assert!((resumed.current_rate - 1_000.0).abs() < 0.01);
         assert!((resumed.peak_rate - 1_500.0).abs() < 0.01);
+    }
+
+    #[test]
+    /// Checks that the short pause while a win is claimed keeps the rate instead of reading 0.
+    fn shared_throughput_holds_through_the_short_pause_of_a_claim() {
+        let start = Instant::now();
+        let mut tracker = ThroughputTracker::new(start, 0, true);
+        let mut stats = throughput_stats(0, MiningState::Mining, 0.0);
+        for tick in 1..=8_u64 {
+            stats.candidates = tick * 250;
+            tracker.observe(
+                &mut stats,
+                start + Duration::from_millis(tick.saturating_mul(250)),
+            );
+        }
+        assert!((stats.current_rate - 1_000.0).abs() < 0.01);
+
+        stats.state = MiningState::Paused;
+        tracker.observe(&mut stats, start + Duration::from_millis(2_100));
+        assert!((stats.current_rate - 1_000.0).abs() < 0.01);
+
+        stats.state = MiningState::Mining;
+        tracker.observe(&mut stats, start + Duration::from_millis(2_150));
+        assert!((stats.current_rate - 1_000.0).abs() < 0.01);
+
+        // The window now spans the 150 ms the GPU lost, so the rate dips a
+        // little rather than starting again from 0.
+        stats.candidates = 2_100;
+        tracker.observe(&mut stats, start + Duration::from_millis(2_250));
+        assert!(stats.current_rate > 900.0 && stats.current_rate < 1_000.0);
+        assert!((stats.peak_rate - 1_000.0).abs() < 0.01);
     }
 
     #[test]
@@ -4658,6 +5069,7 @@ mod tests {
             public_key: [0u8; 33],
             signature: [0u8; 64],
             transaction: Vec::new(),
+            payout: None,
         }
     }
 
@@ -4704,6 +5116,7 @@ mod tests {
             public_key: mining_public,
             signature,
             transaction,
+            payout: None,
         }
     }
 
@@ -4718,10 +5131,14 @@ mod tests {
         )
         .serialize();
         let mining_payout = reward::p2pkh_cashaddr_from_public_key(&reward_public).unwrap();
+        // A random part too: a later test process (the release-profile run
+        // in the same CI job) can get the same process id and would find
+        // files an earlier one left in the shared temp directory.
         let unique = format!(
-            "pickaxe-preflight-{}-{}.json",
+            "pickaxe-preflight-{}-{}-{:016x}.json",
             std::process::id(),
-            PREFLIGHT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
+            PREFLIGHT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed),
+            rand::random::<u64>()
         );
         let journal = std::env::temp_dir().join(unique);
         (
@@ -4824,6 +5241,7 @@ mod tests {
                                         signature,
                                         digest: crate::search::hash256(&transaction),
                                         transaction,
+                                        payout: None,
                                     }
                                 })
                             })
@@ -4834,6 +5252,39 @@ mod tests {
                     let winner = sign_winner(&job, cfg.generation_id);
                     let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
                     production_preflight_local(&cfg, &job, &journal, 1_000).unwrap();
+                    // #### PR #32: a public GPU pool's winner for a rig's own
+                    // payout is claimed only when the hub vouches for it.
+                    if recipient == Recipient::Miner {
+                        let mut rig_cfg = cfg.clone();
+                        rig_cfg.payout_address = crate::config::reprefix_p2pkh_payout(
+                            crate::config::DONATION_ADDRESS,
+                            network,
+                        )
+                        .unwrap();
+                        let rig_winner = winner.clone();
+                        assert!(prepare_submission_for_network(
+                            &rig_winner,
+                            &rig_cfg,
+                            &job,
+                            &settlement,
+                            &journal
+                        )
+                        .is_err());
+                        let vouched = VerifiedWinner {
+                            payout: Some(cfg.payout_address.clone()),
+                            ..rig_winner
+                        };
+                        let pending = prepare_submission_for_network(
+                            &vouched,
+                            &rig_cfg,
+                            &job,
+                            &settlement,
+                            &journal,
+                        )
+                        .unwrap();
+                        assert_eq!(pending.miner_token_amount, job.reward_raw);
+                        let _ = std::fs::remove_file(&journal);
+                    }
                     let pending =
                         prepare_submission_for_network(&winner, &cfg, &job, &settlement, &journal)
                             .unwrap();
@@ -5043,6 +5494,81 @@ mod tests {
         if let Ok(path) = std::env::var("PICKAXE_DIRECT_REWARD_PROOF") {
             fs::write(path, serde_json::to_vec(&samples).unwrap()).unwrap();
         }
+    }
+
+    // #### PR #42
+    // What: while the node is down (`skip_native`), a cadence refresh on
+    // Fulcrum asks Fulcrum alone: the configured node, a listener that never
+    // accepts, sees no connection, and the refresh returns Fulcrum's job.
+    // Look here if: skip_native or the cadence refresh changes.
+    #[test]
+    fn a_fulcrum_refresh_never_calls_the_node_while_it_is_down() {
+        use std::net::TcpListener;
+        use tungstenite::Message;
+        let node = TcpListener::bind("127.0.0.1:0").unwrap();
+        node.set_nonblocking(true).unwrap();
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_node_url(&format!("http://user:pass@{}", node.local_addr().unwrap()))
+            .unwrap();
+        let header = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c";
+        let baton = serde_json::json!({
+            "tx_hash": "11".repeat(32),
+            "tx_pos": 0,
+            "height": 9,
+            "value": 1000,
+            "token_data": {
+                "category": crate::protocol::MAINNET_CATEGORY_HEX,
+                "amount": "840001",
+                "nft": {"capability": "mutable", "commitment": format!("00000000{}", "01".repeat(32))}
+            }
+        });
+        let fulcrum = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", fulcrum.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (stream, _) = fulcrum.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            for _ in 0..4 {
+                let message = ws.read().unwrap();
+                let request: serde_json::Value =
+                    serde_json::from_str(message.to_text().unwrap().trim()).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "server.version" => serde_json::json!(["Fulcrum 1.12.0", "1.5"]),
+                    "blockchain.headers.subscribe" => {
+                        serde_json::json!({"height": 10, "hex": header})
+                    }
+                    "blockchain.scripthash.listunspent" => serde_json::json!([baton]),
+                    other => panic!("unexpected {other}"),
+                };
+                let reply =
+                    serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result});
+                ws.send(Message::Text(format!("{reply}\n").into())).unwrap();
+            }
+        });
+        let mut session = ElectrumSession::connect_failover_for_deployment(
+            &[url],
+            cfg.token.photon_deployment(cfg.network),
+        )
+        .unwrap();
+        let mut sources = SourceCatalog::configured(&cfg).unwrap();
+        let mut native = None;
+        let refreshed = refresh_photon_job_on_cadence(
+            &cfg,
+            &mut session,
+            &mut sources,
+            &mut native,
+            Instant::now(),
+            true,
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(refreshed.job.height, 10);
+        assert!(refreshed.route_warning.is_none());
+        assert!(native.is_none());
+        assert_eq!(
+            node.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "no node call ran"
+        );
     }
 
     #[test]
@@ -5665,6 +6191,7 @@ mod tests {
             public_key: mining_public,
             signature,
             transaction,
+            payout: None,
         };
 
         validate_verified_parent(&winner, &job, &reward_public).unwrap();
@@ -5725,6 +6252,7 @@ mod tests {
             public_key: mining_public,
             signature,
             transaction,
+            payout: None,
         };
 
         let first = prepare_pending_submission(
@@ -5814,6 +6342,7 @@ mod tests {
                     public_key: search_public,
                     signature,
                     transaction,
+                    payout: None,
                 });
                 break;
             }
@@ -6217,11 +6746,39 @@ mod tests {
         assert!(!should_begin_winner_refresh(true, false, false, 0, 1));
         assert!(!should_begin_winner_refresh(false, true, false, 0, 1));
         assert!(!should_begin_winner_refresh(false, false, true, 0, 1));
-        assert!(!winner_refresh_ready(false, false, true));
-        assert!(!winner_refresh_ready(true, true, true));
-        assert!(!winner_refresh_ready(true, false, false));
-        assert!(winner_refresh_ready(true, false, true));
+        assert!(!winner_refresh_ready(false, true));
+        assert!(!winner_refresh_ready(true, false));
+        assert!(winner_refresh_ready(true, true));
     }
+
+    // #### PR #35 test: a claim does not wait for other GPUs ####
+    #[test]
+    fn a_winner_another_gpu_queues_during_a_claim_gets_its_own_check() {
+        // Five winners handled so far; the claim drains one, while a second
+        // GPU queues another winner, so the counter reads seven.
+        let observed = acknowledge_drained(5, 1);
+        assert_eq!(observed, 6);
+        assert!(should_begin_winner_refresh(
+            false, false, false, observed, 7
+        ));
+        // Once that winner is drained too, nothing is left to check.
+        assert!(!should_begin_winner_refresh(
+            false,
+            false,
+            false,
+            acknowledge_drained(observed, 1),
+            7
+        ));
+        // A drain can run before the counter increments; it never re-triggers.
+        assert!(!should_begin_winner_refresh(
+            false,
+            false,
+            false,
+            acknowledge_drained(0, 1),
+            0
+        ));
+    }
+    // #### end PR #35 test ####
 
     #[test]
     /// Checks that submission retry never rebroadcasts parent after it is known.
@@ -7259,6 +7816,55 @@ mod tests {
         assert!(submission_journal_path(MiningNetwork::Chipnet)
             .ends_with("pending-reward-chipnet.json"));
         assert!(submission_journal_path(MiningNetwork::Mainnet).ends_with("pending-reward.json"));
+    }
+
+    // #### PR #42
+    // What: the node mempool gate runs the same way on Chipnet and mainnet:
+    // skipped without a saved node, and a node's rejection stops the claim
+    // on both.
+    // Look here if: preflight_pending_transaction or node_endpoints changes.
+    #[test]
+    fn preflight_runs_the_same_gate_on_every_network() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let txid = "11".repeat(32);
+        let server = {
+            let txid = txid.clone();
+            thread::spawn(move || {
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut request = [0u8; 4096];
+                    let read = std::io::Read::read(&mut stream, &mut request).unwrap();
+                    assert!(String::from_utf8_lossy(&request[..read]).contains("testmempoolaccept"));
+                    let body = format!(
+                        "{{\"result\":[{{\"txid\":\"{txid}\",\"allowed\":false,\"reject-reason\":\"dust\"}}],\"error\":null,\"id\":\"pickaxe\"}}"
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
+                }
+            })
+        };
+        for network in [MiningNetwork::Mainnet, MiningNetwork::Chipnet] {
+            let mut cfg = RuntimeConfig::default();
+            cfg.set_network(network);
+            assert!(
+                preflight_pending_transaction(&cfg, "PHOTON claim", &txid, "0200").is_ok(),
+                "without a saved node there is no gate"
+            );
+            cfg.set_node_url(&format!("http://{address}")).unwrap();
+            assert_eq!(cfg.node_endpoints(), [format!("http://{address}")]);
+            let error =
+                preflight_pending_transaction(&cfg, "PHOTON claim", &txid, "0200").unwrap_err();
+            assert!(
+                error.contains("rejected by native-node mempool preflight"),
+                "{network:?}: {error}"
+            );
+        }
+        server.join().unwrap();
     }
 
     #[test]

@@ -1,0 +1,12 @@
+{
+  "package": "pickaxe-raveos-@VERSION@",
+  "name": "Pickaxe",
+  "version": "@VERSION@",
+  "description": "Pickaxe PHOTON GPU miner",
+  "maintainer": "Pickaxe",
+  "platforms": ["nvidia", "amd"],
+  "dual_coin": false,
+  "algo": ["photon"],
+  "executable": ["pickaxe"],
+  "rev": 1
+}

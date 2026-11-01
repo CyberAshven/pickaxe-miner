@@ -20,3 +20,11 @@ cargo +nightly-2026-04-02 build \
 install -D -m 0644 \
   "$ptx_target_dir/nvptx64-nvidia-cuda/release/pickaxe_rust_engine.ptx" \
   "$repo_dir/cuda/build/photon_rust.ptx"
+
+# A separate CUDA module avoids changing PHOTON code generation.
+cargo +nightly-2026-04-02 build \
+  --locked --release --manifest-path "$repo_dir/rust-engine/electric-kernel/Cargo.toml" \
+  --target nvptx64-nvidia-cuda -Z build-std=core
+install -D -m 0644 \
+  "$ptx_target_dir/nvptx64-nvidia-cuda/release/pickaxe_electric_kernel.ptx" \
+  "$repo_dir/cuda/build/electric_rust.ptx"
