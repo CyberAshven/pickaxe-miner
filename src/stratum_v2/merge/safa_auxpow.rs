@@ -2617,6 +2617,86 @@ pub(crate) mod tests {
         }
     }
 
+    /// #### merge-mining v2: tSAFA's first claim on Chipnet
+    /// BCH P2Pool's live deployment (genesis 8c5ecd6d…c471, category
+    /// 1e642d4e…00fe, the fixture's covenant) and its first claim,
+    /// e30dc911…a47f, confirmed at height 330,017: thread 3's vault before
+    /// the claim and the claim's bytes as BCHN serves them.
+    const CONFIRMED_CLAIM: &str = include_str!("test_data/tsafa-chipnet-confirmed-claim.json");
+
+    // #### merge-mining v2: a claim the covenant accepted on chain
+    // What: P2Pool's first Chipnet tSAFA claim passes check_claim, and
+    // build_claim rebuilds it byte for byte from its own proof, split and
+    // payouts: the next state's target (1d023ffd, 14 blocks after 1d00ffff),
+    // the 2,513-satoshi fee (S at 1 satoshi per byte) and the 1% donation.
+    // Why: Pickaxe has no BCH script VM, so its other claim tests judge the
+    // builder by Pickaxe's own reading of the covenant; BCHN's VM judged
+    // this one.
+    // Look here if: plan_claim, build_claim, check_claim or the ASERT
+    // claim target changes.
+    #[test]
+    fn the_first_confirmed_chipnet_claim_is_rebuilt_byte_for_byte() {
+        let confirmed: serde_json::Value = serde_json::from_str(CONFIRMED_CLAIM).unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(P2POOL_FIXTURE).unwrap();
+        let mut json = fixture["params"].clone();
+        json["version"] = 1.into();
+        json["category"] = confirmed["deployment"]["category"].clone();
+        let deployment = Deployment::from_json(&json.to_string()).unwrap();
+        let hex_field = |value: &serde_json::Value| hex::decode(value.as_str().unwrap()).unwrap();
+        let mut txid: Hash = hex_field(&confirmed["vault"]["txid"]).try_into().unwrap();
+        txid.reverse();
+        let vault = Vault {
+            outpoint: OutPoint {
+                txid,
+                vout: confirmed["vault"]["vout"].as_u64().unwrap() as u32,
+            },
+            value: confirmed["vault"]["value"].as_u64().unwrap(),
+            tokens: confirmed["vault"]["tokens"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap(),
+            commitment: hex_field(&confirmed["vault"]["commitment"])
+                .try_into()
+                .unwrap(),
+            confirmed: true,
+        };
+        let raw = hex_field(&confirmed["claim"]["hex"]);
+        check_claim(&deployment, &vault, &raw).unwrap();
+
+        let state = vault.state().unwrap();
+        assert_eq!(state.thread, 3);
+        assert_eq!(
+            claim_target_bits(
+                state.target_bits,
+                330_015 - state.height,
+                deployment.threads
+            ),
+            Some(0x1d02_3ffd)
+        );
+        let tx = parse_tx(&raw).unwrap();
+        let pushes = parse_pushes(&tx.inputs[0].1).unwrap();
+        let [preimage, _, proof, _] = pushes.as_slice() else {
+            panic!("a claim's unlocking bytecode holds four pushes");
+        };
+        let split = Split::parse(preimage).unwrap();
+        assert_eq!(
+            (split.donation_slot().bps(), split.fee_slot().bps()),
+            (100, 0)
+        );
+        let terms = ClaimTerms {
+            payout: tx.outputs[1].locking.clone(),
+            split,
+            donation: Some(tx.outputs[2].locking.clone()),
+            fee: None,
+        };
+        let claim = build_claim(&deployment, &vault, proof, &terms, 1, None).unwrap();
+        assert_eq!(claim.plan.locktime, 330_015);
+        assert_eq!(claim.plan.fee, 2_513);
+        assert_eq!(claim.txid, confirmed["claim"]["txid"].as_str().unwrap());
+        assert_eq!(claim.raw, raw);
+    }
+
     // #### merge-mining v2: the ASERT band's edges (P2Pool's vectors)
     #[test]
     fn the_asert_band_matches_p2pools_edges() {
