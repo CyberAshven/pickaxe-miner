@@ -889,6 +889,14 @@ Every claim the builder makes passes it before it is broadcast.
   Pickaxe's hex. Once P2Pool's hex for them is in
   `test_data/tsafa-chipnet-claim.json`, the test compares the two byte for
   byte.
+- tSAFA is live on Chipnet: BCH P2Pool's deployment, genesis
+  `8c5ecd6d…c471`, category `1e642d4e…00fe`, the fixture's covenant, 4
+  threads. Its first claim, `e30dc911…a47f`, was confirmed at height
+  330,017, so BCHN's VM accepted it. That claim and thread 3's vault before
+  it are pinned in `test_data/tsafa-chipnet-confirmed-claim.json`.
+  `safa_auxpow::tests::the_first_confirmed_chipnet_claim_is_rebuilt_byte_for_byte`
+  passes it through `check_claim` and has `build_claim` rebuild it from its
+  own proof, split and payouts: the same 2,345 bytes and txid.
 
 ## What Pickaxe does today
 
@@ -922,10 +930,11 @@ Every claim the builder makes passes it before it is broadcast.
 - **A first real token.** Its authors write the covenant (with these checks
   and the token-level rules) and Pickaxe adds its row to the registry; its
   claims follow tSAFA's builder if it is the SAFA covenant.
-- **tSAFA in a VM.** Pickaxe's claims are checked against the covenant's
-  rules in Rust, not run through the covenant: that needs tSAFA's compiled
-  redeem script and a BCH 2026 VM (Libauth, as P2Pool's tests use), and a
-  run against BCHN once tSAFA is broadcast.
+- **tSAFA in a VM.** Pickaxe's tests still check claims against the
+  covenant's rules in Rust, not through a BCH 2026 VM. One claim the
+  covenant accepted on chain is pinned and rebuilt byte for byte (see
+  Cross-checks with BCH P2Pool). A claim of Pickaxe's own merge-mined win
+  has not been broadcast yet.
 - **BCH P2Pool** building output 0 in this format, so Pickaxe can merge-mine
   there.
 - **Disclosure at remote pools:** the adapter asks only its own server for
