@@ -30,23 +30,51 @@ mod cuda_stage_b;
 #[allow(dead_code)]
 pub mod cuda_stage_c;
 pub mod donation;
+// #### PR #51: ELECTRIC on the CPU with keyless claims and pot recovery.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod electric;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 pub mod electrum;
 pub mod gpu_types;
+// #### PR #53: several GPU tokens on the same GPUs, each for its share of the time.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod hash_split;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod hip_photon;
+// #### PR #42: where GPU mining takes its jobs, and the way back to the node.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod job_source;
+// #### PR #42: HiveOS, mmpOS and RaveOS.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod farm_os;
+// #### PR #42: nodes, Fulcrum servers and ZMQ found on a computer.
 #[allow(dead_code)]
 pub mod m29_table;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod mine_watch;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mining_lock;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 pub mod node;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod node_find;
+#[cfg(all(feature = "opencl", not(target_arch = "wasm32")))]
+pub mod opencl_photon;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod session_control;
+// #### PR #53: BCH P2Pool as a dependency Pickaxe installs, updates and runs.
+#[cfg(all(feature = "stratum-v2", not(target_arch = "wasm32")))]
+pub mod p2pool;
 pub mod proof;
 #[allow(dead_code)]
 pub mod protocol;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod reach;
 pub mod reward;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod rigs;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod runtime;
 #[cfg(not(target_arch = "wasm32"))]
@@ -58,7 +86,11 @@ pub mod self_test;
 #[cfg(test)]
 mod stage_b;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod stratum_v2;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod telemetry;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod tls;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 pub mod tui;

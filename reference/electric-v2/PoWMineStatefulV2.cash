@@ -1,0 +1,127 @@
+pragma cashscript ^0.13.3;
+
+/**
+ * Stateful Hashcash-style PoW miner – miner pays fees
+ *
+ * Mutable NFT Commitment (16 bytes):
+ *   [0]     difficulty     (uint8)
+ *   [1-4]   lastHeight     (uint32 LE)
+ *   [5-8]   mineCount      (uint32 LE)
+ *   [9-15]  reserved
+ *
+ * PoW preimage (binds full prior state → no same-state replay):
+ *   hash256( commitment || recipientPkh || nonce )
+ *   nonce length == 8
+ *   first `difficulty` bytes of digest == 0x00
+ *
+ * Per-block difficulty:
+ *   tip > lastHeight → newDiff = minDiff
+ *   else             → newDiff = min(difficulty + 1, maxDiff)
+ */
+contract PoWMineStatefulV2(
+    bytes32 tokenCategory,      // FT category (LE); mutable NFT: tokenCategory + 0x01
+    int     reward,
+    int     minDiff,
+    int     maxDiff
+) {
+    function mine(
+        bytes20 recipientPkh,
+        bytes   nonce
+    ) {
+        // -------------------------------------------------------
+        // 0. Param / input shape
+        // -------------------------------------------------------
+        require(minDiff >= 1);              // fail closed: never difficulty 0
+        require(maxDiff >= minDiff);
+        require(maxDiff <= 6);
+        require(reward > 0);
+
+        // Fee input + optional dust-only extras: keep shape tight
+        require(tx.inputs.length == 2 || tx.inputs.length == 3);
+
+        require(nonce.length == 8);
+
+        // -------------------------------------------------------
+        // 1. State from mutable NFT (must be input 0)
+        // -------------------------------------------------------
+        require(this.activeInputIndex == 0);
+
+        // Explicit mutable-NFT category (capability encoded as +0x01)
+        require(tx.inputs[0].tokenCategory == tokenCategory + 0x01);
+
+        bytes commitment = tx.inputs[0].nftCommitment;
+        require(commitment.length == 16);
+
+        int difficulty = int(commitment.split(1)[0]);
+        int lastHeight = int(commitment.split(1)[1].split(4)[0]);
+        int mineCount  = int(commitment.split(5)[1].split(4)[0]);
+
+        require(difficulty >= minDiff);
+        require(difficulty <= maxDiff);
+
+        // uint32-style guard (CashScript int is larger; prevent wrap in commitment)
+        require(mineCount >= 0);
+        require(mineCount < 4294967295);    // 2^32 - 1 → next fits in 4 bytes
+
+        // -------------------------------------------------------
+        // 2. PoW — full previous commitment in preimage
+        // -------------------------------------------------------
+        bytes32 powHash = hash256(
+            commitment + recipientPkh + nonce
+        );
+
+        require(powHash.split(difficulty)[0] == toPaddedBytes(0, difficulty));
+
+        // -------------------------------------------------------
+        // 3. Difficulty adjustment (nLockTime = block height)
+        // -------------------------------------------------------
+        int currentHeight = tx.locktime;
+        require(currentHeight >= lastHeight);
+        require(currentHeight < 500000000); // height mode, not unix time
+
+        int newDiff = difficulty;
+        if (currentHeight > lastHeight) {
+            newDiff = minDiff;
+        } else {
+            newDiff = difficulty + 1;
+            if (newDiff > maxDiff) {
+                newDiff = maxDiff;
+            }
+        }
+
+        // -------------------------------------------------------
+        // 4. New commitment
+        // -------------------------------------------------------
+        bytes newCommitment =
+            toPaddedBytes(newDiff, 1) +
+            toPaddedBytes(currentHeight, 4) +
+            toPaddedBytes(mineCount + 1, 4) +
+            0x00000000000000;
+
+        // -------------------------------------------------------
+        // 5. Outputs
+        // -------------------------------------------------------
+        bytes25 minerLock = new LockingBytecodeP2PKH(recipientPkh);
+
+        // Output 0 — miner reward (FT only)
+        require(tx.outputs[0].lockingBytecode == minerLock);
+        require(tx.outputs[0].tokenCategory == tokenCategory);
+        require(tx.outputs[0].tokenAmount == reward);
+        require(tx.outputs[0].nftCommitment == 0x);
+        require(tx.outputs[0].value == 1000);
+
+        // Output 1 — covenant continuation (mutable NFT + remaining FT)
+        require(tx.outputs[1].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[1].tokenCategory == tokenCategory + 0x01); // mutable
+        require(tx.outputs[1].nftCommitment == newCommitment);
+        require(tx.outputs[1].nftCommitment.length == 16);
+        require(tx.inputs[0].tokenAmount >= reward);
+        require(tx.outputs[1].tokenAmount == tx.inputs[0].tokenAmount - reward);
+        require(tx.outputs[1].value >= 1000);
+
+        require(tx.outputs.length == 2 || tx.outputs.length == 3);
+        if (tx.outputs.length == 3) {
+            require(tx.outputs[2].tokenCategory == 0x);
+        }
+    }
+}

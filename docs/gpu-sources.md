@@ -25,9 +25,37 @@ selectable until its replacement is proven on hardware.
 | NVIDIA RTX 50 series (compute capability 12.0 and newer) | CUDA | Shared Rust engine: `cuda/build/photon_rust.ptx` | CUDA C++ kernels: build with `--no-default-features --features tail-grind` |
 | AMD Radeon RX 6000, 7000, 9000 | HIP | CUDA C++ kernels compiled for HIP: `hip/build/<arch>/*.hsaco` | Shared Rust engine: set `PICKAXE_HIP_KERNELS=rust` to load `hip/build/<arch>/photon_rust.hsaco` |
 | Older NVIDIA GPUs, other AMD GPUs, Intel GPUs, integrated GPUs | wgpu on Vulkan | Shared Rust stages (`reference/shared-stages/`) and T2 filter (`reference/shared-t2/`) | Original hand-written WGSL stages: set `PICKAXE_WGPU_STAGES=wgsl` |
-| Windows GPUs whose Vulkan driver fails | wgpu on DirectX 12: set `PICKAXE_WGPU_API=dx12` and add Microsoft's DXC ([portable builds](portable.md)) | Same as Vulkan, with the shared stages' DirectX 12/Metal copy | Same as Vulkan |
+| Windows GPUs whose Vulkan driver fails (older Intel drivers now work on Vulkan; see [portable builds](portable.md)) | wgpu on DirectX 12: set `PICKAXE_WGPU_API=dx12` and add Microsoft's DXC ([portable builds](portable.md)) | Same as Vulkan, with the shared stages' DirectX 12/Metal copy | Same as Vulkan |
 | Apple Silicon | wgpu on Metal | Same as Vulkan, with the shared stages' DirectX 12/Metal copy | Same as Vulkan |
+| GPUs no other engine finds (older integrated GPUs without Vulkan or DirectX 12, ARM GPUs with only OpenCL) | OpenCL, only when CUDA, HIP and wgpu find no GPU, or with `--backend opencl` | `src/opencl_t2.cl`: the T2 filter in OpenCL C, with each window's signature made on the CPU | None |
 | Browser miner | wgpu on browser WebGPU | Same as Vulkan; browsers other than Chromium use the DirectX 12/Metal copy | Development builds only (`verify_portable_engine`) |
+
+## OpenCL engine
+
+PR #32 adds an OpenCL engine (`src/opencl_photon.rs`, `src/opencl_t2.cl`) for
+GPUs the other engines cannot drive: integrated GPUs too old for Vulkan or
+DirectX 12 (Intel's 3rd and 4th generation on Windows, for example) and ARM
+boards whose GPU has an OpenCL driver but no Vulkan one. Newer integrated
+GPUs keep the portable engine, which is faster.
+
+- **When it runs:** only when CUDA, HIP and wgpu find no GPU, or with
+  `--backend opencl` (`devices --backend opencl` lists the OpenCL GPUs). A
+  machine whose GPUs another engine drives never loads an OpenCL driver, so a
+  broken driver cannot affect it.
+- **How it mines:** T2 only. The CPU signs each window, one signature per
+  65,536 candidates, with the same code that verifies winners; the GPU hashes
+  the window's candidates in OpenCL C. The kernel is built per layout, so
+  amount positions are constants.
+- **Checks:** `opencl_kernel_matches_the_cpu_for_every_candidate` compares the
+  kernel with the CPU for every candidate of several layouts and window
+  boundaries (opt-in; choose the GPU with `PICKAXE_TEST_OPENCL_DEVICE`).
+  `self-test --backend opencl` and `benchmark --backend opencl` work as for
+  the other engines.
+- **Measured** on the integrated Radeon of the test laptop: about 30.6 MH/s at
+  100% intensity, scaling with intensity (benchmark validation passes), level
+  with the portable engine's 29 MH/s on the same GPU. The kernel's loops are
+  unrolled so the SHA-256 schedule stays in registers; without that it ran
+  13.2 MH/s. No Intel or ARM GPU has run it yet.
 
 ## Which GPUs mine
 

@@ -25,6 +25,18 @@ COMMON = (
 )
 TARGETS = (
     {
+        "name": "electric",
+        "environment": "PICKAXE_BUILD_SHARED_ELECTRIC",
+        "output": "reference/shared-electric",
+        "sources": (
+            "rust-engine/src/sha256.rs",
+            "rust-engine/src/electric.rs",
+            "tools/shared-gpu-proof/electric/Cargo.toml",
+            "tools/shared-gpu-proof/electric/src/lib.rs",
+        ),
+        "shaders": ("pickaxe_electric.wgsl",),
+    },
+    {
         "name": "filter",
         "environment": "PICKAXE_BUILD_SHARED_FILTER",
         "output": "reference/shared-t2",

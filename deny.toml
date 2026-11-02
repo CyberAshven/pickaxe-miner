@@ -11,6 +11,26 @@ ignore = []
 # CC0-1.0: the secp256k1 crates (libsecp256k1 bindings) used for signing.
 allow = ["AGPL-3.0-only", "Apache-2.0", "MIT", "BSD-3-Clause", "ISC", "Zlib", "Unicode-3.0", "CC0-1.0"]
 
+# PR #38: bitcoin 0.32 via the reference Stratum crates uses this unmodified
+# compile-time hex macro. MITNFA retains MIT notice requirements and adds a
+# condition about bug-report attribution for substantially modified copies.
+# Reviewed text: https://spdx.org/licenses/MITNFA.html. Scope to this crate;
+# advisory, source and all other license gates remain in force.
+[[licenses.exceptions]]
+name = "hex_lit"
+version = "=0.1.1"
+allow = ["MITNFA"]
+
+# PR #40: asic-rs (device reports and controls for the ASIC server) uses
+# reqwest with rustls, whose platform verifier ships Mozilla's root
+# certificates as data under CDLA-Permissive-2.0, a permissive data license
+# that sets no conditions on software using the data. Reviewed text:
+# https://spdx.org/licenses/CDLA-Permissive-2.0.html. Scope to this crate.
+[[licenses.exceptions]]
+name = "webpki-root-certs"
+version = "=1.0.10"
+allow = ["CDLA-Permissive-2.0"]
+
 [bans]
 # Different compatible dependency trees may need different crate major versions.
 multiple-versions = "allow"

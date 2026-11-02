@@ -833,6 +833,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pickaxe-shared-electric"
+version = "0.0.0"
+dependencies = [
+ "spirv-std",
+]
+
+[[package]]
 name = "pickaxe-shared-hash-builder"
 version = "0.0.0"
 dependencies = [

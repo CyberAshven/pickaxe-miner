@@ -1,0 +1,13 @@
+[package]
+name = "pickaxe-electric-kernel"
+version = "0.0.1"
+edition = "2021"
+license = "AGPL-3.0-only"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "lib.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("spirv"))'] }
