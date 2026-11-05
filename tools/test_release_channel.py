@@ -68,6 +68,68 @@ class ReleaseChannelTest(unittest.TestCase):
                         self.assertEqual(values['mode'], expected_mode)
                         self.assertEqual(values['tag'], tag)
 
+    def test_replace_mode_needs_a_push_that_changes_the_replace_file(self):
+        """Move an existing tag only when the push itself names it in the file."""
+        workflow = (Path(__file__).resolve().parents[1] /
+                    '.github/workflows/release.yml').read_text(encoding='utf-8')
+        block = re.search(
+            r'      - name: Resolve release tag\n.*?        run: \|\n'
+            r'((?:          [^\n]*\n|\n)+)', workflow, re.S)
+        self.assertIsNotNone(block)
+        script = textwrap.dedent(block[1])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*args):
+                """Run Git in the disposable repository and return its output."""
+                return subprocess.check_output(
+                    ['git', '-c', 'user.name=Release Test',
+                     '-c', 'user.email=release-test@example.invalid',
+                     '-c', 'commit.gpgsign=false', *args],
+                    cwd=root, text=True, stderr=subprocess.STDOUT).strip()
+
+            def commit(message, files):
+                """Commit `files` (path -> text) and return the commit id."""
+                for name, text in files.items():
+                    path = root / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(text, encoding='utf-8')
+                git('add', '-A')
+                git('commit', '-m', message)
+                return git('rev-parse', 'HEAD')
+
+            git('init', '-b', 'master', str(root))
+            released = commit('release', {'Cargo.toml': '[package]\nversion = "0.0.3"\n'})
+            git('tag', 'pickaxe-miner-v0.0.3')
+            named = commit('replace', {'.github/release-replace': 'pickaxe-miner-v0.0.3\n'})
+            unrelated = commit('later', {'README.md': 'later\n'})
+            other = commit('other tag', {'.github/release-replace': 'pickaxe-miner-v0.0.2\n'})
+            output = root / 'outputs'
+            cases = [
+                (named, released, 'replace'),
+                (named, named, 'skip'),
+                (named, '0' * 40, 'skip'),
+                (named, '', 'skip'),
+                (named, 'f' * 40, 'skip'),
+                (unrelated, named, 'skip'),
+                (other, unrelated, 'skip'),
+            ]
+            for head, before, expected_mode in cases:
+                with self.subTest(head=head, before=before):
+                    git('checkout', '-q', head)
+                    output.write_text('', encoding='utf-8')
+                    result = subprocess.run(
+                        [shutil.which('bash'), '--noprofile', '--norc', '-c', script],
+                        cwd=root, capture_output=True, text=True,
+                        env=dict(os.environ, GITHUB_EVENT_NAME='push', PUSH_REF_TYPE='branch',
+                                 PUSH_TAG='master', MANUAL_TAG='', PUSH_BEFORE=before,
+                                 REPO_URL=str(root), GITHUB_OUTPUT=str(output)))
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    values = dict(line.split('=', 1) for line in
+                                  output.read_text(encoding='utf-8').splitlines())
+                    self.assertEqual(values['mode'], expected_mode)
+                    self.assertEqual(values['tag'], 'pickaxe-miner-v0.0.3')
+
     def test_portable_archives_require_the_same_source_commit(self):
         """Reject a portable archive whose recorded source differs from the release."""
         workflow = (Path(__file__).resolve().parents[1] /
@@ -143,6 +205,25 @@ class ReleaseChannelTest(unittest.TestCase):
                     self.assertEqual('release create ' in commands, not rebuild)
                     self.assertEqual('release upload ' in commands, not missing)
                     self.assertEqual('release edit ' in commands, not missing)
+                    self.assertNotIn('git/refs/tags', commands)
+            for missing in (False, True):
+                with self.subTest(replace=True, missing=missing):
+                    calls.unlink(missing_ok=True)
+                    env = dict(os.environ, MODE='replace',
+                               TAG='pickaxe-miner-v0.0.3', SHA='a' * 40,
+                               GH_REPO='example/miner', REBUILD_SHA='',
+                               RELEASE_MISSING=str(int(missing)))
+                    result = subprocess.run(
+                        [shutil.which('bash'), '--noprofile', '--norc', '-c', mock_gh + script],
+                        cwd=directory, env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, not missing,
+                                     result.stdout + result.stderr)
+                    commands = calls.read_text(encoding='utf-8')
+                    self.assertNotIn('release create ', commands)
+                    self.assertEqual(
+                        'api -X PATCH repos/example/miner/git/refs/tags/pickaxe-miner-v0.0.3 '
+                        f'-f sha={"a" * 40} -F force=true' in commands, not missing)
+                    self.assertEqual('release upload ' in commands, not missing)
 
     def test_publication_and_promotion_channels(self):
         """Enforce stable and prerelease ancestry plus replacement provenance."""
@@ -176,7 +257,10 @@ class ReleaseChannelTest(unittest.TestCase):
             git(remote, 'checkout', '-b', 'feature')
             git(remote, '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'unreviewed')
             feature = git(remote, 'rev-parse', 'HEAD')
+            git(remote, 'tag', 'pickaxe-miner-v0.0.3', dev)
             git(remote, 'checkout', 'master')
+            git(remote, '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'fix')
+            later = git(remote, 'rev-parse', 'HEAD')
             git(root, 'clone', str(remote), str(clone))
 
             cases = [
@@ -192,6 +276,11 @@ class ReleaseChannelTest(unittest.TestCase):
                 ('dry-run', 'master', '0.0.2', feature, True),
                 ('skip', 'master', '0.0.1', master, True),
                 ('unknown', 'dev', '0.0.2', master, False),
+                ('replace', 'master', '0.0.2', later, True),
+                ('replace', 'master', '0.0.2', master, True),
+                ('replace', 'master', '0.0.2', dev, False),
+                ('replace', 'master', '0.0.3', later, False),
+                ('replace', 'master', '0.0.2-alpha.1', later, False),
             ]
             for mode, branch, version, sha, allowed in cases:
                 with self.subTest(mode=mode, branch=branch, version=version, sha=sha):
