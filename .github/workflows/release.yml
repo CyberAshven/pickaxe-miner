@@ -116,7 +116,8 @@ jobs:
           replace_requested() {
             [[ -f .github/release-replace ]] || return 1
             [[ "$(tr -d '[:space:]' < .github/release-replace)" == "${tag}" ]] || return 1
-            [[ "${PUSH_BEFORE:-}" =~ ^[0-9a-f]{40}$ && ! "${PUSH_BEFORE}" =~ ^0+$ ]] || return 1
+            # An empty, all-zero (new branch) or unknown commit is refused here.
+            [[ -n "${PUSH_BEFORE:-}" ]] || return 1
             git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null || return 1
             ! git diff --quiet "${PUSH_BEFORE}" HEAD -- .github/release-replace
           }
