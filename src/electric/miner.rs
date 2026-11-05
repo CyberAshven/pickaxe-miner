@@ -21,8 +21,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// How often the miner reads the baton while it searches.
+/// How often the miner reads the baton while it searches, on a node or a
+/// server without change notices.
 const BATON_POLL: Duration = Duration::from_secs(2);
+/// #### Live-state notices: with a Fulcrum server's notices, the baton is
+/// read when the covenant or the tip changes, and otherwise once this often.
+const WATCHED_BATON_POLL: Duration = Duration::from_secs(30);
+/// The least time between two reads brought on by notices.
+const NOTICE_READ_GAP: Duration = Duration::from_secs(1);
 /// How long it waits for a new block or a funded pot before reading again.
 const IDLE_POLL: Duration = Duration::from_secs(10);
 /// Hashes per donation-schedule slot.
@@ -1459,11 +1465,20 @@ fn mine(
         }
         monitor.searching.store(true, Ordering::Release);
         let searching = Searching(&monitor.searching);
+        // A Fulcrum source reports the covenant's and the tip's changes; the
+        // baton is read on a change, with a slow safety read.
+        let watched = link.watch(&deployment.locking_bytecode()).unwrap_or(false);
+        let baton_poll = if watched {
+            WATCHED_BATON_POLL
+        } else {
+            BATON_POLL
+        };
         let win = std::thread::scope(|scope| {
             let search = scope.spawn(|| {
                 super::gpu::search_all(engines, job, &schedule, &next_nonce, &stop, monitor)
             });
             let mut polled = Instant::now();
+            let mut changed = false;
             while !search.is_finished() {
                 std::thread::sleep(Duration::from_millis(20));
                 if monitor.stopped() {
@@ -1477,9 +1492,17 @@ fn mine(
                 {
                     stop.store(true, Ordering::Relaxed);
                 }
-                if polled.elapsed() < BATON_POLL || monitor.stopped() {
+                if monitor.stopped() {
                     continue;
                 }
+                // A failed check reads the baton, which reports the failure; a
+                // change waits for the gap since the last read, never lost.
+                changed |= watched && link.take_change().unwrap_or(true);
+                let gap = if changed { NOTICE_READ_GAP } else { baton_poll };
+                if polled.elapsed() < gap {
+                    continue;
+                }
+                changed = false;
                 polled = Instant::now();
                 match read_baton(link, deployment) {
                     Ok(baton) if baton == now.baton => {}

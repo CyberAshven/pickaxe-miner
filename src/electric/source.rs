@@ -133,6 +133,23 @@ impl Session {
         })
     }
 
+    /// #### Live-state notices: subscribes a Fulcrum source to `locking`'s
+    /// changes (see `ElectrumSession::watch_script_hash`); a node has none.
+    pub fn watch(&mut self, locking: &[u8]) -> Result<bool, String> {
+        match &mut self.link {
+            Link::Node(_) => Ok(false),
+            Link::Fulcrum(session) => session.watch_script_hash(&super::script_hash_hex(locking)),
+        }
+    }
+
+    /// Whether a watched script or the chain tip changed since the last call.
+    pub fn take_change(&mut self) -> Result<bool, String> {
+        match &mut self.link {
+            Link::Node(_) => Ok(false),
+            Link::Fulcrum(session) => session.take_change(),
+        }
+    }
+
     pub fn tip(&mut self) -> Result<u32, String> {
         match &mut self.link {
             Link::Node(watch) => watch.tip(),

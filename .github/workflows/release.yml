@@ -10,6 +10,10 @@ name: Release
 # - push of a pickaxe-miner-v* tag, or manual dispatch with an existing tag:
 #   build and publish that tag. Prereleases must be reachable from dev;
 #   stable releases must be reachable from master. Dev pushes never publish.
+# - push to master that changes .github/release-replace to name the existing
+#   tag of this Cargo.toml version: rebuild that release's downloads from the
+#   pushed commit and move the tag forward to it (replace). Later pushes that
+#   leave the file unchanged skip as usual.
 on:
   push:
     branches:
@@ -101,13 +105,25 @@ jobs:
         env:
           PUSH_REF_TYPE: ${{ github.ref_type }}
           PUSH_TAG: ${{ github.ref_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
           MANUAL_TAG: ${{ inputs.tag }}
           REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
         run: |
           set -euo pipefail
           version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
 
+          # Whether this push changed .github/release-replace to name ${tag}.
+          replace_requested() {
+            [[ -f .github/release-replace ]] || return 1
+            [[ "$(tr -d '[:space:]' < .github/release-replace)" == "${tag}" ]] || return 1
+            # An empty, all-zero (new branch) or unknown commit is refused here.
+            [[ -n "${PUSH_BEFORE:-}" ]] || return 1
+            git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null || return 1
+            ! git diff --quiet "${PUSH_BEFORE}" HEAD -- .github/release-replace
+          }
+
           # mode: publish (existing tag), create (new tag on this commit),
+          # replace (existing tag moved to this commit, downloads rebuilt),
           # dry-run (pull request), skip (master push without a new version).
           case "${GITHUB_EVENT_NAME}:${PUSH_REF_TYPE}" in
             push:tag)
@@ -121,8 +137,12 @@ jobs:
             push:branch)
               tag="pickaxe-miner-v${version}"
               if git ls-remote --exit-code --tags "${REPO_URL}" "refs/tags/${tag}" >/dev/null; then
-                mode="skip"
-                echo "::notice::${tag} already exists; bump Cargo.toml version to publish a new release."
+                if replace_requested; then
+                  mode="replace"
+                else
+                  mode="skip"
+                  echo "::notice::${tag} already exists; bump Cargo.toml version to publish a new release."
+                fi
               else
                 status=$?
                 if [[ "${status}" -eq 2 ]]; then
@@ -197,7 +217,7 @@ jobs:
           fi
           case "${MODE}" in
             dry-run|skip) exit 0 ;;
-            create|publish) ;;
+            create|publish|replace) ;;
             *) echo "Unknown release mode: ${MODE}" >&2; exit 1 ;;
           esac
           channel=master
@@ -205,6 +225,10 @@ jobs:
           git fetch --no-tags origin "${channel}"
           if ! git merge-base --is-ancestor "${SHA}" FETCH_HEAD; then
             echo "${TAG} must point to a reviewed commit on ${channel}." >&2
+            exit 1
+          fi
+          if [[ "${MODE}" == "replace" ]] && ! git merge-base --is-ancestor "refs/tags/${TAG}" "${SHA}"; then
+            echo "${TAG} can only move forward to a later commit." >&2
             exit 1
           fi
           if [[ -n "${REBUILD_SHA:-}" ]]; then
@@ -969,7 +993,7 @@ jobs:
       - validate
       - checksums
       - scanner-docker
-    if: needs.validate.outputs.mode == 'publish' || needs.validate.outputs.mode == 'create'
+    if: needs.validate.outputs.mode == 'publish' || needs.validate.outputs.mode == 'create' || needs.validate.outputs.mode == 'replace'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -1042,9 +1066,14 @@ jobs:
           )
 
           if gh release view "${TAG}" --repo "${GH_REPO}" >/dev/null 2>&1; then
+            # Replace moves the existing tag forward to the built commit; the
+            # validate job checked it is a later commit on master.
+            if [[ "${MODE}" == "replace" ]]; then
+              gh api -X PATCH "repos/${GH_REPO}/git/refs/tags/${TAG}" -f sha="${SHA}" -F force=true >/dev/null
+            fi
             gh release upload "${TAG}" --repo "${GH_REPO}" "${assets[@]}" --clobber
             gh release edit "${TAG}" --repo "${GH_REPO}" --target "${SHA}" --notes-file dist/RELEASE_NOTES.md "${prerelease_args[@]}"
-          elif [[ -n "${REBUILD_SHA}" ]]; then
+          elif [[ -n "${REBUILD_SHA}" || "${MODE}" == "replace" ]]; then
             echo "Refusing to create a release during download replacement: ${TAG}" >&2
             exit 1
           else
