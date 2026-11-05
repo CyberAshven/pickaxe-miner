@@ -1,9 +1,9 @@
 //! Presentation-neutral live PHOTON runtime supervision.
 //!
-//! The authoritative M67.38 browser reference polls BCH height + the mutable
-//! PHOTON baton every 500 ms while GPU batches continue back-to-back. This
-//! supervisor keeps network polling independent of the GPU hot path and applies
-//! an immutable generation change at the worker's next batch boundary.
+//! The supervisor checks BCH height and the mutable PHOTON baton every 2 s
+//! while GPU batches continue back-to-back. It keeps network polling
+//! independent of the GPU hot path and applies an immutable generation change
+//! at the worker's next batch boundary.
 
 use crate::donation::require_direct_reward_policy;
 
@@ -43,7 +43,13 @@ pub const RIGS_ONLY: &str = "rigs only";
 const COMMAND_CAP: usize = 16;
 const EVENT_CAP: usize = 32;
 const SUPERVISOR_POLL: Duration = Duration::from_millis(10);
-const PHOTON_STATE_RECHECK: Duration = Duration::from_millis(500);
+// #### Baton check cadence
+// What: the live PHOTON state (tip, baton, tip) is read every 2 s, and a
+// claim waiting for its accepted baton re-checks at the same pace.
+// Why: this miner's own wins switch to their successor locally, so only
+// another miner's claim waits for this check.
+// Look here if: another miner's claim is noticed late.
+const PHOTON_STATE_RECHECK: Duration = Duration::from_secs(2);
 const ACCEPTED_BATON_RECHECK: Duration = PHOTON_STATE_RECHECK;
 /// How long an indexer may keep listing a baton this miner already spent
 /// before its view is trusted again.
@@ -3233,7 +3239,7 @@ fn run_supervisor(
         if force_winner_refresh {
             // The winning GPU's batch has ended, since a winner is queued only
             // after its batch. Run the existing authoritative refresh
-            // immediately rather than waiting for the next 500 ms deadline.
+            // immediately rather than waiting for the next scheduled check.
             next_state_refresh = Instant::now();
         }
         // #### PR #42: a ready node takes over through the reconnect path.
@@ -6445,9 +6451,10 @@ mod tests {
     }
 
     #[test]
-    /// Checks that photon state recheck matches authoritative m67 cadence.
-    fn photon_state_recheck_matches_authoritative_m67_cadence() {
-        assert_eq!(PHOTON_STATE_RECHECK, Duration::from_millis(500));
+    /// Checks that the live PHOTON state is read every 2 s.
+    fn photon_state_recheck_is_two_seconds() {
+        assert_eq!(PHOTON_STATE_RECHECK, Duration::from_secs(2));
+        assert_eq!(ACCEPTED_BATON_RECHECK, PHOTON_STATE_RECHECK);
     }
 
     #[test]
@@ -6459,12 +6466,14 @@ mod tests {
         let request_finished = first_deadline + Duration::from_millis(220);
         let second_deadline =
             next_periodic_deadline(first_deadline, request_finished, PHOTON_STATE_RECHECK);
-        assert_eq!(second_deadline, start + Duration::from_secs(1));
+        assert_eq!(second_deadline, start + PHOTON_STATE_RECHECK * 2);
 
-        let slow_request_finished = second_deadline + Duration::from_millis(620);
+        // A request slower than the period skips the missed check.
+        let slow_request_finished =
+            second_deadline + PHOTON_STATE_RECHECK + Duration::from_millis(120);
         let next_future_deadline =
             next_periodic_deadline(second_deadline, slow_request_finished, PHOTON_STATE_RECHECK);
-        assert_eq!(next_future_deadline, start + Duration::from_secs(2));
+        assert_eq!(next_future_deadline, start + PHOTON_STATE_RECHECK * 4);
     }
 
     #[test]
