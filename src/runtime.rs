@@ -1,9 +1,9 @@
 //! Presentation-neutral live PHOTON runtime supervision.
 //!
-//! The supervisor checks BCH height and the mutable PHOTON baton every 2 s
-//! while GPU batches continue back-to-back. It keeps network polling
-//! independent of the GPU hot path and applies an immutable generation change
-//! at the worker's next batch boundary.
+//! The supervisor reads BCH height and the mutable PHOTON baton when its
+//! server reports a change (every 2 s on a node) while GPU batches continue
+//! back-to-back. It keeps network reads independent of the GPU hot path and
+//! applies an immutable generation change at the worker's next batch boundary.
 
 use crate::donation::require_direct_reward_policy;
 
@@ -44,12 +44,19 @@ const COMMAND_CAP: usize = 16;
 const EVENT_CAP: usize = 32;
 const SUPERVISOR_POLL: Duration = Duration::from_millis(10);
 // #### Baton check cadence
-// What: the live PHOTON state (tip, baton, tip) is read every 2 s, and a
-// claim waiting for its accepted baton re-checks at the same pace.
+// What: a Fulcrum session subscribed to the PHOTON covenant reads the live
+// state (tip, baton, tip) as soon as the server reports a change (a claim or
+// a new block), looking for its notices every 100 ms, and otherwise once
+// every 30 s. A node, or a server that refuses the subscription, is read
+// every 2 s, and a claim waiting for its accepted baton re-checks every 2 s.
 // Why: this miner's own wins switch to their successor locally, so only
-// another miner's claim waits for this check.
-// Look here if: another miner's claim is noticed late.
+// another miner's claim or a new block needs a read.
+// Look here if: another miner's claim or a block is noticed late.
 const PHOTON_STATE_RECHECK: Duration = Duration::from_secs(2);
+const PHOTON_WATCHED_RECHECK: Duration = Duration::from_secs(30);
+const NOTICE_CHECK: Duration = Duration::from_millis(100);
+/// The least time between two reads brought forward by notices.
+const NOTICE_REFRESH_GAP: Duration = Duration::from_secs(1);
 const ACCEPTED_BATON_RECHECK: Duration = PHOTON_STATE_RECHECK;
 /// How long an indexer may keep listing a baton this miner already spent
 /// before its view is trusted again.
@@ -172,6 +179,16 @@ fn classify_refresh_failure(error: &str) -> RefreshFailureKind {
         RefreshFailureKind::Transport
     } else {
         RefreshFailureKind::Transient
+    }
+}
+
+/// The periodic PHOTON refresh interval: the safety read for a session that
+/// receives change notices, the short check otherwise.
+fn photon_refresh_interval(session: Option<&ElectrumSession>) -> Duration {
+    if session.is_some_and(ElectrumSession::watching) {
+        PHOTON_WATCHED_RECHECK
+    } else {
+        PHOTON_STATE_RECHECK
     }
 }
 
@@ -3014,6 +3031,8 @@ fn run_supervisor(
     let mut next_reconnect = Instant::now();
     let mut reconnect_preference = ReconnectPreference::PreferActive;
     let mut next_state_refresh = Instant::now() + PHOTON_STATE_RECHECK;
+    let mut next_notice_check = Instant::now();
+    let mut last_state_refresh = Instant::now();
     let mut submission_backoff = RECONNECT_MIN;
     let mut next_submission_retry = Instant::now();
     let mut stop = false;
@@ -3234,6 +3253,17 @@ fn run_supervisor(
         }
         if stop {
             break;
+        }
+        // A reported change (a claim or a new block) brings the next refresh
+        // forward; a broken connection shows up in that refresh.
+        if let Some(active) = session.as_mut().filter(|active| active.watching()) {
+            if Instant::now() >= next_notice_check {
+                next_notice_check = Instant::now() + NOTICE_CHECK;
+                if active.take_change().unwrap_or(true) {
+                    next_state_refresh = next_state_refresh
+                        .min((last_state_refresh + NOTICE_REFRESH_GAP).max(Instant::now()));
+                }
+            }
         }
         let force_winner_refresh = winner_refresh_ready(winner_refresh_pending, session.is_some());
         if force_winner_refresh {
@@ -3677,6 +3707,7 @@ fn run_supervisor(
             }
         } else if Instant::now() >= next_state_refresh {
             let previous_state_refresh = next_state_refresh;
+            last_state_refresh = Instant::now();
             let refreshed = if force_winner_refresh {
                 // Every new claim is a direct claim, which re-checks the live
                 // baton before broadcast while the GPU mines its successor.
@@ -3699,7 +3730,7 @@ fn run_supervisor(
             next_state_refresh = next_periodic_deadline(
                 previous_state_refresh,
                 Instant::now(),
-                PHOTON_STATE_RECHECK,
+                photon_refresh_interval(session.as_ref()),
             );
             match refreshed {
                 Ok(boundary) => {
@@ -5533,12 +5564,13 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (stream, _) = fulcrum.accept().unwrap();
             let mut ws = tungstenite::accept(stream).unwrap();
-            for _ in 0..4 {
+            for _ in 0..5 {
                 let message = ws.read().unwrap();
                 let request: serde_json::Value =
                     serde_json::from_str(message.to_text().unwrap().trim()).unwrap();
                 let result = match request["method"].as_str().unwrap() {
                     "server.version" => serde_json::json!(["Fulcrum 1.12.0", "1.5"]),
+                    "blockchain.scripthash.subscribe" => serde_json::json!(null),
                     "blockchain.headers.subscribe" => {
                         serde_json::json!({"height": 10, "hex": header})
                     }
@@ -6451,10 +6483,14 @@ mod tests {
     }
 
     #[test]
-    /// Checks that the live PHOTON state is read every 2 s.
+    /// Checks that the live PHOTON state is read every 2 s without notices,
+    /// and only as a safety read with them.
     fn photon_state_recheck_is_two_seconds() {
         assert_eq!(PHOTON_STATE_RECHECK, Duration::from_secs(2));
         assert_eq!(ACCEPTED_BATON_RECHECK, PHOTON_STATE_RECHECK);
+        assert_eq!(photon_refresh_interval(None), PHOTON_STATE_RECHECK);
+        assert_eq!(PHOTON_WATCHED_RECHECK, Duration::from_secs(30));
+        assert!(NOTICE_CHECK < PHOTON_STATE_RECHECK);
     }
 
     #[test]
