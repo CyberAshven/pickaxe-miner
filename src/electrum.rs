@@ -70,6 +70,10 @@ pub struct ElectrumSession {
     link: Link,
     deployment: &'static PhotonDeployment,
     pub(crate) fee_policy: Option<(std::time::Instant, u64)>,
+    /// Script hashes this session is subscribed to.
+    watched: Vec<String>,
+    /// A change notice arrived since `take_change` last reported.
+    notice: bool,
 }
 
 /// #### PR #40
@@ -87,9 +91,11 @@ enum Link {
     },
     /// #### PR #42: a home Fulcrum server over plain TCP, one JSON-RPC
     /// request per line (only to private addresses; see the configuration).
+    /// `buf` keeps bytes received after the last complete line.
     Tcp {
-        stream: Box<std::io::BufReader<std::net::TcpStream>>,
+        stream: Box<TcpStream>,
         next_id: u64,
+        buf: Vec<u8>,
     },
 }
 
@@ -248,6 +254,8 @@ impl ElectrumSession {
             },
             deployment,
             fee_policy: None,
+            watched: Vec::new(),
+            notice: false,
         })
     }
 
@@ -279,11 +287,14 @@ impl ElectrumSession {
             url: url_str.to_string(),
             server_version: Value::Null,
             link: Link::Tcp {
-                stream: Box::new(std::io::BufReader::new(stream)),
+                stream: Box::new(stream),
                 next_id: 1,
+                buf: Vec::new(),
             },
             deployment,
             fee_policy: None,
+            watched: Vec::new(),
+            notice: false,
         };
         let ver = session.rpc("server.version", json!(["pickaxe-miner", "1.4.1"]))?;
         session.server_version = ver;
@@ -320,6 +331,8 @@ impl ElectrumSession {
             },
             deployment,
             fee_policy: None,
+            watched: Vec::new(),
+            notice: false,
         };
 
         let ver = session.rpc("server.version", json!(["pickaxe-miner", "1.4.1"]))?;
@@ -330,10 +343,15 @@ impl ElectrumSession {
     /// Sends an Electrum JSON-RPC request over the WebSocket, or asks the
     /// node the same question in its own RPCs.
     pub fn rpc(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let notice = &mut self.notice;
         let (ws, next_id, buf) = match &mut self.link {
             Link::Fulcrum { ws, next_id, buf } => (ws, next_id, buf),
             Link::Node { endpoint, .. } => return node_rpc(endpoint, method, &params),
-            Link::Tcp { stream, next_id } => return tcp_rpc(stream, next_id, method, params),
+            Link::Tcp {
+                stream,
+                next_id,
+                buf,
+            } => return tcp_rpc(stream, next_id, buf, notice, method, params),
         };
         let id = *next_id;
         *next_id += 1;
@@ -350,7 +368,7 @@ impl ElectrumSession {
             let msg = ws.read().map_err(websocket_read_error)?;
             match msg {
                 Message::Text(t) => {
-                    if let Some(result) = consume_rpc_text(buf, &t, id)? {
+                    if let Some(result) = consume_rpc_text(buf, &t, id, notice)? {
                         return Ok(result);
                     }
                 }
@@ -401,6 +419,52 @@ impl ElectrumSession {
         }
     }
 
+    /// #### Live-state notices
+    /// What: subscribes this Fulcrum session to a script hash, once. The
+    /// server then pushes a notice whenever the script's outputs change, and
+    /// each `blockchain.headers.subscribe` call already brings notices of new
+    /// blocks; `take_change` reports both. `false` for a node, or a server
+    /// that refuses the subscription, which are read on the short timer.
+    /// Why: a miner rereads state when it changed, not on every tick.
+    /// Look here if: a claim or a block is noticed only at the safety read.
+    pub fn watch_script_hash(&mut self, script_hash: &str) -> Result<bool, String> {
+        if self.is_node() {
+            return Ok(false);
+        }
+        if self
+            .watched
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(script_hash))
+        {
+            return Ok(true);
+        }
+        match self.rpc("blockchain.scripthash.subscribe", json!([script_hash])) {
+            Ok(_) => {
+                self.watched.push(script_hash.to_ascii_lowercase());
+                Ok(true)
+            }
+            Err(error) if error.starts_with("rpc error") => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Whether this session receives change notices.
+    pub fn watching(&self) -> bool {
+        !self.watched.is_empty()
+    }
+
+    /// Reads what the server already pushed, without waiting, and reports
+    /// whether a change notice arrived since the last call.
+    pub fn take_change(&mut self) -> Result<bool, String> {
+        let notice = &mut self.notice;
+        match &mut self.link {
+            Link::Node { .. } => {}
+            Link::Fulcrum { ws, buf, .. } => drain_websocket(ws, buf, notice)?,
+            Link::Tcp { stream, buf, .. } => drain_tcp(stream, buf, notice)?,
+        }
+        Ok(std::mem::take(&mut self.notice))
+    }
+
     /// Fetches a PHOTON mining job from the active Fulcrum source.
     pub fn fetch_live_job(&mut self) -> Result<LiveJob, String> {
         self.fetch_live_snapshot().map(|snapshot| snapshot.job)
@@ -425,6 +489,7 @@ impl ElectrumSession {
 
     /// Reads a consistent snapshot from the active Fulcrum session.
     fn read_live_snapshot(&mut self) -> Result<LiveStateSnapshot, String> {
+        self.watch_script_hash(self.deployment.script_hash_hex)?;
         let header_before = self.rpc("blockchain.headers.subscribe", json!([]))?;
         let unspent = self.rpc(
             "blockchain.scripthash.listunspent",
@@ -450,40 +515,128 @@ impl ElectrumSession {
 }
 
 /// #### PR #42: one request over a plain-TCP Electrum link: a line out,
-/// then lines in until the answer with its id (notifications are skipped).
+/// then lines in until the answer with its id. Notices on the way set
+/// `notice`; a partial line stays in `buf` for the next read.
 fn tcp_rpc(
-    stream: &mut std::io::BufReader<std::net::TcpStream>,
+    stream: &mut TcpStream,
     next_id: &mut u64,
+    buf: &mut Vec<u8>,
+    notice: &mut bool,
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
-    use std::io::{BufRead, Write};
+    use std::io::{Read, Write};
     let id = *next_id;
     *next_id += 1;
     let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
     stream
-        .get_mut()
         .write_all(format!("{req}\n").as_bytes())
         .map_err(|e| format!("transport: send: {e}"))?;
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
+        while let Some(line) = take_line(buf) {
+            let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            if let Some(result) = rpc_value_for_id(&value, id) {
+                return result;
+            }
+            *notice |= is_change_notice(&value);
+        }
         if std::time::Instant::now() > deadline {
             return Err(format!("timeout: rpc waiting for id={id} ({method})"));
         }
-        let mut line = String::new();
+        let mut chunk = [0u8; 4096];
         let read = stream
-            .read_line(&mut line)
+            .read(&mut chunk)
             .map_err(|e| format!("transport: read: {e}"))?;
         if read == 0 {
             return Err("transport: socket closed".into());
         }
-        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
-            continue;
-        };
-        if let Some(result) = rpc_value_for_id(&value, id) {
-            return result;
+        buf.extend_from_slice(&chunk[..read]);
+    }
+}
+
+/// Removes the first complete line from `buf`.
+fn take_line(buf: &mut Vec<u8>) -> Option<String> {
+    let end = buf.iter().position(|byte| *byte == b'\n')?;
+    let line: Vec<u8> = buf.drain(..=end).collect();
+    Some(String::from_utf8_lossy(&line).into_owned())
+}
+
+/// Whether an Electrum message is a pushed notice of a new block or of a
+/// change to a subscribed script.
+fn is_change_notice(value: &Value) -> bool {
+    value.get("id").is_none_or(Value::is_null)
+        && matches!(
+            value.get("method").and_then(Value::as_str),
+            Some("blockchain.headers.subscribe" | "blockchain.scripthash.subscribe")
+        )
+}
+
+/// Switches a WebSocket's socket between blocking and non-blocking reads;
+/// `false` when its stream type has no socket to switch.
+fn set_nonblocking(ws: &Ws, nonblocking: bool) -> Result<bool, String> {
+    let stream = match ws.get_ref() {
+        MaybeTlsStream::Rustls(tls) => tls.get_ref(),
+        MaybeTlsStream::Plain(tcp) => tcp,
+        _ => return Ok(false),
+    };
+    stream
+        .set_nonblocking(nonblocking)
+        .map(|()| true)
+        .map_err(|e| format!("transport: {e}"))
+}
+
+/// Reads every frame a WebSocket already received, without waiting.
+fn drain_websocket(ws: &mut Ws, buf: &mut String, notice: &mut bool) -> Result<(), String> {
+    if !set_nonblocking(ws, true)? {
+        return Ok(());
+    }
+    let drained = (|| loop {
+        match ws.read() {
+            Ok(Message::Text(text)) => {
+                consume_rpc_text(buf, &text, 0, notice)?;
+            }
+            Ok(Message::Close(_)) => return Err("transport: socket closed".to_string()),
+            Ok(_) => {}
+            Err(WebSocketError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(())
+            }
+            Err(error) => return Err(websocket_read_error(error)),
+        }
+    })();
+    set_nonblocking(ws, false)?;
+    drained
+}
+
+/// Reads every line a plain-TCP link already received, without waiting.
+fn drain_tcp(stream: &mut TcpStream, buf: &mut Vec<u8>, notice: &mut bool) -> Result<(), String> {
+    use std::io::Read;
+    stream
+        .set_nonblocking(true)
+        .map_err(|e| format!("transport: {e}"))?;
+    let drained = (|| {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => return Err("transport: socket closed".to_string()),
+                Ok(read) => buf.extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) => return Err(format!("transport: read: {error}")),
+            }
+        }
+    })();
+    stream
+        .set_nonblocking(false)
+        .map_err(|e| format!("transport: {e}"))?;
+    drained?;
+    while let Some(line) = take_line(buf) {
+        if let Ok(value) = serde_json::from_str::<Value>(line.trim()) {
+            *notice |= is_change_notice(&value);
         }
     }
+    Ok(())
 }
 
 /// Matches an RPC response to its request identifier.
@@ -497,8 +650,14 @@ fn rpc_value_for_id(value: &Value, id: u64) -> Option<Result<Value, String>> {
     Some(Ok(value.get("result").cloned().unwrap_or(Value::Null)))
 }
 
-/// Decodes a text frame into an Electrum RPC result.
-fn consume_rpc_text(buf: &mut String, text: &str, id: u64) -> Result<Option<Value>, String> {
+/// Decodes a text frame into an Electrum RPC result; change notices in it
+/// set `notice`.
+fn consume_rpc_text(
+    buf: &mut String,
+    text: &str,
+    id: u64,
+    notice: &mut bool,
+) -> Result<Option<Value>, String> {
     buf.push_str(text);
     while let Some(pos) = buf.find('\n') {
         let line = buf[..pos].trim().to_string();
@@ -512,6 +671,7 @@ fn consume_rpc_text(buf: &mut String, text: &str, id: u64) -> Result<Option<Valu
         if let Some(result) = rpc_value_for_id(&value, id) {
             return result.map(Some);
         }
+        *notice |= is_change_notice(&value);
     }
 
     let trimmed = buf.trim();
@@ -527,6 +687,7 @@ fn consume_rpc_text(buf: &mut String, text: &str, id: u64) -> Result<Option<Valu
         if let Some(result) = matched {
             return result.map(Some);
         }
+        *notice |= is_change_notice(&value);
     }
     Ok(None)
 }
@@ -728,30 +889,56 @@ mod tests {
     #[test]
     fn rpc_consumes_notification_without_newline_before_response() {
         let mut buf = String::new();
+        let mut notice = false;
         let notification =
             r#"{"jsonrpc":"2.0","method":"blockchain.headers.subscribe","params":[{"height":1}]}"#;
-        assert_eq!(consume_rpc_text(&mut buf, notification, 7).unwrap(), None);
+        assert_eq!(
+            consume_rpc_text(&mut buf, notification, 7, &mut notice).unwrap(),
+            None
+        );
         assert!(buf.is_empty());
+        assert!(notice);
 
+        let mut notice = false;
         let response = r#"{"jsonrpc":"2.0","id":7,"result":{"height":1}}"#;
         assert_eq!(
-            consume_rpc_text(&mut buf, response, 7).unwrap(),
+            consume_rpc_text(&mut buf, response, 7, &mut notice).unwrap(),
             Some(json!({"height": 1}))
         );
         assert!(buf.is_empty());
+        assert!(!notice);
     }
 
     #[test]
     fn rpc_ignores_interleaved_notification_and_returns_matching_response() {
         let mut buf = String::new();
+        let mut notice = false;
         let payload = concat!(
-            "{\"jsonrpc\":\"2.0\",\"method\":\"blockchain.headers.subscribe\",\"params\":[{\"height\":2}]}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"blockchain.scripthash.subscribe\",\"params\":[\"ab\",\"cd\"]}\n",
             "{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":[\"ok\"]}\n"
         );
         assert_eq!(
-            consume_rpc_text(&mut buf, payload, 9).unwrap(),
+            consume_rpc_text(&mut buf, payload, 9, &mut notice).unwrap(),
             Some(json!(["ok"]))
         );
+        assert!(notice);
+    }
+
+    #[test]
+    /// Only pushed block and script notices count as changes.
+    fn change_notices_are_pushed_block_and_script_notices() {
+        assert!(is_change_notice(&json!({
+            "jsonrpc": "2.0", "method": "blockchain.scripthash.subscribe", "params": ["ab", "cd"]
+        })));
+        assert!(is_change_notice(&json!({
+            "jsonrpc": "2.0", "method": "blockchain.headers.subscribe", "params": [{"height": 3}]
+        })));
+        assert!(!is_change_notice(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "blockchain.headers.subscribe", "result": {}
+        })));
+        assert!(!is_change_notice(&json!({
+            "jsonrpc": "2.0", "method": "server.peers.subscribe", "params": []
+        })));
     }
 
     // #### PR #40
@@ -826,16 +1013,18 @@ mod tests {
         });
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("tcp://{}", listener.local_addr().unwrap());
+        let (done, finished) = std::sync::mpsc::channel::<()>();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut writer = stream;
-            for _ in 0..4 {
+            for _ in 0..5 {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 let request: Value = serde_json::from_str(line.trim()).unwrap();
                 let result = match request["method"].as_str().unwrap() {
                     "server.version" => json!(["Fulcrum 1.12.0", "1.5"]),
+                    "blockchain.scripthash.subscribe" => json!("aa"),
                     "blockchain.headers.subscribe" => json!({"height": 10, "hex": header}),
                     "blockchain.scripthash.listunspent" => json!([baton]),
                     other => panic!("unexpected {other}"),
@@ -854,13 +1043,99 @@ mod tests {
                 )
                 .unwrap();
             }
+            // Keep the connection open until the client has checked.
+            let _ = finished.recv();
         });
         let mut session =
             ElectrumSession::connect_failover_for_deployment(&[url], &MAINNET_PHOTON).unwrap();
         assert!(!session.is_node());
         let job = session.fetch_live_job().unwrap();
+        // The block notices that came with the answers count as a change.
+        assert!(session.take_change().unwrap());
+        assert!(!session.take_change().unwrap());
+        drop(done);
         server.join().unwrap();
         assert_eq!((job.height, job.baton_txid.as_str()), (10, txid.as_str()));
+        assert!(session.watching());
+        // The server has gone: a check reports the closed link once the close
+        // arrives.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut closed = false;
+        while !closed && std::time::Instant::now() < deadline {
+            closed = session.take_change().is_err();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(closed, "the closed link was not reported");
+    }
+
+    // #### Live-state notices
+    // What: a subscribed session reports a change the server pushes later,
+    // once, even when the notice arrives in two pieces.
+    // Look here if: take_change or drain_tcp changes.
+    #[test]
+    fn a_watched_tcp_fulcrum_reports_a_pushed_change_once() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("tcp://{}", listener.local_addr().unwrap());
+        let (push, pushed) = std::sync::mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            for _ in 0..2 {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(line.trim()).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "server.version" => json!(["Fulcrum 1.12.0", "1.5"]),
+                    "blockchain.scripthash.subscribe" => json!("aa"),
+                    other => panic!("unexpected {other}"),
+                };
+                writeln!(
+                    writer,
+                    "{}",
+                    json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+                )
+                .unwrap();
+            }
+            pushed.recv().unwrap();
+            let notice = json!({
+                "jsonrpc": "2.0",
+                "method": "blockchain.scripthash.subscribe",
+                "params": [MAINNET_PHOTON.script_hash_hex, "bb"]
+            })
+            .to_string();
+            let (head, tail) = notice.split_at(notice.len() / 2);
+            writer.write_all(head.as_bytes()).unwrap();
+            writer.flush().unwrap();
+            thread::sleep(Duration::from_millis(80));
+            writer.write_all(format!("{tail}\n").as_bytes()).unwrap();
+            // Keep the connection open until the client is done.
+            let _ = pushed.recv();
+        });
+        let mut session =
+            ElectrumSession::connect_failover_for_deployment(&[url], &MAINNET_PHOTON).unwrap();
+        assert!(session
+            .watch_script_hash(MAINNET_PHOTON.script_hash_hex)
+            .unwrap());
+        // Already watched: no second request.
+        assert!(session
+            .watch_script_hash(MAINNET_PHOTON.script_hash_hex)
+            .unwrap());
+        assert!(session.watching());
+        assert!(!session.take_change().unwrap());
+
+        push.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut changed = false;
+        while !changed && std::time::Instant::now() < deadline {
+            changed = session.take_change().unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(changed, "the pushed notice was not reported");
+        assert!(!session.take_change().unwrap());
+        drop(push);
+        server.join().unwrap();
     }
 
     // #### PR #40
