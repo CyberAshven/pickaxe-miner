@@ -1057,8 +1057,15 @@ mod tests {
         server.join().unwrap();
         assert_eq!((job.height, job.baton_txid.as_str()), (10, txid.as_str()));
         assert!(session.watching());
-        // The server has gone: the next check reports the closed link.
-        assert!(session.take_change().is_err());
+        // The server has gone: a check reports the closed link once the close
+        // arrives.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut closed = false;
+        while !closed && std::time::Instant::now() < deadline {
+            closed = session.take_change().is_err();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(closed, "the closed link was not reported");
     }
 
     // #### Live-state notices
