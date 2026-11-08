@@ -573,7 +573,10 @@ provider 1 of 2"), and the status file's `template_source` gives its kind
 - Template ids must rise, a SetNewPrevHash must name a template announced as
   future (at most 8 wait), and a current template needs an earlier
   SetNewPrevHash; a provider that breaks this, or sends no transaction data
-  within 2 seconds, is left for the next source.
+  within 2 seconds, is left for the next source. The client negotiates no
+  extensions, so a provider's frames of any extension are ignored, as SV2
+  asks of unknown extensions; a Template Distribution message with the
+  channel bit set breaks the protocol.
 - A provider's new parent is confirmed on the selected network before its
   template is mined: by the first configured node, or by the network's
   Fulcrum servers without one.
@@ -612,6 +615,12 @@ What a client gets:
 - `SetupConnection` for protocol 2, version 2 and no flags. Anything else is
   refused with its error code, echoing unsupported flags, and the session
   closes.
+- No extensions. `RequestExtensions` (extension 0x0001) is answered with
+  `RequestExtensions.Error`, every requested extension unsupported and none
+  required, so the client goes on without them. Any other extension's frame
+  is ignored, as SV2 asks of unknown extensions. A malformed
+  `RequestExtensions`, or a Template Distribution message with the channel
+  bit set, closes the session.
 - After its `CoinbaseOutputConstraints` (within 10 seconds): on a new parent,
   a future `NewTemplate` and at once its `SetNewPrevHash` (the node's current
   time, `nBits`, and the target `compact(nBits)`); on the same parent, a
