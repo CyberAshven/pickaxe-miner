@@ -3450,3 +3450,14 @@ frames get no reply and the session goes on; a RequestExtensions shorter
 than its count, and a CoinbaseOutputConstraints with the channel bit, close
 the session before the first constraints and after. Not yet run against
 another implementation's negotiating client.
+
+Pickaxe's own Template Distribution client (`--template-provider`) closed
+the link on a provider's frame of any extension too, and took any first
+frame after its SetupConnection as the setup's answer. It negotiates no
+extensions, so it now discards a provider's extension frames, while waiting
+for that answer and after; a Template Distribution message with the channel
+bit still breaks the protocol. Host test with a scripted provider: an
+unknown extension's frames before the setup's answer and between two
+templates, with and without the channel bit, leave the link up and the
+second template arrives; a NewTemplate with the channel bit still fails the
+refresh.

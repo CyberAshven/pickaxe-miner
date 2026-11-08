@@ -215,8 +215,12 @@ impl TdpSource {
         )?)?;
         let deadline = Instant::now() + FIRST_TEMPLATE_WAIT;
         let reply = loop {
+            // #### Template Distribution extensions: an extension's frame is
+            // not the answer, and is discarded (see `handle`).
             if let Some(frame) = receiver.receive(Duration::from_millis(100))? {
-                break frame;
+                if frame.header().ext_type_without_channel_msg() == 0 {
+                    break frame;
+                }
             }
             if Instant::now() >= deadline {
                 return Err("template provider did not answer the setup".into());
@@ -276,15 +280,28 @@ impl TdpSource {
     // #### PR #42: a provider's protocol
     // What: template ids only rise; a future template waits for the
     // SetNewPrevHash naming it (at most 8 wait); a current template needs
-    // an earlier SetNewPrevHash; anything else, an extension or the channel
-    // bit closes the link and the server moves to its next source.
+    // an earlier SetNewPrevHash; anything else or the channel bit closes the
+    // link and the server moves to its next source.
     // Why: a provider that breaks the protocol cannot be trusted with the
     // work of every device.
     // Look here if: a provider's link keeps closing with "broke the
     // protocol".
+    // #### Template Distribution extensions
+    // What: a frame of a non-zero extension type (the channel bit aside) is
+    // discarded: this client negotiates no extension, so none is known.
+    // Template Distribution has no channel messages, so the channel bit on
+    // extension 0 still breaks the protocol.
+    // Why: SV2 requires frames of an unknown extension meant for this end to
+    // be discarded and ignored; closing the link on them left a provider
+    // that sends them for the next source.
+    // Look here if: a provider's extension frames reach the template
+    // handling, or close its link.
     fn handle(&mut self, frame: &mut SerializedFrame) -> Result<(), String> {
         let header = frame.header();
-        if header.channel_msg() || header.ext_type_without_channel_msg() != 0 {
+        if header.ext_type_without_channel_msg() != 0 {
+            return Ok(());
+        }
+        if header.channel_msg() {
             return Err(BROKE_PROTOCOL.into());
         }
         match header.msg_type() {
@@ -588,10 +605,16 @@ fn block_parts(block: &str) -> Option<([u8; 80], Vec<u8>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::{template_tests::rpc_template, transport::Limits, wire::encoded};
+    use super::super::super::{
+        template_tests::rpc_template,
+        transport::Limits,
+        wire::{encoded, extension_frame},
+    };
     use super::*;
     use std::net::TcpListener;
-    use stratum_core::template_distribution_sv2::MESSAGE_TYPE_SET_NEW_PREV_HASH;
+    use stratum_core::template_distribution_sv2::{
+        MESSAGE_TYPE_NEW_TEMPLATE, MESSAGE_TYPE_SET_NEW_PREV_HASH,
+    };
 
     // #### PR #42
     // What: a provider's address is sv2tp://HOST:PORT/KEY; without a key
@@ -622,6 +645,14 @@ mod tests {
 
     /// A provider that answers the setup, then sends `frames`.
     fn scripted(frames: Vec<SerializedFrame>) -> (TdpAddress, std::thread::JoinHandle<()>) {
+        scripted_with(Vec::new(), frames)
+    }
+
+    /// The same, sending `early` before its setup answer.
+    fn scripted_with(
+        early: Vec<SerializedFrame>,
+        frames: Vec<SerializedFrame>,
+    ) -> (TdpAddress, std::thread::JoinHandle<()>) {
         let secret = [21; 32];
         let public = super::super::super::server::authority_public(&secret).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -639,6 +670,9 @@ mod tests {
             .unwrap();
             let (mut sender, mut receiver) = session.split();
             receiver.receive(Duration::from_secs(5)).unwrap().unwrap();
+            for frame in early {
+                sender.send(frame).unwrap();
+            }
             sender
                 .send(
                     encoded(
@@ -674,6 +708,57 @@ mod tests {
         let mut source = TdpSource::new(address, 122, Box::new(|_, _| Ok(None)));
         assert_eq!(source.refresh().err().as_deref(), Some(BROKE_PROTOCOL));
         assert!(source.link.is_none());
+        provider.join().unwrap();
+    }
+
+    // #### Template Distribution extensions
+    // What: a provider's frames of an extension this client never
+    // negotiated, before its setup answer and between templates, with and
+    // without the channel bit, are discarded: the link stays up and the
+    // next template (new bits) arrives. A NewTemplate with the channel bit
+    // still breaks the protocol.
+    // Look here if: TdpSource::handle or the setup's answer changes.
+    #[test]
+    fn a_providers_unknown_extension_frames_are_discarded() {
+        let template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+        let mut raw = rpc_template();
+        raw["bits"] = serde_json::json!("1d00ffff");
+        raw["target"] = serde_json::json!(format!("00000000ffff{}", "00".repeat(26)));
+        let limit = BchTemplate::from_rpc(&raw).unwrap();
+        let unknown = |channel| extension_frame(0x4c54, 0x00, channel, &[0; 8]).unwrap();
+        let (address, provider) = scripted_with(
+            vec![unknown(false)],
+            vec![
+                super::super::convert::new_template(5, true, &template).unwrap(),
+                super::super::convert::set_new_prev_hash(5, &template).unwrap(),
+                unknown(false),
+                unknown(true),
+                super::super::convert::new_template(6, true, &limit).unwrap(),
+                super::super::convert::set_new_prev_hash(6, &limit).unwrap(),
+            ],
+        );
+        let mut source = TdpSource::new(address, 122, Box::new(|_, _| Ok(None)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while source
+            .current()
+            .is_none_or(|(_, current)| current.bits != limit.bits)
+        {
+            assert!(Instant::now() < deadline, "the next template never arrived");
+            source.refresh().unwrap();
+        }
+        assert!(source.link.is_some());
+        provider.join().unwrap();
+        let mut frame = super::super::convert::new_template(5, true, &template).unwrap();
+        let payload = frame.payload().to_vec();
+        let (address, provider) = scripted(vec![extension_frame(
+            0,
+            MESSAGE_TYPE_NEW_TEMPLATE,
+            true,
+            &payload,
+        )
+        .unwrap()]);
+        let mut source = TdpSource::new(address, 122, Box::new(|_, _| Ok(None)));
+        assert_eq!(source.refresh().err().as_deref(), Some(BROKE_PROTOCOL));
         provider.join().unwrap();
     }
 
