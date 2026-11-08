@@ -10,7 +10,7 @@ use super::super::{
     template::{compact_target, double_sha256, fold, Hash},
     template_tests::transaction,
     transport::{Limits, Receiver, Sender, Session},
-    wire::encoded,
+    wire::{encoded, extension_frame},
 };
 use super::convert::tests::sri_coinbase;
 use serde_json::{json, Value};
@@ -25,6 +25,10 @@ use stratum_core::{
     bitcoin::{block::Header, consensus, Block},
     codec_sv2::SerializedFrame,
     common_messages_sv2::{self as common, Protocol, SetupConnection, SetupConnectionError},
+    extensions_sv2::{
+        EXTENSION_TYPE_EXTENSIONS_NEGOTIATION, MESSAGE_TYPE_REQUEST_EXTENSIONS,
+        MESSAGE_TYPE_REQUEST_EXTENSIONS_ERROR, MESSAGE_TYPE_REQUEST_EXTENSIONS_SUCCESS,
+    },
     template_distribution_sv2::{
         CoinbaseOutputConstraints, NewTemplate, RequestTransactionData,
         RequestTransactionDataError, RequestTransactionDataSuccess, SetNewPrevHash, SubmitSolution,
@@ -126,6 +130,24 @@ impl Client {
             },
             MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS,
         );
+    }
+
+    /// The same with the channel bit, which no Template Distribution
+    /// message has.
+    fn channel_constraints(&mut self, size: u32) {
+        let message = CoinbaseOutputConstraints {
+            coinbase_output_max_additional_size: size,
+            coinbase_output_max_additional_sigops: 0,
+        };
+        let frame = encoded(message, MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS, true).unwrap();
+        self.sender.send(frame).unwrap();
+    }
+
+    /// `payload` as message `kind` of `extension`.
+    fn send_extension(&mut self, extension: u16, kind: u8, channel: bool, payload: &[u8]) {
+        self.sender
+            .send(extension_frame(extension, kind, channel, payload).unwrap())
+            .unwrap();
     }
 
     fn receive(&mut self) -> SerializedFrame {
@@ -636,4 +658,111 @@ fn client_frames_over_64_kib_close_the_session() {
     let payload: binary_sv2::B016M = big.as_slice().try_into().unwrap();
     client.send(payload, MESSAGE_TYPE_SUBMIT_SOLUTION);
     assert!(client.closed_within(Duration::from_secs(5)));
+}
+
+// #### Template Distribution extensions
+// What: a RequestExtensions right after setup (request 7 for 0x4C54 and
+// 0x0002, in the spec's layout) is answered with RequestExtensions.Error:
+// extension type 0x0001 without the channel bit, the same request id, both
+// extensions unsupported and none required. The session then serves
+// templates and transaction data as usual.
+// Look here if: tdp::server::extension or the setup steps change.
+#[test]
+fn request_extensions_is_answered_with_its_error_and_templates_follow() {
+    let server = Running::templates(pool_node(), Arc::new(TestDirectory::new()));
+    let mut client = Client::setup(&server);
+    client.send_extension(
+        EXTENSION_TYPE_EXTENSIONS_NEGOTIATION,
+        MESSAGE_TYPE_REQUEST_EXTENSIONS,
+        false,
+        &[7, 0, 2, 0, 0x54, 0x4c, 2, 0],
+    );
+    let mut reply = client.receive();
+    assert_eq!(
+        (reply.header().ext_type(), reply.header().msg_type()),
+        (
+            EXTENSION_TYPE_EXTENSIONS_NEGOTIATION,
+            MESSAGE_TYPE_REQUEST_EXTENSIONS_ERROR
+        )
+    );
+    // request_id | unsupported_extensions: 2 x U16 | required_extensions: 0.
+    assert_eq!(
+        reply.payload().to_vec(),
+        [7, 0, 2, 0, 0x54, 0x4c, 2, 0, 0, 0]
+    );
+    client.constraints(122);
+    let (template, _) = client.future_template();
+    assert!(client.request(template.id).is_ok());
+}
+
+// #### Template Distribution extensions
+// What: frames of extensions this provider does not know, with and without
+// the channel bit, before the constraints and after, get no reply and leave
+// the session serving; a client's RequestExtensions.Success is one of them.
+// Look here if: tdp::server::extension changes.
+#[test]
+fn frames_of_unknown_extensions_are_ignored() {
+    let server = Running::templates(pool_node(), Arc::new(TestDirectory::new()));
+    let mut client = Client::setup(&server);
+    client.send_extension(0x4c54, 0x00, false, &[1, 2, 3]);
+    client.send_extension(0x4001, 0x01, true, &[0; 8]);
+    client.send_extension(
+        EXTENSION_TYPE_EXTENSIONS_NEGOTIATION,
+        MESSAGE_TYPE_REQUEST_EXTENSIONS_SUCCESS,
+        false,
+        &[7, 0, 0, 0],
+    );
+    client.constraints(122);
+    let (template, _) = client.future_template();
+    client.send_extension(0x4c54, 0x02, false, &[]);
+    assert!(client.request(template.id).is_ok());
+}
+
+// #### Template Distribution extensions
+// What: a RequestExtensions whose list is shorter than its count closes the
+// session, as other malformed messages do, before the constraints and
+// after. Before them the window is 1 s, well inside the 3 s setup deadline.
+// Look here if: tdp::server::extension changes.
+#[test]
+fn a_malformed_request_extensions_closes_the_session() {
+    let server = Running::templates(pool_node(), Arc::new(TestDirectory::new()));
+    // Request 7 announces two extensions and carries one.
+    let malformed: &[u8] = &[7, 0, 2, 0, 0x54, 0x4c];
+    let mut first = Client::setup(&server);
+    first.send_extension(
+        EXTENSION_TYPE_EXTENSIONS_NEGOTIATION,
+        MESSAGE_TYPE_REQUEST_EXTENSIONS,
+        false,
+        malformed,
+    );
+    assert!(first.closed_within(Duration::from_secs(1)));
+    let mut later = Client::setup(&server);
+    later.constraints(122);
+    later.future_template();
+    later.send_extension(
+        EXTENSION_TYPE_EXTENSIONS_NEGOTIATION,
+        MESSAGE_TYPE_REQUEST_EXTENSIONS,
+        false,
+        malformed,
+    );
+    assert!(later.closed_within(Duration::from_secs(3)));
+}
+
+// #### Template Distribution extensions
+// What: Template Distribution has no channel messages, so its
+// CoinbaseOutputConstraints with the channel bit closes the session, as a
+// first constraints and as a change. Taken as constraints, either would
+// bring a template instead.
+// Look here if: tdp::server::extension changes.
+#[test]
+fn a_template_distribution_frame_with_the_channel_bit_closes_the_session() {
+    let server = Running::templates(pool_node(), Arc::new(TestDirectory::new()));
+    let mut first = Client::setup(&server);
+    first.channel_constraints(122);
+    assert!(first.closed_within(Duration::from_secs(1)));
+    let mut later = Client::setup(&server);
+    later.constraints(122);
+    later.future_template();
+    later.channel_constraints(221);
+    assert!(later.closed_within(Duration::from_secs(3)));
 }

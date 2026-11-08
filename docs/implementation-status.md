@@ -3420,3 +3420,33 @@ Branch `feat/merge-mining-v2`, on `dev`.
 Not in this change: BCH P2Pool building output 0 in this format (Pickaxe
 still refuses tokens with a P2Pool-prepared coinbase), and live or
 covenant-VM checks.
+
+## Template Distribution server: extension frames (2026-11-08)
+
+`serve --tp-listen` closed a client's session on any frame with a non-zero
+extension type, and on any frame between SetupConnection and the first
+CoinbaseOutputConstraints other than those constraints. A client that
+negotiates extensions sends RequestExtensions (extension 0x0001) right after
+SetupConnection.Success and waits for the answer, so it was dropped there
+and reconnected in a loop. SV2 says frames of an unknown extension meant for
+this end are discarded and ignored, and a server that supports none of the
+requested extensions answers with RequestExtensions.Error.
+
+- RequestExtensions is answered with RequestExtensions.Error (stratum-core's
+  `extensions_sv2` types): the same request id, every requested extension
+  unsupported and none required, so the client can go on without them.
+- Any other extension's frame, with or without the channel bit, is
+  discarded, before the constraints and after. The constraints must still
+  come within 10 seconds of setup, whatever comes first.
+- Still closing the session: a malformed RequestExtensions, an unknown
+  Template Distribution message, and a Template Distribution message with
+  the channel bit. Before the first constraints, a CoinbaseOutputConstraints
+  with the channel bit used to be taken as the constraints.
+
+Host tests against the real server over Noise: a RequestExtensions for
+0x4C54 and 0x0002, written in the spec's layout, gets the Error with its
+golden payload, then templates and transaction data; unknown extensions'
+frames get no reply and the session goes on; a RequestExtensions shorter
+than its count, and a CoinbaseOutputConstraints with the channel bit, close
+the session before the first constraints and after. Not yet run against
+another implementation's negotiating client.

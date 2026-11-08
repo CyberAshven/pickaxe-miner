@@ -612,6 +612,12 @@ What a client gets:
 - `SetupConnection` for protocol 2, version 2 and no flags. Anything else is
   refused with its error code, echoing unsupported flags, and the session
   closes.
+- No extensions. `RequestExtensions` (extension 0x0001) is answered with
+  `RequestExtensions.Error`, every requested extension unsupported and none
+  required, so the client goes on without them. Any other extension's frame
+  is ignored, as SV2 asks of unknown extensions. A malformed
+  `RequestExtensions`, or a Template Distribution message with the channel
+  bit set, closes the session.
 - After its `CoinbaseOutputConstraints` (within 10 seconds): on a new parent,
   a future `NewTemplate` and at once its `SetNewPrevHash` (the node's current
   time, `nBits`, and the target `compact(nBits)`); on the same parent, a
