@@ -14,8 +14,12 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+#[cfg(feature = "gui")]
+pub(crate) use miners::label_event;
 use miners::Tokens;
-pub use miners::{run_electric, run_miners, Miners};
+pub use miners::{
+    run_electric, run_miners, sessions_shown_elsewhere, show_sessions_in, Miners, SessionView,
+};
 mod session_preferences;
 use ratatui::{
     backend::CrosstermBackend,
@@ -4529,7 +4533,7 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
 }
 
 /// Appends one Unix-timestamped line to the optional `PICKAXE_TUI_LOG` file.
-fn append_tui_log(line: &str) {
+pub(crate) fn append_tui_log(line: &str) {
     let Ok(path) = std::env::var("PICKAXE_TUI_LOG") else {
         return;
     };
@@ -4590,7 +4594,7 @@ fn win_probability_for_rule(target_le_hex: &str, rule: ProofRule) -> Option<f64>
 }
 
 /// Formats the periodic status line for the TUI observation log.
-fn tui_status_line(snapshot: &RuntimeSnapshot) -> String {
+pub(crate) fn tui_status_line(snapshot: &RuntimeSnapshot) -> String {
     let expected = expected_winner_seconds(
         &snapshot.photon_target_le,
         snapshot.search.rate,

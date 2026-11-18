@@ -31,6 +31,31 @@ name = "webpki-root-certs"
 version = "=1.0.10"
 allow = ["CDLA-Permissive-2.0"]
 
+# The desktop window (`gui` feature): egui's clipboard on Windows (arboard)
+# uses these two crates under the Boost Software License 1.0, a permissive
+# license that asks only to keep its notice with source copies. Reviewed text:
+# https://spdx.org/licenses/BSL-1.0.html. Scope to these crates.
+[[licenses.exceptions]]
+name = "clipboard-win"
+version = "=5.4.3"
+allow = ["BSL-1.0"]
+
+[[licenses.exceptions]]
+name = "error-code"
+version = "=3.4.0"
+allow = ["BSL-1.0"]
+
+# The desktop window's text: egui's bundled fonts, Hack and Noto Emoji under
+# the SIL Open Font License 1.1 and Ubuntu under the Ubuntu Font Licence 1.0.
+# Both allow bundling the fonts unmodified with any software; they only limit
+# selling the fonts alone and reusing their names for modified fonts.
+# Reviewed texts: https://spdx.org/licenses/OFL-1.1.html and
+# https://spdx.org/licenses/Ubuntu-font-1.0.html. Scope to this crate.
+[[licenses.exceptions]]
+name = "epaint_default_fonts"
+version = "=0.37.0"
+allow = ["OFL-1.1", "Ubuntu-font-1.0"]
+
 [bans]
 # Different compatible dependency trees may need different crate major versions.
 multiple-versions = "allow"

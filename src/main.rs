@@ -2172,6 +2172,27 @@ fn run_application(open_profiles: bool) {
                 }
             }
         }
+        // The desktop window: the setup and dashboard, mining the same
+        // sessions as the terminal.
+        cli::Commands::Gui { start } => {
+            #[cfg(feature = "gui")]
+            let result = pickaxe_miner::gui::run(pickaxe_miner::gui::Start {
+                cfg,
+                config_path,
+                backend: backend_kind,
+                selection: effective_device,
+                start,
+            });
+            #[cfg(not(feature = "gui"))]
+            let result: Result<(), String> = {
+                let _ = (cfg, config_path, backend_kind, effective_device, start);
+                Err("this build has no desktop window; build with --features gui".into())
+            };
+            if let Err(error) = result {
+                eprintln!("error: {error}");
+                exit_after_error(1);
+            }
+        }
         cli::Commands::Repl => run_repl(cfg),
     }
 }

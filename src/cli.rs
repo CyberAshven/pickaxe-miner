@@ -198,6 +198,14 @@ pub enum Commands {
         #[command(subcommand)]
         command: P2poolCommand,
     },
+    /// Open the desktop window: the mining setup and dashboard, mining the
+    /// same sessions as the terminal (builds with the `gui` feature).
+    Gui {
+        /// Start mining with the saved settings as soon as the GPUs are
+        /// found, as pressing Start mining would.
+        #[arg(long)]
+        start: bool,
+    },
     #[command(hide = true)]
     Repl,
 }
