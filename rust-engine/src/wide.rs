@@ -161,6 +161,9 @@ pub(crate) use set;
 #[cfg(not(target_arch = "spirv"))]
 macro_rules! limbs {
     ($i:ident in $start:literal..8 => $body:block) => {
+        // The bodies index several limb arrays by `i`, as the SPIR-V
+        // unrolling below needs; an iterator form would not match it.
+        #[allow(clippy::needless_range_loop)]
         for $i in $start..8 $body
     };
 }
