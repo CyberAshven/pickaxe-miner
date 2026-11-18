@@ -28,7 +28,7 @@ const SETTLED: Duration = Duration::from_millis(500);
 const LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 /// What the window asks of a running session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Control {
     Pause(bool),
     Intensity(u8),
@@ -37,11 +37,29 @@ pub enum Control {
         index: usize,
         up: bool,
     },
+    /// Moves the donation of the token at this place one step.
+    Donation {
+        index: usize,
+        up: bool,
+    },
+    /// Reconnects the token at this place (runtime tokens).
+    Reconnect {
+        index: usize,
+    },
+    /// PHOTON alone, as its terminal dashboard allows: a new payout, or a
+    /// Fulcrum server (`None`: the automatic servers again).
+    SetPayout(String),
+    SetFulcrum(Option<String>),
     /// Stops once pending rewards are settled, or `now`.
     Stop {
         now: bool,
     },
 }
+
+/// The terminal token dashboard's answer when a session with a split or
+/// ELECTRIC is asked to change its payout or servers.
+pub const SETUP_ONLY: &str = "Stop and use setup to change this session's address or servers; \
+                              its fee pot and pending claims remain bound to their recipients.";
 
 /// One token of the session, as its row shows it.
 #[derive(Debug, Clone, PartialEq)]
@@ -51,6 +69,10 @@ pub struct TokenLine {
     pub rate: f64,
     pub rewards: u64,
     pub state: String,
+    /// The donation in effect, once the token reports it.
+    pub donation: Option<crate::donation::TokenDonation>,
+    /// A runtime token, which reconnects on request.
+    pub runtime: bool,
 }
 
 /// One mining GPU and what it reports.
@@ -86,6 +108,12 @@ pub struct Board {
     pub started: Option<Instant>,
     /// Why the last session stopped, if it failed.
     pub error: Option<String>,
+    /// PHOTON alone: its payout and servers can change while it mines.
+    pub single_runtime: bool,
+    /// The command each rig runs to join this coordinator, by place.
+    pub rig_join: Vec<(String, String)>,
+    /// The answer to the last control, as the terminal's status line.
+    pub notice: Option<String>,
 }
 
 impl Board {
@@ -189,14 +217,38 @@ impl Link {
             board.started = Some(Instant::now());
             board.push_event("Mining session started".into());
         });
+        let mut rig_join: Option<Vec<(String, String)>> = None;
         while !finished() {
             let mut events = Vec::new();
+            let mut notice = None;
             for control in self.take() {
                 let done = match control {
-                    Control::Pause(pause) => miners.pause(pause).map(|()| paused = pause),
-                    Control::Intensity(value) => miners.intensity(value),
-                    Control::Share { index, up } => miners.split.map_or(Ok(()), |(slots, _)| {
-                        crate::hash_split::step_share(slots, index, up).map(|_| ())
+                    Control::Pause(pause) => miners.pause(pause).map(|()| {
+                        paused = pause;
+                        None
+                    }),
+                    Control::Intensity(value) => miners
+                        .intensity(value)
+                        .map(|()| Some(format!("Intensity {value}%"))),
+                    Control::Share { index, up } => miners.split.map_or(Ok(None), |(slots, _)| {
+                        crate::hash_split::step_share(slots, index, up).map(|_| None)
+                    }),
+                    Control::Donation { index, up } => donate(miners, index, up),
+                    Control::Reconnect { index } => reconnect(miners, index),
+                    Control::SetPayout(address) => lone_runtime(miners).and_then(|runtime| {
+                        runtime
+                            .set_payout(address)
+                            .map(|()| Some("Payout address updated".into()))
+                    }),
+                    Control::SetFulcrum(Some(url)) => lone_runtime(miners).and_then(|runtime| {
+                        runtime
+                            .set_fulcrum_endpoint(url)
+                            .map(|()| Some("Fulcrum endpoint updated; reconnecting".into()))
+                    }),
+                    Control::SetFulcrum(None) => lone_runtime(miners).and_then(|runtime| {
+                        runtime
+                            .clear_fulcrum_endpoint()
+                            .map(|()| Some("Custom Fulcrum endpoint cleared; reconnecting".into()))
                     }),
                     Control::Stop { now: true } => return Ok(()),
                     Control::Stop { now: false } => {
@@ -204,11 +256,19 @@ impl Link {
                         // the terminal dashboard for profiles.
                         crate::session_control::request_profiles();
                         stopping = true;
-                        Ok(())
+                        Ok(None)
                     }
                 };
-                if let Err(error) = done {
-                    events.push(error);
+                match done {
+                    Ok(Some(message)) => {
+                        events.push(message.clone());
+                        notice = Some(message);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        events.push(error.clone());
+                        notice = Some(error);
+                    }
                 }
             }
             let reading = read(miners, &mut rewards, sampler.as_ref(), &mut events);
@@ -240,8 +300,31 @@ impl Link {
                 }
                 last_log = Some(Instant::now());
             }
+            // Where rigs join this coordinator: its listen address and key
+            // never change while it runs.
+            if rig_join.is_none() {
+                if let Some(rigs) = reading.runtime.as_ref().and_then(|s| s.rigs.as_ref()) {
+                    rig_join = Some(
+                        crate::rigs::join_lines(
+                            rigs,
+                            miners.network,
+                            crate::reach::Interfaces::detect(),
+                        )
+                        .into_iter()
+                        .map(|(place, command)| (place.label().to_owned(), command))
+                        .collect(),
+                    );
+                }
+            }
             self.update(|board| {
                 reading.apply(board, paused, stopping);
+                board.single_runtime = lone_runtime(miners).is_ok();
+                if let Some(lines) = &rig_join {
+                    board.rig_join.clone_from(lines);
+                }
+                if notice.is_some() {
+                    board.notice = notice;
+                }
                 for event in events {
                     board.push_event(event);
                 }
@@ -317,15 +400,7 @@ fn read(
         || electric.as_ref().is_some_and(|e| {
             e.pending || e.withdrawal.phase == crate::electric::withdrawal::Phase::Sending
         });
-    let order: Vec<SplitToken> = match miners.split {
-        Some((slots, _)) => slots.iter().map(|slot| slot.token).collect(),
-        None => miners
-            .runtimes
-            .iter()
-            .map(|(token, _)| *token)
-            .chain(miners.electric.map(|_| SplitToken::Electric))
-            .collect(),
-    };
+    let order = token_order(miners);
     let tokens = order
         .iter()
         .map(|token| {
@@ -333,16 +408,19 @@ fn read(
                 .split
                 .and_then(|(slots, _)| slots.iter().find(|slot| slot.token == *token))
                 .map(|slot| slot.share.load(Ordering::Relaxed));
-            let (rate, rewards, state) = match miners.runtimes.iter().position(|(t, _)| t == token)
-            {
+            let runtime = miners.runtimes.iter().position(|(t, _)| t == token);
+            let (rate, rewards, state, donation) = match runtime {
                 Some(i) => (
                     snapshots[i].search.current_rate,
                     rewards[i],
                     crate::hash_split::runtime_state(&snapshots[i]),
+                    Some(snapshots[i].token_donation),
                 ),
-                None => electric.as_ref().map_or((0.0, 0, "Stopped".into()), |e| {
-                    (e.rate, e.claims, e.state.clone())
-                }),
+                None => electric
+                    .as_ref()
+                    .map_or((0.0, 0, "Stopped".into(), None), |e| {
+                        (e.rate, e.claims, e.state.clone(), e.donation)
+                    }),
             };
             TokenLine {
                 name: token.name().into(),
@@ -350,6 +428,8 @@ fn read(
                 rate,
                 rewards,
                 state,
+                donation,
+                runtime: runtime.is_some(),
             }
         })
         .collect();
@@ -388,6 +468,69 @@ fn read(
     }
 }
 
+/// The session's tokens in the order its rows show them: the split's, or
+/// the runtime tokens and then ELECTRIC.
+fn token_order(miners: &Miners<'_>) -> Vec<SplitToken> {
+    match miners.split {
+        Some((slots, _)) => slots.iter().map(|slot| slot.token).collect(),
+        None => miners
+            .runtimes
+            .iter()
+            .map(|(token, _)| *token)
+            .chain(miners.electric.map(|_| SplitToken::Electric))
+            .collect(),
+    }
+}
+
+/// PHOTON alone, whose payout and servers can change while it mines (as on
+/// its terminal dashboard); with a split or ELECTRIC they are set up again.
+fn lone_runtime<'a>(miners: &Miners<'a>) -> Result<&'a RuntimeSupervisor, String> {
+    match (miners.runtimes.as_slice(), miners.split, miners.electric) {
+        ([(_, runtime)], None, None) => Ok(*runtime),
+        _ => Err(SETUP_ONLY.into()),
+    }
+}
+
+/// Moves a token's donation one step, as the terminal token dashboard's
+/// Left/Right do.
+fn donate(miners: &Miners<'_>, index: usize, up: bool) -> Result<Option<String>, String> {
+    let Some(token) = token_order(miners).get(index).copied() else {
+        return Ok(None);
+    };
+    if let Some((_, runtime)) = miners.runtimes.iter().find(|(t, _)| *t == token) {
+        let next = runtime.snapshot().token_donation.adjusted(up);
+        return runtime
+            .set_donation(next)
+            .map(|()| Some(format!("Donation {next}")));
+    }
+    let Some(monitor) = miners.electric.filter(|_| token == SplitToken::Electric) else {
+        return Ok(None);
+    };
+    let next = monitor
+        .summary()
+        .donation
+        .unwrap_or(crate::electric::DONATION_DEFAULT)
+        .adjusted(up);
+    monitor
+        .request_donation(miners.network, next)
+        .map(|()| Some(format!("ELECTRIC donation {next}")))
+}
+
+/// Reconnects a runtime token, as the terminal token dashboard's `r` does.
+fn reconnect(miners: &Miners<'_>, index: usize) -> Result<Option<String>, String> {
+    let Some(token) = token_order(miners).get(index).copied() else {
+        return Ok(None);
+    };
+    match miners.runtimes.iter().find(|(t, _)| *t == token) {
+        Some((_, runtime)) => runtime
+            .reconnect()
+            .map(|()| Some(format!("{} reconnect requested.", token.name()))),
+        None => Ok(Some(
+            "ELECTRIC reconnects automatically on transport errors.".into(),
+        )),
+    }
+}
+
 /// Shows token sessions in the window (see `tui::SessionView`).
 pub struct WindowView(pub Arc<Link>);
 
@@ -412,7 +555,9 @@ pub fn mine(launch: &Launch, config_path: &Path) -> Result<(), String> {
         Plan::Electric => {
             crate::electric::miner::run_from_setup(&launch.cfg, &launch.gpus, config_path)
         }
-        Plan::Runtime(token) => mine_runtime_token(launch, *token, config_path),
+        Plan::Runtime(token) => {
+            mine_runtime_token(&launch.cfg, *token, &launch.gpus, None, config_path, None)
+        }
     };
     // The stop asked the session to save its settings; nothing else
     // should read that request later.
@@ -420,16 +565,25 @@ pub fn mine(launch: &Launch, config_path: &Path) -> Result<(), String> {
     mined
 }
 
-/// A runtime token (PHOTON) alone, as the terminal's mining dashboard runs it.
-fn mine_runtime_token(
-    launch: &Launch,
+/// A runtime token (PHOTON) alone, as `pickaxe` runs it after its setup
+/// (`run_headless_mining` in src/main.rs): with this miner's rigs when it
+/// coordinates them, and the session saved to `profile` when it stops.
+pub(super) fn mine_runtime_token(
+    cfg: &crate::config::RuntimeConfig,
     token: crate::config::MiningToken,
+    gpus: &[GpuDevice],
+    rigs: Option<crate::rigs::RigHub>,
     config_path: &Path,
+    profile: Option<&str>,
 ) -> Result<(), String> {
-    let cfg = &launch.cfg;
     cfg.ensure_mining_supported()?;
-    let _gpu_lock = crate::mining_lock::acquire_gpu_lock()?;
-    let supervisor = RuntimeSupervisor::start_on_gpus(cfg.clone(), &launch.gpus)?;
+    // A coordinator with no GPU of its own uses none, so takes no lock.
+    let _gpu_lock = if gpus.is_empty() && rigs.is_some() {
+        None
+    } else {
+        Some(crate::mining_lock::acquire_gpu_lock()?)
+    };
+    let supervisor = RuntimeSupervisor::start_on_gpus_with_rigs(cfg.clone(), gpus, rigs)?;
     let stop = Arc::new(AtomicBool::new(false));
     crate::session_control::install_stop(&stop)?;
     let shown = crate::tui::run_miners(
@@ -440,7 +594,7 @@ fn mine_runtime_token(
             split: None,
             stop: Some(&stop),
         },
-        &launch.gpus,
+        gpus,
         &|| stop.load(Ordering::Relaxed),
     );
     let last = supervisor.stop();
@@ -451,7 +605,22 @@ fn mine_runtime_token(
         saved
             .token_donations
             .insert(saved.token.as_str().into(), last.token_donation);
-        crate::tui::remember_token_session(&saved, &launch.gpus, config_path, Vec::new(), false);
+        crate::tui::remember_token_session(&saved, gpus, config_path, Vec::new(), false);
+    }
+    if let Some(name) = profile {
+        // As every stop of a profile's PHOTON session saves it; the
+        // token's minimum is not saved, so a later minimum applies.
+        crate::config::MiningProfiles::save_session(
+            &crate::config::profiles_path(config_path),
+            name,
+            &crate::config::SessionSettings {
+                intensity: last.search.intensity,
+                address: last.payout_address.clone(),
+                token_donation: (last.token_donation != last.donation_default)
+                    .then_some(last.token_donation),
+            },
+        )
+        .map_err(|error| format!("save mining profile: {error}"))?;
     }
     shown
 }
@@ -467,6 +636,8 @@ mod tests {
             rate,
             rewards: 0,
             state: String::new(),
+            donation: None,
+            runtime: true,
         }
     }
 

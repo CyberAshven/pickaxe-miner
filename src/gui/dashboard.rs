@@ -30,6 +30,14 @@ pub fn show(ui: &mut egui::Ui, board: &Board, link: &Link) {
             gpus(ui, board);
             ui.add_space(10.0);
             chain(ui, board);
+            if board.single_runtime && board.live {
+                ui.add_space(10.0);
+                settings(ui, board, link);
+            }
+            if let Some(rigs) = board.runtime.as_ref().and_then(|s| s.rigs.as_ref()) {
+                ui.add_space(10.0);
+                rigs_panel(ui, rigs, &board.rig_join);
+            }
             if board.electric.is_some() {
                 ui.add_space(10.0);
                 pot(ui, board);
@@ -186,8 +194,12 @@ fn tokens(ui: &mut egui::Ui, board: &Board, link: &Link) {
         .inner_margin(egui::Margin::same(10))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
+            if let Some(notice) = &board.notice {
+                ui.label(notice);
+                ui.add_space(4.0);
+            }
             egui::Grid::new("tokens")
-                .num_columns(if split { 5 } else { 4 })
+                .num_columns(if split { 7 } else { 6 })
                 .spacing([24.0, 8.0])
                 .striped(true)
                 .show(ui, |ui| {
@@ -197,7 +209,9 @@ fn tokens(ui: &mut egui::Ui, board: &Board, link: &Link) {
                     }
                     ui.strong("Hash rate");
                     ui.strong("Rewards");
+                    ui.strong("Donation");
                     ui.strong("State");
+                    ui.strong("");
                     ui.end_row();
                     for (index, token) in board.tokens.iter().enumerate() {
                         ui.label(
@@ -227,7 +241,39 @@ fn tokens(ui: &mut egui::Ui, board: &Board, link: &Link) {
                         }
                         ui.monospace(format_hash_rate(token.rate));
                         ui.monospace(token.rewards.to_string());
+                        let can = board.live && !board.stopping;
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(can, egui::Button::new("◀"))
+                                .accessible_name(format!("Lower the {} donation", token.name))
+                                .clicked()
+                            {
+                                link.send(Control::Donation { index, up: false });
+                            }
+                            ui.monospace(
+                                token
+                                    .donation
+                                    .map_or_else(|| "reading".into(), |d| d.to_string()),
+                            );
+                            if ui
+                                .add_enabled(can, egui::Button::new("▶"))
+                                .accessible_name(format!("Raise the {} donation", token.name))
+                                .clicked()
+                            {
+                                link.send(Control::Donation { index, up: true });
+                            }
+                        });
                         ui.label(&token.state);
+                        if token.runtime
+                            && ui
+                                .add_enabled(can, egui::Button::new("Reconnect"))
+                                .on_hover_text("Reconnect this token's server")
+                                .clicked()
+                        {
+                            link.send(Control::Reconnect { index });
+                        } else if !token.runtime {
+                            ui.label("");
+                        }
                         ui.end_row();
                     }
                 });
@@ -401,6 +447,154 @@ fn chain(ui: &mut egui::Ui, board: &Board) {
                         }
                     }
                 });
+        });
+}
+
+/// A one-line text field kept across frames; returns the text when its
+/// button is pressed or Enter is pressed in it.
+fn apply_line(
+    ui: &mut egui::Ui,
+    label: &str,
+    key: &str,
+    hint: &str,
+    button: &str,
+) -> Option<String> {
+    let id = egui::Id::unique(key);
+    let mut value: String = ui.data(|data| data.get_temp(id)).unwrap_or_default();
+    let mut apply = None;
+    ui.horizontal(|ui| {
+        let label = ui.add_sized([110.0, 18.0], egui::Label::new(label));
+        let field = ui
+            .add(
+                egui::TextEdit::singleline(&mut value)
+                    .hint_text(hint)
+                    .desired_width(420.0),
+            )
+            .labelled_by(label.id);
+        let entered = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        if ui.button(button).clicked() || entered {
+            apply = Some(value.trim().to_owned());
+        }
+    });
+    if apply.is_some() {
+        value.clear();
+    }
+    ui.data_mut(|data| data.insert_temp(id, value));
+    apply.filter(|value| !value.is_empty())
+}
+
+/// PHOTON alone: its payout and Fulcrum server change while it mines, as
+/// its terminal dashboard's `address` and `endpoint` commands do.
+fn settings(ui: &mut egui::Ui, board: &Board, link: &Link) {
+    let Some(snapshot) = &board.runtime else {
+        return;
+    };
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.strong("Settings");
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.weak("Payout");
+                ui.monospace(&snapshot.payout_address);
+            });
+            if let Some(address) = apply_line(
+                ui,
+                "New payout",
+                "pickaxe.payout",
+                "bitcoincash:… or bchtest:…",
+                "Change payout",
+            ) {
+                link.send(Control::SetPayout(address));
+            }
+            ui.add_space(6.0);
+            if let Some(url) = apply_line(
+                ui,
+                "Fulcrum server",
+                "pickaxe.fulcrum",
+                "wss://host:port",
+                "Use this server",
+            ) {
+                link.send(Control::SetFulcrum(Some(url)));
+            }
+            if ui
+                .button("Automatic servers")
+                .on_hover_text("Clear the custom Fulcrum server and use the built-in list")
+                .clicked()
+            {
+                link.send(Control::SetFulcrum(None));
+            }
+        });
+}
+
+/// The rigs this miner coordinates, and the command each rig runs to join.
+fn rigs_panel(ui: &mut egui::Ui, rigs: &crate::rigs::RigSummary, join: &[(String, String)]) {
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.strong("Rigs");
+            ui.add_space(4.0);
+            let mut line = format!(
+                "{} connected · {} GPUs · {} · {} winners · {} rejected",
+                rigs.connected,
+                rigs.gpus,
+                format_hash_rate(rigs.rate),
+                rigs.winners,
+                rigs.rejected
+            );
+            if rigs.public {
+                line.push_str(&format!(
+                    " · public pool, fee {:.2}%",
+                    f64::from(rigs.fee_bps.unwrap_or(0)) / 100.0
+                ));
+            }
+            ui.label(line);
+            if !rigs.rigs.is_empty() {
+                ui.add_space(4.0);
+                egui::Grid::new("rigs")
+                    .num_columns(5)
+                    .spacing([14.0, 6.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for heading in ["Rig", "GPUs", "Rate", "Winners", "Version"] {
+                            ui.weak(heading);
+                        }
+                        ui.end_row();
+                        for rig in &rigs.rigs {
+                            ui.label(&rig.name);
+                            ui.monospace(rig.gpus.to_string());
+                            ui.monospace(format_hash_rate(rig.rate));
+                            ui.monospace(rig.winners.to_string());
+                            ui.label(&rig.version);
+                            ui.end_row();
+                            for gpu in rig.devices.iter().filter(|gpu| gpu.error.is_some()) {
+                                ui.label(format!("  {}", gpu.name));
+                                ui.colored_label(
+                                    ui.visuals().error_fg_color,
+                                    gpu.error.as_deref().unwrap_or(""),
+                                );
+                                ui.end_row();
+                            }
+                        }
+                    });
+            }
+            ui.add_space(6.0);
+            ui.weak("Rigs join with:");
+            for (index, (place, command)) in join.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.weak(place);
+                    ui.monospace(command);
+                    if ui
+                        .small_button("Copy")
+                        .accessible_name(format!("Copy join line {}", index + 1))
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(command.clone());
+                    }
+                });
+            }
         });
 }
 

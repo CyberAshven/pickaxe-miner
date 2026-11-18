@@ -4662,6 +4662,23 @@ pub fn run(
     let stop = Arc::new(AtomicBool::new(false));
     crate::session_control::install_stop(&stop)?;
     let initial = supervisor.snapshot();
+    // A window showing sessions (`pickaxe gui`) shows this one too.
+    if sessions_shown_elsewhere() {
+        let token = crate::hash_split::SplitToken::Gpu(crate::config::MiningToken::Photon);
+        let shown = run_miners(
+            &Miners {
+                network: initial.network,
+                runtimes: vec![(token, &supervisor)],
+                electric: None,
+                split: None,
+                stop: Some(&stop),
+            },
+            &devices,
+            &|| stop.load(Ordering::Relaxed),
+        );
+        let last = supervisor.stop();
+        return shown.map(|()| last);
+    }
     let mut state = TuiState::new(&initial);
     state.set_devices(devices);
     let mut terminal = TerminalSession::enter()?;

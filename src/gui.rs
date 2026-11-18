@@ -13,8 +13,13 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 mod dashboard;
+// Wired into the App with the setup that yields a `tui::SetupResult`.
+#[allow(dead_code)]
+mod launch;
 #[cfg(all(test, feature = "gui-preview"))]
 mod preview;
+#[allow(dead_code)]
+mod rig;
 mod session;
 mod setup;
 
@@ -47,11 +52,30 @@ pub fn run(start: Start) -> Result<(), String> {
         "Pickaxe",
         options,
         Box::new(move |cc| {
+            release_own_console();
             link.set_context(cc.egui_ctx.clone());
             Ok(Box::new(App::new(start, link)))
         }),
     )
     .map_err(|error| format!("open the window: {error}"))
+}
+
+/// A console Windows opened only for this process (a double-click or a
+/// shortcut) is released once the window is up, so no empty terminal sits
+/// behind it. A console the miner was started from stays.
+fn release_own_console() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+        let mut processes = [0u32; 2];
+        // SAFETY: the buffer holds `processes.len()` ids, as passed.
+        let attached = unsafe { GetConsoleProcessList(processes.as_mut_ptr(), 2) };
+        if attached == 1 {
+            // SAFETY: detaching from the console has no preconditions;
+            // later writes to stdout and stderr are discarded.
+            unsafe { FreeConsole() };
+        }
+    }
 }
 
 /// The window draws on the low-power GPU where a computer has two, so the

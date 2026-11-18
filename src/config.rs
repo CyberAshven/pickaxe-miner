@@ -1714,7 +1714,32 @@ fn valid_profile_name(name: &str) -> Result<&str, String> {
     }
 }
 
+/// What a PHOTON mining session saves back to its profile when it stops:
+/// the intensity, payout and donation the dashboard may have changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSettings {
+    pub intensity: u8,
+    pub address: String,
+    /// `None` keeps the token's minimum, so a later minimum applies.
+    pub token_donation: Option<crate::donation::TokenDonation>,
+}
+
 impl MiningProfiles {
+    /// Saves `session` into the profile `name` at `path` (the terminal and
+    /// the desktop window both save a stopped session this way).
+    pub fn save_session(path: &Path, name: &str, session: &SessionSettings) -> Result<(), String> {
+        let mut profiles = Self::load_optional(path)?;
+        let profile = profiles
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.name.eq_ignore_ascii_case(name))
+            .ok_or("mining profile was renamed or removed during this session")?;
+        profile.settings.intensity = Some(session.intensity);
+        profile.settings.address = Some(session.address.clone());
+        profile.settings.token_donation_bps = session.token_donation;
+        profiles.save(path)
+    }
+
     pub fn load_optional(path: &Path) -> Result<Self, String> {
         if !path.exists() {
             return Ok(Self::default());

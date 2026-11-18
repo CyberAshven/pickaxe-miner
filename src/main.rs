@@ -9,7 +9,7 @@ use pickaxe_miner::{
     reach, rigs, runtime, search, self_test, stratum_v2, telemetry, tui, tx,
 };
 
-use config::RuntimeConfig;
+use config::{RuntimeConfig, SessionSettings};
 use electrum::{ElectrumSession, LiveJob};
 use search::SearchHandle;
 use std::io::{self, BufRead, Write};
@@ -1254,28 +1254,13 @@ fn run_headless_mining(
     Ok(None)
 }
 
-/// What a mining session saves back to its profile when it stops.
-struct SessionSettings {
-    intensity: u8,
-    address: String,
-    token_donation: Option<pickaxe_miner::donation::TokenDonation>,
-}
-
+/// Saves what a mining session changed back to its profile when it stops.
 fn persist_session_profile(
     path: &std::path::Path,
     name: &str,
     session: &SessionSettings,
 ) -> Result<(), String> {
-    let mut profiles = config::MiningProfiles::load_optional(path)?;
-    let profile = profiles
-        .profiles
-        .iter_mut()
-        .find(|profile| profile.name.eq_ignore_ascii_case(name))
-        .ok_or("mining profile was renamed or removed during this session")?;
-    profile.settings.intensity = Some(session.intensity);
-    profile.settings.address = Some(session.address.clone());
-    profile.settings.token_donation_bps = session.token_donation;
-    profiles.save(path)
+    config::MiningProfiles::save_session(path, name, session)
 }
 
 /// Dispatches the requested CLI command and mining mode.
@@ -1305,22 +1290,8 @@ fn run_as_rig(
     json: bool,
     status: Option<&std::path::Path>,
 ) {
-    let result = (|| {
-        let _gpu_lock = mining_lock::acquire_gpu_lock()?;
-        let stop = Arc::new(AtomicBool::new(false));
-        pickaxe_miner::session_control::install_stop(&stop)?;
-        rigs::run_rig(
-            coordinators,
-            name,
-            Some(payout).filter(|payout| !payout.trim().is_empty()),
-            gpus,
-            intensity,
-            json,
-            stop,
-            status,
-        )
-    })();
-    if let Err(error) = result {
+    if let Err(error) = rigs::mine_as_rig(coordinators, name, payout, gpus, intensity, json, status)
+    {
         eprintln!("error: {error}");
         exit_after_error(1);
     }
@@ -1354,9 +1325,9 @@ fn coordinators(addresses: &[String], keys: &[String]) -> Result<Vec<(String, St
 }
 
 /// #### PR #42: whether a start from a Linux desktop without a terminal
-/// reopens in one: never for a headless run (`--no-tui`, `--json`) or a
+/// reopens in one: never for a headless run (`--no-tui`, `--json`), a
 /// farm system's (`farm-os`), which may run without a terminal while the
-/// desktop is up.
+/// desktop is up, or the desktop window (`gui`), which needs none.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn should_relaunch(
     args: &[std::ffi::OsString],
@@ -1366,7 +1337,7 @@ fn should_relaunch(
 ) -> bool {
     let headless = args
         .iter()
-        .any(|arg| arg == "--no-tui" || arg == "--json" || arg == "farm-os");
+        .any(|arg| arg == "--no-tui" || arg == "--json" || arg == "farm-os" || arg == "gui");
     !stdin_tty && !stdout_tty && desktop && !headless
 }
 
@@ -2085,27 +2056,15 @@ fn run_application(open_profiles: bool) {
             let rig_hub = match rigs_listen {
                 None => None,
                 Some(listen) => {
-                    match rigs::RigHub::start(listen, &config_path.with_extension("rigs-key")) {
+                    // #### PR #32: a public GPU pool.
+                    match rigs::start_coordinator(
+                        listen,
+                        &config_path.with_extension("rigs-key"),
+                        rigs_public.then_some((rigs_fee, rigs_fee_address.as_deref())),
+                        cfg.network,
+                        &cfg.payout_address,
+                    ) {
                         Ok(hub) => {
-                            // #### PR #32: a public GPU pool.
-                            if rigs_public {
-                                let address = match config::validate_payout_address(
-                                    cfg.network,
-                                    rigs_fee_address
-                                        .as_deref()
-                                        .unwrap_or(cfg.payout_address.as_str()),
-                                ) {
-                                    Ok(address) => address,
-                                    Err(error) => {
-                                        eprintln!("error: pool fee address: {error}");
-                                        exit_after_error(2);
-                                    }
-                                };
-                                hub.set_public(Some(rigs::PublicRigs {
-                                    fee_bps: rigs_fee.map_or(0, u16::from),
-                                    address,
-                                }));
-                            }
                             // #### PR #40: where rigs reach this coordinator.
                             let interfaces = reach::Interfaces::detect();
                             let connect: Vec<_> = hub
@@ -2450,6 +2409,8 @@ mod tests {
             &["mine", "--no-tui"][..],
             &["mine", "--json"][..],
             &["farm-os", "mine", "--pool", "x"][..],
+            &["gui"][..],
+            &["gui", "--start"][..],
         ] {
             assert!(
                 !should_relaunch(&args(headless), false, false, true),

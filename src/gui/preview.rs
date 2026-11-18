@@ -128,6 +128,8 @@ fn board() -> Board {
                 rate: 780e6,
                 rewards: 3,
                 state: "Mining · height 948201".into(),
+                donation: Some(crate::donation::TokenDonation::from_bps(400)),
+                runtime: true,
             },
             TokenLine {
                 name: "ELECTRIC".into(),
@@ -135,6 +137,8 @@ fn board() -> Board {
                 rate: 2.1e9,
                 rewards: 1,
                 state: "Searching at difficulty 3".into(),
+                donation: Some(crate::donation::TokenDonation::from_bps(400)),
+                runtime: false,
             },
         ],
         gpus: vec![GpuLine {
@@ -162,8 +166,52 @@ fn board() -> Board {
         .map(String::from)
         .collect(),
         started: Instant::now().checked_sub(Duration::from_secs(3 * 3600 + 25 * 60)),
+        notice: Some("Donation 4.00%".into()),
         ..Board::default()
     }
+}
+
+/// PHOTON alone, coordinating two rigs.
+fn coordinator_board() -> Board {
+    let mut board = board();
+    board.tokens.truncate(1);
+    board.tokens[0].share = None;
+    board.history.truncate(1);
+    board.electric = None;
+    board.layout.clear();
+    board.single_runtime = true;
+    let rig = |name: &str, rate: f64| crate::rigs::RigLine {
+        name: name.into(),
+        gpus: 2,
+        rate,
+        winners: 1,
+        version: env!("CARGO_PKG_VERSION").into(),
+        ..Default::default()
+    };
+    if let Some(snapshot) = board.runtime.as_mut() {
+        snapshot.payout_address = crate::config::DONATION_ADDRESS.into();
+        snapshot.rigs = Some(crate::rigs::RigSummary {
+            listen: "0.0.0.0:3340".into(),
+            key: "9b1f…".into(),
+            connected: 2,
+            gpus: 4,
+            rate: 2.9e9,
+            winners: 2,
+            rigs: vec![rig("garage", 1.5e9), rig("office", 1.4e9)],
+            ..Default::default()
+        });
+    }
+    board.rig_join = vec![
+        (
+            "local network".into(),
+            "pickaxe mine --coordinator stratum2+tcp://192.168.1.20:3340/9b1f…".into(),
+        ),
+        (
+            "Tailscale".into(),
+            "pickaxe mine --coordinator stratum2+tcp://100.64.0.7:3340/9b1f…".into(),
+        ),
+    ];
+    board
 }
 
 #[test]
@@ -195,5 +243,39 @@ fn gui_preview() {
     let link = Link::default();
     save("dashboard.png", TALL, |ui| {
         dashboard::show(ui, &board, &link)
+    });
+    let coordinator = coordinator_board();
+    save("coordinator.png", TALL, |ui| {
+        dashboard::show(ui, &coordinator, &link)
+    });
+    let rig = super::rig::RigBoard {
+        status: Some(crate::rigs::rig_status_json(
+            Some(("192.168.1.20:3340", false)),
+            true,
+            1.5e9,
+            3,
+            0,
+            &[crate::rigs::RigGpu {
+                name: "NVIDIA GeForce RTX 3080".into(),
+                status: "mining".into(),
+                rate: 1.5e9,
+                winners: 3,
+                temperature_c: Some(66.0),
+                power_watts: Some(240.0),
+                fan_percent: Some(55.0),
+                ..Default::default()
+            }],
+        )),
+        events: [
+            "connected: {\"coordinator\":\"192.168.1.20:3340\"}",
+            "job: {\"height\":948201}",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect(),
+        started: Some(Instant::now()),
+    };
+    save("rig.png", SIZE, |ui| {
+        super::rig::show(ui, &rig, true, &|| {})
     });
 }
