@@ -9,6 +9,7 @@ use super::{
     server::{self, ServerConfig, ServerStats},
     telemetry::{AddressIssue, DeviceSnapshot},
     template::{compact_target, BchTemplate},
+    view::{ConnectInfo, ServerControl, ServerFrame, ServerView},
 };
 use crate::{
     cli::StratumV2Command,
@@ -40,7 +41,8 @@ use std::{
 
 /// Runs a `stratum-v2` command. `profile` names the setup profile a server
 /// started from (#### PR #42: a donation changed on its Advanced page is
-/// saved there too).
+/// saved there too). A server shows in the view `view::show_servers_in`
+/// set, when there is one, instead of the terminal.
 pub fn run(
     action: StratumV2Command,
     config: &RuntimeConfig,
@@ -48,6 +50,27 @@ pub fn run(
     no_tui: bool,
     json: bool,
     profile: Option<&str>,
+) -> Result<(), String> {
+    serve(
+        action,
+        config,
+        config_path,
+        no_tui,
+        json,
+        profile,
+        super::view::shown_in(),
+    )
+}
+
+/// `run`, with the view that takes the terminal dashboard's place.
+fn serve(
+    action: StratumV2Command,
+    config: &RuntimeConfig,
+    config_path: &Path,
+    no_tui: bool,
+    json: bool,
+    profile: Option<&str>,
+    view: Option<&dyn ServerView>,
 ) -> Result<(), String> {
     if let StratumV2Command::Status = action {
         print!("{}", super::status_report());
@@ -538,7 +561,8 @@ pub fn run(
     });
     let stop = Arc::new(AtomicBool::new(false));
     crate::session_control::install_stop(&stop)?;
-    let mut terminal = if no_tui || json {
+    // A view shows the server in the terminal's place, and prints nothing.
+    let mut terminal = if no_tui || json || view.is_some() {
         None
     } else {
         Some(TerminalSession::enter()?)
@@ -731,6 +755,8 @@ pub fn run(
     // info page (`i`) every address, Tailscale's included, ready to copy.
     let interfaces = crate::reach::Interfaces::detect();
     let devices_hint = device_hint(bound, sv1_bound, interfaces);
+    // A view has its own Connection info, so no key to name.
+    let devices_at = device_addresses(bound, sv1_bound, interfaces);
     let serve_mode = if !pools.is_empty() {
         ServeMode::JoinPool
     } else if public_pool.is_some() {
@@ -749,7 +775,7 @@ pub fn run(
     // #### PR #42: for the Connection info page.
     let job_declaration_on = declaring || declarator.is_some();
     let result = (|| {
-        if terminal.is_none() {
+        if terminal.is_none() && view.is_none() {
             // The pool's identity may be a payout address: never printed.
             println!(
                 "{}",
@@ -781,6 +807,17 @@ pub fn run(
         let mut panel: Option<DevicePanel> = None;
         // #### end PR #42 ####
         let mut connect: Option<ConnectPage> = None;
+        // A view's Connection info, read again when the view asks, as
+        // opening the page (`i`) does.
+        let connect_page = |interfaces| ConnectPage {
+            lines: connect_lines(bound, sv1_bound, authority.as_deref(), interfaces),
+            templates: template_lines(tp_bound, interfaces),
+            key: authority.clone(),
+            mode: serve_mode,
+            job_declaration: job_declaration_on,
+            note: None,
+        };
+        let mut view_connect = view.map(|_| ConnectInfo::from(&connect_page(interfaces)));
         while !stop.load(Ordering::Relaxed)
             && worker.as_ref().is_none_or(|worker| !worker.is_finished())
         {
@@ -822,71 +859,22 @@ pub fn run(
                     devices_saved = Some(list);
                 }
             }
+            let texts = PageText {
+                network: config.network.as_str(),
+                pools: pool_address.as_deref(),
+                declaring,
+                node_client: node_client.as_deref(),
+                snapshot: &snapshot,
+                donation: donation_value,
+                pool_suffix: &pool_suffix,
+                sv2: bound,
+                sv1: sv1_bound,
+                setting_error,
+                authority: authority.as_deref(),
+            };
             if let Some(terminal) = terminal.as_mut() {
-                let overview_text = if let Some(pool) = pool_address.as_ref().filter(|_| !declaring)
-                {
-                    format!(
-                        "{} · Pool {pool} (SV2, encrypted)\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\n{}\nThe pool builds the blocks; the donation is that share of mining work under the donation address at the pool.\nConnection errors: SV1 {}\nSV1 {}",
-                        config.network.as_str(),
-                        snapshot.connections,
-                        snapshot.sessions_started,
-                        snapshot.shares_accepted,
-                        snapshot.shares_rejected,
-                        snapshot.sv1_local_rejected,
-                        work_line(&snapshot, true),
-                        snapshot.sv1_connection_errors,
-                        sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
-                    )
-                } else {
-                    format!(
-                    "{} · Node {}{} · Height {} · Donation {}{}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\n{}\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}{}\nSV2 {} · SV1 {}\n{}\n{}{}{}{}",
-                    config.network.as_str(), if snapshot.template_ready { "Ready" } else { "Waiting" }, node_label(node_client.as_deref(), &snapshot),
-                    snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), donation_summary(donation_value), pool_suffix, snapshot.connections, snapshot.sessions_started,
-                    snapshot.shares_accepted, snapshot.shares_rejected, snapshot.sv1_local_rejected, work_line(&snapshot, false), snapshot.blocks_accepted, snapshot.blocks_pending,
-                    snapshot.blocks_rejected, snapshot.block_retries, snapshot.last_block_result.unwrap_or("Waiting"),
-                    snapshot.connection_errors, snapshot.sv1_connection_errors,
-                    snapshot.template_failures, snapshot.last_template_error.unwrap_or("None"), notices_suffix(&snapshot),
-                    bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
-                    sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
-                    setting_error.map(str::to_owned).unwrap_or_else(|| format!("Authority {}", authority.as_deref().unwrap_or("—"))),
-                    records_line(&snapshot),
-                    templates_line(&snapshot),
-                    jd_line(&snapshot),
-                    jd_client_line(&snapshot, pool_address.as_deref()),
-                    )
-                };
-                let online = devices.iter().filter(|device| device.connected).count();
-                let total_rate: f64 = devices
-                    .iter()
-                    .filter(|device| device.connected)
-                    .filter_map(|device| device.hashrate_estimate)
-                    .sum();
-                let header = if let Some(pool) = pool_address.as_ref().filter(|_| !declaring) {
-                    format!(
-                        "{} · Pool {pool} (SV2, encrypted) · the pool builds blocks and pays\n{online} of {} workers online · {} · Shares {} accepted / {} rejected\n{devices_hint}",
-                        config.network.as_str(),
-                        devices.len(),
-                        crate::telemetry::format_hash_rate(total_rate),
-                        snapshot.shares_accepted,
-                        snapshot.shares_rejected,
-                    )
-                } else {
-                    format!(
-                        "{} · Node {}{} · Height {} · Donation {}{}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending\n{devices_hint}",
-                        config.network.as_str(),
-                        if snapshot.template_ready { "Ready" } else { "Waiting" },
-                        node_label(node_client.as_deref(), &snapshot),
-                        snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()),
-                        donation_summary(donation_value),
-                        pool_suffix,
-                        devices.len(),
-                        crate::telemetry::format_hash_rate(total_rate),
-                        snapshot.shares_accepted,
-                        snapshot.shares_rejected,
-                        snapshot.blocks_accepted,
-                        snapshot.blocks_pending,
-                    )
-                };
+                let overview_text = texts.overview();
+                let header = texts.header(&devices, &devices_hint);
                 let lights = status_lights(
                     own_p2pool.as_ref(),
                     pool_address.is_some() && !declaring,
@@ -996,41 +984,20 @@ pub fn run(
                                             Instant::now(),
                                         )
                                     });
-                                    if let Some(mut view) = opened {
-                                        // #### PR #42: where devices reach
-                                        // this server, for the pool pages.
-                                        view.set_server_urls(
-                                            connect_lines(
-                                                bound,
-                                                sv1_bound,
-                                                authority.as_deref(),
-                                                crate::reach::Interfaces::detect(),
-                                            )
-                                            .into_iter()
-                                            .map(|line| (line.place, line.sv2, line.url))
-                                            .collect(),
-                                        );
-                                        view.identify(&fleet);
-                                        panel = Some(view);
+                                    if let Some(view) = opened {
+                                        panel = Some(ready_panel(
+                                            view,
+                                            bound,
+                                            sv1_bound,
+                                            authority.as_deref(),
+                                            &fleet,
+                                        ));
                                     }
                                 }
                                 // #### end PR #42 ####
                                 KeyCode::Char('a') | KeyCode::Char('A') => advanced = !advanced,
                                 KeyCode::Char('i') | KeyCode::Char('I') if !advanced => {
-                                    let interfaces = crate::reach::Interfaces::detect();
-                                    connect = Some(ConnectPage {
-                                        lines: connect_lines(
-                                            bound,
-                                            sv1_bound,
-                                            authority.as_deref(),
-                                            interfaces,
-                                        ),
-                                        templates: template_lines(tp_bound, interfaces),
-                                        key: authority.clone(),
-                                        mode: serve_mode,
-                                        job_declaration: job_declaration_on,
-                                        note: None,
-                                    });
+                                    connect = Some(connect_page(crate::reach::Interfaces::detect()));
                                 }
                                 KeyCode::Esc => advanced = false,
                                 KeyCode::Tab if !advanced => overview = !overview,
@@ -1042,19 +1009,16 @@ pub fn run(
                                 | KeyCode::Right
                                     if advanced =>
                                 {
-                                    let next = donation_value.adjusted(matches!(
-                                        key.code,
-                                        KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Right
-                                    ));
-                                    if next != donation_value {
-                                        match save_donation(config_path, profile, next) {
-                                            Ok(()) => {
-                                                *donation.write().map_err(|_| "donation setting unavailable")? = next;
-                                                setting_error = None;
-                                            }
-                                            Err(()) => setting_error = Some("Could not save donation; previous setting retained"),
-                                        }
-                                    }
+                                    step_donation(
+                                        &donation,
+                                        matches!(
+                                            key.code,
+                                            KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Right
+                                        ),
+                                        config_path,
+                                        profile,
+                                        &mut setting_error,
+                                    )?;
                                 }
                                 KeyCode::Char('q') => stop.store(true, Ordering::Relaxed),
                                 KeyCode::Char('c')
@@ -1091,6 +1055,87 @@ pub fn run(
                         }
                     }
                 }
+            } else if let Some(view) = view {
+                // What the terminal pages show, then the view's requests as
+                // their keys apply them.
+                let frame = ServerFrame {
+                    network: config.network,
+                    title: dashboard_title,
+                    mode: serve_mode,
+                    joining: pool_address.is_some() && !declaring,
+                    pool: pool_address.clone(),
+                    node_client: node_client.clone(),
+                    lights: status_lights(
+                        own_p2pool.as_ref(),
+                        pool_address.is_some() && !declaring,
+                        &snapshot,
+                        &devices,
+                    ),
+                    header: texts.header(&devices, &devices_at),
+                    overview: texts.overview(),
+                    advanced: advanced_text(donation_value, pool_address.is_some()),
+                    started: started.clone(),
+                    devices_hint: devices_at.clone(),
+                    connect: view_connect.clone().unwrap_or_default(),
+                    donation: donation_value,
+                    setting_error,
+                    panel: panel.as_ref().map(DevicePanel::text),
+                    devices: devices.clone(),
+                    // The rows are in `devices`; the device addresses stay
+                    // here (see the devices file).
+                    stats: ServerStats {
+                        device_stats: Default::default(),
+                        ..snapshot
+                    },
+                };
+                view.show(frame);
+                for control in view.controls() {
+                    match control {
+                        ServerControl::Stop => stop.store(true, Ordering::Relaxed),
+                        ServerControl::Donation { up } => step_donation(
+                            &donation,
+                            up,
+                            config_path,
+                            profile,
+                            &mut setting_error,
+                        )?,
+                        ServerControl::ReadAddresses => {
+                            view_connect = Some(ConnectInfo::from(&connect_page(
+                                crate::reach::Interfaces::detect(),
+                            )));
+                        }
+                        // As Enter on a row: `devices` holds the rows shown.
+                        ServerControl::OpenDevice(label) => {
+                            let opened = stats.lock().ok().and_then(|stats| {
+                                DevicePanel::for_label(
+                                    &stats.device_stats,
+                                    &devices,
+                                    &label,
+                                    Instant::now(),
+                                )
+                            });
+                            if let Some(opened) = opened {
+                                panel = Some(ready_panel(
+                                    opened,
+                                    bound,
+                                    sv1_bound,
+                                    authority.as_deref(),
+                                    &fleet,
+                                ));
+                            }
+                        }
+                        ServerControl::PanelKey(key) => {
+                            if panel
+                                .as_mut()
+                                .is_some_and(|open| open.handle_key(key.into(), &fleet))
+                            {
+                                panel = None;
+                            }
+                        }
+                        ServerControl::ClosePanel => panel = None,
+                    }
+                }
+                thread::sleep(VIEW_INTERVAL);
             } else {
                 println!("{status}");
                 thread::sleep(Duration::from_secs(1));
@@ -1314,6 +1359,59 @@ fn save_donation(path: &Path, profile: Option<&str>, value: BchDonation) -> Resu
     Ok(())
 }
 
+/// The Advanced page's donation change, from its keys or a view: one 0.5%
+/// step, saved before new jobs use it. A save that fails keeps the old
+/// setting and says so in `setting_error`.
+fn step_donation(
+    donation: &RwLock<BchDonation>,
+    up: bool,
+    config_path: &Path,
+    profile: Option<&str>,
+    setting_error: &mut Option<&'static str>,
+) -> Result<(), String> {
+    let current = *donation
+        .read()
+        .map_err(|_| "donation setting unavailable")?;
+    let next = current.adjusted(up);
+    if next != current {
+        match save_donation(config_path, profile, next) {
+            Ok(()) => {
+                *donation
+                    .write()
+                    .map_err(|_| "donation setting unavailable")? = next;
+                *setting_error = None;
+            }
+            Err(()) => {
+                *setting_error = Some("Could not save donation; previous setting retained")
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How often a view gets a frame and its requests are applied.
+const VIEW_INTERVAL: Duration = Duration::from_millis(200);
+
+/// A Device panel opened from the workers page or a view: told where
+/// devices reach this server (#### PR #42: for its pool pages), and asking
+/// the device what it is.
+fn ready_panel(
+    mut panel: DevicePanel,
+    sv2: Option<std::net::SocketAddr>,
+    sv1: Option<std::net::SocketAddr>,
+    authority: Option<&str>,
+    fleet: &Arc<Fleet>,
+) -> DevicePanel {
+    panel.set_server_urls(
+        connect_lines(sv2, sv1, authority, crate::reach::Interfaces::detect())
+            .into_iter()
+            .map(|line| (line.place, line.sv2, line.url))
+            .collect(),
+    );
+    panel.identify(fleet);
+    panel
+}
+
 /// #### PR #42: what the server started with.
 struct Started {
     sv2: Option<std::net::SocketAddr>,
@@ -1461,14 +1559,8 @@ fn donation_summary(donation: BchDonation) -> String {
     format!("{donation} ({work} of work · {reward} of block rewards and token wins)")
 }
 
-/// Advanced settings: the donation, adjustable from 0% to 100%.
-fn render_advanced(
-    frame: &mut Frame<'_>,
-    donation: BchDonation,
-    error: Option<&str>,
-    pool: bool,
-    started: &str,
-) {
+/// What the Advanced page says the donation pays, and how it changes.
+fn advanced_text(donation: BchDonation, pool: bool) -> String {
     let (work, reward) = donation.shares();
     // #### PR #40: at a pool the whole donation is mining work (#### PR #48:
     // accepted shares weighted by difficulty).
@@ -1484,10 +1576,23 @@ fn render_advanced(
              the whole {donation} as mining work instead."
         )
     };
+    format!(
+        "{split}\nThe default is 1.50%; any setting from 0% to 100% works, in 0.5% steps. \
+         Changes apply to new jobs and are saved."
+    )
+}
+
+/// Advanced settings: the donation, adjustable from 0% to 100%.
+fn render_advanced(
+    frame: &mut Frame<'_>,
+    donation: BchDonation,
+    error: Option<&str>,
+    pool: bool,
+    started: &str,
+) {
     let mut text = format!(
-        "Donation  {donation}\n\n{split}\nThe default is 1.50%; any setting from 0% to 100% \
-         works, in 0.5% steps. Changes apply to new jobs and are saved.\n\n{started}\n←/→ or \
-         +/-  Change donation · a or Esc  Back"
+        "Donation  {donation}\n\n{}\n\n{started}\n←/→ or +/-  Change donation · a or Esc  Back",
+        advanced_text(donation, pool)
     );
     if let Some(error) = error {
         text.push_str(&format!("\n\n{error}"));
@@ -1606,6 +1711,108 @@ fn with_lights<'a>(lights: Vec<ratatui::text::Line<'a>>, text: &'a str) -> ratat
     let mut lines = lights;
     lines.extend(ratatui::text::Text::from(text).lines);
     ratatui::text::Text::from(lines)
+}
+
+/// One tick's overview and workers-page texts, for the terminal pages and
+/// a `ServerView` alike.
+struct PageText<'a> {
+    network: &'a str,
+    /// The pools in failover order, or your own P2Pool node by name.
+    pools: Option<&'a str>,
+    /// This server declares its node's templates to the pool.
+    declaring: bool,
+    node_client: Option<&'a str>,
+    snapshot: &'a ServerStats,
+    donation: BchDonation,
+    pool_suffix: &'a str,
+    sv2: Option<std::net::SocketAddr>,
+    sv1: Option<std::net::SocketAddr>,
+    /// Why the last donation change was not saved; shown instead of the
+    /// authority key.
+    setting_error: Option<&'a str>,
+    authority: Option<&'a str>,
+}
+
+impl PageText<'_> {
+    /// The pool devices mine at, when it builds the blocks.
+    fn joined(&self) -> Option<&str> {
+        self.pools.filter(|_| !self.declaring)
+    }
+
+    /// The overview page's status.
+    fn overview(&self) -> String {
+        let snapshot = self.snapshot;
+        let sv1_bound = self.sv1;
+        let bound = self.sv2;
+        if let Some(pool) = self.joined() {
+            format!(
+                "{} · Pool {pool} (SV2, encrypted)\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\n{}\nThe pool builds the blocks; the donation is that share of mining work under the donation address at the pool.\nConnection errors: SV1 {}\nSV1 {}",
+                self.network,
+                snapshot.connections,
+                snapshot.sessions_started,
+                snapshot.shares_accepted,
+                snapshot.shares_rejected,
+                snapshot.sv1_local_rejected,
+                work_line(snapshot, true),
+                snapshot.sv1_connection_errors,
+                sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
+            )
+        } else {
+            format!(
+            "{} · Node {}{} · Height {} · Donation {}{}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\n{}\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}{}\nSV2 {} · SV1 {}\n{}\n{}{}{}{}",
+            self.network, if snapshot.template_ready { "Ready" } else { "Waiting" }, node_label(self.node_client, snapshot),
+            snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), donation_summary(self.donation), self.pool_suffix, snapshot.connections, snapshot.sessions_started,
+            snapshot.shares_accepted, snapshot.shares_rejected, snapshot.sv1_local_rejected, work_line(snapshot, false), snapshot.blocks_accepted, snapshot.blocks_pending,
+            snapshot.blocks_rejected, snapshot.block_retries, snapshot.last_block_result.unwrap_or("Waiting"),
+            snapshot.connection_errors, snapshot.sv1_connection_errors,
+            snapshot.template_failures, snapshot.last_template_error.unwrap_or("None"), notices_suffix(snapshot),
+            bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
+            sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
+            self.setting_error.map(str::to_owned).unwrap_or_else(|| format!("Authority {}", self.authority.unwrap_or("—"))),
+            records_line(snapshot),
+            templates_line(snapshot),
+            jd_line(snapshot),
+            jd_client_line(snapshot, self.pools),
+            )
+        }
+    }
+
+    /// The workers page's header, ending with where devices connect.
+    fn header(&self, devices: &[DeviceSnapshot], devices_hint: &str) -> String {
+        let snapshot = self.snapshot;
+        let online = devices.iter().filter(|device| device.connected).count();
+        let total_rate: f64 = devices
+            .iter()
+            .filter(|device| device.connected)
+            .filter_map(|device| device.hashrate_estimate)
+            .sum();
+        if let Some(pool) = self.joined() {
+            format!(
+                "{} · Pool {pool} (SV2, encrypted) · the pool builds blocks and pays\n{online} of {} workers online · {} · Shares {} accepted / {} rejected\n{devices_hint}",
+                self.network,
+                devices.len(),
+                crate::telemetry::format_hash_rate(total_rate),
+                snapshot.shares_accepted,
+                snapshot.shares_rejected,
+            )
+        } else {
+            format!(
+                "{} · Node {}{} · Height {} · Donation {}{}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending\n{devices_hint}",
+                self.network,
+                if snapshot.template_ready { "Ready" } else { "Waiting" },
+                node_label(self.node_client, snapshot),
+                snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()),
+                donation_summary(self.donation),
+                self.pool_suffix,
+                devices.len(),
+                crate::telemetry::format_hash_rate(total_rate),
+                snapshot.shares_accepted,
+                snapshot.shares_rejected,
+                snapshot.blocks_accepted,
+                snapshot.blocks_pending,
+            )
+        }
+    }
 }
 
 fn render_dashboard(
@@ -1926,6 +2133,20 @@ fn device_hint(
     sv1: Option<std::net::SocketAddr>,
     interfaces: crate::reach::Interfaces,
 ) -> String {
+    let addresses = device_addresses(sv2, sv1, interfaces);
+    if addresses.is_empty() {
+        addresses
+    } else {
+        format!("{addresses} · i  Connection info")
+    }
+}
+
+/// `device_hint` without the terminal's key for Connection info.
+fn device_addresses(
+    sv2: Option<std::net::SocketAddr>,
+    sv1: Option<std::net::SocketAddr>,
+    interfaces: crate::reach::Interfaces,
+) -> String {
     let shown = |address: std::net::SocketAddr| {
         crate::reach::addresses(address, interfaces)
             .into_iter()
@@ -1934,15 +2155,12 @@ fn device_hint(
     };
     match (sv1, sv2) {
         (Some(sv1), Some(sv2)) => format!(
-            "Point devices at: SV1 stratum+tcp://{} · SV2 {} · i  Connection info",
+            "Point devices at: SV1 stratum+tcp://{} · SV2 {}",
             shown(sv1),
             shown(sv2)
         ),
-        (Some(sv1), None) => format!(
-            "Point devices at: SV1 stratum+tcp://{} · i  Connection info",
-            shown(sv1)
-        ),
-        (None, Some(sv2)) => format!("Point devices at: SV2 {} · i  Connection info", shown(sv2)),
+        (Some(sv1), None) => format!("Point devices at: SV1 stratum+tcp://{}", shown(sv1)),
+        (None, Some(sv2)) => format!("Point devices at: SV2 {}", shown(sv2)),
         (None, None) => String::new(),
     }
 }
@@ -1950,7 +2168,7 @@ fn device_hint(
 /// #### PR #40
 /// What this server is, for what a device's username means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ServeMode {
+pub enum ServeMode {
     /// Blocks pay this server's payout address.
     Solo,
     /// Each miner's username is their payout address.
@@ -1964,10 +2182,11 @@ enum ServeMode {
 /// #### PR #40
 /// One address devices connect to: where it works from and the line to
 /// paste into a device (or, for SV2, into another Pickaxe's Join a pool).
-struct ConnectLine {
-    place: crate::reach::Place,
-    sv2: bool,
-    url: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectLine {
+    pub place: crate::reach::Place,
+    pub sv2: bool,
+    pub url: String,
 }
 
 /// #### PR #40
