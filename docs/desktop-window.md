@@ -32,49 +32,59 @@ of its own.
 The window drives the terminal's own setup (`tui::SetupDriver`), so it has
 the same steps, rows, words, checks and saved profiles:
 
-- **Profiles**: the saved profiles; one opens its settings with Start
-  selected, and **Rename** and **Delete** (after **Delete**/**Keep**) work on
-  the profile under the cursor. **+ New profile** starts the steps below.
+- **Profiles**: the saved profiles, each with its own **Open**, **Rename**
+  and **Delete** (Delete asks first: **Delete** or **Keep**); a click on a
+  profile opens it too, with Start selected. **+ New profile** starts the
+  steps below.
 - **Hardware**: GPU mining, ASIC mining or running a pool.
 - **Network**: Mainnet or Chipnet.
 - **Token**: the GPU tokens, ELECTRIC and the hash split, with the search
   box; an ASIC's target; or what a pool's miners mine.
 - **Settings**: every row of the terminal's settings page for the chosen
-  hardware, including the Advanced section. A choice changes with its
-  **<** **>** buttons (the terminal's Left/Right), a text row opens its field
-  on a click (**Save** or Enter keeps it, **Cancel** or Esc drops it, and a
-  wrong value stays open with the reason on the status line), a header such
-  as Advanced is a checkbox, and **Start** checks the settings as the
-  terminal does and saves the profile. With ELECTRIC, its fee pot shows
-  beside the rows with its balance, address and QR code; **Pot QR** shows it
+  hardware, including the Advanced section. A value changes with its
+  **<** **>** buttons (the terminal's Left/Right; a click on its name only
+  moves the cursor there), a text row opens its field on a click anywhere
+  on it (**Save** or Enter keeps it, **Cancel** or Esc drops it, and a wrong
+  value stays open with the reason on the status line), a header such as
+  Advanced is a checkbox, and **Start mining** (or the server's or pool's
+  Start) checks the settings as the terminal does and saves the profile.
+  With ELECTRIC, its fee pot shows beside the rows, or under them in a
+  narrow window, with its balance, address and QR code; **Pot QR** shows it
   full-size to scan.
-- **GPUs**, **Fulcrum servers** and **BCH nodes**: the same lists, with
-  **Mine on it or not**/**All**, and **Remove**, **Other PC**, **Tailscale**,
-  **Cookie file** and **Yes** for a public address. A node or server found
-  on this or another computer is added with a click.
+- **GPUs**, **Fulcrum servers** and **BCH nodes**: the same lists. Each
+  GPU's checkbox ticks it, and **All** ticks them all; each saved server or
+  node has its own **Remove** (and a node its **Cookie file**), with **Other
+  PC**, **Tailscale** and **Yes** for a public address below. A node or
+  server found on this or another computer is added with a click. **Done**
+  goes back to the settings.
 
-A click on a row does what Enter does there; the status line shows what
-the terminal's would. The terminal's keys work too while no field is being
-typed into: the arrows, Enter, Esc, Delete and the letter keys the bottom
-line names. **Back** is Esc: it goes back a step, closes a field, or quits
-on the first screen.
+A click on a row does what Enter does there, and the status line shows
+what the terminal's would. Where the terminal's hint says more than its
+keys (such as "0.5% steps"), the row says it too. The terminal's keys work
+while no widget has the keyboard: the arrows, Enter, Esc, Delete and the
+letter keys the bottom line names; Tab moves between the buttons instead,
+and Space or Enter presses one. In the token search, Up and Down move
+through the list and Esc goes back. **Back** is Esc: it goes back a step,
+closes a field, or, on the first screen, asks **Quit Pickaxe?** before the
+window closes.
 
 The setup reads the saved profiles and connections beside the
-configuration (`--config`). A new profile starts from the saved settings
-and the command-line flags `pickaxe gui` takes as `pickaxe mine` does
-(`--network`, `--address`, `--intensity`, `--fulcrum`, `--backend`,
-`--device`); a saved profile opens with its own settings, since the window
-does not yet lay the terminal's command-line overrides over it. A
-`--node-zmq` given on the command line wins over a profile's block notices,
-as in the terminal. While the setup looks for GPUs and reads the profiles,
-the window shows a spinner. When a session stops, the setup is made again
-from what is saved, as the terminal returns to its profiles.
+configuration (`--config`). The first setup takes the command line as
+`pickaxe mine` does: a new profile starts from the saved settings and the
+flags, and a saved profile opens with `--network`/`--chipnet`, `--token`,
+`--intensity`, `--fulcrum`, `--node-rpc`, `--source` and the GPUs of
+`--backend`/`--device`/`--include-integrated` laid over it; `--node-zmq`
+wins over a profile's block notices in the first session. While it looks
+for GPUs and reads the profiles, the window shows a spinner. When a session
+stops, the setup is made again from what is saved alone, without the
+command line, as the terminal's return to its profiles is.
 
-`pickaxe gui --start` opens the profile last mined, or the first, and starts
-it as Enter twice on it would, for example when the computer starts; with no
-saved profile the setup shows. Start with ELECTRIC reads the fee pot's
-balance from the network first, behind a spinner, as the terminal waits for
-it.
+`pickaxe gui --start` opens the profile Start last started (kept in
+`last-profile.txt` beside the profiles, by the terminal's setup too), or
+the first, and starts it as Enter twice on it would, for example when the
+computer starts; with no saved profile the setup shows. Start with ELECTRIC
+reads the fee pot's balance from the network first, behind a spinner, as
+the terminal waits for it.
 
 ## Dashboard
 

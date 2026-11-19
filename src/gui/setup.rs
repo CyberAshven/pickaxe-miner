@@ -1,38 +1,50 @@
 //! The window's mining setup: the terminal setup itself
 //! (`tui::SetupDriver`), with its steps, rows and words, drawn with egui.
 //! A click does what the terminal's key on that row does, and the
-//! terminal's keys work here too while no field is being typed into.
+//! terminal's keys work here too while no widget has the keyboard.
 use crate::backend::{BackendKind, DeviceSelection};
 use crate::config::RuntimeConfig;
 use crate::tui::{
     EditView, ItemKind, Piece, PotView, SetupDriver, SetupInput, SetupItem, SetupKey, SetupOutcome,
-    SetupResult, SetupView, Tone,
+    SetupOverrides, SetupResult, SetupView, Tone,
 };
 use eframe::egui;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
-/// What the setup is made from, again after each session: the saved
-/// settings and the command line, and where the settings are kept.
+/// What a setup is made from: the saved settings and the command line, and
+/// where the settings are kept.
 #[derive(Clone)]
 pub struct Inputs {
     pub cfg: RuntimeConfig,
     pub config_path: PathBuf,
     pub backend: BackendKind,
     pub selection: DeviceSelection,
+    /// What the command line changes in a saved profile opened.
+    pub overrides: SetupOverrides,
+    /// The command line names the GPUs, so the ones it chose win over a
+    /// profile's.
+    pub cli_gpus: bool,
 }
 
 /// How the setup ended.
 pub enum Done {
     /// Start was pressed: the profile is saved, and this is its session.
     Start(Box<SetupResult>),
-    /// The setup was left on its first screen.
+    /// The setup was left on its first screen, and the miner confirmed it.
     Quit,
 }
 
 /// Green for what is ready, as the dashboard's chart draws it.
 const GOOD: egui::Color32 = egui::Color32::from_rgb(105, 219, 124);
+/// Start's fill: the one filled button of the setup.
+const START_FILL: egui::Color32 = egui::Color32::from_rgb(35, 134, 54);
+/// The width of a row's name, so values line up.
+const NAME_WIDTH: f32 = 150.0;
+/// From this width the fee pot shows beside the settings; under them when
+/// narrower.
+const POT_BESIDE: f32 = 900.0;
 
 enum State {
     /// Finding the GPUs and reading the saved profiles, on another thread.
@@ -40,7 +52,7 @@ enum State {
     Failed(String),
     Ready(Box<SetupDriver>),
     /// A step that waits on the network (Start reading ELECTRIC's fee
-    /// pot), on another thread; what the wait shows.
+    /// pot, `--start`), on another thread; what the wait shows.
     Busy(
         mpsc::Receiver<(Box<SetupDriver>, SetupOutcome)>,
         &'static str,
@@ -48,19 +60,28 @@ enum State {
 }
 
 pub struct Setup {
-    inputs: Inputs,
+    /// The command line's inputs, until a session has run; after that the
+    /// setup is made from what is saved alone, as the terminal's return to
+    /// its profiles is.
+    first: Option<Inputs>,
+    config_path: PathBuf,
     state: State,
     /// Why the last session stopped, for the status line once the setup is
     /// ready.
     notice: Option<String>,
+    /// The first screen was left (Esc, Q): the window asks before closing.
+    quitting: bool,
 }
 
 impl Setup {
     pub fn new(inputs: Inputs) -> Self {
+        let config_path = inputs.config_path.clone();
         Self {
-            state: prepare(inputs.clone()),
-            inputs,
+            state: prepare(Some(inputs.clone()), config_path.clone()),
+            first: Some(inputs),
+            config_path,
             notice: None,
+            quitting: false,
         }
     }
 
@@ -68,22 +89,36 @@ impl Setup {
     #[cfg(all(test, feature = "gui-preview"))]
     pub fn ready(driver: SetupDriver) -> Self {
         Self {
-            inputs: Inputs {
-                cfg: RuntimeConfig::default(),
-                config_path: PathBuf::new(),
-                backend: BackendKind::Auto,
-                selection: DeviceSelection::Default,
-            },
+            first: None,
+            config_path: PathBuf::new(),
             state: State::Ready(Box::new(driver)),
             notice: None,
+            quitting: false,
         }
     }
 
-    /// Makes the setup again from what is saved, as the terminal does when
-    /// a session returns to the profiles; `notice` says why it stopped.
+    /// A setup whose step on another thread has just ended with `outcome`.
+    #[cfg(all(test, feature = "gui-preview"))]
+    fn finishing(driver: SetupDriver, outcome: SetupOutcome) -> Self {
+        let (send, receive) = mpsc::channel();
+        send.send((Box::new(driver), outcome)).unwrap();
+        Self {
+            first: None,
+            config_path: PathBuf::new(),
+            state: State::Busy(receive, "Testing…"),
+            notice: None,
+            quitting: false,
+        }
+    }
+
+    /// Makes the setup again after a session from what is saved, without
+    /// the command line, as the terminal does when a session returns to its
+    /// profiles; `notice` says why it stopped.
     pub fn reload(&mut self, notice: Option<String>) {
-        self.state = prepare(self.inputs.clone());
+        self.first = None;
+        self.state = prepare(None, self.config_path.clone());
         self.notice = notice;
+        self.quitting = false;
     }
 
     /// Something runs on another thread, so the window looks again soon.
@@ -111,7 +146,7 @@ impl Setup {
             State::Busy(receive, _) => match receive.try_recv() {
                 Ok((driver, outcome)) => {
                     self.state = State::Ready(driver);
-                    return ended(outcome);
+                    return self.ended(outcome);
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -123,9 +158,20 @@ impl Setup {
         None
     }
 
+    fn ended(&mut self, outcome: SetupOutcome) -> Option<Done> {
+        match outcome {
+            SetupOutcome::Continue => None,
+            SetupOutcome::Complete(result) => Some(Done::Start(result)),
+            SetupOutcome::Cancel => {
+                self.quitting = true;
+                None
+            }
+        }
+    }
+
     /// `pickaxe gui --start`: once the setup is ready, starts the profile
-    /// last mined, or the first, as Enter twice on it would (`poll` gives
-    /// its session). False while the GPUs are looked for.
+    /// Start last started, or the first, as Enter twice on it would (`poll`
+    /// gives its session). False while the GPUs are looked for.
     pub fn start_now(&mut self) -> bool {
         match std::mem::replace(&mut self.state, State::Failed(String::new())) {
             State::Ready(driver) => {
@@ -145,31 +191,40 @@ impl Setup {
 
     /// Draws the setup; how it ended, if it did.
     pub fn show(&mut self, ui: &mut egui::Ui) -> Option<Done> {
-        let mut done = self.poll();
+        // A step that ended on another thread comes first: a Start it ended
+        // with has saved its profile already.
+        if let Some(done) = self.poll() {
+            return Some(done);
+        }
         let inputs = match &mut self.state {
             State::Preparing(_) => {
                 waiting(ui, "Looking for GPUs and reading your profiles…");
                 ui.ctx().request_repaint_after(Duration::from_millis(200));
-                return done;
+                return None;
             }
             State::Busy(_, what) => {
                 waiting(ui, what);
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
-                return done;
+                return None;
             }
             State::Failed(error) => {
                 let error = error.clone();
                 if failed(ui, &error) {
-                    self.reload(None);
+                    // Again with what failed: the command line's, if no
+                    // session ran yet.
+                    self.state = prepare(self.first.clone(), self.config_path.clone());
                 }
-                return done;
+                return None;
             }
             State::Ready(driver) => {
                 let wait = driver.tick();
                 ui.ctx().request_repaint_after(wait);
-                draw(ui, &driver.view())
+                draw(ui, &driver.view(), self.quitting)
             }
         };
+        if self.quitting {
+            return self.confirm_quit(ui);
+        }
         for input in inputs {
             let State::Ready(driver) = &mut self.state else {
                 break;
@@ -184,20 +239,43 @@ impl Setup {
                 }
                 break;
             }
-            done = ended(driver.act(input));
-            if done.is_some() {
+            let outcome = driver.act(input);
+            let go_on = matches!(outcome, SetupOutcome::Continue);
+            if let Some(done) = self.ended(outcome) {
+                return Some(done);
+            }
+            // Esc or Q left the first screen: the rest waits for the answer.
+            if !go_on {
                 break;
             }
         }
-        done
+        None
     }
-}
 
-fn ended(outcome: SetupOutcome) -> Option<Done> {
-    match outcome {
-        SetupOutcome::Continue => None,
-        SetupOutcome::Complete(result) => Some(Done::Start(result)),
-        SetupOutcome::Cancel => Some(Done::Quit),
+    /// "Quit Pickaxe?": the terminal quits on Esc or Q on its first screen;
+    /// the window asks first. Enter or Quit closes it, Esc or Stay stays.
+    fn confirm_quit(&mut self, ui: &mut egui::Ui) -> Option<Done> {
+        let mut quit = false;
+        let mut stay = false;
+        let modal = egui::Modal::new(egui::Id::unique("pickaxe.setup.quit")).show(ui.ctx(), |ui| {
+            ui.set_width(260.0);
+            ui.heading("Quit Pickaxe?");
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                quit = ui.button("Quit").clicked();
+                stay = ui.button("Stay").clicked();
+            });
+        });
+        // Enter answers Quit unless it presses a focused button.
+        quit |= ui.memory(|memory| memory.focused().is_none())
+            && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        if quit {
+            return Some(Done::Quit);
+        }
+        if stay || modal.should_close() {
+            self.quitting = false;
+        }
+        None
     }
 }
 
@@ -216,13 +294,47 @@ fn busy(
 }
 
 /// Finds the GPUs and reads the saved profiles and connections on another
-/// thread, as `pickaxe mine` does before its setup.
-fn prepare(inputs: Inputs) -> State {
+/// thread, as `pickaxe mine` does before its setup: from `first`, or from
+/// what is saved alone.
+fn prepare(first: Option<Inputs>, config_path: PathBuf) -> State {
     let (send, receive) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = send.send(setup_driver(inputs));
+        let inputs = match first {
+            Some(inputs) => Ok(inputs),
+            None => saved_inputs(&config_path),
+        };
+        let _ = send.send(inputs.and_then(setup_driver));
     });
     State::Preparing(receive)
+}
+
+/// The inputs `pickaxe` starts again from for its profiles: the saved
+/// configuration alone, its backend and GPUs, and no command line
+/// (`run_application` in src/main.rs).
+fn saved_inputs(config_path: &Path) -> Result<Inputs, String> {
+    let saved = crate::config::SavedConfig::load_optional(config_path)?;
+    let mut cfg = RuntimeConfig::default();
+    let mut backend = BackendKind::Auto;
+    let mut selection = DeviceSelection::Default;
+    let mut integrated = false;
+    if let Some(saved) = &saved {
+        saved.apply_to_runtime(&mut cfg)?;
+        if let Some(value) = &saved.backend {
+            backend = BackendKind::parse(value)?;
+        }
+        if let Some(devices) = &saved.device {
+            selection = devices.selection();
+        }
+        integrated = saved.include_integrated == Some(true);
+    }
+    Ok(Inputs {
+        cfg,
+        config_path: config_path.to_path_buf(),
+        backend,
+        selection: selection.with_integrated(integrated),
+        overrides: SetupOverrides::default(),
+        cli_gpus: false,
+    })
 }
 
 fn setup_driver(inputs: Inputs) -> Result<SetupDriver, String> {
@@ -251,6 +363,10 @@ fn setup_driver(inputs: Inputs) -> Result<SetupDriver, String> {
     };
     let chosen = crate::backend::resolve_mining_devices(inputs.backend, &inputs.selection)
         .unwrap_or_default();
+    let mut overrides = inputs.overrides;
+    if inputs.cli_gpus {
+        overrides.gpus = Some(chosen.iter().map(|gpu| (gpu.backend, gpu.index)).collect());
+    }
     SetupDriver::new(
         inputs.cfg,
         devices,
@@ -261,7 +377,7 @@ fn setup_driver(inputs: Inputs) -> Result<SetupDriver, String> {
         &sources_path,
         sources,
         &config::node_cookies_path(&inputs.config_path),
-        crate::tui::SetupOverrides::default(),
+        overrides,
     )
 }
 
@@ -287,8 +403,7 @@ fn failed(ui: &mut egui::Ui, error: &str) -> bool {
     again
 }
 
-/// The open field's and the token search's ids: the keys go to them while
-/// they have focus.
+/// The open field's and the token search's ids.
 fn edit_id() -> egui::Id {
     egui::Id::unique("pickaxe.setup.edit")
 }
@@ -298,12 +413,15 @@ fn search_id() -> egui::Id {
 }
 
 /// Draws the screen; what was clicked or typed, in order.
-fn draw(ui: &mut egui::Ui, view: &SetupView) -> Vec<SetupInput> {
+fn draw(ui: &mut egui::Ui, view: &SetupView, quitting: bool) -> Vec<SetupInput> {
     let mut out = Vec::new();
-    keyboard(ui, &mut out);
+    if !quitting {
+        keyboard(ui, &mut out);
+    }
+    let wide = ui.available_width() >= POT_BESIDE;
     egui::Panel::top("setup-bar").show(ui, |ui| {
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("Pickaxe").size(20.0).strong());
             ui.separator();
             ui.label(&view.heading);
@@ -311,32 +429,50 @@ fn draw(ui: &mut egui::Ui, view: &SetupView) -> Vec<SetupInput> {
         ui.add_space(4.0);
     });
     egui::Panel::bottom("setup-actions").show(ui, |ui| actions(ui, view, &mut out));
-    let full = view.pot.as_ref().filter(|pot| pot.full);
-    if let Some(pot) = view.pot.as_ref().filter(|pot| !pot.full) {
+    let side = view.pot.as_ref().filter(|pot| !pot.full);
+    if let Some(pot) = side.filter(|_| wide) {
         egui::Panel::right("setup-pot")
             .default_size(320.0)
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| pot_panel(ui, pot, 4.0));
+                egui::ScrollArea::both().show(ui, |ui| pot_panel(ui, pot, 4.0));
             });
     }
     egui::CentralPanel::default().show(ui, |ui| {
-        egui::ScrollArea::vertical().show(ui, |ui| match full {
-            Some(pot) => pot_panel(ui, pot, 8.0),
-            None => page(ui, view, &mut out),
-        });
+        match view.pot.as_ref().filter(|pot| pot.full) {
+            // The QR code keeps its size to scan; it scrolls when the window
+            // is smaller.
+            Some(pot) => {
+                egui::ScrollArea::both().show(ui, |ui| pot_panel(ui, pot, 8.0));
+            }
+            None => {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    page(ui, view, &mut out);
+                    if let Some(pot) = side.filter(|_| !wide) {
+                        ui.add_space(10.0);
+                        egui::Frame::group(ui.style())
+                            .inner_margin(egui::Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                egui::ScrollArea::horizontal()
+                                    .id_salt("setup-pot-under")
+                                    .show(ui, |ui| pot_panel(ui, pot, 4.0));
+                            });
+                    }
+                });
+            }
+        }
     });
     out
 }
 
-/// The terminal's keys, while no field has the keyboard. Buttons keep no
-/// keyboard focus here: the setup's own keys move through it.
+/// The terminal's keys, while no widget has the keyboard: Tab, Space and
+/// Enter work a focused button, and a field keeps its typing. The token
+/// search passes Up and Down on, to move through the list it filters.
 fn keyboard(ui: &mut egui::Ui, out: &mut Vec<SetupInput>) {
     let focused = ui.memory(|memory| memory.focused());
     let searching = focused == Some(search_id());
-    match focused {
-        Some(id) if id == edit_id() => return,
-        Some(id) if id != search_id() => ui.memory_mut(|memory| memory.surrender_focus(id)),
-        _ => {}
+    if focused.is_some() && !searching {
+        return;
     }
     let events = ui.input(|input| input.events.clone());
     for event in events {
@@ -350,8 +486,6 @@ fn keyboard(ui: &mut egui::Ui, out: &mut Vec<SetupInput>) {
                 let key = match key {
                     egui::Key::ArrowUp => SetupKey::Up,
                     egui::Key::ArrowDown => SetupKey::Down,
-                    // The search box keeps its own Left, Right, Enter and
-                    // typing.
                     _ if searching => continue,
                     egui::Key::ArrowLeft => SetupKey::Left,
                     egui::Key::ArrowRight => SetupKey::Right,
@@ -376,7 +510,7 @@ fn keyboard(ui: &mut egui::Ui, out: &mut Vec<SetupInput>) {
 fn actions(ui: &mut egui::Ui, view: &SetupView, out: &mut Vec<SetupInput>) {
     ui.add_space(6.0);
     if !view.status.is_empty() {
-        ui.label(egui::RichText::new(&view.status).strong());
+        ui.add(egui::Label::new(egui::RichText::new(&view.status).strong()).wrap());
         ui.add_space(4.0);
     }
     ui.horizontal_wrapped(|ui| {
@@ -390,7 +524,7 @@ fn actions(ui: &mut egui::Ui, view: &SetupView, out: &mut Vec<SetupInput>) {
         }
     });
     ui.add_space(2.0);
-    ui.label(egui::RichText::new(view.keys).small().weak());
+    ui.add(egui::Label::new(egui::RichText::new(view.keys).weak()).wrap());
     ui.add_space(4.0);
 }
 
@@ -403,10 +537,8 @@ fn color(ui: &egui::Ui, tone: Tone) -> egui::Color32 {
     }
 }
 
-/// Pieces of setup text as one label's text. A line's leading spaces (the
-/// terminal's indents) are left out, and the terminal's few drawing
-/// glyphs, which the window's font lacks, are said in text: the Advanced
-/// header's ▾ ▸ (its checkbox shows it open) and arrows.
+/// Pieces of setup text as one label's text; a line's leading spaces (the
+/// terminal's indents) are left out.
 fn text(ui: &egui::Ui, pieces: &[Piece]) -> egui::text::LayoutJob {
     let font = egui::TextStyle::Body.resolve(ui.style());
     let mut job = egui::text::LayoutJob::default();
@@ -416,13 +548,8 @@ fn text(ui: &egui::Ui, pieces: &[Piece]) -> egui::text::LayoutJob {
         } else {
             piece.text.as_str()
         };
-        let shown = shown
-            .replace("▾ ", "")
-            .replace("▸ ", "")
-            .replace('←', "<-")
-            .replace('→', "->");
         job.append(
-            &shown,
+            shown,
             0.0,
             egui::TextFormat::simple(font.clone(), color(ui, piece.tone)),
         );
@@ -444,6 +571,24 @@ fn bar(pieces: &[Piece]) -> Option<(f32, String)> {
     Some((value / 100.0, percent.to_owned()))
 }
 
+/// What a row's hint says besides the terminal's keys, which the window's
+/// buttons and clicks stand for: "< >  0.5% steps" says "0.5% steps".
+fn hint_words(hint: &str) -> String {
+    const KEYS: [&str; 7] = [
+        "[Enter] or < > change",
+        "[Enter] change",
+        "[Enter] list",
+        "[Enter] done",
+        "[Enter]",
+        "< >",
+        "·",
+    ];
+    let words = KEYS
+        .iter()
+        .fold(hint.to_owned(), |words, key| words.replace(key, " "));
+    words.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// An item's value: a bar drawn as one, or its text.
 fn value(ui: &mut egui::Ui, pieces: &[Piece]) {
     match bar(pieces) {
@@ -451,7 +596,7 @@ fn value(ui: &mut egui::Ui, pieces: &[Piece]) {
             ui.add(
                 egui::ProgressBar::new(fraction)
                     .text(percent)
-                    .desired_width(220.0),
+                    .desired_width(ui.available_width().clamp(80.0, 220.0)),
             );
         }
         None => {
@@ -470,8 +615,8 @@ fn lines(ui: &mut egui::Ui, lines: &[Vec<Piece>]) {
     }
 }
 
-/// The screen's title and rows: rows to choose or change in a grid, lines
-/// of text and Start between them.
+/// The screen's title and rows: rows to choose or change, lines of text,
+/// and Start.
 fn page(ui: &mut egui::Ui, view: &SetupView, out: &mut Vec<SetupInput>) {
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::same(10))
@@ -483,24 +628,13 @@ fn page(ui: &mut egui::Ui, view: &SetupView, out: &mut Vec<SetupInput>) {
                 search_box(ui, search, view.search_hint, out);
                 ui.add_space(6.0);
             }
-            let mut run = Vec::new();
-            let mut grids = 0;
             for (index, item) in view.items.iter().enumerate() {
                 match item.kind {
-                    ItemKind::Info | ItemKind::Start => {
-                        rows(ui, view, &run, grids, out);
-                        run.clear();
-                        grids += 1;
-                        if item.kind == ItemKind::Start {
-                            start(ui, view, index, item, out);
-                        } else {
-                            lines(ui, std::slice::from_ref(&item.value));
-                        }
-                    }
-                    _ => run.push(index),
+                    ItemKind::Info => lines(ui, std::slice::from_ref(&item.value)),
+                    ItemKind::Start => start(ui, view, index, item, out),
+                    _ => row(ui, view, index, out),
                 }
             }
-            rows(ui, view, &run, grids, out);
             // A field of its own (another computer, a cookie file).
             if let Some(edit) = view.edit.as_ref().filter(|edit| edit.item.is_none()) {
                 ui.add_space(6.0);
@@ -521,61 +655,116 @@ fn search_box(ui: &mut egui::Ui, search: &str, hint: &'static str, out: &mut Vec
                 egui::TextEdit::singleline(&mut typed)
                     .id(search_id())
                     .hint_text(hint)
-                    .desired_width(460.0),
+                    .desired_width(ui.available_width().min(460.0)),
             )
             .labelled_by(label.id);
         if response.changed() {
             out.push(SetupInput::Search(typed));
         }
-        if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-            out.push(SetupInput::Key(SetupKey::Enter));
+        if response.lost_focus() {
+            if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                out.push(SetupInput::Key(SetupKey::Enter));
+            } else if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                // Esc goes back at once, as on the terminal's token list.
+                out.push(SetupInput::Back);
+            }
         }
     });
 }
 
-/// Rows `run` of the screen: name, value or its controls, and the
-/// terminal's key hint.
-fn rows(
-    ui: &mut egui::Ui,
-    view: &SetupView,
-    run: &[usize],
-    grid: usize,
-    out: &mut Vec<SetupInput>,
-) {
-    if run.is_empty() {
-        return;
-    }
-    egui::Grid::new(("pickaxe.setup.rows", grid))
-        .num_columns(3)
-        .spacing([14.0, 6.0])
-        .max_col_width(560.0)
-        .show(ui, |ui| {
-            for &index in run {
-                row(ui, view, index, out);
-                ui.end_row();
-            }
-        });
-}
-
+/// One row: its name; its value or controls, or its open field; then what
+/// its hint says besides keys, and its own buttons.
 fn row(ui: &mut egui::Ui, view: &SetupView, index: usize, out: &mut Vec<SetupInput>) {
     let item = &view.items[index];
     // While a field is open, the other rows wait, as in the terminal.
     let free = view.edit.is_none();
-    let label = match item.kind {
-        // Under the cursor, a checkbox is highlighted as a selected row is.
+    let edit = view.edit.as_ref().filter(|edit| edit.item == Some(index));
+    ui.horizontal(|ui| {
+        let left = ui.cursor().min.x;
+        let label = name(ui, item, free);
+        if label.clicked() {
+            out.push(match item.kind {
+                ItemKind::Cycle { .. } => SetupInput::Select(index),
+                _ => SetupInput::Click(index),
+            });
+        }
+        let used = ui.cursor().min.x - left;
+        if used < NAME_WIDTH {
+            ui.add_space(NAME_WIDTH - used);
+        }
+        if let Some(edit) = edit {
+            field(ui, edit, label.id, out);
+            return;
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            for (command, text) in item.actions.iter().rev() {
+                if ui
+                    .add_enabled(free, egui::Button::new(*text).small())
+                    .accessible_name(format!("{text} {}", item.label))
+                    .clicked()
+                {
+                    out.push(SetupInput::Row {
+                        item: index,
+                        command: *command,
+                    });
+                }
+            }
+            let words = hint_words(&item.hint);
+            if !words.is_empty() {
+                ui.weak(words);
+            }
+            ui.with_layout(
+                egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+                |ui| match item.kind {
+                    ItemKind::Cycle { enter } => cycle(ui, free, index, item, enter, out),
+                    ItemKind::Toggle { .. } => value(ui, &item.value),
+                    // The whole row chooses, opens or edits it.
+                    _ if item.value.iter().any(|piece| !piece.text.trim().is_empty()) => {
+                        let value = egui::Button::new(text(ui, &item.value))
+                            .frame_when_inactive(false)
+                            .wrap();
+                        if ui.add_enabled(free, value).clicked() {
+                            out.push(SetupInput::Click(index));
+                        }
+                    }
+                    _ => {}
+                },
+            );
+        });
+    });
+}
+
+/// A row's name, under the cursor when highlighted: a button where a click
+/// does what Enter does, a checkbox for a toggle, and plain text for a
+/// value its < > change (a click only moves the cursor there).
+fn name(ui: &mut egui::Ui, item: &SetupItem, free: bool) -> egui::Response {
+    let highlight = egui::Frame::new()
+        .fill(if item.selected {
+            ui.visuals().selection.bg_fill
+        } else {
+            egui::Color32::TRANSPARENT
+        })
+        .corner_radius(4)
+        // As much as a button's, so every row's name starts in one column.
+        .inner_margin(egui::Margin::from(ui.spacing().button_padding));
+    match item.kind {
         ItemKind::Toggle { on } => {
             let mut on = on;
-            let fill = if item.selected {
-                ui.visuals().selection.bg_fill
-            } else {
-                egui::Color32::TRANSPARENT
-            };
-            egui::Frame::new()
-                .fill(fill)
-                .corner_radius(4)
-                .inner_margin(egui::Margin::symmetric(4, 1))
+            highlight
                 .show(ui, |ui| {
                     ui.add_enabled(free, egui::Checkbox::new(&mut on, item.label.as_str()))
+                })
+                .inner
+        }
+        ItemKind::Cycle { .. } => {
+            highlight
+                .show(ui, |ui| {
+                    ui.add_enabled(
+                        free,
+                        egui::Label::new(item.label.as_str())
+                            .sense(egui::Sense::click())
+                            .selectable(false),
+                    )
                 })
                 .inner
         }
@@ -583,21 +772,7 @@ fn row(ui: &mut egui::Ui, view: &SetupView, index: usize, out: &mut Vec<SetupInp
             free,
             egui::Button::selectable(item.selected, item.label.as_str()),
         ),
-    };
-    if label.clicked() {
-        out.push(SetupInput::Click(index));
     }
-    let edit = view.edit.as_ref().filter(|edit| edit.item == Some(index));
-    match (edit, item.kind) {
-        (Some(edit), _) => {
-            ui.horizontal(|ui| field(ui, edit, label.id, out));
-        }
-        (None, ItemKind::Cycle { enter }) => {
-            ui.horizontal(|ui| cycle(ui, free, index, item, enter, out));
-        }
-        _ => value(ui, &item.value),
-    }
-    ui.label(egui::RichText::new(&item.hint).small().weak());
 }
 
 /// A value < > step (the terminal's Left and Right), and the button for
@@ -642,7 +817,8 @@ fn cycle(
     }
 }
 
-/// The open field, with Save and Cancel; Enter saves and Esc cancels.
+/// The open field, as wide as there is room for, with Save and Cancel;
+/// Enter saves and Esc cancels.
 fn field(ui: &mut egui::Ui, edit: &EditView, label: egui::Id, out: &mut Vec<SetupInput>) {
     // A paste goes to the setup, which takes line breaks as spaces.
     if ui.memory(|memory| memory.has_focus(edit_id())) {
@@ -660,14 +836,16 @@ fn field(ui: &mut egui::Ui, edit: &EditView, label: egui::Id, out: &mut Vec<Setu
         out.extend(pasted.into_iter().map(SetupInput::Paste));
     }
     let mut typed = edit.text.clone();
+    // Room for Save and Cancel beside it.
+    let width = (ui.available_width() - 140.0).clamp(120.0, 480.0);
     let response = ui
         .add(
             egui::TextEdit::singleline(&mut typed)
                 .id(edit_id())
-                .desired_width(420.0),
+                .desired_width(width),
         )
         .labelled_by(label);
-    // The field holds the keyboard until it is saved or cancelled.
+    // The field takes the keyboard while no other widget has it.
     if ui.memory(|memory| memory.focused().is_none()) {
         response.request_focus();
     }
@@ -689,7 +867,8 @@ fn field(ui: &mut egui::Ui, edit: &EditView, label: egui::Id, out: &mut Vec<Setu
     }
 }
 
-/// Start, as the terminal colors it.
+/// Start: a filled button when it can start, outlined while the cursor is
+/// on it.
 fn start(
     ui: &mut egui::Ui,
     view: &SetupView,
@@ -698,14 +877,20 @@ fn start(
     out: &mut Vec<SetupInput>,
 ) {
     ui.add_space(10.0);
-    let tone = item.value.first().map_or(Tone::Plain, |piece| piece.tone);
-    let button = egui::Button::selectable(
-        item.selected,
-        egui::RichText::new(item.value_text())
-            .size(17.0)
-            .color(color(ui, tone)),
-    )
+    let ready = item.value.first().map(|piece| piece.tone) == Some(Tone::Good);
+    let text = egui::RichText::new(item.value_text()).size(17.0).strong();
+    let mut button = egui::Button::new(if ready {
+        text.color(egui::Color32::WHITE)
+    } else {
+        text
+    })
     .min_size(egui::vec2(220.0, 38.0));
+    if ready {
+        button = button.fill(START_FILL);
+    }
+    if item.selected {
+        button = button.stroke(egui::Stroke::new(2.0, ui.visuals().selection.stroke.color));
+    }
     if ui.add_enabled(view.edit.is_none(), button).clicked() {
         out.push(SetupInput::Click(index));
     }
@@ -737,5 +922,84 @@ fn pot_panel(ui: &mut egui::Ui, pot: &PotView, module: f32) {
         lines(ui, &pot.before);
         qr(ui);
         lines(ui, &pot.after);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hints_keep_their_words_and_leave_the_keys_to_the_buttons() {
+        for (hint, words) in [
+            ("[Enter] or < > change", ""),
+            ("< >  [Enter] list", ""),
+            ("< >  0.5% steps", "0.5% steps"),
+            ("< >  5% steps · [Enter] done", "5% steps"),
+            ("< > halves or doubles  [Enter]", "halves or doubles"),
+            ("[Enter]  most ASIC firmware", "most ASIC firmware"),
+            ("< > [Enter]  a Pickaxe pool", "a Pickaxe pool"),
+        ] {
+            assert_eq!(hint_words(hint), words, "{hint}");
+        }
+    }
+
+    #[test]
+    fn terminal_bars_read_as_their_percent() {
+        let bar_of = |text: &str| {
+            bar(&[Piece {
+                text: text.into(),
+                tone: Tone::Plain,
+            }])
+        };
+        assert_eq!(bar_of("██████████ 100%"), Some((1.0, "100%".into())));
+        assert_eq!(bar_of("█████░░░░░  50%"), Some((0.5, "50%".into())));
+        assert_eq!(bar_of("4.00% of PHOTON mining work"), None);
+    }
+
+    /// A Start that ended on another thread survives a click or key in the
+    /// same frame.
+    #[cfg(feature = "gui-preview")]
+    #[test]
+    fn a_start_from_another_thread_is_never_dropped() {
+        let devices = vec![crate::backend::GpuDevice {
+            index: 0,
+            name: "Test GPU".into(),
+            vendor: String::new(),
+            vram_bytes: None,
+            backend: BackendKind::Wgpu,
+            detail: String::new(),
+            integrated: false,
+            ready: true,
+            pci: None,
+        }];
+        let result = SetupResult {
+            config: RuntimeConfig::default(),
+            gpus: devices.clone(),
+            profile_name: "Rig A".into(),
+            server: None,
+            options: Default::default(),
+            electric: false,
+            split: None,
+        };
+        let mut setup = Setup::finishing(
+            SetupDriver::preview(devices, Default::default()),
+            SetupOutcome::Complete(Box::new(result)),
+        );
+        let mut done = None;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_ui(|ui| {
+                if let Some(ended) = setup.show(ui) {
+                    done = Some(ended);
+                }
+            });
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(1);
+        drop(harness);
+        match done {
+            Some(Done::Start(result)) => assert_eq!(result.profile_name, "Rig A"),
+            _ => panic!("the Start was lost"),
+        }
     }
 }

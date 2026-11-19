@@ -20,6 +20,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const SIZE: [f32; 2] = [1040.0, 760.0];
+/// The window's smallest size.
+const SMALL: [f32; 2] = [640.0, 480.0];
 /// Tall enough to show the whole dashboard in one picture.
 const TALL: [f32; 2] = [1040.0, 1240.0];
 
@@ -31,11 +33,12 @@ fn out_dir() -> PathBuf {
 }
 
 fn save(name: &str, size: [f32; 2], ui: impl FnMut(&mut egui::Ui)) {
+    // The window's fonts from the first frame, which the builder draws.
     let mut harness = egui_kittest::Harness::builder()
         .with_size(size)
+        .with_context_setup(|ctx| ctx.set_fonts(super::fonts()))
         .wgpu()
         .build_ui(ui);
-    harness.ctx.set_fonts(super::fonts());
     harness.run_steps(4);
     let image = harness.render().expect("render the screen");
     let path = out_dir().join(name);
@@ -471,6 +474,7 @@ fn the_setup_answers_clicks_and_keys() {
     ));
     let mut harness = egui_kittest::Harness::builder()
         .with_size(SIZE)
+        .with_context_setup(|ctx| ctx.set_fonts(super::fonts()))
         .build_ui(|ui| {
             setup.show(ui);
         });
@@ -492,6 +496,47 @@ fn the_setup_answers_clicks_and_keys() {
     harness.get_by_label("Back").click();
     harness.run_steps(2);
     assert!(harness.query_by_label("Setup   2/4 Network").is_some());
+    // Esc on the first screen asks before the window closes.
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(2);
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(2);
+    assert!(harness.query_by_label("Quit Pickaxe?").is_some());
+    harness.get_by_label("Stay").click();
+    harness.run_steps(2);
+    assert!(harness.query_by_label("Quit Pickaxe?").is_none());
+    assert!(harness.query_by_label("Setup   1/4 Hardware").is_some());
+}
+
+/// A profile's own row opens, renames and deletes that profile, whatever
+/// row the cursor is on.
+#[test]
+fn a_profiles_buttons_act_on_their_row() {
+    use egui_kittest::kittest::Queryable;
+    let mut setup = Setup::ready(SetupDriver::preview(preview_gpus(), preview_profiles()));
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(SIZE)
+        .with_context_setup(|ctx| ctx.set_fonts(super::fonts()))
+        .build_ui(|ui| {
+            setup.show(ui);
+        });
+    // A few frames after each click: the bottom panel takes a frame to
+    // grow to a status line, which moves its buttons.
+    harness.run_steps(4);
+    harness.get_by_label("Delete Chipnet test").click();
+    harness.run_steps(4);
+    assert!(harness
+        .query_by_label_contains("Delete profile \u{201c}Chipnet test\u{201d}?")
+        .is_some());
+    harness.get_by_label("Keep").click();
+    harness.run_steps(4);
+    assert!(harness.query_by_label_contains("Delete profile").is_none());
+    harness.get_by_label("Open Chipnet test").click();
+    harness.run_steps(4);
+    assert!(harness
+        .query_by_label_contains("profile: Chipnet test")
+        .is_some());
+    harness.check_accessibility();
 }
 
 /// The setup's screens, reached by clicks as a miner would reach them.
@@ -529,6 +574,16 @@ fn setup_previews() {
     let mut driver = settings();
     click(&mut driver, "Fulcrum");
     shot("setup-connections.png", SIZE, driver);
+    // The window's smallest size.
+    let mut driver = settings();
+    click(&mut driver, "Address");
+    driver.act(SetupInput::SetText(crate::config::DONATION_ADDRESS.into()));
+    shot("setup-editing-small.png", SMALL, driver);
+    shot(
+        "setup-profiles-small.png",
+        SMALL,
+        SetupDriver::preview(preview_gpus(), preview_profiles()),
+    );
 }
 
 /// The ASIC server's pages and its Device panel.
