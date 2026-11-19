@@ -7,8 +7,8 @@ pub mod backend_kind;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod benchmark;
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(target_arch = "wasm32"))]
 pub mod child_process;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod cli;
 pub mod config;
 pub mod crypto;
