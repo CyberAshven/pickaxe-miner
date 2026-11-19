@@ -6,11 +6,12 @@
 //! which applies it as the terminal's keys do.
 use crate::p2pool::launch::Light;
 use crate::stratum_v2::view::{
-    self, ConnectInfo, ConnectLine, PanelKey, ServeMode, ServerControl, ServerFrame, ServerView,
+    self, ConnectInfo, ConnectLine, PanelFrame, PanelInput, PanelKey, ServeMode, ServerControl,
+    ServerFrame, ServerView,
 };
 use eframe::egui;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// What the window shows of the server.
 #[derive(Debug, Clone, Default)]
@@ -110,6 +111,16 @@ impl ServerView for WindowServerView {
     fn controls(&self) -> Vec<ServerControl> {
         self.0.take()
     }
+
+    // Closing the window while the server starts never waits for it to
+    // take requests.
+    fn stop_requested(&self) -> bool {
+        self.0
+            .board
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stopping
+    }
 }
 
 /// The terminal dashboard's pages: Tab, i and a there.
@@ -126,19 +137,159 @@ fn page_id() -> egui::Id {
     egui::Id::unique("pickaxe.asic.page")
 }
 
+/// The workers page or the overview, which Connection info and Advanced
+/// settings open over and go back to, as in the terminal.
+fn under_id() -> egui::Id {
+    egui::Id::unique("pickaxe.asic.under")
+}
+
 fn copied_id() -> egui::Id {
     egui::Id::unique("pickaxe.asic.copied")
 }
 
+/// How long Connection info says what was copied.
+const COPIED_FOR: Duration = Duration::from_secs(4);
+
 /// Shows `page` the next time the server is drawn.
 pub fn open_page(context: &egui::Context, page: Page) {
-    context.data_mut(|data| data.insert_temp(page_id(), page));
+    context.data_mut(|data| {
+        if data.get_temp::<Page>(page_id()) != Some(page) {
+            data.remove::<(String, Instant)>(copied_id());
+        }
+        if matches!(page, Page::Workers | Page::Overview) {
+            data.insert_temp(under_id(), page);
+        }
+        data.insert_temp(page_id(), page);
+    });
+}
+
+/// What one of the terminal's page keys does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Press {
+    /// Shows this page.
+    Open(Page),
+    /// Asks this of the server.
+    Send(ServerControl),
+    /// Copies Connection info's line with this number, from 1, as there.
+    Copy(usize),
+}
+
+/// The terminal dashboard's keys on `page`, as the window reads them from
+/// `events`: Tab between the workers page and the overview, i for
+/// Connection info, a for Advanced settings, Esc back, ←/→, + (or =) and −
+/// for the donation there, a number to copy a Connection info line, and q
+/// to stop. `under` is the page Connection info and Advanced settings go
+/// back to.
+pub fn page_keys(events: &[egui::Event], page: Page, under: Page) -> Vec<Press> {
+    let mut presses = Vec::new();
+    let mut press = |key: Option<char>, named: Option<egui::Key>| {
+        let done = match (page, key, named) {
+            (_, Some('q'), _) => Press::Send(ServerControl::Stop),
+            (Page::Connection, Some('i' | 'I'), _)
+            | (Page::Connection, _, Some(egui::Key::Escape)) => Press::Open(under),
+            (Page::Connection, Some(digit @ '1'..='9'), _) => {
+                Press::Copy(usize::from(digit as u8 - b'0'))
+            }
+            (Page::Connection, _, _) => return,
+            (Page::Advanced, Some('a' | 'A'), _) | (Page::Advanced, _, Some(egui::Key::Escape)) => {
+                Press::Open(under)
+            }
+            (Page::Advanced, Some('+' | '='), _)
+            | (Page::Advanced, _, Some(egui::Key::ArrowRight)) => {
+                Press::Send(ServerControl::Donation { up: true })
+            }
+            (Page::Advanced, Some('-'), _) | (Page::Advanced, _, Some(egui::Key::ArrowLeft)) => {
+                Press::Send(ServerControl::Donation { up: false })
+            }
+            (_, Some('a' | 'A'), _) => Press::Open(Page::Advanced),
+            (Page::Workers | Page::Overview, Some('i' | 'I'), _) => Press::Open(Page::Connection),
+            (Page::Workers, _, Some(egui::Key::Tab)) => Press::Open(Page::Overview),
+            (Page::Overview, _, Some(egui::Key::Tab)) => Press::Open(Page::Workers),
+            _ => return,
+        };
+        presses.push(done);
+    };
+    for event in events {
+        match event {
+            egui::Event::Text(text) => {
+                for c in text.chars() {
+                    press(Some(c), None);
+                }
+            }
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.is_none() => press(None, Some(*key)),
+            _ => (),
+        }
+    }
+    presses
 }
 
 /// Draws the server: a bar with its state and Stop, then the page chosen,
 /// or the Device panel over them while one is open.
 pub fn show(ui: &mut egui::Ui, board: &AsicBoard, link: &AsicLink) {
     link.set_context(ui.ctx().clone());
+    // The terminal's page keys work while no widget holds the keyboard
+    // (focus comes with Tab or a click into a field; Esc lets it go).
+    let keys_free = ui.memory(|memory| memory.focused().is_none());
+    let panel_open = board
+        .frame
+        .as_ref()
+        .is_some_and(|frame| frame.panel.is_some());
+    let mut took_tab = false;
+    if keys_free && !panel_open && board.frame.is_some() {
+        let page: Page = ui.data(|data| data.get_temp(page_id())).unwrap_or_default();
+        let under: Page = ui
+            .data(|data| data.get_temp(under_id()))
+            .unwrap_or_default();
+        let events = ui.input(|input| input.events.clone());
+        took_tab = events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::Tab,
+                    pressed: true,
+                    ..
+                }
+            )
+        }) && matches!(page, Page::Workers | Page::Overview);
+        for press in page_keys(&events, page, under) {
+            match press {
+                Press::Open(next) => {
+                    if next == Page::Connection {
+                        link.send(ServerControl::ReadAddresses);
+                    }
+                    open_page(ui.ctx(), next);
+                }
+                Press::Send(ServerControl::Donation { up }) => {
+                    if board.live && board.steerable() {
+                        link.send(ServerControl::Donation { up });
+                    }
+                }
+                Press::Send(control) => {
+                    if board.steerable() {
+                        link.send(control);
+                    }
+                }
+                Press::Copy(number) => {
+                    if let Some(frame) = &board.frame {
+                        let connect = &frame.connect;
+                        if let Some(line) = connect
+                            .lines
+                            .iter()
+                            .chain(&connect.templates)
+                            .nth(number - 1)
+                        {
+                            copy(ui, &line.url);
+                        }
+                    }
+                }
+            }
+        }
+    }
     egui::Panel::top("asic-bar").show(ui, |ui| top_bar(ui, board, link));
     egui::CentralPanel::default().show(ui, |ui| {
         let Some(frame) = &board.frame else {
@@ -167,6 +318,15 @@ pub fn show(ui: &mut egui::Ui, board: &AsicBoard, link: &AsicLink) {
                 Page::Advanced => advanced(ui, frame, board, link),
             });
     });
+    // Tab switched pages, as in the terminal: no widget takes the focus
+    // it would have moved to.
+    if took_tab {
+        ui.memory_mut(|memory| {
+            if let Some(id) = memory.focused() {
+                memory.surrender_focus(id);
+            }
+        });
+    }
 }
 
 /// The server's state, as the bar says it.
@@ -362,6 +522,7 @@ fn workers(ui: &mut egui::Ui, frame: &ServerFrame, board: &AsicBoard, link: &Asi
         "Now and 1 hour come from validated shares (30s warm-up); Device says, Temp and Fan are \
          the device's own report.",
     );
+    ui.weak("Tab  Overview · i  Connection info · a  Advanced settings · q  Stop server");
 }
 
 /// A titled number, as the token dashboard's cards.
@@ -471,6 +632,7 @@ fn overview(ui: &mut egui::Ui, frame: &ServerFrame) {
     });
     ui.add_space(4.0);
     ui.weak("Rate uses validated shares; 30s warm-up, up to 5m window.");
+    ui.weak("Tab  Workers · i  Connection info · a  Advanced settings · q  Stop server");
 }
 
 /// One address with its place and a Copy button.
@@ -495,10 +657,20 @@ fn address_rows(ui: &mut egui::Ui, id: &str, lines: &[ConnectLine]) {
     });
 }
 
-/// Copies `text` and says so under Connection info, as its number keys do.
+/// Copies `text` and says so under Connection info for a few seconds, as
+/// its number keys do.
 fn copy(ui: &egui::Ui, text: &str) {
     ui.ctx().copy_text(text.to_owned());
-    ui.data_mut(|data| data.insert_temp(copied_id(), format!("Copied {text}")));
+    ui.data_mut(|data| data.insert_temp(copied_id(), (format!("Copied {text}"), Instant::now())));
+}
+
+/// What Connection info still says about the last copy, and for how long.
+fn copied_note(copied: Option<(String, Instant)>, now: Instant) -> Option<(String, Duration)> {
+    let (note, at) = copied?;
+    COPIED_FOR
+        .checked_sub(now.saturating_duration_since(at))
+        .filter(|left| !left.is_zero())
+        .map(|left| (note, left))
 }
 
 fn connection(ui: &mut egui::Ui, connect: &ConnectInfo) {
@@ -552,9 +724,26 @@ fn connection(ui: &mut egui::Ui, connect: &ConnectInfo) {
             }
         });
     }
-    if let Some(note) = ui.data(|data| data.get_temp::<String>(copied_id())) {
+    let count = connect.lines.len() + connect.templates.len();
+    if count > 0 {
         ui.add_space(6.0);
-        ui.weak(note);
+        ui.weak(format!(
+            "{}  Copy a line (in the order shown) · i or Esc  Back · q  Stop server",
+            if count == 1 {
+                "1".to_owned()
+            } else {
+                format!("1-{}", count.min(9))
+            }
+        ));
+    }
+    let copied = ui.data(|data| data.get_temp::<(String, Instant)>(copied_id()));
+    match copied_note(copied, Instant::now()) {
+        Some((note, left)) => {
+            ui.add_space(6.0);
+            ui.weak(note);
+            ui.ctx().request_repaint_after(left);
+        }
+        None => ui.data_mut(|data| data.remove::<(String, Instant)>(copied_id())),
     }
 }
 
@@ -598,19 +787,7 @@ fn advanced(ui: &mut egui::Ui, frame: &ServerFrame, board: &AsicBoard, link: &As
                 link.send(ServerControl::Donation { up: true });
             }
         });
-        // The terminal's keys work here too: ←/→, + (or =) and −.
-        if can {
-            let (down, up) = ui.input(|input| {
-                let pressed = |keys: &[egui::Key]| keys.iter().any(|key| input.key_pressed(*key));
-                (
-                    pressed(&[egui::Key::ArrowLeft, egui::Key::Minus]),
-                    pressed(&[egui::Key::ArrowRight, egui::Key::Plus, egui::Key::Equals]),
-                )
-            });
-            if down || up {
-                link.send(ServerControl::Donation { up });
-            }
-        }
+        ui.weak("Left/Right or +/-  Change donation · a or Esc  Back");
         ui.add_space(4.0);
         ui.label(&frame.advanced);
         if let Some(error) = frame.setting_error {
@@ -650,12 +827,17 @@ pub fn key_line(line: &str) -> Option<Vec<(PanelKey, String)>> {
         .collect()
 }
 
-/// The keys typed in the window, as the Device panel reads them.
-pub fn panel_keys(events: &[egui::Event]) -> Vec<PanelKey> {
+/// The keys typed in the window, as the Device panel reads them. Pasted
+/// text counts only where the panel reads text (`PanelInput::Text`):
+/// elsewhere its characters would choose and confirm actions.
+pub fn panel_keys(events: &[egui::Event], input: PanelInput) -> Vec<PanelKey> {
     let mut keys = Vec::new();
     for event in events {
         match event {
-            egui::Event::Text(text) | egui::Event::Paste(text) => {
+            egui::Event::Text(text) => {
+                keys.extend(text.chars().filter(|c| !c.is_control()).map(PanelKey::Char))
+            }
+            egui::Event::Paste(text) if input == PanelInput::Text => {
                 keys.extend(text.chars().filter(|c| !c.is_control()).map(PanelKey::Char))
             }
             egui::Event::Key {
@@ -680,16 +862,21 @@ pub fn panel_keys(events: &[egui::Event]) -> Vec<PanelKey> {
 /// The Device panel, as the terminal draws it: its text, with the keys it
 /// names as buttons. Typed keys go to the panel, so its number, letter,
 /// Enter, Esc, Tab and Backspace keys work as in the terminal.
-fn device_panel(ui: &mut egui::Ui, text: &str, board: &AsicBoard, link: &AsicLink) {
+fn device_panel(ui: &mut egui::Ui, panel: &PanelFrame, board: &AsicBoard, link: &AsicLink) {
     let can = board.live && board.steerable();
+    // Read before this frame's widgets: who holds the keyboard.
+    let focused = ui.memory(|memory| memory.focused());
     ui.horizontal(|ui| {
         ui.strong("Device panel");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Esc, as in the terminal: one page back, and from the
+            // panel's first page back to the workers.
             if ui
-                .add_enabled(can, egui::Button::new("Back to workers"))
+                .add_enabled(can, egui::Button::new("Back"))
+                .on_hover_text("Esc: one page back; from the first page, back to the workers")
                 .clicked()
             {
-                link.send(ServerControl::ClosePanel);
+                link.send(ServerControl::PanelKey(PanelKey::Esc));
             }
         });
     });
@@ -697,8 +884,9 @@ fn device_panel(ui: &mut egui::Ui, text: &str, board: &AsicBoard, link: &AsicLin
         "Type the keys the panel names, or press their buttons. Nothing reaches the device \
          without your confirmation.",
     );
-    // The panel holds the keyboard: Tab and Enter go to it, never to a
-    // button that happens to have focus.
+    // While a page reads typed text or a number, the panel holds the
+    // keyboard: Tab and Enter go to it, never to a button that happens to
+    // have focus. Elsewhere the keyboard is free, so Tab reaches Stop.
     let holder = ui
         .interact(
             egui::Rect::from_min_size(ui.cursor().min, egui::Vec2::ZERO),
@@ -706,7 +894,8 @@ fn device_panel(ui: &mut egui::Ui, text: &str, board: &AsicBoard, link: &AsicLin
             egui::Sense::focusable_noninteractive(),
         )
         .accessible_name("Device panel keys");
-    if can {
+    let typing = can && panel.input != PanelInput::Keys;
+    if typing {
         holder.request_focus();
         ui.memory_mut(|memory| {
             memory.set_focus_lock_filter(
@@ -719,7 +908,11 @@ fn device_panel(ui: &mut egui::Ui, text: &str, board: &AsicBoard, link: &AsicLin
                 },
             )
         });
-        for key in panel_keys(&ui.input(|input| input.events.clone())) {
+    } else if focused == Some(holder.id) {
+        holder.surrender_focus();
+    }
+    if can && (typing || focused.is_none() || focused == Some(holder.id)) {
+        for key in panel_keys(&ui.input(|input| input.events.clone()), panel.input) {
             link.send(ServerControl::PanelKey(key));
         }
     }
@@ -728,7 +921,7 @@ fn device_panel(ui: &mut egui::Ui, text: &str, board: &AsicBoard, link: &AsicLin
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for line in text.lines() {
+                for line in panel.text.lines() {
                     match key_line(line) {
                         Some(keys) => {
                             ui.horizontal_wrapped(|ui| {
@@ -810,8 +1003,12 @@ mod tests {
             ]
         );
         assert!(view.controls().is_empty(), "each request is sent once");
+        assert!(!view.stop_requested());
         link.send(ServerControl::Stop);
         assert_eq!(state_text(&link.board()), "Stopping…");
+        // The server sees it between its startup steps, before it drains
+        // the requests.
+        assert!(view.stop_requested());
         assert_eq!(view.controls(), vec![ServerControl::Stop]);
         link.finished(Some("cannot bind SV1 listener".into()));
         let board = link.board();
@@ -828,6 +1025,127 @@ mod tests {
         let board = link.board();
         assert!(board.frame.is_none() && !board.stopping && !board.ended);
         assert!(link.take().is_empty());
+        assert!(!WindowServerView(Arc::clone(&link)).stop_requested());
+    }
+
+    fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn the_terminals_page_keys_work_in_the_window() {
+        let none = egui::Modifiers::NONE;
+        let text = |text: &str| [egui::Event::Text(text.into())];
+        let tab = [key(egui::Key::Tab, none)];
+        let esc = [key(egui::Key::Escape, none)];
+        let open = |page| vec![Press::Open(page)];
+        let under = Page::Overview;
+        // Tab between the workers page and the overview, nowhere else.
+        assert_eq!(page_keys(&tab, Page::Workers, under), open(Page::Overview));
+        assert_eq!(page_keys(&tab, Page::Overview, under), open(Page::Workers));
+        assert!(page_keys(&tab, Page::Advanced, under).is_empty());
+        assert!(page_keys(&tab, Page::Connection, under).is_empty());
+        assert!(page_keys(
+            &[key(egui::Key::Tab, egui::Modifiers::SHIFT)],
+            Page::Workers,
+            under
+        )
+        .is_empty());
+        // i opens Connection info and goes back from it, as Esc does.
+        assert_eq!(
+            page_keys(&text("i"), Page::Workers, under),
+            open(Page::Connection)
+        );
+        assert_eq!(page_keys(&text("I"), Page::Connection, under), open(under));
+        assert_eq!(page_keys(&esc, Page::Connection, under), open(under));
+        assert!(page_keys(&text("i"), Page::Advanced, under).is_empty());
+        // a opens Advanced settings and goes back; Esc goes back too.
+        assert_eq!(
+            page_keys(&text("a"), Page::Overview, under),
+            open(Page::Advanced)
+        );
+        assert_eq!(page_keys(&text("a"), Page::Advanced, under), open(under));
+        assert_eq!(page_keys(&esc, Page::Advanced, under), open(under));
+        assert!(page_keys(&text("a"), Page::Connection, under).is_empty());
+        // The donation's keys, on Advanced settings only.
+        let up = Press::Send(ServerControl::Donation { up: true });
+        let down = Press::Send(ServerControl::Donation { up: false });
+        assert_eq!(
+            page_keys(&text("+=-"), Page::Advanced, under),
+            vec![up.clone(), up.clone(), down.clone()]
+        );
+        assert_eq!(
+            page_keys(
+                &[
+                    key(egui::Key::ArrowRight, none),
+                    key(egui::Key::ArrowLeft, none)
+                ],
+                Page::Advanced,
+                under
+            ),
+            vec![up, down]
+        );
+        assert!(page_keys(&text("+"), Page::Workers, under).is_empty());
+        // A number copies a Connection info line; q stops anywhere.
+        assert_eq!(
+            page_keys(&text("3"), Page::Connection, under),
+            vec![Press::Copy(3)]
+        );
+        assert!(page_keys(&text("3"), Page::Workers, under).is_empty());
+        for page in [
+            Page::Workers,
+            Page::Overview,
+            Page::Connection,
+            Page::Advanced,
+        ] {
+            assert_eq!(
+                page_keys(&text("q"), page, under),
+                vec![Press::Send(ServerControl::Stop)]
+            );
+        }
+    }
+
+    #[test]
+    fn the_copy_note_goes_after_a_few_seconds() {
+        let at = Instant::now();
+        let copied = Some(("Copied stratum+tcp://192.168.1.20:3333".to_owned(), at));
+        let (note, left) = copied_note(copied.clone(), at + Duration::from_secs(1)).unwrap();
+        assert_eq!(note, "Copied stratum+tcp://192.168.1.20:3333");
+        assert_eq!(left, COPIED_FOR - Duration::from_secs(1));
+        assert!(copied_note(copied, at + COPIED_FOR).is_none());
+        assert!(copied_note(None, at).is_none());
+    }
+
+    // A paste reaches the panel only on its login and pool pages: a pasted
+    // "1y" on the menu would choose an action and confirm it.
+    #[test]
+    fn a_paste_reaches_the_panel_only_where_it_reads_text() {
+        let events = [
+            egui::Event::Paste("1y".into()),
+            egui::Event::Text("2".into()),
+        ];
+        assert_eq!(
+            panel_keys(&events, PanelInput::Keys),
+            vec![PanelKey::Char('2')]
+        );
+        assert_eq!(
+            panel_keys(&events, PanelInput::Number),
+            vec![PanelKey::Char('2')]
+        );
+        assert_eq!(
+            panel_keys(&events, PanelInput::Text),
+            vec![
+                PanelKey::Char('1'),
+                PanelKey::Char('y'),
+                PanelKey::Char('2')
+            ]
+        );
     }
 
     #[test]
@@ -860,16 +1178,15 @@ mod tests {
 
     #[test]
     fn typed_keys_reach_the_panel() {
-        let key = |key, shift| egui::Event::Key {
-            key,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: if shift {
-                egui::Modifiers::SHIFT
-            } else {
-                egui::Modifiers::NONE
-            },
+        let key = |code, shift| {
+            key(
+                code,
+                if shift {
+                    egui::Modifiers::SHIFT
+                } else {
+                    egui::Modifiers::NONE
+                },
+            )
         };
         let events = [
             egui::Event::Text("2y".into()),
@@ -882,7 +1199,7 @@ mod tests {
             egui::Event::Copy,
         ];
         assert_eq!(
-            panel_keys(&events),
+            panel_keys(&events, PanelInput::Text),
             vec![
                 PanelKey::Char('2'),
                 PanelKey::Char('y'),

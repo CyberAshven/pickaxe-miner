@@ -9,7 +9,7 @@ use super::{
     server::{self, ServerConfig, ServerStats},
     telemetry::{AddressIssue, DeviceSnapshot},
     template::{compact_target, BchTemplate},
-    view::{ConnectInfo, ServerControl, ServerFrame, ServerView},
+    view::{ConnectInfo, PanelFrame, ServerControl, ServerFrame, ServerView},
 };
 use crate::{
     cli::StratumV2Command,
@@ -79,6 +79,12 @@ fn serve(
     if let StratumV2Command::Watch = action {
         return watch(config_path);
     }
+    // A view's Stop ends the server between its startup steps too, before
+    // it takes the view's other requests; returning drops what started.
+    let stop_asked = || view.is_some_and(ServerView::stop_requested);
+    if stop_asked() {
+        return Ok(());
+    }
     // #### PR #61: your own P2Pool node, started here and mined at as this
     // server's pool under your share address.
     let own_p2pool = match &action {
@@ -87,6 +93,9 @@ fn serve(
         } => Some(crate::p2pool::own::OwnNode::start(config, config_path)?),
         _ => None,
     };
+    if stop_asked() {
+        return Ok(());
+    }
     // #### PR #40
     // Pool mode: SV1 devices mine at a remote SV2 pool through the adapter,
     // and no local node or SV2 server runs.
@@ -299,11 +308,17 @@ fn serve(
         _ => None,
     };
     let reserve = super::tdp::reserve_for(tokens.is_some());
+    if stop_asked() {
+        return Ok(());
+    }
     let node = if (pools.is_empty() || declaring) && header_work.is_none() {
         Some(preflight_sources(config, &providers, reserve)?)
     } else {
         None
     };
+    if stop_asked() {
+        return Ok(());
+    }
     let serving = node.is_some() || header_work.is_some();
     // #### PR #40
     // The node's client and version, such as "Bitcoin Cash Node 29.1.0",
@@ -559,6 +574,9 @@ fn serve(
             )
         }),
     });
+    if stop_asked() {
+        return Ok(());
+    }
     let stop = Arc::new(AtomicBool::new(false));
     crate::session_control::install_stop(&stop)?;
     // A view shows the server in the terminal's place, and prints nothing.
@@ -1082,7 +1100,10 @@ fn serve(
                     connect: view_connect.clone().unwrap_or_default(),
                     donation: donation_value,
                     setting_error,
-                    panel: panel.as_ref().map(DevicePanel::text),
+                    panel: panel.as_ref().map(|open| PanelFrame {
+                        text: open.text(),
+                        input: open.input(),
+                    }),
                     devices: devices.clone(),
                     // The rows are in `devices`; the device addresses stay
                     // here (see the devices file).
@@ -5065,6 +5086,8 @@ mod tests {
     struct ScriptedView {
         frames: Mutex<Vec<ServerFrame>>,
         script: Mutex<std::collections::VecDeque<Vec<ServerControl>>>,
+        /// Stop was asked for before the server took requests.
+        stop: AtomicBool,
     }
 
     impl ServerView for ScriptedView {
@@ -5075,16 +5098,15 @@ mod tests {
         fn controls(&self) -> Vec<ServerControl> {
             self.script.lock().unwrap().pop_front().unwrap_or_default()
         }
+
+        fn stop_requested(&self) -> bool {
+            self.stop.load(Ordering::Relaxed)
+        }
     }
 
-    // The desktop window's hook: a server shown in a view hands it what its
-    // pages show each tick, applies its requests as the terminal's keys do
-    // (the donation is saved first) and stops on its Stop. Pool mode with
-    // an SV1 listener on a loopback port the system picks needs no node and
-    // no device.
-    #[test]
-    fn a_view_shows_the_server_and_steers_it() {
-        use super::super::view::PanelKey;
+    /// Pool mode with an SV1 listener on a loopback port the system picks:
+    /// no node and no device.
+    fn pool_serve() -> (StratumV2Command, RuntimeConfig) {
         let config = RuntimeConfig {
             network: crate::config::MiningNetwork::Chipnet,
             payout_address: crate::config::CHIPNET_DONATION_ADDRESS.into(),
@@ -5110,6 +5132,16 @@ mod tests {
         else {
             panic!("not a serve command")
         };
+        (action, config)
+    }
+
+    // The desktop window's hook: a server shown in a view hands it what its
+    // pages show each tick, applies its requests as the terminal's keys do
+    // (the donation is saved first) and stops on its Stop.
+    #[test]
+    fn a_view_shows_the_server_and_steers_it() {
+        use super::super::view::PanelKey;
+        let (action, config) = pool_serve();
         let dir = super::super::journal::TestDirectory::new();
         let path = dir.0.join("chipnet.json");
         let view = ScriptedView::default();
@@ -5172,6 +5204,20 @@ mod tests {
         for frame in &frames {
             assert!(!format!("{frame:?}").contains(&config.payout_address));
         }
+    }
+
+    // A Stop asked for while the server starts ends it there: closing the
+    // window then never waits for the server to take requests.
+    #[test]
+    fn a_stop_during_startup_ends_the_server_before_it_serves() {
+        let (action, config) = pool_serve();
+        let dir = super::super::journal::TestDirectory::new();
+        let path = dir.0.join("chipnet.json");
+        let view = ScriptedView::default();
+        view.stop.store(true, Ordering::Relaxed);
+        serve(action, &config, &path, false, false, None, Some(&view)).unwrap();
+        assert!(view.frames.lock().unwrap().is_empty());
+        assert!(!status_path(&path).exists(), "it never served");
     }
 
     // A view's Connection info is the terminal page's, apart from its keys.
