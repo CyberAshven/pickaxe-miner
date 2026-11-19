@@ -60,6 +60,40 @@ while mining stops the same way as **Stop**.
 With `PICKAXE_TUI_LOG` set, the window writes the terminal dashboard's log:
 events, and status lines every 10 seconds.
 
+## ASIC server dashboard
+
+The BCH ASIC server runs as from the terminal (`stratum-v2 serve`): the
+same node, pools, Job Declaration, threads, status file
+(`<config>.sv2-status.json`) and owner-only devices file. The window takes
+its terminal dashboard's place through `stratum_v2::view::ServerView`: five
+times a second the server hands the window what its pages show and applies
+the window's requests as its keys do. With the window it prints nothing to
+the terminal.
+
+- The bar: network, BCH or token mining, the server's state, uptime and
+  **Stop** (as `q`).
+- The lights: your own P2Pool node and BCH node, the pool's when joining
+  one, or the node's and Job Declaration's.
+- **Workers**: the terminal's header and its workers table, column for
+  column, with a **Panel** button on each row (as Enter).
+- **Overview**: workers online, shares, blocks, height and the best share,
+  then the terminal overview's status lines (node, ZMQ notices, templates,
+  Job Declaration, token wins, validated work) and its devices table.
+- **Connection info**: every SV1, SV2 and template address at each place
+  this computer is reached (this computer, your network, Tailscale), each
+  with **Copy**, what to type as the username and password, and the
+  template provider settings for an SRI pool. Opening it reads this
+  computer's addresses again, as `i` does.
+- **Advanced settings**: the donation with ◀ and ▶ (or ←/→, + and −) in
+  the terminal's 0.5% steps, saved before new jobs use it; a failed save
+  keeps the old setting and says so. Below it, what the server started with.
+- **Device panel**: the terminal's panel for one worker, online or offline,
+  under the same rules (its address is never shown, an offline row's device
+  must be confirmed, every action asks first). The keys it names are
+  buttons, and keys typed in the window reach it as in the terminal: the
+  numbers, letters, Enter, Esc, Tab and Backspace, so pools, fan, power and
+  the device's login are entered the same way. **Back to workers** closes it.
+
 ## Not in the window yet
 
 The terminal setup's other choices: the node and Fulcrum connection lists,
@@ -70,7 +104,8 @@ carry the names they will read.
 
 ## Screens without a desktop
 
-`cargo test --features gui-preview -- --ignored gui_preview` draws both
-screens offscreen with made-up data and saves them as PNG files in
+`cargo test --features gui-preview -- --ignored gui_preview` draws the
+screens offscreen with made-up data (`gui_preview_asic` the ASIC server's
+pages) and saves them as PNG files in
 `target/gui-preview` (or `PICKAXE_GUI_PREVIEW_DIR`). The same renderer checks
 that every control has a name a screen reader can read.

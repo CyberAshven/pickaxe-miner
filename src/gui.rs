@@ -12,6 +12,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
+// The BCH ASIC server's dashboard; drawn once the App shows its screen.
+#[cfg(feature = "stratum-v2")]
+#[allow(dead_code)]
+mod asic;
 mod dashboard;
 // Wired into the App with the setup that yields a `tui::SetupResult`.
 #[allow(dead_code)]
@@ -39,6 +43,12 @@ pub struct Start {
 pub fn run(start: Start) -> Result<(), String> {
     let link = Arc::new(session::Link::default());
     crate::tui::show_sessions_in(Box::new(session::WindowView(Arc::clone(&link))))?;
+    #[cfg(feature = "stratum-v2")]
+    let servers = Arc::new(asic::AsicLink::default());
+    #[cfg(feature = "stratum-v2")]
+    crate::stratum_v2::view::show_servers_in(Box::new(asic::WindowServerView(Arc::clone(
+        &servers,
+    ))))?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Pickaxe")

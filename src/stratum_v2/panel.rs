@@ -300,6 +300,20 @@ impl DevicePanel {
             .map(|row| Self::for_row(devices, row, now))
     }
 
+    /// What Enter does on a view's row (`view::ServerControl::OpenDevice`):
+    /// the panel for the row with this label among this frame's `rows`,
+    /// under the same rules as `for_selection`.
+    pub(super) fn for_label(
+        devices: &Devices,
+        rows: &[DeviceSnapshot],
+        label: &str,
+        now: Instant,
+    ) -> Option<Self> {
+        rows.iter()
+            .find(|row| row.label == label)
+            .map(|row| Self::for_row(devices, row, now))
+    }
+
     /// The panel for a row of the workers page, online or offline, with the
     /// address its device last connected from. Nothing is sent to the device
     /// until `identify` and a confirmed action.
@@ -1001,8 +1015,8 @@ impl DevicePanel {
         }
     }
 
-    /// The panel's text.
-    fn text(&self) -> String {
+    /// The panel's text, for the terminal and a view.
+    pub(super) fn text(&self) -> String {
         let status = match (self.online, self.offline_for) {
             (true, _) => "Online".to_owned(),
             (false, Some(age)) => format!("Offline for {}", span(age)),
@@ -1534,6 +1548,35 @@ mod tests {
         selection.step(KeyCode::Home, &labels);
         assert_eq!(selection.index(), Some(0));
         assert!(DevicePanel::for_selection(&devices, &[], &selection, start).is_none());
+    }
+
+    // A view opens a row by its label, under the rules Enter uses.
+    #[test]
+    fn a_view_opens_the_row_with_its_label() {
+        let start = Instant::now();
+        let (mut devices, ids) = three_devices(start);
+        let rows = devices.snapshots(start);
+        let label = devices.label(ids[2]).unwrap();
+        let panel = DevicePanel::for_label(&devices, &rows, &label, start).unwrap();
+        assert_eq!(panel.label, label);
+        assert_eq!(panel.target, Ok("192.168.0.3".parse().unwrap()));
+        assert!(panel.text().contains(&format!("Worker  {label} · Online")));
+        assert!(DevicePanel::for_label(&devices, &rows, "nobody #9", start).is_none());
+        // An offline row opens with its last address, as Enter does.
+        devices.share(
+            ids[2],
+            ShareEvent::Accepted([255; 32]),
+            true,
+            start + Duration::from_secs(30),
+        );
+        let closed = start + Duration::from_secs(120);
+        devices.close(ids[2], true, Some("SV1 disconnected"), closed);
+        let later = closed + Duration::from_secs(5);
+        let rows = devices.snapshots(later);
+        let panel = DevicePanel::for_label(&devices, &rows, &label, later).unwrap();
+        assert!(!panel.online);
+        assert_eq!(panel.target, Ok("192.168.0.3".parse().unwrap()));
+        assert_eq!(panel.offline_for, Some(Duration::from_secs(5)));
     }
 
     // #### PR #42

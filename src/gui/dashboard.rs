@@ -681,7 +681,7 @@ fn events(ui: &mut egui::Ui, board: &Board) {
 }
 
 /// Hours, minutes and seconds, as the terminal dashboard shows uptime.
-fn clock(elapsed: Duration) -> String {
+pub(super) fn clock(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
     format!(
         "{:02}:{:02}:{:02}",
