@@ -25,6 +25,7 @@ mod preview;
 mod rig;
 mod session;
 mod setup;
+mod style;
 
 /// What the window starts from: the saved settings and the command line, as
 /// the terminal setup reads them, and where they are saved.

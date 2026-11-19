@@ -172,7 +172,7 @@ pub fn show(ui: &mut egui::Ui, board: &RigBoard, live: bool, stop: &dyn Fn()) {
                         .show(ui, |ui| {
                             ui.set_min_width(150.0);
                             ui.weak(title);
-                            ui.heading(value);
+                            ui.label(super::style::number(value, 20.0));
                         });
                 }
             });

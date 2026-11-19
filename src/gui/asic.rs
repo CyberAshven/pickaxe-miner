@@ -522,7 +522,10 @@ fn workers(ui: &mut egui::Ui, frame: &ServerFrame, board: &AsicBoard, link: &Asi
         "Now and 1 hour come from validated shares (30s warm-up); Device says, Temp and Fan are \
          the device's own report.",
     );
-    ui.weak("Tab  Overview · i  Connection info · a  Advanced settings · q  Stop server");
+    super::style::keys(
+        ui,
+        "Tab  Overview · i  Connection info · a  Advanced settings · q  Stop server",
+    );
 }
 
 /// A titled number, as the token dashboard's cards.
@@ -533,7 +536,7 @@ fn card(ui: &mut egui::Ui, title: &str, value: &str, detail: Option<&str>) {
             ui.set_min_width(150.0);
             ui.vertical(|ui| {
                 ui.weak(title);
-                ui.heading(value);
+                ui.label(super::style::number(value, 20.0));
                 if let Some(detail) = detail {
                     ui.weak(detail);
                 }
@@ -632,7 +635,10 @@ fn overview(ui: &mut egui::Ui, frame: &ServerFrame) {
     });
     ui.add_space(4.0);
     ui.weak("Rate uses validated shares; 30s warm-up, up to 5m window.");
-    ui.weak("Tab  Workers · i  Connection info · a  Advanced settings · q  Stop server");
+    super::style::keys(
+        ui,
+        "Tab  Workers · i  Connection info · a  Advanced settings · q  Stop server",
+    );
 }
 
 /// One address with its place and a Copy button.
@@ -782,12 +788,12 @@ fn advanced(ui: &mut egui::Ui, frame: &ServerFrame, board: &AsicBoard, link: &As
             if step_button(ui, can, false, "Lower the donation by 0.5%").clicked() {
                 link.send(ServerControl::Donation { up: false });
             }
-            ui.heading(frame.donation.to_string());
+            ui.label(super::style::number(frame.donation.to_string(), 18.0));
             if step_button(ui, can, true, "Raise the donation by 0.5%").clicked() {
                 link.send(ServerControl::Donation { up: true });
             }
         });
-        ui.weak("Left/Right or +/-  Change donation · a or Esc  Back");
+        super::style::keys(ui, "Left/Right or +/-  Change donation · a or Esc  Back");
         ui.add_space(4.0);
         ui.label(&frame.advanced);
         if let Some(error) = frame.setting_error {

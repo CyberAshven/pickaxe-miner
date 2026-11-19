@@ -132,9 +132,42 @@ pub struct Board {
     /// The command each rig runs to join this coordinator, by place.
     pub rig_join: Vec<(String, String)>,
     /// The answer to the last control, as the terminal's status line, and
-    /// when it was given.
+    /// when it was given, whether it is an error, and the part of the
+    /// dashboard it answers.
     pub notice: Option<String>,
     pub notice_at: Option<Instant>,
+    pub notice_error: bool,
+    pub notice_for: NoticeFor,
+}
+
+/// The part of the dashboard a control's answer is shown in: next to the
+/// control that asked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NoticeFor {
+    /// Pause, intensity, Stop.
+    #[default]
+    Bar,
+    /// A token's share, donation or reconnect.
+    Tokens,
+    /// PHOTON alone's payout and Fulcrum server.
+    Settings,
+    /// ELECTRIC's Max/send.
+    Pot,
+}
+
+impl Control {
+    fn notice_for(&self) -> NoticeFor {
+        match self {
+            Self::Share { .. } | Self::Donation { .. } | Self::Reconnect { .. } => {
+                NoticeFor::Tokens
+            }
+            Self::SetPayout(_) | Self::SetFulcrum(_) => NoticeFor::Settings,
+            Self::Withdraw(_) => NoticeFor::Pot,
+            Self::Pause(_) | Self::Intensity(_) | Self::Stop { .. } | Self::KeepMining => {
+                NoticeFor::Bar
+            }
+        }
+    }
 }
 
 impl Board {
@@ -243,8 +276,9 @@ impl Link {
         let mut rig_join: Option<Vec<(String, String)>> = None;
         while !finished() {
             let mut events = Vec::new();
-            let mut notice = None;
+            let mut notice: Option<(String, bool, NoticeFor)> = None;
             for control in self.take() {
+                let place = control.notice_for();
                 let done = match control {
                     Control::Pause(pause) => miners.pause(pause).map(|()| {
                         paused = pause;
@@ -313,12 +347,12 @@ impl Link {
                 match done {
                     Ok(Some(message)) => {
                         events.push(message.clone());
-                        notice = Some(message);
+                        notice = Some((message, false, place));
                     }
                     Ok(None) => {}
                     Err(error) => {
                         events.push(error.clone());
-                        notice = Some(error);
+                        notice = Some((error, true, place));
                     }
                 }
             }
@@ -376,9 +410,11 @@ impl Link {
                 if let Some(lines) = &rig_join {
                     board.rig_join.clone_from(lines);
                 }
-                if notice.is_some() {
-                    board.notice = notice;
+                if let Some((message, error, place)) = notice {
+                    board.notice = Some(message);
                     board.notice_at = Some(Instant::now());
+                    board.notice_error = error;
+                    board.notice_for = place;
                 }
                 for event in events {
                     board.push_event(event);

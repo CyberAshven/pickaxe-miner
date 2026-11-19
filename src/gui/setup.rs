@@ -38,8 +38,6 @@ pub enum Done {
 
 /// Green for what is ready, as the dashboard's chart draws it.
 const GOOD: egui::Color32 = egui::Color32::from_rgb(105, 219, 124);
-/// Start's fill: the one filled button of the setup.
-const START_FILL: egui::Color32 = egui::Color32::from_rgb(35, 134, 54);
 /// The width of a row's name, so values line up.
 const NAME_WIDTH: f32 = 150.0;
 /// From this width the fee pot shows beside the settings; under them when
@@ -509,10 +507,6 @@ fn keyboard(ui: &mut egui::Ui, out: &mut Vec<SetupInput>) {
 /// keys for it.
 fn actions(ui: &mut egui::Ui, view: &SetupView, out: &mut Vec<SetupInput>) {
     ui.add_space(6.0);
-    if !view.status.is_empty() {
-        ui.add(egui::Label::new(egui::RichText::new(&view.status).strong()).wrap());
-        ui.add_space(4.0);
-    }
     ui.horizontal_wrapped(|ui| {
         if ui.button(view.back).clicked() {
             out.push(SetupInput::Back);
@@ -522,9 +516,10 @@ fn actions(ui: &mut egui::Ui, view: &SetupView, out: &mut Vec<SetupInput>) {
                 out.push(SetupInput::Command(*command));
             }
         }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            super::style::keys(ui, view.keys);
+        });
     });
-    ui.add_space(2.0);
-    ui.add(egui::Label::new(egui::RichText::new(view.keys).weak()).wrap());
     ui.add_space(4.0);
 }
 
@@ -628,12 +623,21 @@ fn page(ui: &mut egui::Ui, view: &SetupView, out: &mut Vec<SetupInput>) {
                 search_box(ui, search, view.search_hint, out);
                 ui.add_space(6.0);
             }
+            let mut answered = view.status.is_empty();
             for (index, item) in view.items.iter().enumerate() {
                 match item.kind {
                     ItemKind::Info => lines(ui, std::slice::from_ref(&item.value)),
                     ItemKind::Start => start(ui, view, index, item, out),
                     _ => row(ui, view, index, out),
                 }
+                // The answer to an action shows under the row it came from.
+                if item.selected && !answered {
+                    status(ui, &view.status);
+                    answered = true;
+                }
+            }
+            if !answered {
+                status(ui, &view.status);
             }
             // A field of its own (another computer, a cookie file).
             if let Some(edit) = view.edit.as_ref().filter(|edit| edit.item.is_none()) {
@@ -644,6 +648,20 @@ fn page(ui: &mut egui::Ui, view: &SetupView, out: &mut Vec<SetupInput>) {
                 });
             }
         });
+}
+
+/// The setup's answer (a check that failed, what a key did), beside the
+/// row it concerns.
+fn status(ui: &mut egui::Ui, status: &str) {
+    ui.add_space(2.0);
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .stroke(egui::Stroke::new(1.0, super::style::accent(ui)))
+        .corner_radius(4.0)
+        .show(ui, |ui| {
+            ui.add(egui::Label::new(egui::RichText::new(status).strong()).wrap());
+        });
+    ui.add_space(4.0);
 }
 
 fn search_box(ui: &mut egui::Ui, search: &str, hint: &'static str, out: &mut Vec<SetupInput>) {
@@ -878,16 +896,12 @@ fn start(
 ) {
     ui.add_space(10.0);
     let ready = item.value.first().map(|piece| piece.tone) == Some(Tone::Good);
-    let text = egui::RichText::new(item.value_text()).size(17.0).strong();
-    let mut button = egui::Button::new(if ready {
-        text.color(egui::Color32::WHITE)
+    let mut button = if ready {
+        super::style::primary(ui, item.value_text())
     } else {
-        text
-    })
-    .min_size(egui::vec2(220.0, 38.0));
-    if ready {
-        button = button.fill(START_FILL);
-    }
+        egui::Button::new(egui::RichText::new(item.value_text()).size(17.0).strong())
+            .min_size(egui::vec2(220.0, 38.0))
+    };
     if item.selected {
         button = button.stroke(egui::Stroke::new(2.0, ui.visuals().selection.stroke.color));
     }

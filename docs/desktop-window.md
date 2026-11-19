@@ -88,6 +88,14 @@ the terminal waits for it.
 
 ## Dashboard
 
+The dashboard leads with the hash rate, the session's rewards, the GPUs'
+temperature and power, the intensity, the tokens and their chart. GPUs,
+the network and PHOTON's settings sit under **Details**, one click away.
+Each control's answer shows next to it, in red when it failed. **Stop now**
+and Max/send's **Send** ask before they act, since neither can be undone.
+The screens use one accent color, numbers in the monospace font, and show
+the terminal's keys when the pointer rests on **Keyboard**.
+
 - Each token's hash rate, share, rewards, donation and state, with
   **Reconnect** for PHOTON.
 - Ten minutes of hash rate, one lane per token, each on its own scale:

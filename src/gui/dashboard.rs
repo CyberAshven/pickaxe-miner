@@ -1,6 +1,7 @@
 //! The window's mining dashboard: what the terminal dashboard shows, with
 //! its pause, intensity, split and stop controls.
-use super::session::{Board, Control, Link, HISTORY_CAP};
+use super::session::{Board, Control, Link, NoticeFor, HISTORY_CAP};
+use super::style;
 use crate::telemetry::{format_hash_rate, GpuTelemetry};
 use eframe::egui;
 use std::time::Duration;
@@ -25,19 +26,26 @@ pub fn show(ui: &mut egui::Ui, board: &Board, link: &Link) {
         .show(ui, |ui| events(ui, board));
     egui::CentralPanel::default().show(ui, |ui| {
         egui::ScrollArea::both().show(ui, |ui| {
+            if starting(board) {
+                egui::Frame::group(ui.style())
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                "Starting: loading the GPU kernels and reading the chain. The \
+                                 first start can take a few minutes.",
+                            );
+                        });
+                    });
+                ui.add_space(10.0);
+            }
             stats(ui, board, link);
             ui.add_space(10.0);
             tokens(ui, board, link);
             ui.add_space(10.0);
             chart(ui, board);
-            ui.add_space(10.0);
-            gpus(ui, board);
-            ui.add_space(10.0);
-            chain(ui, board);
-            if board.single_runtime && board.live {
-                ui.add_space(10.0);
-                settings(ui, board, link);
-            }
             if let Some(rigs) = board.runtime.as_ref().and_then(|s| s.rigs.as_ref()) {
                 ui.add_space(10.0);
                 rigs_panel(ui, rigs, &board.rig_join);
@@ -46,8 +54,46 @@ pub fn show(ui: &mut egui::Ui, board: &Board, link: &Link) {
                 ui.add_space(10.0);
                 pot(ui, board, link);
             }
+            ui.add_space(10.0);
+            // GPUs, the chain and PHOTON's settings, a click away.
+            egui::CollapsingHeader::new("Details")
+                .id_salt("dashboard-details")
+                .default_open(board.notice_for == NoticeFor::Settings && fresh(board))
+                .show(ui, |ui| {
+                    gpus(ui, board);
+                    ui.add_space(10.0);
+                    chain(ui, board);
+                    if board.single_runtime && board.live {
+                        ui.add_space(10.0);
+                        settings(ui, board, link);
+                    }
+                });
         });
     });
+}
+
+/// The session is starting: nothing has reported yet.
+fn starting(board: &Board) -> bool {
+    !board.live && board.started.is_none() && board.error.is_none()
+}
+
+/// A control's answer is still shown for a while after it was given.
+fn fresh(board: &Board) -> bool {
+    board.notice.is_some()
+        && board
+            .notice_at
+            .is_some_and(|at| at.elapsed() < NOTICE_SHOWN)
+}
+
+/// The last control's answer, if it belongs to this part of the dashboard.
+fn notice_here(ui: &mut egui::Ui, board: &Board, place: NoticeFor) {
+    if board.notice_for != place || !fresh(board) {
+        return;
+    }
+    if let Some(notice) = &board.notice {
+        style::answer(ui, notice, board.notice_error);
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
+    }
 }
 
 /// The terminal dashboard's keys, when no text field has the keyboard:
@@ -108,6 +154,21 @@ fn state_text(board: &Board) -> String {
 
 fn top_bar(ui: &mut egui::Ui, board: &Board, link: &Link) {
     ui.add_space(4.0);
+    bar_row(ui, board, link);
+    notice_here(ui, board, NoticeFor::Bar);
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            style::keys(
+                ui,
+                "P or Space pause / resume · + and - intensity · B stop after pending \
+                 rewards · Esc keep mining · Q close",
+            );
+        });
+    });
+    ui.add_space(2.0);
+}
+
+fn bar_row(ui: &mut egui::Ui, board: &Board, link: &Link) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Pickaxe").size(20.0).strong());
         if let Some(network) = board.network {
@@ -116,7 +177,7 @@ fn top_bar(ui: &mut egui::Ui, board: &Board, link: &Link) {
         ui.separator();
         ui.label(state_text(board));
         if let Some(started) = board.started.filter(|_| board.live) {
-            ui.weak(clock(started.elapsed()));
+            ui.label(style::number(clock(started.elapsed()), 13.0).weak());
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if !board.live {
@@ -134,16 +195,24 @@ fn top_bar(ui: &mut egui::Ui, board: &Board, link: &Link) {
                 return;
             }
             if board.stopping {
-                if ui
-                    .button("Stop now")
-                    .on_hover_text(
-                        "Stop without waiting or saving; a pending reward is kept and \
-                         resolved next time",
-                    )
-                    .clicked()
+                let asking = egui::Id::unique("pickaxe.stop-now");
+                let mut open = ui.data(|data| data.get_temp(asking).unwrap_or(false));
+                if ui.button("Stop now").clicked() {
+                    open = true;
+                }
+                if style::confirm(
+                    ui,
+                    &mut open,
+                    "pickaxe.stop-now.dialog",
+                    "Stop now?",
+                    "Mining stops without waiting for the pending reward, which is kept and \
+                     resolved by the next session. This session's changes are not saved.",
+                    "Stop now",
+                ) == Some(true)
                 {
                     link.send(Control::Stop { now: true });
                 }
+                ui.data_mut(|data| data.insert_temp(asking, open));
                 if ui
                     .button("Keep mining")
                     .on_hover_text("Take back Stop and resume mining")
@@ -166,7 +235,6 @@ fn top_bar(ui: &mut egui::Ui, board: &Board, link: &Link) {
             }
         });
     });
-    ui.add_space(4.0);
 }
 
 /// A titled value; `add` gets the title's id to name its widgets by.
@@ -184,51 +252,41 @@ fn card(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui, egui::Id
 
 fn stats(ui: &mut egui::Ui, board: &Board, link: &Link) {
     let rewards: u64 = board.tokens.iter().map(|token| token.rewards).sum();
-    let height = board
-        .runtime
-        .as_ref()
-        .map(|snapshot| snapshot.height)
-        .filter(|height| *height > 0)
-        .or_else(|| board.electric.as_ref().and_then(|electric| electric.height));
     ui.horizontal_wrapped(|ui| {
         // Tokens count different work, so their rates are never added.
         card(ui, "Hash rate", |ui, _| match board.tokens.as_slice() {
             [] => {
-                ui.heading("–");
+                ui.label(style::number("–", 20.0));
             }
             [token] => {
-                ui.heading(format_hash_rate(token.rate));
+                ui.label(style::number(format_hash_rate(token.rate), 20.0));
             }
             tokens => {
-                for (index, token) in tokens.iter().enumerate() {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{}  {}",
-                            token.name,
-                            format_hash_rate(token.rate)
-                        ))
-                        .color(LINE_COLORS[index % LINE_COLORS.len()]),
-                    );
+                for token in tokens {
+                    ui.label(style::number(
+                        format!("{:<9}{}", token.name, format_hash_rate(token.rate)),
+                        14.0,
+                    ));
                 }
             }
         });
         card(ui, "Rewards this session", |ui, _| {
             match board.tokens.as_slice() {
                 [_, _, ..] => {
-                    for (index, token) in board.tokens.iter().enumerate() {
-                        ui.label(
-                            egui::RichText::new(format!("{}  {}", token.name, token.rewards))
-                                .color(LINE_COLORS[index % LINE_COLORS.len()]),
-                        );
+                    for token in &board.tokens {
+                        ui.label(style::number(
+                            format!("{:<9}{}", token.name, token.rewards),
+                            14.0,
+                        ));
                     }
                 }
                 _ => {
-                    ui.heading(rewards.to_string());
+                    ui.label(style::number(rewards.to_string(), 20.0));
                 }
             }
         });
-        card(ui, "BCH height", |ui, _| {
-            ui.heading(height.map_or_else(|| "–".into(), |height| height.to_string()));
+        card(ui, "GPU", |ui, _| {
+            ui.label(style::number(gpu_glance(board), 20.0));
         });
         card(ui, "Intensity", |ui, title| {
             intensity(ui, title, board, link)
@@ -264,15 +322,6 @@ fn tokens(ui: &mut egui::Ui, board: &Board, link: &Link) {
         .inner_margin(egui::Margin::same(10))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            if let Some(notice) = board.notice.as_ref().filter(|_| {
-                board
-                    .notice_at
-                    .is_some_and(|at| at.elapsed() < NOTICE_SHOWN)
-            }) {
-                ui.colored_label(ui.visuals().warn_fg_color, notice);
-                ui.add_space(4.0);
-                ui.ctx().request_repaint_after(Duration::from_secs(1));
-            }
             egui::Grid::new("tokens")
                 .num_columns(if split { 7 } else { 6 })
                 .spacing([24.0, 8.0])
@@ -289,11 +338,7 @@ fn tokens(ui: &mut egui::Ui, board: &Board, link: &Link) {
                     ui.strong("");
                     ui.end_row();
                     for (index, token) in board.tokens.iter().enumerate() {
-                        ui.label(
-                            egui::RichText::new(&token.name)
-                                .strong()
-                                .color(LINE_COLORS[index % LINE_COLORS.len()]),
-                        );
+                        ui.strong(&token.name);
                         if split {
                             ui.horizontal(|ui| {
                                 let can = board.live && !board.stopping;
@@ -356,6 +401,7 @@ fn tokens(ui: &mut egui::Ui, board: &Board, link: &Link) {
                 ui.add_space(4.0);
                 ui.weak(&board.layout);
             }
+            notice_here(ui, board, NoticeFor::Tokens);
         });
 }
 
@@ -473,6 +519,38 @@ fn gpus(ui: &mut egui::Ui, board: &Board) {
         });
 }
 
+/// The hottest GPU and the power of all of them, or a dash before any reports.
+fn gpu_glance(board: &Board) -> String {
+    let readings: Vec<&GpuTelemetry> = if board.gpus.is_empty() {
+        vec![&board.telemetry]
+    } else {
+        board.gpus.iter().map(|gpu| &gpu.telemetry).collect()
+    };
+    let hottest = readings
+        .iter()
+        .filter_map(|t| t.temperature_c)
+        .fold(None, |most: Option<f64>, t| {
+            Some(most.map_or(t, |m| m.max(t)))
+        });
+    let watts: f64 = readings.iter().filter_map(|t| t.power_watts).sum();
+    match (hottest, watts > 0.0) {
+        (Some(t), true) => format!("{t:.0} °C · {watts:.0} W"),
+        (Some(t), false) => format!("{t:.0} °C"),
+        (None, true) => format!("{watts:.0} W"),
+        (None, false) => "–".into(),
+    }
+}
+
+/// The BCH height the session last read.
+fn height(board: &Board) -> Option<u32> {
+    board
+        .runtime
+        .as_ref()
+        .map(|snapshot| snapshot.height)
+        .filter(|height| *height > 0)
+        .or_else(|| board.electric.as_ref().and_then(|electric| electric.height))
+}
+
 fn chain(ui: &mut egui::Ui, board: &Board) {
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::same(10))
@@ -484,6 +562,11 @@ fn chain(ui: &mut egui::Ui, board: &Board) {
                 .num_columns(2)
                 .spacing([14.0, 6.0])
                 .show(ui, |ui| {
+                    if let Some(height) = height(board) {
+                        ui.weak("BCH height");
+                        ui.monospace(height.to_string());
+                        ui.end_row();
+                    }
                     if let Some(snapshot) = &board.runtime {
                         ui.weak("Source");
                         ui.label(snapshot.job_source.label());
@@ -578,6 +661,7 @@ fn settings(ui: &mut egui::Ui, board: &Board, link: &Link) {
             ui.set_min_width(ui.available_width());
             ui.strong("Settings");
             ui.add_space(4.0);
+            notice_here(ui, board, NoticeFor::Settings);
             ui.horizontal(|ui| {
                 ui.weak("Payout");
                 ui.monospace(&snapshot.payout_address);
@@ -723,7 +807,7 @@ fn pot(ui: &mut egui::Ui, board: &Board, link: &Link) {
             });
             if electric.withdrawal.enabled {
                 ui.add_space(8.0);
-                max_send(ui, &electric.withdrawal, board.network, link);
+                max_send(ui, &electric.withdrawal, board, link);
             }
         });
 }
@@ -734,16 +818,19 @@ fn pot(ui: &mut egui::Ui, board: &Board, link: &Link) {
 fn max_send(
     ui: &mut egui::Ui,
     send: &crate::electric::withdrawal::View,
-    network: Option<crate::config::MiningNetwork>,
+    board: &Board,
     link: &Link,
 ) {
     use super::session::Withdraw;
     use crate::electric::withdrawal::Phase;
-    let network = network.map_or("this network", |network| network.as_str());
+    let network = board
+        .network
+        .map_or("this network", |network| network.as_str());
     ui.strong(format!(
         "Max/send · {network} · plain BCH from this fee pot"
     ));
     let id = egui::Id::unique("pickaxe.max-send");
+    notice_here(ui, board, NoticeFor::Pot);
     match send.phase {
         Phase::Idle | Phase::Complete | Phase::Error => {
             if !send.message.is_empty() {
@@ -803,18 +890,32 @@ fn max_send(
             }
             // This exact quote is now on screen.
             link.send(Control::Withdraw(Withdraw::Presented(send.clone())));
+            let asking = egui::Id::unique("pickaxe.max-send.confirm");
+            let mut open = ui.data(|data| data.get_temp(asking).unwrap_or(false));
             ui.horizontal(|ui| {
-                if ui
-                    .button(format!("Send {} sats", send.amount))
-                    .on_hover_text("Sends this quote; it cannot be undone")
-                    .clicked()
-                {
-                    link.send(Control::Withdraw(Withdraw::Confirm));
+                if ui.button(format!("Send {} sats", send.amount)).clicked() {
+                    open = true;
                 }
                 if ui.button("Cancel").clicked() {
                     link.send(Control::Withdraw(Withdraw::Cancel));
                 }
             });
+            if style::confirm(
+                ui,
+                &mut open,
+                "pickaxe.max-send.dialog",
+                &format!("Send {} sats?", send.amount),
+                &format!(
+                    "All of this pot's plain BCH goes to {}, {} sats in fees. A sent \
+                     transaction cannot be undone.",
+                    send.destination, send.fee
+                ),
+                "Send",
+            ) == Some(true)
+            {
+                link.send(Control::Withdraw(Withdraw::Confirm));
+            }
+            ui.data_mut(|data| data.insert_temp(asking, open));
         }
         Phase::Sending => {
             ui.horizontal(|ui| {
