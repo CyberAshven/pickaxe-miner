@@ -550,15 +550,16 @@ fn gui_preview_asic() {
         });
     }
     if let Some(frame) = asic.frame.as_mut() {
-        frame.panel = Some(
-            "Worker  rig1 #1 · Online\nAvalonminer AvalonNano3s · firmware 2025.03 · 140 W\n\
-             Reached on: local network\nIdentified by asic-rs: AvalonMiner\n\n1  Restart\n2  \
-             Pause mining\n3  Locate (blink the LED)\n4  Fan speed…\n5  Power mode…\n6  Pools…\n\
-             l  Enter this device's login\n\nEsc  Back to workers\n\nActions go straight to the \
-             device, on your local network or Tailscale. Each one needs your confirmation. The \
-             device's address is never shown."
+        frame.panel = Some(crate::stratum_v2::view::PanelFrame {
+            text: "Worker  rig1 #1 · Online\nAvalonminer AvalonNano3s · firmware 2025.03 · 140 \
+                   W\nReached on: local network\nIdentified by asic-rs: AvalonMiner\n\n1  \
+                   Restart\n2  Pause mining\n3  Locate (blink the LED)\n4  Fan speed…\n5  Power \
+                   mode…\n6  Pools…\nl  Enter this device's login\n\nEsc  Back to workers\n\n\
+                   Actions go straight to the device, on your local network or Tailscale. Each \
+                   one needs your confirmation. The device's address is never shown."
                 .into(),
-        );
+            input: crate::stratum_v2::view::PanelInput::Keys,
+        });
     }
     save("asic-panel.png", SIZE, |ui| asic::show(ui, &asic, &servers));
 }

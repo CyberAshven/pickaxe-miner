@@ -144,7 +144,18 @@ the terminal.
   must be confirmed, every action asks first). The keys it names are
   buttons, and keys typed in the window reach it as in the terminal: the
   numbers, letters, Enter, Esc, Tab and Backspace, so pools, fan, power and
-  the device's login are entered the same way. **Back to workers** closes it.
+  the device's login are entered the same way. **Back** is Esc: one page
+  back, and from the panel's first page back to the workers. Pasted text
+  reaches only the login and pool pages, never the menu or a confirmation.
+
+The terminal's page keys work while no button or field holds the keyboard
+(Esc lets it go): Tab between Workers and Overview, `i` for Connection info
+(a number copies its line), `a` for Advanced settings, Esc back, and `q` to
+stop. While a Device panel page reads text or a number it keeps the
+keyboard; on its other pages Tab reaches **Stop**. A **Stop** pressed while
+the server starts (your own P2Pool node, the node, the ports) ends it
+between those steps, so closing the window then does not wait for it to
+serve.
 
 ## Not in the window yet
 

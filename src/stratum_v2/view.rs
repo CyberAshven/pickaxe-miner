@@ -31,6 +31,13 @@ pub trait ServerView: Send + Sync {
     /// What the viewer asked of the server since the last tick, oldest
     /// first.
     fn controls(&self) -> Vec<ServerControl>;
+    /// Whether the viewer asked the server to stop. The server checks it
+    /// between its startup steps (starting your own P2Pool node, reading
+    /// the node, binding the ports), before it takes `controls`, and stops
+    /// there.
+    fn stop_requested(&self) -> bool {
+        false
+    }
 }
 
 static SERVER_VIEW: OnceLock<Box<dyn ServerView>> = OnceLock::new();
@@ -132,7 +139,27 @@ pub struct ServerFrame {
     pub devices_hint: String,
     pub connect: ConnectInfo,
     /// The open Device panel's page.
-    pub panel: Option<String>,
+    pub panel: Option<PanelFrame>,
+}
+
+/// The open Device panel: its page as the terminal shows it, and what the
+/// page reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelFrame {
+    pub text: String,
+    pub input: PanelInput,
+}
+
+/// What a Device panel page reads from the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelInput {
+    /// Single keys that choose or confirm: the menu, a confirmation, the
+    /// device's pools.
+    Keys,
+    /// A number typed, then Enter: the fan speed or power limit.
+    Number,
+    /// Text typed, which may be pasted: the device's login, a new pool.
+    Text,
 }
 
 /// Connection info: every address devices and pools connect to, and what

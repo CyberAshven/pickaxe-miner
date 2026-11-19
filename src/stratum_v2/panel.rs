@@ -15,6 +15,7 @@ use super::{
         IDENTIFIES_WITH_LOGIN,
     },
     telemetry::{worker_name, AddressIssue, DeviceSnapshot, Devices},
+    view::PanelInput,
 };
 use crate::reach::Place;
 use asic_rs::core::traits::miner::MinerAuth;
@@ -1015,6 +1016,16 @@ impl DevicePanel {
         }
     }
 
+    /// What the page shown reads: a view takes pasted text only where the
+    /// panel reads text, never as keys that choose or confirm an action.
+    pub(super) fn input(&self) -> PanelInput {
+        match self.page {
+            Page::Login(_) | Page::PoolForm(_) => PanelInput::Text,
+            Page::Fan(_) | Page::Power(_) => PanelInput::Number,
+            Page::Menu | Page::Confirm(_) | Page::Pools | Page::PoolConfirm(_) => PanelInput::Keys,
+        }
+    }
+
     /// The panel's text, for the terminal and a view.
     pub(super) fn text(&self) -> String {
         let status = match (self.online, self.offline_for) {
@@ -1548,6 +1559,45 @@ mod tests {
         selection.step(KeyCode::Home, &labels);
         assert_eq!(selection.index(), Some(0));
         assert!(DevicePanel::for_selection(&devices, &[], &selection, start).is_none());
+    }
+
+    // A view takes pasted text only on the pages that read text: never on
+    // the menu, a confirmation or the pool list, where a pasted "1y" would
+    // choose an action and confirm it.
+    #[test]
+    fn only_the_login_and_pool_pages_read_text() {
+        let fleet = Arc::new(Fleet::new());
+        // A public address: nothing is ever sent.
+        let mut panel = DevicePanel::new(
+            "rig1 #1".into(),
+            true,
+            String::new(),
+            Ok("203.0.113.9".parse().unwrap()),
+        );
+        *panel.controls.lock().unwrap() = Some(DeviceControls {
+            firmware: Some("AntMiner Stock".into()),
+            actions: vec![DeviceAction::Restart],
+            fan: Some(FanRange { min: 15, max: 100 }),
+            ..DeviceControls::default()
+        });
+        assert_eq!(panel.input(), PanelInput::Keys, "the menu");
+        panel.handle_key(key(KeyCode::Char('1')), &fleet);
+        assert_eq!(panel.page, Page::Confirm(DeviceAction::Restart));
+        assert_eq!(panel.input(), PanelInput::Keys, "a confirmation");
+        panel.handle_key(key(KeyCode::Esc), &fleet);
+        panel.handle_key(key(KeyCode::Char('2')), &fleet);
+        assert_eq!(panel.page, Page::Fan(String::new()));
+        assert_eq!(panel.input(), PanelInput::Number, "the fan speed");
+        panel.handle_key(key(KeyCode::Esc), &fleet);
+        panel.handle_key(key(KeyCode::Char('l')), &fleet);
+        assert!(matches!(panel.page, Page::Login(_)));
+        assert_eq!(panel.input(), PanelInput::Text, "the device's login");
+        panel.handle_key(key(KeyCode::Esc), &fleet);
+        panel.page = Page::Pools;
+        assert_eq!(panel.input(), PanelInput::Keys, "the device's pools");
+        panel.handle_key(key(KeyCode::Char('n')), &fleet);
+        assert!(matches!(panel.page, Page::PoolForm(_)));
+        assert_eq!(panel.input(), PanelInput::Text, "a new pool");
     }
 
     // A view opens a row by its label, under the rules Enter uses.
