@@ -102,6 +102,11 @@ pub struct SetupItem {
     /// The terminal's cursor is on it.
     pub selected: bool,
     pub kind: ItemKind,
+    /// What the row itself offers besides a click, with button text: a
+    /// profile's Open, Rename and Delete, a saved node's Remove
+    /// (`SetupInput::Row`). The terminal takes these keys on the row under
+    /// its cursor.
+    pub actions: Vec<(SetupCommand, &'static str)>,
     pub(super) target: Target,
 }
 
@@ -118,6 +123,7 @@ impl SetupItem {
             hint: String::new(),
             selected,
             kind,
+            actions: Vec::new(),
             target,
         }
     }
@@ -173,10 +179,12 @@ pub struct PotView {
     pub after: Vec<Vec<Piece>>,
 }
 
-/// A command of the screen shown that no row carries (a key in the
+/// A command of the screen shown, or of one of its rows (a key in the
 /// terminal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupCommand {
+    /// Opens the profile (Enter).
+    Open,
     /// Renames the profile under the cursor (R).
     Rename,
     /// Deletes the profile under the cursor once confirmed (D), or removes
@@ -205,6 +213,7 @@ impl SetupCommand {
     /// The terminal's key for the command on `step`.
     fn key(self, step: SetupStep) -> KeyCode {
         match self {
+            Self::Open => KeyCode::Enter,
             Self::Rename => KeyCode::Char('r'),
             Self::Delete if step == SetupStep::Connections => KeyCode::Delete,
             Self::Delete => KeyCode::Char('d'),
@@ -261,15 +270,16 @@ pub enum SetupInput {
     /// Enter on the item: a Cycle item's own action (`enter`).
     Press(usize),
     /// < (`forward: false`) or > on the item: Left or Right on it.
-    Step {
-        item: usize,
-        forward: bool,
-    },
+    Step { item: usize, forward: bool },
     /// A key, as the terminal takes it.
     Key(SetupKey),
     /// Esc: back a step, closes what is open, or quits on the first screen.
     Back,
+    /// One of the screen's commands (`SetupView::commands`).
     Command(SetupCommand),
+    /// One of a row's own commands (`SetupItem::actions`): the cursor moves
+    /// to the row, then the command's key.
+    Row { item: usize, command: SetupCommand },
     /// The GPU token list's search, as typed.
     Search(String),
     /// The open field's text, as typed.
@@ -387,7 +397,7 @@ impl SetupDriver {
     /// The screen shown.
     pub fn view(&self) -> SetupView {
         let flow = &self.flow;
-        let (title, items) = self.page();
+        let (title, items) = self.rows();
         let edit = flow.editing.map(|field| EditView {
             label: self.edit_label(field),
             text: flow.text_input.clone(),
@@ -434,6 +444,44 @@ impl SetupDriver {
         }
     }
 
+    /// The rows with the screen's row commands on them: the saved profiles'
+    /// Open, Rename and Delete, and the saved servers' and nodes' Remove
+    /// (and a node's cookie file). The terminal takes them as keys on the
+    /// row under its cursor.
+    fn rows(&self) -> (String, Vec<SetupItem>) {
+        let flow = &self.flow;
+        let (title, mut items) = self.page();
+        if flow.editing.is_some() || flow.profile_delete_pending {
+            return (title, items);
+        }
+        let saved = flow
+            .sources
+            .list(flow.config.network, flow.connection_kind)
+            .len();
+        for item in &mut items {
+            item.actions = match (flow.step, item.target) {
+                (SetupStep::Profiles, Target::Profile(index))
+                    if index < flow.profiles.profiles.len() =>
+                {
+                    vec![
+                        (SetupCommand::Open, "Open"),
+                        (SetupCommand::Rename, "Rename"),
+                        (SetupCommand::Delete, "Delete"),
+                    ]
+                }
+                (SetupStep::Connections, Target::Connection(index)) if index < saved => {
+                    let mut actions = vec![(SetupCommand::Delete, "Remove")];
+                    if flow.connection_kind == ConnectionKind::Node {
+                        actions.push((SetupCommand::CookieFile, "Cookie file"));
+                    }
+                    actions
+                }
+                _ => Vec::new(),
+            };
+        }
+        (title, items)
+    }
+
     /// What the open field is called: its row's name, or what it asks for.
     fn edit_label(&self, field: TextField) -> String {
         let flow = &self.flow;
@@ -454,38 +502,23 @@ impl SetupDriver {
             return Vec::new();
         }
         match flow.step {
+            // The profile's own Delete asked; its rows carry the rest.
             SetupStep::Profiles if flow.profile_delete_pending => {
                 vec![(SetupCommand::Yes, "Delete"), (SetupCommand::No, "Keep")]
             }
-            SetupStep::Profiles if flow.profile_selected < flow.profiles.profiles.len() => vec![
-                (SetupCommand::Rename, "Rename"),
-                (SetupCommand::Delete, "Delete"),
-            ],
             SetupStep::Connections => {
-                let saved = flow
-                    .sources
-                    .list(flow.config.network, flow.connection_kind)
-                    .len();
                 let mut commands = Vec::new();
                 if flow.public_question.is_some() {
                     commands.push((SetupCommand::Yes, "Yes"));
-                }
-                if flow.connection_selected < saved {
-                    commands.push((SetupCommand::Delete, "Remove"));
                 }
                 commands.extend([
                     (SetupCommand::OtherComputer, "Other PC"),
                     (SetupCommand::Tailscale, "Tailscale"),
                 ]);
-                if flow.connection_kind == ConnectionKind::Node {
-                    commands.push((SetupCommand::CookieFile, "Cookie file"));
-                }
                 commands
             }
-            SetupStep::Gpus => vec![
-                (SetupCommand::ToggleGpu, "Mine on it or not"),
-                (SetupCommand::AllGpus, "All"),
-            ],
+            // Each GPU's checkbox ticks it (Space).
+            SetupStep::Gpus => vec![(SetupCommand::AllGpus, "All")],
             SetupStep::Settings if flow.electric_in_use() && !flow.pot_view => {
                 vec![(SetupCommand::PotView, "Pot QR")]
             }
@@ -502,6 +535,8 @@ impl SetupDriver {
         match flow.step {
             SetupStep::Profiles if !flow.profile_delete_pending => "Quit",
             SetupStep::Hardware if flow.profiles.profiles.is_empty() => "Quit",
+            // The terminal's word for leaving these lists: "[Esc] done".
+            SetupStep::Connections | SetupStep::Gpus => "Done",
             _ => "Back",
         }
     }
@@ -547,6 +582,7 @@ impl SetupDriver {
             SetupInput::Key(key) => self.key(key.code()),
             SetupInput::Back => self.key(KeyCode::Esc),
             SetupInput::Command(command) => self.command(command),
+            SetupInput::Row { item, command } => self.row_command(item, command),
             SetupInput::Search(text) => self.search(&text),
             SetupInput::SetText(text) => self.set_text(&text),
             SetupInput::Paste(text) => self.paste(&text),
@@ -580,20 +616,24 @@ impl SetupDriver {
         }
     }
 
-    /// `pickaxe gui --start`: opens the profile last mined, or the first,
-    /// and presses Start, as Enter twice on it would. Without a profile,
-    /// the setup stays for the miner.
+    /// `pickaxe gui --start`: opens the profile Start last started (kept
+    /// beside the profiles), or the first, and presses Start, as Enter
+    /// twice on it would. Without a profile, the setup stays for the miner.
     pub fn start_now(&mut self) -> SetupOutcome {
         let flow = &mut self.flow;
         if flow.step != SetupStep::Profiles || flow.profiles.profiles.is_empty() {
             return SetupOutcome::Continue;
         }
-        let last = crate::session_control::active_profile().and_then(|name| {
-            flow.profiles
-                .profiles
-                .iter()
-                .position(|profile| profile.name.eq_ignore_ascii_case(&name))
-        });
+        let last = flow
+            .profile_path
+            .as_deref()
+            .and_then(last_profile)
+            .and_then(|name| {
+                flow.profiles
+                    .profiles
+                    .iter()
+                    .position(|profile| profile.name.eq_ignore_ascii_case(&name))
+            });
         if let Some(index) = last {
             flow.profile_selected = index;
         }
@@ -748,6 +788,19 @@ impl SetupDriver {
 
     fn command(&mut self, command: SetupCommand) -> SetupAction {
         if !self.commands().iter().any(|(shown, _)| *shown == command) {
+            return SetupAction::Continue;
+        }
+        self.key(command.key(self.flow.step))
+    }
+
+    /// A row's own command: the cursor moves to the row, then its key.
+    fn row_command(&mut self, index: usize, command: SetupCommand) -> SetupAction {
+        let offered = self
+            .rows()
+            .1
+            .get(index)
+            .is_some_and(|item| item.actions.iter().any(|(shown, _)| *shown == command));
+        if !offered || !self.select(index) {
             return SetupAction::Continue;
         }
         self.key(command.key(self.flow.step))
@@ -993,10 +1046,16 @@ mod tests {
         assert!(view.items[0]
             .value_text()
             .contains("GPU · Mainnet · PHOTON"));
-        assert!(view
-            .commands
-            .iter()
-            .any(|(command, _)| *command == SetupCommand::Rename));
+        // The profile's own row opens, renames and deletes it.
+        assert_eq!(
+            view.items[0].actions,
+            [
+                (SetupCommand::Open, "Open"),
+                (SetupCommand::Rename, "Rename"),
+                (SetupCommand::Delete, "Delete")
+            ]
+        );
+        assert!(view.commands.is_empty());
         driver.act(SetupInput::Click(item(&driver, "Rig A")));
         let view = driver.view();
         assert!(view.status.contains("Loaded"), "{}", view.status);
@@ -1009,13 +1068,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn start_now_opens_the_first_profile_and_starts() {
-        let dir = folder("start-now");
-        let mut driver = driver(&dir);
+    /// A setup with `names` saved as profiles in `dir`.
+    fn with_profiles(dir: &Path, names: &[&str]) -> SetupDriver {
+        let mut driver = driver(dir);
         let mut saved = RuntimeConfig::default();
         saved.set_payout(MAINNET.into()).unwrap();
-        for name in ["First", "Second"] {
+        for name in names {
             driver
                 .flow
                 .profiles
@@ -1026,12 +1084,84 @@ mod tests {
                 )
                 .unwrap();
         }
+        driver
+            .flow
+            .profiles
+            .save(&dir.join("config.profiles.json"))
+            .unwrap();
         driver.flow.step = SetupStep::Profiles;
+        driver
+    }
+
+    #[test]
+    fn start_now_starts_the_profile_last_started() {
+        let dir = folder("start-now");
+        // Nothing started yet: the first profile.
+        let mut driver = with_profiles(&dir, &["First", "Second"]);
         assert_eq!(complete(driver.start_now()).profile_name, "First");
+        // Second started from its row, then a new window's --start.
+        let saved = |dir: &Path| {
+            let mut driver = self::driver(dir);
+            driver.flow.profiles =
+                MiningProfiles::load_optional(&dir.join("config.profiles.json")).unwrap();
+            driver.flow.step = SetupStep::Profiles;
+            driver
+        };
+        let mut driver = saved(&dir);
+        driver.act(SetupInput::Row {
+            item: item(&driver, "Second"),
+            command: SetupCommand::Open,
+        });
+        let start = driver.view().items.iter().position(|item| item.selected);
+        complete(driver.act(SetupInput::Click(start.unwrap())));
+        assert_eq!(
+            last_profile(&dir.join("config.profiles.json")).as_deref(),
+            Some("Second")
+        );
+        assert_eq!(complete(saved(&dir).start_now()).profile_name, "Second");
         // Without a profile the setup stays.
-        let mut fresh = self::driver(&dir);
+        let mut fresh = self::driver(&folder("start-none"));
         assert!(matches!(fresh.start_now(), SetupOutcome::Continue));
         assert_eq!(fresh.flow.step, SetupStep::Hardware);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_profiles_row_renames_and_deletes_that_profile() {
+        let dir = folder("rows");
+        let mut driver = with_profiles(&dir, &["First", "Second"]);
+        // The cursor rests on First; Second's row acts on Second.
+        driver.act(SetupInput::Row {
+            item: item(&driver, "Second"),
+            command: SetupCommand::Rename,
+        });
+        let edit = driver.view().edit.expect("the name opens for typing");
+        assert_eq!(edit.text, "Second");
+        driver.act(SetupInput::SetText("Garage".into()));
+        driver.act(SetupInput::Commit);
+        assert_eq!(driver.flow.profiles.profiles[1].name, "Garage");
+        driver.act(SetupInput::Select(item(&driver, "First")));
+        driver.act(SetupInput::Row {
+            item: item(&driver, "Garage"),
+            command: SetupCommand::Delete,
+        });
+        // Delete asks first; the rows wait for the answer.
+        let view = driver.view();
+        assert!(view.status.contains("Garage"), "{}", view.status);
+        assert!(view.items.iter().all(|item| item.actions.is_empty()));
+        assert_eq!(
+            view.commands,
+            [(SetupCommand::Yes, "Delete"), (SetupCommand::No, "Keep")]
+        );
+        driver.act(SetupInput::Command(SetupCommand::Yes));
+        let names: Vec<_> = driver
+            .flow
+            .profiles
+            .profiles
+            .iter()
+            .map(|profile| profile.name.as_str())
+            .collect();
+        assert_eq!(names, ["First"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1110,12 +1240,25 @@ mod tests {
         assert!(driver.view().items[saved]
             .label
             .contains("fulcrum.example.org"));
-        driver.act(SetupInput::Select(saved));
-        assert!(driver
-            .view()
-            .commands
-            .contains(&(SetupCommand::Delete, "Remove")));
+        assert_eq!(
+            driver.view().items[saved].actions,
+            [(SetupCommand::Delete, "Remove")]
+        );
+        assert_eq!(driver.view().back, "Done");
+        // A screen command is not a row's: nothing is removed.
         driver.act(SetupInput::Command(SetupCommand::Delete));
+        assert_eq!(
+            driver
+                .flow
+                .sources
+                .list(MiningNetwork::Mainnet, ConnectionKind::Fulcrum)
+                .len(),
+            1
+        );
+        driver.act(SetupInput::Row {
+            item: saved,
+            command: SetupCommand::Delete,
+        });
         assert!(driver
             .flow
             .sources

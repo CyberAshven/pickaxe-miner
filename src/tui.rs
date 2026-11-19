@@ -575,7 +575,24 @@ impl ProfileChoices {
     }
 }
 
-#[derive(Default)]
+/// The profile Start last started, by name, kept beside the profiles
+/// (`last-profile.txt`), so `pickaxe gui --start` starts it again.
+fn last_profile_path(profiles: &Path) -> PathBuf {
+    profiles.with_file_name("last-profile.txt")
+}
+
+/// The profile Start last started; none when it was never saved.
+fn last_profile(profiles: &Path) -> Option<String> {
+    let name = std::fs::read_to_string(last_profile_path(profiles)).ok()?;
+    Some(name.trim().to_owned()).filter(|name| !name.is_empty())
+}
+
+fn save_last_profile(profiles: &Path, name: &str) -> Result<(), String> {
+    crate::config::write_private_atomic(&last_profile_path(profiles), name.as_bytes())
+        .map_err(|error| format!("save the last profile started: {error}"))
+}
+
+#[derive(Default, Clone)]
 pub struct SetupOverrides {
     pub network: Option<MiningNetwork>,
     pub token: Option<String>,
@@ -3692,6 +3709,11 @@ impl SetupFlow {
                     let new = updated.profiles[self.profile_selected].name.clone();
                     ProfileChoices::rename(path, &old, Some(&new))?;
                     self.saved_choices = ProfileChoices::load(path);
+                    // The profile last started keeps its place under its new
+                    // name.
+                    if last_profile(path).is_some_and(|last| last.eq_ignore_ascii_case(&old)) {
+                        save_last_profile(path, &new)?;
+                    }
                 }
                 self.profiles = updated;
                 Ok("Profile renamed".into())
@@ -4529,6 +4551,7 @@ impl SetupFlow {
                     ProfileChoices::rename(&path, &old, None)?;
                 }
                 ProfileChoices::save(&path, &name, &self.profile_choices())?;
+                save_last_profile(&path, &name)?;
                 Ok(name)
             })?;
         // The saved profile is the open one now, so a setup that stays (the

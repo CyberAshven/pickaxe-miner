@@ -759,6 +759,37 @@ fn runtime_config_from_cli(args: &cli::Cli) -> Result<RuntimeConfig, String> {
     runtime_config_from_cli_with_base(args, RuntimeConfig::default())
 }
 
+/// The command line names the GPUs to mine on (`--backend`, `--device`,
+/// `--include-integrated`), so they win over a saved profile's.
+fn cli_names_gpus(args: &cli::Cli) -> bool {
+    args.backend.is_some() || args.device.is_some() || args.include_integrated
+}
+
+/// What the command line changes in the setup's saved profiles, with the
+/// GPUs it named (`selected_gpus`) when it names any.
+fn setup_overrides(args: &cli::Cli, selected_gpus: &[backend::GpuDevice]) -> tui::SetupOverrides {
+    tui::SetupOverrides {
+        network: if args.chipnet {
+            Some(config::MiningNetwork::Chipnet)
+        } else {
+            args.network
+                .as_deref()
+                .map(|value| config::MiningNetwork::parse(value).expect("validated CLI network"))
+        },
+        token: args.token.clone(),
+        intensity: args.intensity,
+        fulcrum: args.fulcrum.clone(),
+        node_rpc: args.node_rpc.clone(),
+        source: args.source.clone(),
+        gpus: cli_names_gpus(args).then(|| {
+            selected_gpus
+                .iter()
+                .map(|gpu| (gpu.backend, gpu.index))
+                .collect()
+        }),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MineStartup {
     InteractiveSetup,
@@ -1887,29 +1918,7 @@ fn run_application(open_profiles: bool) {
                             exit_after_error(2);
                         }
                     }
-                    let overrides = tui::SetupOverrides {
-                        network: if args.chipnet {
-                            Some(config::MiningNetwork::Chipnet)
-                        } else {
-                            args.network.as_deref().map(|value| {
-                                config::MiningNetwork::parse(value).expect("validated CLI network")
-                            })
-                        },
-                        token: args.token.clone(),
-                        intensity: args.intensity,
-                        fulcrum: args.fulcrum.clone(),
-                        node_rpc: args.node_rpc.clone(),
-                        source: args.source.clone(),
-                        gpus: (args.backend.is_some()
-                            || args.device.is_some()
-                            || args.include_integrated)
-                            .then(|| {
-                                selected_gpus
-                                    .iter()
-                                    .map(|gpu| (gpu.backend, gpu.index))
-                                    .collect()
-                            }),
-                    };
+                    let overrides = setup_overrides(&args, &selected_gpus);
                     let setup = match tui::run_setup(
                         cfg,
                         devices,
@@ -2142,6 +2151,10 @@ fn run_application(open_profiles: bool) {
                 selection: effective_device,
                 start,
                 cli_node_zmq: args.node_zmq.is_some(),
+                // The GPUs the command line names are found with the rest,
+                // once the window is up.
+                overrides: setup_overrides(&args, &[]),
+                cli_gpus: cli_names_gpus(&args),
             });
             #[cfg(not(feature = "gui"))]
             let result: Result<(), String> = {

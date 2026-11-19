@@ -36,8 +36,16 @@ pub struct Start {
     /// Start mining as soon as the GPUs are found (`pickaxe gui --start`).
     pub start: bool,
     /// The command line named its own ZMQ block notices (`--node-zmq`),
-    /// which then win over a profile's.
+    /// which then win over a profile's in the first session.
     pub cli_node_zmq: bool,
+    /// What the command line changes in a saved profile the first setup
+    /// opens, as in the terminal (`--network`, `--token`, `--intensity`,
+    /// `--fulcrum`, `--node-rpc`, `--source`). Its GPUs are left out: the
+    /// window finds them.
+    pub overrides: crate::tui::SetupOverrides,
+    /// The command line names the GPUs (`--backend`, `--device`,
+    /// `--include-integrated`), so they win over a profile's too.
+    pub cli_gpus: bool,
 }
 
 /// Opens the window and returns when it closes. A session still mining
@@ -170,6 +178,8 @@ impl App {
             config_path: start.config_path.clone(),
             backend: start.backend,
             selection: start.selection.clone(),
+            overrides: start.overrides.clone(),
+            cli_gpus: start.cli_gpus,
         });
         let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
         if let Err(error) = crate::session_control::install_stop(&interrupt) {
@@ -199,7 +209,10 @@ impl App {
         #[cfg(feature = "stratum-v2")]
         self.servers.reset();
         let config_path = self.start.config_path.clone();
-        let cli_node_zmq = self.start.cli_node_zmq;
+        // The command line's block notices serve the first session only:
+        // the setup after it is made without the command line, as the
+        // terminal's return to its profiles is.
+        let cli_node_zmq = std::mem::take(&mut self.start.cli_node_zmq);
         let link = Arc::clone(&self.link);
         #[cfg(feature = "stratum-v2")]
         let servers = Arc::clone(&self.servers);
