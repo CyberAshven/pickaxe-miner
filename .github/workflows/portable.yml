@@ -144,7 +144,7 @@ jobs:
           rustup default stable
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends clang
-          cargo install --locked wasm-bindgen-cli --version 0.2.128
+          cargo install --locked wasm-bindgen-cli --version 0.2.130
       - name: Check browser engine and transport
         run: |
           cargo clippy --locked --lib --no-default-features --features portable-wgpu --target wasm32-unknown-unknown -- -D warnings
