@@ -24,3 +24,9 @@ secp256k1 = "0.33.1"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("spirv"))'] }
+
+[lints.clippy]
+# The limb loops (`limbs!` in src/wide.rs) index several limb arrays by the
+# same position to match their SPIR-V unrolling; clippy 1.100 flags them.
+# The sources stay as pinned in reference/shared-stages/SHA256SUMS.
+needless_range_loop = "allow"
