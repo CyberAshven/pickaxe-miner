@@ -640,7 +640,7 @@ fn supervise(
         restart.store(false, Ordering::SeqCst);
         lock(shared).seen = Seen::default();
         set(shared, State::Starting);
-        let spawned = std::process::Command::new(&command.program)
+        let spawned = crate::child_process::command(&command.program)
             .args(&command.args)
             .envs(command.env.iter().map(|(key, value)| (key, value)))
             .current_dir(&command.dir)
@@ -960,7 +960,7 @@ mod tests {
     fn on_windows_p2pool_joins_the_job_that_ends_with_pickaxe() {
         use std::os::windows::io::AsRawHandle;
         let command = script(&[], true);
-        let mut child = std::process::Command::new(&command.program)
+        let mut child = crate::child_process::command(&command.program)
             .args(&command.args)
             .envs(command.env.iter().map(|(key, value)| (key, value)))
             .stdout(std::process::Stdio::null())

@@ -8551,7 +8551,7 @@ pub(crate) fn event_log_text(event: &RuntimeEvent) -> String {
 }
 
 /// Removes embedded credentials from a displayed endpoint.
-fn redact_endpoint(input: &str) -> String {
+pub(crate) fn redact_endpoint(input: &str) -> String {
     let Some((scheme, rest)) = input.split_once("://") else {
         return input.into();
     };

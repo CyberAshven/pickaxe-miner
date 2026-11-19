@@ -1922,7 +1922,7 @@ pub(crate) fn restrict_private_config(path: &Path) -> Result<(), String> {
 /// other local users cannot read `user:pass@host` out of the config.
 #[cfg(windows)]
 fn restrict_config_to_current_user(path: &Path) -> Result<(), String> {
-    let whoami = std::process::Command::new("whoami")
+    let whoami = crate::child_process::command("whoami")
         .output()
         .map_err(|error| format!("identify config owner for {}: {error}", path.display()))?;
     if !whoami.status.success() {
@@ -1938,7 +1938,7 @@ fn restrict_config_to_current_user(path: &Path) -> Result<(), String> {
             path.display()
         ));
     }
-    let output = std::process::Command::new("icacls")
+    let output = crate::child_process::command("icacls")
         .arg(path)
         .arg("/inheritance:r")
         .arg("/grant:r")

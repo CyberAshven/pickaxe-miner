@@ -49,10 +49,30 @@ pub enum Control {
     /// Fulcrum server (`None`: the automatic servers again).
     SetPayout(String),
     SetFulcrum(Option<String>),
-    /// Stops once pending rewards are settled, or `now`.
+    /// Stops once pending rewards are settled (pausing the GPUs, as the
+    /// terminal's B does), or `now` (as its q does: nothing is saved).
     Stop {
         now: bool,
     },
+    /// Takes back a Stop that waits for pending rewards (the terminal's Esc).
+    KeepMining,
+    /// ELECTRIC's Max/send from an owner-controlled fee pot.
+    Withdraw(Withdraw),
+}
+
+/// A step of ELECTRIC's Max/send, as the terminal's pot view keys do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Withdraw {
+    /// M: start entering a destination.
+    Edit,
+    /// The destination as typed or pasted, then Enter: prepare a quote.
+    Prepare(String),
+    /// The quote as it was drawn; only a drawn quote can be sent.
+    Presented(crate::electric::withdrawal::View),
+    /// Y: send the drawn quote.
+    Confirm,
+    /// Esc: cancel (not while sending).
+    Cancel,
 }
 
 /// The terminal token dashboard's answer when a session with a split or
@@ -111,8 +131,10 @@ pub struct Board {
     pub single_runtime: bool,
     /// The command each rig runs to join this coordinator, by place.
     pub rig_join: Vec<(String, String)>,
-    /// The answer to the last control, as the terminal's status line.
+    /// The answer to the last control, as the terminal's status line, and
+    /// when it was given.
     pub notice: Option<String>,
+    pub notice_at: Option<Instant>,
 }
 
 impl Board {
@@ -207,6 +229,8 @@ impl Link {
         let mut rewards = vec![0u64; miners.runtimes.len()];
         let mut paused = false;
         let mut stopping = false;
+        // Whether mining was paused before a Stop paused it.
+        let mut paused_before_stop = false;
         let mut settled_since: Option<Instant> = None;
         let mut last_sample = Instant::now();
         let mut last_log: Option<Instant> = None;
@@ -230,7 +254,11 @@ impl Link {
                         .intensity(value)
                         .map(|()| Some(format!("Intensity {value}%"))),
                     Control::Share { index, up } => miners.split.map_or(Ok(None), |(slots, _)| {
-                        crate::hash_split::step_share(slots, index, up).map(|_| None)
+                        crate::hash_split::step_share(slots, index, up).map(|share| {
+                            slots
+                                .get(index)
+                                .map(|slot| format!("{} share {share}%", slot.token.name()))
+                        })
                     }),
                     Control::Donation { index, up } => donate(miners, index, up),
                     Control::Reconnect { index } => reconnect(miners, index),
@@ -250,13 +278,37 @@ impl Link {
                             .map(|()| Some("Custom Fulcrum endpoint cleared; reconnecting".into()))
                     }),
                     Control::Stop { now: true } => return Ok(()),
+                    Control::Stop { now: false } if stopping => Ok(None),
                     Control::Stop { now: false } => {
-                        // The session saves what changed, as on leaving
-                        // the terminal dashboard for profiles.
-                        crate::session_control::request_profiles();
-                        stopping = true;
-                        Ok(None)
+                        let all_zero = miners.split.is_some_and(|(slots, _)| {
+                            slots
+                                .iter()
+                                .all(|slot| slot.share.load(Ordering::Relaxed) == 0)
+                        });
+                        if all_zero {
+                            Err("Give a token a nonzero share before saving its profile; \
+                                 Pause pauses mining."
+                                .into())
+                        } else {
+                            // As the terminal's B: pause, settle, then save.
+                            paused_before_stop = paused;
+                            miners.pause(true).map(|()| {
+                                paused = true;
+                                stopping = true;
+                                Some("Finishing pending rewards before stopping.".into())
+                            })
+                        }
                     }
+                    Control::KeepMining if stopping => {
+                        stopping = false;
+                        settled_since = None;
+                        miners.pause(paused_before_stop).map(|()| {
+                            paused = paused_before_stop;
+                            Some("Mining continues.".into())
+                        })
+                    }
+                    Control::KeepMining => Ok(None),
+                    Control::Withdraw(step) => withdraw(miners, step),
                 };
                 match done {
                     Ok(Some(message)) => {
@@ -274,6 +326,9 @@ impl Link {
             if stopping && !reading.pending {
                 let since = *settled_since.get_or_insert_with(Instant::now);
                 if since.elapsed() >= SETTLED {
+                    // The session saves what changed, as on leaving the
+                    // terminal dashboard for profiles.
+                    crate::session_control::request_profiles();
                     break;
                 }
             } else {
@@ -323,6 +378,7 @@ impl Link {
                 }
                 if notice.is_some() {
                     board.notice = notice;
+                    board.notice_at = Some(Instant::now());
                 }
                 for event in events {
                     board.push_event(event);
@@ -515,6 +571,32 @@ fn donate(miners: &Miners<'_>, index: usize, up: bool) -> Result<Option<String>,
         .map(|()| Some(format!("ELECTRIC donation {next}")))
 }
 
+/// One Max/send step on ELECTRIC's withdrawal control, as the terminal's
+/// pot view keys drive it; the control keeps its own rules (an owner pot
+/// only, a quote sent only after it was drawn, no cancel while sending).
+fn withdraw(miners: &Miners<'_>, step: Withdraw) -> Result<Option<String>, String> {
+    let Some(monitor) = miners.electric else {
+        return Ok(Some("This session has no ELECTRIC fee pot.".into()));
+    };
+    let mut send = monitor.withdrawal.lock().unwrap_or_else(|e| e.into_inner());
+    match step {
+        Withdraw::Edit => send.edit(),
+        Withdraw::Prepare(destination) => {
+            if send.view().phase == crate::electric::withdrawal::Phase::Editing {
+                while !send.view().destination.is_empty() {
+                    send.backspace();
+                }
+                send.paste(&destination);
+                send.enter();
+            }
+        }
+        Withdraw::Presented(view) => send.presented(&view),
+        Withdraw::Confirm => send.confirm(),
+        Withdraw::Cancel => send.cancel(),
+    }
+    Ok(None)
+}
+
 /// Reconnects a runtime token, as the terminal token dashboard's `r` does.
 fn reconnect(miners: &Miners<'_>, index: usize) -> Result<Option<String>, String> {
     let Some(token) = token_order(miners).get(index).copied() else {
@@ -618,6 +700,43 @@ mod tests {
             donation: None,
             runtime: true,
         }
+    }
+
+    #[test]
+    fn max_send_steps_drive_the_withdrawal_as_the_pot_keys_do() {
+        use crate::electric::withdrawal::Phase;
+        let monitor = crate::electric::ui::Monitor::new(100, false, "Preview GPU".into());
+        let miners = Miners {
+            network: MiningNetwork::Mainnet,
+            runtimes: vec![],
+            electric: Some(&monitor),
+            split: None,
+            stop: None,
+        };
+        let phase = || monitor.withdrawal.lock().unwrap().view().phase;
+        // Only an owner-controlled pot sends.
+        withdraw(&miners, Withdraw::Edit).unwrap();
+        assert_eq!(phase(), Phase::Idle);
+        monitor.withdrawal.lock().unwrap().enabled = true;
+        withdraw(&miners, Withdraw::Edit).unwrap();
+        assert_eq!(phase(), Phase::Editing);
+        // A destination with extra text is refused, as a paste is.
+        withdraw(&miners, Withdraw::Prepare("pay me bitcoincash:q".into())).unwrap();
+        assert_eq!(phase(), Phase::Error);
+        withdraw(&miners, Withdraw::Edit).unwrap();
+        withdraw(
+            &miners,
+            Withdraw::Prepare(crate::config::DONATION_ADDRESS.into()),
+        )
+        .unwrap();
+        let view = monitor.withdrawal.lock().unwrap().view();
+        assert_eq!(view.phase, Phase::Preparing);
+        assert_eq!(view.destination, crate::config::DONATION_ADDRESS);
+        // No quote was drawn, so nothing is sent.
+        withdraw(&miners, Withdraw::Confirm).unwrap();
+        assert_eq!(phase(), Phase::Preparing);
+        withdraw(&miners, Withdraw::Cancel).unwrap();
+        assert_eq!(phase(), Phase::Idle);
     }
 
     #[test]

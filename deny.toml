@@ -5,7 +5,14 @@ all-features = true
 unmaintained = "all"
 unsound = "all"
 yanked = "deny"
-ignore = []
+# chrono and chrono-tz are marked unmaintained (no vulnerability); asic-rs
+# (the ASIC server's device reports) still depends on them through
+# asic-rs-core, up to its latest release 0.8.10. Drop these once it moves
+# to jiff or time.
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; only through asic-rs" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained; only through asic-rs" },
+]
 
 [licenses]
 # CC0-1.0: the secp256k1 crates (libsecp256k1 bindings) used for signing.

@@ -62,7 +62,7 @@ pub fn run(start: Start) -> Result<(), String> {
         wgpu_options: window_renderer(),
         ..Default::default()
     };
-    eframe::run_native(
+    let shown = eframe::run_native(
         "Pickaxe",
         options,
         Box::new(move |cc| {
@@ -81,7 +81,10 @@ pub fn run(start: Start) -> Result<(), String> {
             )))
         }),
     )
-    .map_err(|error| format!("open the window: {error}"))
+    .map_err(|error| format!("open the window: {error}"));
+    // The window never hands profiles back to the terminal.
+    crate::session_control::take_profiles_request();
+    shown
 }
 
 /// A console Windows opened only for this process (a double-click or a
@@ -97,7 +100,10 @@ fn release_own_console() {
         if attached == 1 {
             // SAFETY: detaching from the console has no preconditions;
             // later writes to stdout and stderr are discarded.
-            unsafe { FreeConsole() };
+            if unsafe { FreeConsole() } != 0 {
+                // Programs started from now on open no console of their own.
+                crate::child_process::console_released();
+            }
         }
     }
 }
@@ -143,6 +149,13 @@ struct App {
     worker: Option<JoinHandle<Result<(), String>>>,
     /// The window was asked to close while a session ran.
     closing: bool,
+    /// The window's own stop flag, bound while no session has bound its
+    /// own: Ctrl+C in the setup closes the window instead of stopping the
+    /// next session, and a stop before a session binds is not lost.
+    interrupt: Arc<std::sync::atomic::AtomicBool>,
+    /// A stop was asked for before the session could take it; it is asked
+    /// again every frame until the session ends.
+    stop_asked: bool,
 }
 
 impl App {
@@ -158,6 +171,10 @@ impl App {
             backend: start.backend,
             selection: start.selection.clone(),
         });
+        let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Err(error) = crate::session_control::install_stop(&interrupt) {
+            crate::tui::append_tui_log(&format!("event window {error}"));
+        }
         Self {
             start,
             link,
@@ -168,6 +185,8 @@ impl App {
             screen: Screen::Setup,
             worker: None,
             closing: false,
+            interrupt,
+            stop_asked: false,
         }
     }
 
@@ -184,7 +203,19 @@ impl App {
         let link = Arc::clone(&self.link);
         #[cfg(feature = "stratum-v2")]
         let servers = Arc::clone(&self.servers);
+        self.interrupt
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.stop_asked = false;
         self.worker = Some(std::thread::spawn(move || {
+            // The request to save on stop never outlives the session, even
+            // if it panics, so nothing later mistakes it for "profiles".
+            struct Unrequest;
+            impl Drop for Unrequest {
+                fn drop(&mut self) {
+                    crate::session_control::take_profiles_request();
+                }
+            }
+            let _unrequest = Unrequest;
             let mined = launch::run(&result, &config_path, cli_node_zmq);
             let error = mined.as_ref().err().cloned();
             #[cfg(feature = "stratum-v2")]
@@ -204,9 +235,13 @@ impl App {
 
     /// Stops the session shown: tokens settle a pending reward first; the
     /// ASIC server stops through its own control; rig mode stops as Ctrl+C
-    /// stops it.
+    /// stops it. A token session still starting (not yet showing) is
+    /// stopped as Ctrl+C would, since nothing reads its controls yet.
     fn stop(&self) {
         match self.screen {
+            Screen::Mining(launch::Screen::Tokens) if !self.link.board().live => {
+                crate::session_control::stop_session()
+            }
             Screen::Mining(launch::Screen::Tokens) => {
                 self.link.send(session::Control::Stop { now: false })
             }
@@ -215,6 +250,36 @@ impl App {
                 .servers
                 .send(crate::stratum_v2::view::ServerControl::Stop),
             Screen::Mining(_) | Screen::Setup => crate::session_control::stop_session(),
+        }
+    }
+
+    /// A close while a session runs waits for it to stop as Stop does; the
+    /// request is repeated until the session has bound its controls, then
+    /// the window closes. Runs from `logic`, so a minimized window too.
+    fn handle_close(&mut self, ctx: &egui::Context) {
+        if ctx.input(|input| input.viewport().close_requested()) && self.worker.is_some() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.closing = true;
+        }
+        if self
+            .interrupt
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            // Ctrl+C with no session closes the window; a stop that reached
+            // the window's flag before the session bound its own is kept.
+            if self.worker.is_some() {
+                self.stop_asked = true;
+            } else {
+                self.closing = true;
+            }
+        }
+        if self.worker.is_some() {
+            if self.closing || self.stop_asked {
+                self.stop();
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            }
+        } else if self.closing {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -235,6 +300,27 @@ impl App {
                 .map(|error| format!("Mining stopped: {error}")),
         );
         self.screen = Screen::Setup;
+        self.stop_asked = false;
+        // The setup takes Ctrl+C again.
+        self.interrupt
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = crate::session_control::install_stop(&self.interrupt);
+    }
+}
+
+impl Drop for App {
+    /// The window can close without the app seeing the request (an error
+    /// in the window system, the process asked to exit): the session is
+    /// stopped and its worker waited for, so claims and saves finish.
+    fn drop(&mut self) {
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        while !worker.is_finished() {
+            self.stop();
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        let _ = worker.join();
     }
 }
 
@@ -243,6 +329,7 @@ impl eframe::App for App {
     // screen), so a start and a finished session never wait for a frame.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.collect();
+        self.handle_close(ctx);
         if self.worker.is_some() {
             return;
         }
@@ -259,16 +346,6 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        if ctx.input(|input| input.viewport().close_requested()) && self.worker.is_some() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            if !self.closing {
-                self.stop();
-            }
-            self.closing = true;
-        }
-        if self.closing && self.worker.is_none() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
         let live = self.worker.is_some();
         match self.screen {
             Screen::Setup => {

@@ -78,20 +78,36 @@ it.
 
 ## Dashboard
 
-- Each token's hash rate, share, rewards and state.
+- Each token's hash rate, share, rewards, donation and state, with
+  **Reconnect** for PHOTON.
 - Ten minutes of hash rate, one lane per token, each on its own scale:
   tokens count different work, so their rates are never added.
 - Each GPU's rate, temperature, power, load and fan.
-- The job source, server and baton.
-- For ELECTRIC, its fee pot's address as text and as a QR code to fund it.
+- The job source, server (credentials removed, as in the terminal) and baton.
+- PHOTON alone: its payout and Fulcrum server can change while it mines, as
+  the terminal's `address` and `endpoint` commands do; with ELECTRIC or a
+  split they are set up again.
+- A coordinator's rigs, and the command each rig runs to join, with
+  **Copy**.
+- For ELECTRIC, its fee pot's address as text and as a QR code to fund it,
+  and for an owner-controlled pot **Max/send**: a destination, a preview
+  of what it receives and the fees, then **Send** for exactly that quote.
 - The session's events.
 
-**Pause**, the intensity slider and the split's **−**/**+** steer the running
-session as the terminal dashboard's keys do. **Stop** waits for a pending
-reward to settle, then saves the session's intensity, address and shares to
-its profile as leaving for profiles does. **Stop now** does not wait; a
-pending reward is kept and resolved by the next session. Closing the window
-while mining stops the same way as **Stop**.
+**Pause**, the intensity slider, each token's donation **−**/**+** and the
+split's **−**/**+** steer the running session as the terminal dashboard's
+keys do; with no text field in use, P or Space pauses, + and - step the
+intensity, B stops and Q closes the window. **Stop** works as the
+terminal's B: it refuses while every split share is 0, pauses the GPUs,
+waits for pending rewards to settle, then saves the session's intensity,
+address, donations and shares to its profile; **Keep mining** (or Esc)
+takes it back. **Stop now** does not wait or save, as the terminal's q: a
+pending reward is kept and resolved by the next session. While a session is
+still starting, **Stop** stops it as Ctrl+C would. Closing the window while
+mining stops as **Stop** does, minimized or not, and the window stays until
+the session has stopped. Ctrl+C in the terminal the window was started from
+closes the window from the setup, and stops a running session as in the
+terminal.
 
 With `PICKAXE_TUI_LOG` set, the window writes the terminal dashboard's log:
 events, and status lines every 10 seconds.

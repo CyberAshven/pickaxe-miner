@@ -13,14 +13,18 @@ const LINE_COLORS: [egui::Color32; 4] = [
     egui::Color32::from_rgb(218, 119, 242),
 ];
 
+/// How long the answer to a control stays on screen.
+const NOTICE_SHOWN: Duration = Duration::from_secs(8);
+
 pub fn show(ui: &mut egui::Ui, board: &Board, link: &Link) {
+    keys(ui, board, link);
     egui::Panel::top("bar").show(ui, |ui| top_bar(ui, board, link));
     egui::Panel::bottom("events")
         .resizable(true)
         .default_size(170.0)
         .show(ui, |ui| events(ui, board));
     egui::CentralPanel::default().show(ui, |ui| {
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::ScrollArea::both().show(ui, |ui| {
             stats(ui, board, link);
             ui.add_space(10.0);
             tokens(ui, board, link);
@@ -40,10 +44,45 @@ pub fn show(ui: &mut egui::Ui, board: &Board, link: &Link) {
             }
             if board.electric.is_some() {
                 ui.add_space(10.0);
-                pot(ui, board);
+                pot(ui, board, link);
             }
         });
     });
+}
+
+/// The terminal dashboard's keys, when no text field has the keyboard:
+/// P or Space pauses or resumes, + and - step the intensity by 5, B stops
+/// after pending rewards (Esc takes that back), Q closes the window.
+fn keys(ui: &mut egui::Ui, board: &Board, link: &Link) {
+    if !board.live || ui.ctx().memory(|memory| memory.focused().is_some()) {
+        return;
+    }
+    let pressed = |key| ui.input(|input| input.key_pressed(key));
+    if board.stopping {
+        if pressed(egui::Key::Escape) {
+            link.send(Control::KeepMining);
+        }
+        return;
+    }
+    if pressed(egui::Key::P) || pressed(egui::Key::Space) {
+        link.send(Control::Pause(!board.paused));
+    }
+    if pressed(egui::Key::Plus) || pressed(egui::Key::Equals) {
+        link.send(Control::Intensity(
+            board.intensity.saturating_add(5).min(100),
+        ));
+    }
+    if pressed(egui::Key::Minus) {
+        link.send(Control::Intensity(
+            board.intensity.saturating_sub(5).max(10),
+        ));
+    }
+    if pressed(egui::Key::B) {
+        link.send(Control::Stop { now: false });
+    }
+    if pressed(egui::Key::Q) {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+    }
 }
 
 fn state_text(board: &Board) -> String {
@@ -81,17 +120,36 @@ fn top_bar(ui: &mut egui::Ui, board: &Board, link: &Link) {
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if !board.live {
+                // Starting (shaders, the fee pot): nothing reads the
+                // session's controls yet, so stop it as Ctrl+C would.
+                if board.started.is_none()
+                    && board.error.is_none()
+                    && ui
+                        .button("Stop")
+                        .on_hover_text("Stop starting this session")
+                        .clicked()
+                {
+                    crate::session_control::stop_session();
+                }
                 return;
             }
             if board.stopping {
                 if ui
                     .button("Stop now")
                     .on_hover_text(
-                        "Stop without waiting; a pending reward is kept and resolved next time",
+                        "Stop without waiting or saving; a pending reward is kept and \
+                         resolved next time",
                     )
                     .clicked()
                 {
                     link.send(Control::Stop { now: true });
+                }
+                if ui
+                    .button("Keep mining")
+                    .on_hover_text("Take back Stop and resume mining")
+                    .clicked()
+                {
+                    link.send(Control::KeepMining);
                 }
                 return;
             }
@@ -155,7 +213,19 @@ fn stats(ui: &mut egui::Ui, board: &Board, link: &Link) {
             }
         });
         card(ui, "Rewards this session", |ui, _| {
-            ui.heading(rewards.to_string());
+            match board.tokens.as_slice() {
+                [_, _, ..] => {
+                    for (index, token) in board.tokens.iter().enumerate() {
+                        ui.label(
+                            egui::RichText::new(format!("{}  {}", token.name, token.rewards))
+                                .color(LINE_COLORS[index % LINE_COLORS.len()]),
+                        );
+                    }
+                }
+                _ => {
+                    ui.heading(rewards.to_string());
+                }
+            }
         });
         card(ui, "BCH height", |ui, _| {
             ui.heading(height.map_or_else(|| "–".into(), |height| height.to_string()));
@@ -194,9 +264,14 @@ fn tokens(ui: &mut egui::Ui, board: &Board, link: &Link) {
         .inner_margin(egui::Margin::same(10))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            if let Some(notice) = &board.notice {
-                ui.label(notice);
+            if let Some(notice) = board.notice.as_ref().filter(|_| {
+                board
+                    .notice_at
+                    .is_some_and(|at| at.elapsed() < NOTICE_SHOWN)
+            }) {
+                ui.colored_label(ui.visuals().warn_fg_color, notice);
                 ui.add_space(4.0);
+                ui.ctx().request_repaint_after(Duration::from_secs(1));
             }
             egui::Grid::new("tokens")
                 .num_columns(if split { 7 } else { 6 })
@@ -377,10 +452,15 @@ fn gpus(ui: &mut egui::Ui, board: &Board) {
                         ui.weak(heading);
                     }
                     ui.end_row();
-                    if board.gpus.is_empty() {
-                        ui.label("All");
+                    // ELECTRIC alone reports its GPUs together; a coordinator
+                    // whose rigs mine has none here.
+                    if board.gpus.is_empty() && board.telemetry.samples > 0 {
+                        ui.label("All GPUs");
                         ui.monospace("–");
                         telemetry_cells(ui, &board.telemetry);
+                        ui.end_row();
+                    } else if board.gpus.is_empty() {
+                        ui.weak("No GPU mines on this computer");
                         ui.end_row();
                     }
                     for gpu in &board.gpus {
@@ -410,7 +490,7 @@ fn chain(ui: &mut egui::Ui, board: &Board) {
                         ui.end_row();
                         if !snapshot.endpoint.is_empty() {
                             ui.weak("Server");
-                            ui.label(&snapshot.endpoint);
+                            ui.label(crate::tui::redact_endpoint(&snapshot.endpoint));
                             ui.end_row();
                         }
                         if !snapshot.baton_txid.is_empty() {
@@ -432,7 +512,7 @@ fn chain(ui: &mut egui::Ui, board: &Board) {
                     if let Some(electric) = &board.electric {
                         if let Some(endpoint) = &electric.endpoint {
                             ui.weak("ELECTRIC server");
-                            ui.label(endpoint);
+                            ui.label(crate::tui::redact_endpoint(endpoint));
                             ui.end_row();
                         }
                         if let Some(difficulty) = electric.difficulty {
@@ -451,24 +531,30 @@ fn chain(ui: &mut egui::Ui, board: &Board) {
 }
 
 /// A one-line text field kept across frames; returns the text when its
-/// button is pressed or Enter is pressed in it.
+/// button is pressed or Enter is pressed in it. The text stays until
+/// `applied` says the session took it, so a refused value can be fixed.
 fn apply_line(
     ui: &mut egui::Ui,
     label: &str,
     key: &str,
     hint: &str,
     button: &str,
+    applied: impl Fn(&str) -> bool,
 ) -> Option<String> {
     let id = egui::Id::unique(key);
     let mut value: String = ui.data(|data| data.get_temp(id)).unwrap_or_default();
+    if !value.is_empty() && applied(value.trim()) {
+        value.clear();
+    }
     let mut apply = None;
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         let label = ui.add_sized([110.0, 18.0], egui::Label::new(label));
+        let width = (ui.available_width() - 150.0).clamp(160.0, 420.0);
         let field = ui
             .add(
                 egui::TextEdit::singleline(&mut value)
                     .hint_text(hint)
-                    .desired_width(420.0),
+                    .desired_width(width),
             )
             .labelled_by(label.id);
         let entered = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
@@ -476,9 +562,6 @@ fn apply_line(
             apply = Some(value.trim().to_owned());
         }
     });
-    if apply.is_some() {
-        value.clear();
-    }
     ui.data_mut(|data| data.insert_temp(id, value));
     apply.filter(|value| !value.is_empty())
 }
@@ -505,6 +588,7 @@ fn settings(ui: &mut egui::Ui, board: &Board, link: &Link) {
                 "pickaxe.payout",
                 "bitcoincash:… or bchtest:…",
                 "Change payout",
+                |value| value == snapshot.payout_address,
             ) {
                 link.send(Control::SetPayout(address));
             }
@@ -515,6 +599,7 @@ fn settings(ui: &mut egui::Ui, board: &Board, link: &Link) {
                 "pickaxe.fulcrum",
                 "wss://host:port",
                 "Use this server",
+                |value| value == snapshot.endpoint,
             ) {
                 link.send(Control::SetFulcrum(Some(url)));
             }
@@ -598,8 +683,9 @@ fn rigs_panel(ui: &mut egui::Ui, rigs: &crate::rigs::RigSummary, join: &[(String
         });
 }
 
-/// ELECTRIC's fee pot: its address to fund, as text and a QR code.
-fn pot(ui: &mut egui::Ui, board: &Board) {
+/// ELECTRIC's fee pot: its address to fund, as text and a QR code, and for
+/// an owner-controlled pot its Max/send.
+fn pot(ui: &mut egui::Ui, board: &Board, link: &Link) {
     let Some(electric) = &board.electric else {
         return;
     };
@@ -631,11 +717,116 @@ fn pot(ui: &mut egui::Ui, board: &Board) {
                         }
                     }
                     if let Some(key) = &electric.pot_key {
-                        ui.weak(format!("Recovery key: {key}. Back it up."));
+                        ui.weak(format!("Recovery key file: {key}. Back it up."));
                     }
                 });
             });
+            if electric.withdrawal.enabled {
+                ui.add_space(8.0);
+                max_send(ui, &electric.withdrawal, board.network, link);
+            }
         });
+}
+
+/// Max/send from an owner-controlled pot, step by step as the terminal's
+/// pot view: enter a destination, preview the quote, then send exactly the
+/// quote shown. The session refuses a send whose quote was not drawn.
+fn max_send(
+    ui: &mut egui::Ui,
+    send: &crate::electric::withdrawal::View,
+    network: Option<crate::config::MiningNetwork>,
+    link: &Link,
+) {
+    use super::session::Withdraw;
+    use crate::electric::withdrawal::Phase;
+    let network = network.map_or("this network", |network| network.as_str());
+    ui.strong(format!(
+        "Max/send · {network} · plain BCH from this fee pot"
+    ));
+    let id = egui::Id::unique("pickaxe.max-send");
+    match send.phase {
+        Phase::Idle | Phase::Complete | Phase::Error => {
+            if !send.message.is_empty() {
+                ui.label(&send.message);
+            }
+            if ui
+                .button("Max/send…")
+                .on_hover_text("Send all of this pot's plain BCH to an address you choose")
+                .clicked()
+            {
+                ui.data_mut(|data| data.remove::<String>(id));
+                link.send(Control::Withdraw(Withdraw::Edit));
+            }
+        }
+        Phase::Editing => {
+            let mut destination: String = ui.data(|data| data.get_temp(id)).unwrap_or_default();
+            let mut prepare = false;
+            ui.horizontal_wrapped(|ui| {
+                let label = ui.label("Destination");
+                let field = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut destination)
+                            .hint_text("a BCH address")
+                            .desired_width((ui.available_width() - 160.0).clamp(160.0, 420.0)),
+                    )
+                    .labelled_by(label.id);
+                prepare =
+                    field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                prepare |= ui.button("Preview").clicked();
+                if ui.button("Cancel").clicked() {
+                    link.send(Control::Withdraw(Withdraw::Cancel));
+                }
+            });
+            ui.weak("Type or paste a BCH address, then Preview shows what it receives.");
+            if prepare && !destination.trim().is_empty() {
+                link.send(Control::Withdraw(Withdraw::Prepare(
+                    destination.trim().into(),
+                )));
+            }
+            ui.data_mut(|data| data.insert_temp(id, destination));
+        }
+        Phase::Preparing => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Finishing any pending claim; preparing Max/send…");
+            });
+        }
+        Phase::Preview => {
+            ui.monospace(format!("To: {}", send.destination));
+            ui.label(format!("Receive: {} sats", send.amount));
+            ui.label(format!(
+                "Total fee: {} sats · {} transaction(s)",
+                send.fee, send.count
+            ));
+            if !send.message.is_empty() {
+                ui.label(&send.message);
+            }
+            // This exact quote is now on screen.
+            link.send(Control::Withdraw(Withdraw::Presented(send.clone())));
+            ui.horizontal(|ui| {
+                if ui
+                    .button(format!("Send {} sats", send.amount))
+                    .on_hover_text("Sends this quote; it cannot be undone")
+                    .clicked()
+                {
+                    link.send(Control::Withdraw(Withdraw::Confirm));
+                }
+                if ui.button("Cancel").clicked() {
+                    link.send(Control::Withdraw(Withdraw::Cancel));
+                }
+            });
+        }
+        Phase::Sending => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(if send.message.is_empty() {
+                    "Sending…"
+                } else {
+                    send.message.as_str()
+                });
+            });
+        }
+    }
 }
 
 /// `text` as a QR code drawn in dark modules of `module` points on white,
