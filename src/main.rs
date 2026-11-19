@@ -747,6 +747,17 @@ fn runtime_config_from_cli_with_base(
     if let Some(value) = &args.node_zmq {
         cfg.set_node_zmq(value)?;
     }
+    // #### Pool modes: your own P2Pool's settings, over a profile's.
+    args.check_p2pool_flags()?;
+    if let Some(address) = &args.node_p2p {
+        cfg.p2pool.node_p2p = Some(config::validate_node_p2p(address)?);
+    }
+    if let Some(donation) = args.p2pool_donation {
+        cfg.p2pool.donation = Some(donation);
+    }
+    if args.p2pool_standalone {
+        cfg.p2pool.standalone = true;
+    }
     if let Some(source) = &args.source {
         cfg.set_source(source)?;
     }

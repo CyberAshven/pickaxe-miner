@@ -579,6 +579,9 @@ mod tests {
             zmq: "tcp://node.example:28332".into(),
             bootstrap_address: String::new(),
             authority_secret: [7; 32],
+            node_p2p: None,
+            operator: None,
+            standalone: false,
         };
         let view = View {
             network: MiningNetwork::Chipnet,

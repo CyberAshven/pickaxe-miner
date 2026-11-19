@@ -36,7 +36,9 @@ use std::{
 use stratum_core::bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
 
 const MAX_CONNECTIONS: usize = 64;
-const TEMPLATE_RECOVERY_GRACE: Duration = Duration::from_secs(3);
+/// #### Pool modes: also how long your own P2Pool node may serve no work
+/// before devices leave it for a fallback pool (`sv1::Preferred::down`).
+pub(super) const TEMPLATE_RECOVERY_GRACE: Duration = Duration::from_secs(3);
 
 // No Debug: contains a local authority secret and payout configuration.
 pub struct ServerConfig {

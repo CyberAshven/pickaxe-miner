@@ -122,6 +122,8 @@ pub const RETURN_AFTER: Duration = Duration::from_secs(30);
 #[derive(Debug)]
 pub struct Preferred {
     healthy_since: Mutex<Option<Instant>>,
+    /// #### Pool modes: since when it has served no work, if it is down.
+    down_since: Mutex<Option<Instant>>,
     return_after: Duration,
 }
 
@@ -137,6 +139,7 @@ impl Preferred {
     pub fn with_return_after(return_after: Duration) -> Self {
         Self {
             healthy_since: Mutex::new(None),
+            down_since: Mutex::new(None),
             return_after,
         }
     }
@@ -150,6 +153,27 @@ impl Preferred {
                 _ => (),
             }
         }
+        if let Ok(mut down) = self.down_since.lock() {
+            match (healthy, *down) {
+                (false, None) => *down = Some(now),
+                (true, Some(_)) => *down = None,
+                _ => (),
+            }
+        }
+    }
+
+    /// #### Pool modes: whether the source has served no work for the
+    /// solo fallback's grace (`server::TEMPLATE_RECOVERY_GRACE`): devices
+    /// then leave it and skip it for the fallback pools. Never before it
+    /// was first marked.
+    pub fn down(&self, now: Instant) -> bool {
+        self.down_since
+            .lock()
+            .ok()
+            .and_then(|since| *since)
+            .is_some_and(|since| {
+                now.saturating_duration_since(since) >= super::server::TEMPLATE_RECOVERY_GRACE
+            })
     }
 
     /// Whether devices on a fallback pool should come back: the source has
@@ -186,7 +210,91 @@ pub struct Upstream {
     pub prefer: Option<Arc<Preferred>>,
     /// #### PR #42: this server mines a token that fixes the version slot.
     pub fixed_version: bool,
+    /// #### Pool modes: each device's channel opens at authorize under its
+    /// miner's own login (`miner_login`), never under `identity`, which
+    /// then only names the donation's form.
+    pub miners: Option<MinerLogins>,
+    /// #### Pool modes: this upstream is the preferred source itself (your
+    /// own P2Pool node): devices leave it, and skip it, once it has served
+    /// no work for the grace (`Preferred::down`).
+    pub serving: Option<Arc<Preferred>>,
 }
+
+// #### Pool modes: one upstream channel per miner identity
+// What: at a Non-custodial Pool (your own P2Pool with --public) each
+// device's channel at P2Pool opens at authorize under its miner's own
+// payout, `<payout>[.worker],p2p=<share address>` (the share address of
+// that payout's key, as the server's own identity is built), never the
+// owner's. A payout P2Pool cannot pay (a p address, or none) is refused at
+// authorize with the reason. The login's `,donation=` is the miner's
+// Pickaxe donation (the pool's setting otherwise) and never reaches
+// P2Pool, whose own donation is the operator's setting. At a fallback pool
+// the identity is `<payout>[.worker]`.
+// Why: P2Pool pays each share's owner; under the owner's identity every
+// miner's work would pay the owner.
+// Look here if: a Pool-mode device mines for the wrong address, or a q
+// address is refused.
+/// #### Pool modes: how devices' logins become identities upstream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MinerLogins {
+    pub network: crate::config::MiningNetwork,
+    /// The upstream is BCH P2Pool: the identity names the share address.
+    pub p2pool: bool,
+}
+
+/// #### Pool modes: a miner's identity upstream and the Pickaxe donation
+/// their login chose, if any.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MinerLogin {
+    pub identity: String,
+    pub donation: Option<BchDonation>,
+}
+
+/// The reason a payout P2Pool cannot pay is refused.
+pub const P2PKH_ONLY: &str =
+    "P2Pool pays shares to a key: the username must be a P2PKH (q) address on this network";
+
+/// #### Pool modes: the upstream identity of a device's `username`
+/// (`<payout>[.worker][,options]`): the payout read as a public pool reads
+/// it (`payout::identity_login`, which also reads its donation choice).
+pub fn miner_login(logins: MinerLogins, username: &str) -> Result<MinerLogin, String> {
+    let login = super::payout::identity_login(logins.network, username)?;
+    let (user, options) = username
+        .trim()
+        .split_once(',')
+        .unwrap_or((username.trim(), ""));
+    let identity = match user.trim().split_once('.') {
+        Some((_, worker)) if !worker.is_empty() => format!("{}.{worker}", login.payout),
+        _ => login.payout.clone(),
+    };
+    if !logins.p2pool {
+        return Ok(MinerLogin {
+            identity,
+            donation: login.donation,
+        });
+    }
+    let share = crate::tx::p2pool_share_address(&login.payout).map_err(|_| P2PKH_ONLY)?;
+    if options
+        .split(',')
+        .filter_map(|option| option.trim().strip_prefix("p2p="))
+        .any(|given| given.trim() != share)
+    {
+        return Err(
+            "p2p= must be your payout's own share address; leave it out and the pool adds it"
+                .into(),
+        );
+    }
+    Ok(MinerLogin {
+        identity: format!("{identity},p2p={share}"),
+        donation: login.donation,
+    })
+}
+
+/// #### Pool modes: why a session at your own P2Pool node ends, or skips
+/// it: the solo server's own reason, so the workers page reads the same.
+const NOT_SERVING: &str = "template source unavailable; reconnect when healthy";
+/// #### Pool modes: a login refused at authorize, on the workers page.
+const REFUSED_LOGIN: &str = "login refused";
 
 /// #### PR #40: the identity the adapter's channels open with at this
 /// server's own listener; not a worker name.
@@ -204,7 +312,17 @@ impl Upstream {
             public: false,
             prefer: None,
             fixed_version: false,
+            miners: None,
+            serving: None,
         }
+    }
+
+    /// #### Pool modes: whether devices leave this upstream now, or skip
+    /// it: it is the preferred source and has served no work for the grace.
+    pub fn down(&self, now: Instant) -> bool {
+        self.serving
+            .as_ref()
+            .is_some_and(|serving| serving.down(now))
     }
 
     /// #### PR #40: this server's own listener running a public pool.
@@ -328,6 +446,11 @@ fn serve(
     let mut failure = String::from("SV2 server unavailable");
     let mut chosen = None;
     for upstream in upstreams {
+        // #### Pool modes: your own P2Pool node while it serves no work.
+        if upstream.down(Instant::now()) {
+            failure = NOT_SERVING.into();
+            continue;
+        }
         match open(upstream) {
             Ok(opened) => {
                 chosen = Some((upstream, opened));
@@ -436,9 +559,15 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
     // only here (a remote pool may not know the negotiation).
     let merge = !upstream.remote && negotiate_merge(&mut send, &mut receive)?;
     // #### PR #40: a public pool opens the device's channel at authorize.
-    if upstream.public {
+    // #### Pool modes: so does a pool where each miner mines under their own
+    // login, with the donation's route.
+    if upstream.public || upstream.miners.is_some() {
+        let bridge = match upstream.miners {
+            Some(logins) => Bridge::miners(logins, upstream.remote, upstream.donation.clone()),
+            None => Bridge::public(),
+        };
         return Ok(Opened {
-            bridge: Bridge::public()
+            bridge: bridge
                 .with_fixed_version(upstream.fixed_version)
                 .with_merge(merge),
             send,
@@ -665,6 +794,13 @@ fn serve_session(
         {
             send.close();
             return Ok(());
+        }
+        // #### Pool modes: and sessions at your own P2Pool node end once it
+        // has served no work for the grace, as the solo server's do; the
+        // device reconnects to the first fallback pool that takes it.
+        if upstream.down(Instant::now()) {
+            send.close();
+            return Err(NOT_SERVING.into());
         }
         if upstream.remote {
             // Firmware already has its reply; a verdict that never comes is
@@ -915,6 +1051,15 @@ struct Bridge {
     /// mining.configure (`merge_wanted`, the `pickaxe-merge` extension).
     merge_available: bool,
     merge_wanted: bool,
+    /// #### Pool modes: devices open their channel under their miner's own
+    /// login (`miner_login`).
+    miners: Option<MinerLogins>,
+    /// #### Pool modes: the Pickaxe donation the miner's login chose, for
+    /// the donation's route once the channel opens.
+    chosen: Option<BchDonation>,
+    /// #### Pool modes: the identity asked for once more if the pool
+    /// refuses the one with `,pickaxe-donation=0`.
+    retry_identity: Option<String>,
 }
 
 /// #### PR #40
@@ -926,8 +1071,11 @@ enum Public {
     /// Waiting for the device's username.
     Waiting,
     /// The channel request to send, and the authorize to answer.
+    /// #### Pool modes: `identity` is what the channel opens under: the
+    /// username, or the miner's identity upstream.
     Asking {
         name: String,
+        identity: String,
         authorize: u64,
     },
     /// Sent; the authorize is answered when the server replies.
@@ -991,6 +1139,9 @@ impl Bridge {
             fixed: false,
             merge_available: false,
             merge_wanted: false,
+            miners: None,
+            chosen: None,
+            retry_identity: None,
         })
     }
 
@@ -1097,23 +1248,43 @@ impl Bridge {
             fixed: false,
             merge_available: false,
             merge_wanted: false,
+            miners: None,
+            chosen: None,
+            retry_identity: None,
+        }
+    }
+
+    /// #### Pool modes: a device whose channel opens at authorize under its
+    /// miner's own login, at a remote pool with the donation's `route`.
+    fn miners(logins: MinerLogins, remote: bool, route: Option<DonationRoute>) -> Self {
+        Self {
+            remote,
+            route: route.filter(|_| remote),
+            miners: Some(logins),
+            ..Self::public()
         }
     }
 
     /// #### PR #40: a public pool's channel request, sent once.
     fn channel_request(&mut self) -> Result<Option<OpenExtendedMiningChannelOwned>, String> {
-        let Public::Asking { name, authorize } = &self.public else {
+        let Public::Asking {
+            name,
+            identity,
+            authorize,
+        } = &self.public
+        else {
             return Ok(None);
         };
-        let (name, authorize) = (name.clone(), *authorize);
-        self.public = Public::Opening {
-            name: name.clone(),
-            authorize,
-        };
+        let (name, identity, authorize) = (name.clone(), identity.clone(), *authorize);
+        self.public = Public::Opening { name, authorize };
         sv1_to_sv2::build_sv2_open_extended_mining_channel(
             1,
-            name,
-            1.0,
+            identity,
+            if self.remote {
+                REMOTE_NOMINAL_HASHRATE
+            } else {
+                1.0
+            },
             Target::from_le_bytes([255; 32]),
             (POOL_EXTRANONCE1 + POOL_EXTRANONCE2) as u16,
         )
@@ -1422,9 +1593,34 @@ impl Bridge {
                     && !auth.name.chars().any(char::is_control);
                 // #### PR #40: in a public pool the username is the payout,
                 // so the server decides; the answer waits for its reply.
-                if accepted && matches!(self.public, Public::Waiting) {
+                // #### Pool modes: a login the pool cannot pay is refused
+                // here, with the reason; at a fallback pool that is not
+                // P2Pool the channel asks for no second donation, as `open`
+                // does, and once more without that if refused.
+                let login = self
+                    .miners
+                    .filter(|_| accepted)
+                    .map(|logins| (logins, miner_login(logins, &auth.name)));
+                if let Some((_, Err(reason))) = &login {
+                    self.local_rejection = Some(REFUSED_LOGIN);
+                    out.push(reject(id, 24, reason));
+                } else if accepted && matches!(self.public, Public::Waiting) {
+                    let identity = match login {
+                        Some((logins, Ok(login))) => {
+                            self.chosen = login.donation;
+                            let zero = self.remote && !logins.p2pool && self.route.is_some();
+                            self.retry_identity = zero.then(|| login.identity.clone());
+                            if zero {
+                                format!("{},pickaxe-donation=0", login.identity)
+                            } else {
+                                login.identity
+                            }
+                        }
+                        _ => auth.name.clone(),
+                    };
                     self.public = Public::Asking {
                         name: auth.name.clone(),
+                        identity,
                         authorize: id,
                     };
                 } else {
@@ -1602,6 +1798,12 @@ impl Bridge {
                 }
                 self.user = Lane::new(&opened)?;
                 self.worker = Some(name);
+                self.retry_identity = None;
+                // #### Pool modes: the miner's own Pickaxe donation, or the
+                // pool's setting (read live) when the login chose none.
+                if let (Some(choice), Some(route)) = (self.chosen, self.route.as_mut()) {
+                    route.rate = Arc::new(RwLock::new(choice));
+                }
                 out.push(json!({"id":authorize,"result":true,"error":null}));
             }
             MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR
@@ -1609,7 +1811,7 @@ impl Bridge {
             {
                 let error: OpenMiningChannelError =
                     binary_sv2::from_bytes(frame.payload()).map_err(|_| "invalid channel error")?;
-                let Public::Opening { authorize, .. } =
+                let Public::Opening { name, authorize } =
                     std::mem::replace(&mut self.public, Public::Waiting)
                 else {
                     return Err("unexpected SV2 channel error".into());
@@ -1617,10 +1819,31 @@ impl Bridge {
                 if error.request_id != 1 {
                     return Err("unexpected SV2 channel error".into());
                 }
+                // #### Pool modes: once more without `,pickaxe-donation=0`.
+                if let Some(identity) = self.retry_identity.take() {
+                    self.public = Public::Asking {
+                        name,
+                        identity,
+                        authorize,
+                    };
+                    return Ok((out, verdicts));
+                }
                 // #### merge-mining v2: a malformed `,donation=` says so.
                 if error.error_code.as_ref() == b"invalid-donation" {
                     self.local_rejection = Some("invalid donation option");
                     out.push(reject(authorize, 24, super::payout::DONATION_OPTION_ERROR));
+                } else if self.remote {
+                    // #### Pool modes: the pool's own reason.
+                    self.local_rejection = Some(REFUSED_LOGIN);
+                    let code: String = String::from_utf8_lossy(error.error_code.as_ref())
+                        .chars()
+                        .filter(|character| !character.is_control())
+                        .collect();
+                    out.push(reject(
+                        authorize,
+                        24,
+                        &format!("the pool refused this login ({code})"),
+                    ));
                 } else {
                     self.local_rejection = Some("username is not a payout address");
                     out.push(reject(

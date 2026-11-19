@@ -38,6 +38,39 @@ to the internet, through your router's port forwarding or on a server. SV1
 is not encrypted; SV2 is, and miners pin the authority key the server prints
 when it starts.
 
+## A Non-custodial Pool, or P2Pool v2
+
+#### Pool modes
+
+The server above is a **Public Solo Endpoint**: each miner keeps the blocks
+they find. In a **Non-custodial Pool**, people on your server share every
+block by their work: P2Pool runs inside, on its own share chain, alone.
+**P2Pool v2** is the same, linked with other P2Pool servers. There is no
+pool wallet either way: each block's coinbase pays everyone directly.
+
+```text
+pickaxe_miner stratum-v2 serve --config pool.json \
+  --listen 0.0.0.0:3336 --sv1-listen 0.0.0.0:3333 \
+  --own-p2pool --public [--p2pool-standalone] \
+  --pool-fee 1 --pool-fee-address <q or p address> --pool-tag /MyPool/ \
+  [--p2pool-donation 1] [--fallback-pool stratum2+tcp://HOST:PORT/KEY]
+```
+
+Miners connect as below, with a `q` (P2PKH) address as their username, as
+P2Pool pays shares to a key; each mines under their own address, never
+yours. Four cuts, each separate:
+
+| Cut | Goes to | Set by | Paid as |
+|---|---|---|---|
+| Pickaxe donation | the Pickaxe project, paid by whoever runs Pickaxe (you) | your donation setting; a miner may choose their own with `,donation=` | mining work, on a second channel at P2Pool |
+| P2Pool donation | the P2Pool project | you, as P2Pool's runner: `--p2pool-donation`, 0% to 10% (1% default) | each block's coinbase |
+| Operator fee | you, the host | `--pool-fee` (at most 10%, from what P2Pool's donation leaves) and `--pool-fee-address` | each block's coinbase only |
+| The rest | the miners | | each block's coinbase, by their work |
+
+`--pool-tag` is P2Pool's pool signature here (at most 16 characters).
+Details, fallback pools and nodes without ZMQ are in
+[p2pool.md](p2pool.md#pool-modes).
+
 ## Running the pool as a service
 
 The ASIC server has run this way on Debian since 2026-10-08 (solo, on
@@ -193,7 +226,7 @@ terminal, and the details, see [farm.md](farm.md#a-public-gpu-pool).
 
 ## Not yet
 
-- Shared rewards, where every miner gets part of every block: that is P2Pool
-  v2 (coming), also without custody.
+- Shared rewards are the Non-custodial Pool and P2Pool v2 above; their
+  setup screens come next.
 - Tested end to end with simulated SV1 and SV2 devices on a test node, not
   yet with real public miners.
