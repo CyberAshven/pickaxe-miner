@@ -2,12 +2,16 @@
 //! to look at them without a desktop:
 //! `cargo test --features gui-preview -- --ignored gui_preview`
 //! writes them to `PICKAXE_GUI_PREVIEW_DIR` (default `target/gui-preview`).
+#[cfg(feature = "stratum-v2")]
+use super::asic::{self, AsicBoard, AsicLink, Page};
 use super::dashboard;
 use super::session::{Board, GpuLine, Link, TokenLine, HISTORY_CAP};
 use super::setup::Setup;
 use crate::backend::{BackendKind, GpuDevice};
 use crate::config::{MiningNetwork, MiningProfiles, RuntimeConfig, SavedConfig};
 use crate::runtime::{RuntimeSnapshot, SupervisorState};
+#[cfg(feature = "stratum-v2")]
+use crate::stratum_v2::telemetry::DeviceSnapshot;
 use crate::telemetry::GpuTelemetry;
 use crate::tui::{SetupDriver, SetupInput};
 use eframe::egui;
@@ -31,6 +35,7 @@ fn save(name: &str, size: [f32; 2], ui: impl FnMut(&mut egui::Ui)) {
         .with_size(size)
         .wgpu()
         .build_ui(ui);
+    harness.ctx.set_fonts(super::fonts());
     harness.run_steps(4);
     let image = harness.render().expect("render the screen");
     let path = out_dir().join(name);
@@ -215,6 +220,148 @@ fn coordinator_board() -> Board {
     board
 }
 
+#[cfg(feature = "stratum-v2")]
+fn asic_device(label: &str, connected: bool, rate: f64, model: &str) -> DeviceSnapshot {
+    DeviceSnapshot {
+        label: label.into(),
+        protocol: "SV1",
+        connected,
+        channels: 1,
+        accepted: if connected { 1_284 } else { 312 },
+        rejected: if connected { 3 } else { 9 },
+        adapter_rejected: 0,
+        last_rejection: (!connected).then_some("stale job"),
+        hashrate_estimate: connected.then_some(rate),
+        hashrate_hour: Some(rate * 0.98),
+        difficulty: Some(65_536.0),
+        best_share: Some(2.5e6),
+        estimate_seconds: 300.0,
+        last_share_seconds: Some(if connected { 4 } else { 900 }),
+        connection_error: (!connected).then_some("SV1 disconnected"),
+        adapter_error: None,
+        reported_hashrate: connected.then_some(rate * 1.02),
+        temperature_c: connected.then_some(64.0),
+        fan: connected.then(|| "62%".into()),
+        model: Some(model.into()),
+        firmware: Some("2025.03".into()),
+        power_w: connected.then_some(140.0),
+    }
+}
+
+/// A solo server with three workers, as a Chipnet test farm shows it.
+#[cfg(feature = "stratum-v2")]
+fn asic_board() -> AsicBoard {
+    use crate::stratum_v2::view::{ConnectInfo, ConnectLine, ServeMode, ServerFrame};
+    let devices = vec![
+        asic_device("rig1 #1", true, 6.1e12, "Avalonminer AvalonNano3s"),
+        asic_device("rig2 #2", true, 1.2e12, "Bitaxe Gamma"),
+        asic_device("garage #3", false, 9.8e12, "Antminer S19"),
+    ];
+    let line = |place, sv2, url: &str| ConnectLine {
+        place,
+        sv2,
+        url: url.into(),
+    };
+    use crate::reach::Place;
+    let key = "9fXpAuthorityKeyExampleOnly2kq";
+    let stats = crate::stratum_v2::server::ServerStats {
+        connections: 2,
+        shares_accepted: 2_568,
+        shares_rejected: 6,
+        blocks_accepted: 1,
+        blocks_pending: 1,
+        template_ready: true,
+        height: Some(298_114),
+        nodes: 1,
+        best_share: Some((2.5e6, "rig1 #1".into())),
+        sessions_started: 5,
+        ..Default::default()
+    };
+    let frame = ServerFrame {
+        network: MiningNetwork::Chipnet,
+        title: "Pickaxe · BCH ASIC mining",
+        mode: ServeMode::Solo,
+        joining: false,
+        pool: None,
+        node_client: Some("Bitcoin Cash Node 29.1.0".into()),
+        stats,
+        devices,
+        lights: vec![(
+            "Node",
+            crate::p2pool::launch::Light::Green,
+            "templates ready · height 298114".into(),
+        )],
+        donation: crate::donation::bch::BchDonation::default(),
+        setting_error: None,
+        header: "chipnet · Node Ready (Bitcoin Cash Node 29.1.0) · Height 298114 · Donation 1.50% \
+                 (0.50% of work · 1.00% of block rewards and token wins)\n2 of 3 workers online · \
+                 7.30 TH/s · Shares 2568 accepted / 6 rejected · Blocks 1 accepted / 1 pending\n\
+                 Point devices at: SV1 stratum+tcp://192.168.1.20:3333 · SV2 192.168.1.20:3336"
+            .into(),
+        overview:
+            "chipnet · Node Ready (Bitcoin Cash Node 29.1.0) · Height 298114 · Donation 1.50% \
+                   (0.50% of work · 1.00% of block rewards and token wins)\nDevices 2 · Sessions 5 \
+                   · Shares 2568 accepted / 6 rejected (0 at SV1 adapter)\nValidated work: \
+                   donation 0.51% · fee 0.00%\nBlocks 1 accepted / 1 pending / 0 rejected · \
+                   Retries 0 · Last accepted\nConnection errors: SV2 0 / SV1 1\nTemplate errors 0 \
+                   · Last None · ZMQ 14 notices\nSV2 0.0.0.0:3336 · SV1 0.0.0.0:3333\nAuthority \
+                   9fXpAuthorityKeyExampleOnly2kq\nBest share 2.50M by rig1 #1 · Recent blocks \
+                   #298113 rig1 #1 accepted 12m ago"
+                .into(),
+        advanced: "0.50% of mining work and 1.00% of each block reward and merge-mined token win \
+                   go to the Pickaxe donation address. A token whose covenant takes no split \
+                   gives the whole 1.50% as mining work instead.\nThe default is 1.50%; any \
+                   setting from 0% to 100% works, in 0.5% steps. Changes apply to new jobs and \
+                   are saved."
+            .into(),
+        started: "Set when the server started (change them in the setup's Advanced section or on \
+                  the command line; they apply after a restart):\nListening  SV2 0.0.0.0:3336 · \
+                  SV1 0.0.0.0:3333 · Templates 0.0.0.0:48442\nStart difficulty  4,096; vardiff \
+                  then moves each device toward 20 shares a minute\n"
+            .into(),
+        devices_hint:
+            "Point devices at: SV1 stratum+tcp://192.168.1.20:3333 · SV2 192.168.1.20:3336".into(),
+        connect: ConnectInfo {
+            lines: vec![
+                line(
+                    Place::LocalNetwork,
+                    false,
+                    "stratum+tcp://192.168.1.20:3333",
+                ),
+                line(Place::Tailscale, false, "stratum+tcp://100.64.0.7:3333"),
+                line(
+                    Place::LocalNetwork,
+                    true,
+                    &format!("stratum2+tcp://192.168.1.20:3336/{key}"),
+                ),
+                line(
+                    Place::Tailscale,
+                    true,
+                    &format!("stratum2+tcp://100.64.0.7:3336/{key}"),
+                ),
+            ],
+            templates: vec![line(Place::LocalNetwork, true, "192.168.1.20:48442")],
+            notes: "\nUsername: any name for the device; it names the device on the workers \
+                    page. Every block pays this server's payout address.\nPassword: anything; it \
+                    is not checked.\nASICs in another place connect to a computer there running \
+                    Pickaxe with Join a pool, pointed at an SV2 line above; only encrypted SV2 \
+                    crosses the internet.\n"
+                .into(),
+            template_config: Some(format!(
+                "[template_provider_type.Sv2Tp]\naddress = \"192.168.1.20:48442\"\npublic_key = \
+                 \"{key}\"\n"
+            )),
+        },
+        panel: None,
+    };
+    AsicBoard {
+        live: true,
+        frame: Some(frame),
+        started: Instant::now().checked_sub(Duration::from_secs(26 * 3600 + 4 * 60)),
+        ..AsicBoard::default()
+    }
+}
+
 #[test]
 #[ignore = "renders with the GPU; run on request"]
 fn gui_preview() {
@@ -382,4 +529,36 @@ fn setup_previews() {
     let mut driver = settings();
     click(&mut driver, "Fulcrum");
     shot("setup-connections.png", SIZE, driver);
+}
+
+/// The ASIC server's pages and its Device panel.
+#[cfg(feature = "stratum-v2")]
+#[test]
+#[ignore = "renders with the GPU; run on request"]
+fn gui_preview_asic() {
+    let mut asic = asic_board();
+    let servers = AsicLink::default();
+    for (name, page) in [
+        ("asic-workers.png", Page::Workers),
+        ("asic-overview.png", Page::Overview),
+        ("asic-connection.png", Page::Connection),
+        ("asic-advanced.png", Page::Advanced),
+    ] {
+        save(name, SIZE, |ui| {
+            asic::open_page(ui.ctx(), page);
+            asic::show(ui, &asic, &servers)
+        });
+    }
+    if let Some(frame) = asic.frame.as_mut() {
+        frame.panel = Some(
+            "Worker  rig1 #1 · Online\nAvalonminer AvalonNano3s · firmware 2025.03 · 140 W\n\
+             Reached on: local network\nIdentified by asic-rs: AvalonMiner\n\n1  Restart\n2  \
+             Pause mining\n3  Locate (blink the LED)\n4  Fan speed…\n5  Power mode…\n6  Pools…\n\
+             l  Enter this device's login\n\nEsc  Back to workers\n\nActions go straight to the \
+             device, on your local network or Tailscale. Each one needs your confirmation. The \
+             device's address is never shown."
+                .into(),
+        );
+    }
+    save("asic-panel.png", SIZE, |ui| asic::show(ui, &asic, &servers));
 }

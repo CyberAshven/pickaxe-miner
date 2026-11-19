@@ -15,6 +15,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
+/// The BCH ASIC server's dashboard.
+#[cfg(feature = "stratum-v2")]
+mod asic;
 mod dashboard;
 mod launch;
 #[cfg(all(test, feature = "gui-preview"))]
@@ -44,6 +47,12 @@ pub fn run(start: Start) -> Result<(), String> {
     crate::tui::show_sessions_in(Box::new(session::WindowView(Arc::clone(&link))))?;
     let rigs = Arc::new(rig::RigLink::default());
     crate::rigs::show_rigs_in(Box::new(rig::WindowRigView(Arc::clone(&rigs))))?;
+    #[cfg(feature = "stratum-v2")]
+    let servers = Arc::new(asic::AsicLink::default());
+    #[cfg(feature = "stratum-v2")]
+    crate::stratum_v2::view::show_servers_in(Box::new(asic::WindowServerView(Arc::clone(
+        &servers,
+    ))))?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Pickaxe")
@@ -58,9 +67,18 @@ pub fn run(start: Start) -> Result<(), String> {
         options,
         Box::new(move |cc| {
             release_own_console();
+            cc.egui_ctx.set_fonts(fonts());
             link.set_context(cc.egui_ctx.clone());
             rigs.set_context(cc.egui_ctx.clone());
-            Ok(Box::new(App::new(start, link, rigs)))
+            #[cfg(feature = "stratum-v2")]
+            servers.set_context(cc.egui_ctx.clone());
+            Ok(Box::new(App::new(
+                start,
+                link,
+                rigs,
+                #[cfg(feature = "stratum-v2")]
+                servers,
+            )))
         }),
     )
     .map_err(|error| format!("open the window: {error}"))
@@ -82,6 +100,17 @@ fn release_own_console() {
             unsafe { FreeConsole() };
         }
     }
+}
+
+/// egui's bundled fonts, with the monospace font (Hack) last in the
+/// proportional chain: it has the arrows, blocks and box lines the
+/// terminal's text uses (← →, █ ░, ▾ ▸), which the proportional font lacks.
+pub(crate) fn fonts() -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some(chain) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        chain.push("Hack".to_owned());
+    }
+    fonts
 }
 
 /// The window draws on the low-power GPU where a computer has two, so the
@@ -107,6 +136,8 @@ struct App {
     start: Start,
     link: Arc<session::Link>,
     rigs: Arc<rig::RigLink>,
+    #[cfg(feature = "stratum-v2")]
+    servers: Arc<asic::AsicLink>,
     setup: setup::Setup,
     screen: Screen,
     worker: Option<JoinHandle<Result<(), String>>>,
@@ -115,7 +146,12 @@ struct App {
 }
 
 impl App {
-    fn new(start: Start, link: Arc<session::Link>, rigs: Arc<rig::RigLink>) -> Self {
+    fn new(
+        start: Start,
+        link: Arc<session::Link>,
+        rigs: Arc<rig::RigLink>,
+        #[cfg(feature = "stratum-v2")] servers: Arc<asic::AsicLink>,
+    ) -> Self {
         let setup = setup::Setup::new(setup::Inputs {
             cfg: start.cfg.clone(),
             config_path: start.config_path.clone(),
@@ -126,6 +162,8 @@ impl App {
             start,
             link,
             rigs,
+            #[cfg(feature = "stratum-v2")]
+            servers,
             setup,
             screen: Screen::Setup,
             worker: None,
@@ -139,12 +177,19 @@ impl App {
         let screen = launch::screen_for(&result);
         self.link.reset();
         self.rigs.reset();
+        #[cfg(feature = "stratum-v2")]
+        self.servers.reset();
         let config_path = self.start.config_path.clone();
         let cli_node_zmq = self.start.cli_node_zmq;
         let link = Arc::clone(&self.link);
+        #[cfg(feature = "stratum-v2")]
+        let servers = Arc::clone(&self.servers);
         self.worker = Some(std::thread::spawn(move || {
             let mined = launch::run(&result, &config_path, cli_node_zmq);
-            link.finished(mined.as_ref().err().cloned());
+            let error = mined.as_ref().err().cloned();
+            #[cfg(feature = "stratum-v2")]
+            servers.finished(error.clone());
+            link.finished(error);
             mined
         }));
         self.screen = Screen::Mining(screen);
@@ -157,13 +202,18 @@ impl App {
         }
     }
 
-    /// Stops the session shown: tokens settle a pending reward first; rig
-    /// mode and the ASIC server stop as Ctrl+C stops them.
+    /// Stops the session shown: tokens settle a pending reward first; the
+    /// ASIC server stops through its own control; rig mode stops as Ctrl+C
+    /// stops it.
     fn stop(&self) {
         match self.screen {
             Screen::Mining(launch::Screen::Tokens) => {
                 self.link.send(session::Control::Stop { now: false })
             }
+            #[cfg(feature = "stratum-v2")]
+            Screen::Mining(launch::Screen::Asic) => self
+                .servers
+                .send(crate::stratum_v2::view::ServerControl::Stop),
             Screen::Mining(_) | Screen::Setup => crate::session_control::stop_session(),
         }
     }
@@ -235,7 +285,12 @@ impl eframe::App for App {
                 live,
                 &crate::session_control::stop_session,
             ),
-            Screen::Mining(launch::Screen::Asic) => asic(ui, live),
+            #[cfg(feature = "stratum-v2")]
+            Screen::Mining(launch::Screen::Asic) => {
+                asic::show(ui, &self.servers.board(), &self.servers)
+            }
+            #[cfg(not(feature = "stratum-v2"))]
+            Screen::Mining(launch::Screen::Asic) => without_asic_server(ui),
         }
         if live {
             // The worker also asks for a frame whenever the session moves.
@@ -244,27 +299,11 @@ impl eframe::App for App {
     }
 }
 
-/// The BCH ASIC server while it runs; its dashboard is still to come.
-fn asic(ui: &mut egui::Ui, live: bool) {
-    egui::Panel::top("asic-bar").show(ui, |ui| {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Pickaxe").size(20.0).strong());
-            ui.label(egui::RichText::new("ASIC").monospace());
-            ui.separator();
-            ui.label(if live { "Running" } else { "Stopped" });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if live && ui.button("Stop").clicked() {
-                    crate::session_control::stop_session();
-                }
-            });
-        });
-        ui.add_space(4.0);
-    });
+/// A build without Stratum V2 has no ASIC server; its start fails at once
+/// and the window returns to the setup with the reason.
+#[cfg(not(feature = "stratum-v2"))]
+fn without_asic_server(ui: &mut egui::Ui) {
     egui::CentralPanel::default().show(ui, |ui| {
-        ui.add_space(24.0);
-        ui.heading("The BCH ASIC server is running.");
-        ui.add_space(6.0);
-        ui.label("Stop stops it and returns to the setup.");
+        ui.label("This build does not include the BCH ASIC server (Stratum V2).");
     });
 }
