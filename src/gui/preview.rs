@@ -4,11 +4,12 @@
 //! writes them to `PICKAXE_GUI_PREVIEW_DIR` (default `target/gui-preview`).
 use super::dashboard;
 use super::session::{Board, GpuLine, Link, TokenLine, HISTORY_CAP};
-use super::setup::{Choice, Entry, Form};
+use super::setup::Setup;
 use crate::backend::{BackendKind, GpuDevice};
-use crate::config::{MiningNetwork, RuntimeConfig};
+use crate::config::{MiningNetwork, MiningProfiles, RuntimeConfig, SavedConfig};
 use crate::runtime::{RuntimeSnapshot, SupervisorState};
 use crate::telemetry::GpuTelemetry;
+use crate::tui::{SetupDriver, SetupInput};
 use eframe::egui;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -217,28 +218,7 @@ fn coordinator_board() -> Board {
 #[test]
 #[ignore = "renders with the GPU; run on request"]
 fn gui_preview() {
-    let mut entry = Entry::from_config(&RuntimeConfig::default());
-    entry.choice = Choice::Split;
-    let mut form = Form::found(
-        entry,
-        vec![
-            (
-                gpu(
-                    0,
-                    "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
-                    BackendKind::Cuda,
-                    false,
-                    12,
-                ),
-                true,
-            ),
-            (gpu(1, "AMD Radeon 610M", BackendKind::Wgpu, true, 2), false),
-        ],
-    );
-    let base = RuntimeConfig::default();
-    save("setup.png", SIZE, |ui| {
-        form.show(ui, &base);
-    });
+    setup_previews();
     let board = board();
     let link = Link::default();
     save("dashboard.png", TALL, |ui| {
@@ -278,4 +258,128 @@ fn gui_preview() {
     save("rig.png", SIZE, |ui| {
         super::rig::show(ui, &rig, true, &|| {})
     });
+}
+
+/// The GPUs the setup previews list.
+fn preview_gpus() -> Vec<GpuDevice> {
+    vec![
+        gpu(
+            0,
+            "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+            BackendKind::Cuda,
+            false,
+            12,
+        ),
+        gpu(1, "AMD Radeon 610M", BackendKind::Wgpu, true, 2),
+    ]
+}
+
+/// Two saved profiles, paying the project's own donation addresses.
+fn preview_profiles() -> MiningProfiles {
+    let mut profiles = MiningProfiles::default();
+    let mut mainnet = RuntimeConfig::default();
+    mainnet
+        .set_payout(crate::config::DONATION_ADDRESS.into())
+        .unwrap();
+    let mut chipnet = RuntimeConfig::default();
+    chipnet.set_network(MiningNetwork::Chipnet);
+    chipnet
+        .set_payout(crate::config::CHIPNET_DONATION_ADDRESS.into())
+        .unwrap();
+    chipnet.set_intensity(60).unwrap();
+    for (name, config) in [("Laptop", &mainnet), ("Chipnet test", &chipnet)] {
+        profiles
+            .upsert(
+                None,
+                name,
+                SavedConfig::from_effective(
+                    "auto",
+                    &crate::backend::DeviceSelection::Default,
+                    config,
+                ),
+            )
+            .unwrap();
+    }
+    profiles
+}
+
+/// Clicks the item called `label` on the setup's screen.
+fn click(driver: &mut SetupDriver, label: &str) {
+    let item = driver
+        .view()
+        .items
+        .iter()
+        .position(|item| item.label == label)
+        .unwrap_or_else(|| panic!("no {label:?} on the screen"));
+    driver.act(SetupInput::Click(item));
+}
+
+/// Clicks and the terminal's keys move the window's setup, with no GPU.
+#[test]
+fn the_setup_answers_clicks_and_keys() {
+    use egui_kittest::kittest::Queryable;
+    let mut setup = Setup::ready(SetupDriver::preview(
+        preview_gpus(),
+        MiningProfiles::default(),
+    ));
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(SIZE)
+        .build_ui(|ui| {
+            setup.show(ui);
+        });
+    harness.run_steps(2);
+    assert!(harness.query_by_label("Setup   1/4 Hardware").is_some());
+    harness.get_by_label("GPU mining").click();
+    harness.run_steps(2);
+    assert!(harness.query_by_label("Setup   2/4 Network").is_some());
+    // Down moves to Chipnet and Enter goes on, as in the terminal.
+    harness.key_press(egui::Key::ArrowDown);
+    harness.run_steps(2);
+    assert!(harness
+        .query_by_label_contains("Chipnet selected")
+        .is_some());
+    harness.key_press(egui::Key::Enter);
+    harness.run_steps(2);
+    assert!(harness.query_by_label("Setup   3/4 Token").is_some());
+    harness.check_accessibility();
+    harness.get_by_label("Back").click();
+    harness.run_steps(2);
+    assert!(harness.query_by_label("Setup   2/4 Network").is_some());
+}
+
+/// The setup's screens, reached by clicks as a miner would reach them.
+fn setup_previews() {
+    let shot = |name: &str, size: [f32; 2], driver: SetupDriver| {
+        let mut setup = Setup::ready(driver);
+        save(name, size, |ui| {
+            setup.show(ui);
+        });
+    };
+    shot(
+        "setup-profiles.png",
+        SIZE,
+        SetupDriver::preview(preview_gpus(), preview_profiles()),
+    );
+    let fresh = || SetupDriver::preview(preview_gpus(), MiningProfiles::default());
+    shot("setup-hardware.png", SIZE, fresh());
+    let mut driver = fresh();
+    click(&mut driver, "GPU mining");
+    click(&mut driver, "Mainnet");
+    shot("setup-token.png", SIZE, driver);
+    let settings = || {
+        let mut driver = fresh();
+        click(&mut driver, "GPU mining");
+        click(&mut driver, "Mainnet");
+        click(&mut driver, "PHOTON");
+        click(&mut driver, "Advanced");
+        driver
+    };
+    shot("setup-settings.png", TALL, settings());
+    let mut driver = settings();
+    click(&mut driver, "Address");
+    driver.act(SetupInput::SetText(crate::config::DONATION_ADDRESS.into()));
+    shot("setup-editing.png", SIZE, driver);
+    let mut driver = settings();
+    click(&mut driver, "Fulcrum");
+    shot("setup-connections.png", SIZE, driver);
 }

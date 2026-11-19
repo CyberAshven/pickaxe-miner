@@ -244,7 +244,7 @@ fn tokens(ui: &mut egui::Ui, board: &Board, link: &Link) {
                         let can = board.live && !board.stopping;
                         ui.horizontal(|ui| {
                             if ui
-                                .add_enabled(can, egui::Button::new("◀"))
+                                .add_enabled(can, egui::Button::new("−"))
                                 .accessible_name(format!("Lower the {} donation", token.name))
                                 .clicked()
                             {
@@ -256,7 +256,7 @@ fn tokens(ui: &mut egui::Ui, board: &Board, link: &Link) {
                                     .map_or_else(|| "reading".into(), |d| d.to_string()),
                             );
                             if ui
-                                .add_enabled(can, egui::Button::new("▶"))
+                                .add_enabled(can, egui::Button::new("+"))
                                 .accessible_name(format!("Raise the {} donation", token.name))
                                 .clicked()
                             {
@@ -613,7 +613,7 @@ fn pot(ui: &mut egui::Ui, board: &Board) {
                 return;
             };
             ui.horizontal(|ui| {
-                qr(ui, address);
+                qr(ui, address, 4.0);
                 ui.vertical(|ui| {
                     ui.label("Fund it with plain BCH; it pays each claim's transaction fee.");
                     ui.horizontal(|ui| {
@@ -638,17 +638,17 @@ fn pot(ui: &mut egui::Ui, board: &Board) {
         });
 }
 
-/// `text` as a QR code drawn in dark modules on white, with a quiet zone.
-fn qr(ui: &mut egui::Ui, text: &str) {
+/// `text` as a QR code drawn in dark modules of `module` points on white,
+/// with a quiet zone.
+pub(super) fn qr(ui: &mut egui::Ui, text: &str, module: f32) {
     let Ok(code) = qrcode::QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::M)
     else {
         return;
     };
     const QUIET: usize = 4;
-    const MODULE: f32 = 4.0;
     let width = code.width();
     let colors = code.to_colors();
-    let side = (width + 2 * QUIET) as f32 * MODULE;
+    let side = (width + 2 * QUIET) as f32 * module;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, egui::Color32::WHITE);
@@ -656,9 +656,9 @@ fn qr(ui: &mut egui::Ui, text: &str) {
         for x in 0..width {
             if colors[y * width + x] == qrcode::Color::Dark {
                 let corner = rect.left_top()
-                    + egui::vec2((x + QUIET) as f32 * MODULE, (y + QUIET) as f32 * MODULE);
+                    + egui::vec2((x + QUIET) as f32 * module, (y + QUIET) as f32 * module);
                 painter.rect_filled(
-                    egui::Rect::from_min_size(corner, egui::vec2(MODULE, MODULE)),
+                    egui::Rect::from_min_size(corner, egui::vec2(module, module)),
                     0.0,
                     egui::Color32::BLACK,
                 );
@@ -681,7 +681,7 @@ fn events(ui: &mut egui::Ui, board: &Board) {
 }
 
 /// Hours, minutes and seconds, as the terminal dashboard shows uptime.
-fn clock(elapsed: Duration) -> String {
+pub(super) fn clock(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
     format!(
         "{:02}:{:02}:{:02}",

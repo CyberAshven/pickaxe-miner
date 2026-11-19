@@ -1,6 +1,5 @@
 //! A mining session as the window sees it: the worker that runs it and the
 //! view that reads and steers it in the terminal dashboard's place.
-use super::setup::{Launch, Plan};
 use crate::backend::GpuDevice;
 use crate::config::MiningNetwork;
 use crate::electric::ui::Summary;
@@ -543,26 +542,6 @@ impl crate::tui::SessionView for WindowView {
     ) -> Result<(), String> {
         self.0.follow(miners, gpus, finished)
     }
-}
-
-/// Runs the session the setup chose until it stops, on this thread: the
-/// same session functions the terminal setup starts.
-pub fn mine(launch: &Launch, config_path: &Path) -> Result<(), String> {
-    let mined = match &launch.plan {
-        Plan::Split(shares) => {
-            crate::hash_split::run(&launch.cfg, &launch.gpus, shares, config_path, false)
-        }
-        Plan::Electric => {
-            crate::electric::miner::run_from_setup(&launch.cfg, &launch.gpus, config_path)
-        }
-        Plan::Runtime(token) => {
-            mine_runtime_token(&launch.cfg, *token, &launch.gpus, None, config_path, None)
-        }
-    };
-    // The stop asked the session to save its settings; nothing else
-    // should read that request later.
-    crate::session_control::take_profiles_request();
-    mined
 }
 
 /// A runtime token (PHOTON) alone, as `pickaxe` runs it after its setup
