@@ -244,7 +244,7 @@ fn tokens(ui: &mut egui::Ui, board: &Board, link: &Link) {
                         let can = board.live && !board.stopping;
                         ui.horizontal(|ui| {
                             if ui
-                                .add_enabled(can, egui::Button::new("◀"))
+                                .add_enabled(can, egui::Button::new("−"))
                                 .accessible_name(format!("Lower the {} donation", token.name))
                                 .clicked()
                             {
@@ -256,7 +256,7 @@ fn tokens(ui: &mut egui::Ui, board: &Board, link: &Link) {
                                     .map_or_else(|| "reading".into(), |d| d.to_string()),
                             );
                             if ui
-                                .add_enabled(can, egui::Button::new("▶"))
+                                .add_enabled(can, egui::Button::new("+"))
                                 .accessible_name(format!("Raise the {} donation", token.name))
                                 .clicked()
                             {
