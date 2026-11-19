@@ -2457,13 +2457,19 @@ fn serve_device(
             // ASIC-exclusive token the donation is that token's share of work.
             // #### merge-mining v2: a public pool miner's own donation choice
             // sets this connection's rate (see `MiningSession::donation_choice`).
-            let chosen = mining.donation_choice();
-            let donation = || -> Result<JobDonation, String> {
+            // #### one donation, the higher rate: the connection's rate is
+            // the higher of the pool's and the login's, less the miner's own
+            // visible donation (see `MiningSession::public_donation`).
+            let donation = |mining: &mut MiningSession| -> Result<JobDonation, String> {
                 if let Some(rate) = config.token_donation {
                     return Ok(JobDonation::Token(rate));
                 }
-                if let Some(choice) = chosen.filter(|_| config.public.is_some()) {
-                    return Ok(JobDonation::Bch(choice));
+                if config.public.is_some() {
+                    let server = *config
+                        .donation
+                        .read()
+                        .map_err(|_| "donation setting unavailable".to_owned())?;
+                    return Ok(JobDonation::Bch(mining.public_donation(server)));
                 }
                 if config
                     .uplink
@@ -2492,11 +2498,12 @@ fn serve_device(
                     hold: shared.hold.lock().ok().and_then(|hold| *hold),
                 })
             };
+            let job_donation = donation(&mut mining)?;
             for frame in availability.update(
                 &mut mining,
                 current_job()?,
                 Instant::now(),
-                donation()?,
+                job_donation,
                 fee,
                 acknowledged(),
             )? {
@@ -2530,11 +2537,12 @@ fn serve_device(
                 }
                 // A node failure or tip change may have occurred while waiting
                 // for a device frame; resample before validating that frame.
+                let job_donation = donation(&mut mining)?;
                 for update in availability.update(
                     &mut mining,
                     current_job()?,
                     Instant::now(),
-                    donation()?,
+                    job_donation,
                     fee,
                     acknowledged(),
                 )? {
@@ -2568,6 +2576,14 @@ fn serve_device(
                                     .work
                                     .add(&target, payout.donation_work, payout.fee_work);
                             }
+                        }
+                    }
+                    // #### one donation, the higher rate: a donation
+                    // channel's share is donation work in the work split,
+                    // and repays no quota of the miner's own jobs.
+                    if let Some(target) = mining.donation_share.take() {
+                        if let Ok(mut stats) = shared.stats.lock() {
+                            stats.work.add(&target, true, false);
                         }
                     }
                 }
@@ -2756,6 +2772,12 @@ fn serve_device(
                     if let Some(identity) = mining.identity.take() {
                         stats.device_stats.set_worker(device, &identity);
                     }
+                    // #### one donation, the higher rate: the miner's
+                    // effective rate and own Pickaxe credit, on a public
+                    // pool.
+                    stats
+                        .device_stats
+                        .set_donation(device, mining.donation_terms());
                     // #### merge-mining v2: a job refused token merge
                     // mining (the own-root check) says so on the dashboard.
                     if let Some(reason) = mining.token_refusal.take() {

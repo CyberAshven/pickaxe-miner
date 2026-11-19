@@ -33,6 +33,10 @@ mod panel;
 // #### PR #42: merge mining for BCH covenant tokens (no token registered yet).
 #[cfg(feature = "stratum-v2")]
 pub mod merge;
+// #### one donation, the higher rate: a miner's own Pickaxe's donation,
+// credited where a Public Solo Endpoint sees it mined.
+#[cfg(feature = "stratum-v2")]
+mod own_donation;
 #[cfg(feature = "stratum-v2")]
 mod payout;
 #[cfg(feature = "stratum-v2")]
