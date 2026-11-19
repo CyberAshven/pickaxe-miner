@@ -113,6 +113,9 @@ pub fn show(ui: &mut egui::Ui, board: &RigBoard, live: bool, stop: &dyn Fn()) {
             } else {
                 "Stopped".into()
             });
+            if let Some(started) = board.started.filter(|_| live) {
+                ui.weak(super::dashboard::clock(started.elapsed()));
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if live && ui.button("Stop").clicked() {
                     stop();

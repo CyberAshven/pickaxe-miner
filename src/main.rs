@@ -2141,6 +2141,7 @@ fn run_application(open_profiles: bool) {
                 backend: backend_kind,
                 selection: effective_device,
                 start,
+                cli_node_zmq: args.node_zmq.is_some(),
             });
             #[cfg(not(feature = "gui"))]
             let result: Result<(), String> = {
