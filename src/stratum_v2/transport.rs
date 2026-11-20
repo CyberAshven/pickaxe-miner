@@ -375,7 +375,8 @@ fn read_until(
             Ok(n) => output = &mut output[n..],
             Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
             Err(e) if out_of_buffers(&e) => thread::sleep(NO_BUFFERS_PAUSE),
-            Err(_) => return Err("SV2 frame read failed or timed out".into()),
+            Err(e) if timed_out_early(&e, deadline) => (),
+            Err(e) => return Err(io_failure("SV2 frame read failed or timed out", &e)),
         }
     }
     Ok(())
@@ -392,6 +393,28 @@ fn out_of_buffers(error: &io::Error) -> bool {
     (cfg!(windows) && code == Some(10055))
         || (cfg!(target_os = "linux") && code == Some(105))
         || (cfg!(target_os = "macos") && code == Some(55))
+}
+
+/// What: a read or write that reports a timeout before the frame's own
+/// deadline has passed.
+/// Why: the socket timeout is set to what is left of the frame's deadline, so
+/// an earlier timeout is not the frame's; the loop sets the timeout again and,
+/// once the deadline has passed, ends with "SV2 frame deadline exceeded".
+/// Look here if: a frame read or write gives up before its deadline.
+fn timed_out_early(error: &io::Error, deadline: Instant) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    ) && Instant::now() < deadline
+}
+
+/// A frame read or write failure, naming the OS error after the fixed text
+/// (`telemetry::connection_reason` matches the fixed text as a prefix).
+fn io_failure(what: &str, error: &io::Error) -> String {
+    match error.raw_os_error() {
+        Some(code) => format!("{what} ({:?}, OS error {code})", error.kind()),
+        None => format!("{what} ({:?})", error.kind()),
+    }
 }
 
 /// The pause before trying again a read or write the OS refused for lack of
@@ -417,7 +440,8 @@ fn write_until(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> R
             Ok(n) => bytes = &bytes[n..],
             Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
             Err(e) if out_of_buffers(&e) => thread::sleep(NO_BUFFERS_PAUSE),
-            Err(_) => return Err("SV2 frame write failed or timed out".into()),
+            Err(e) if timed_out_early(&e, deadline) => (),
+            Err(e) => return Err(io_failure("SV2 frame write failed or timed out", &e)),
         }
     }
     Ok(())
@@ -614,7 +638,14 @@ mod tests {
             ..Limits::TDP_CLIENT
         });
         let sent = thread::spawn(move || to_client.send(big(&vec![7u8; 4 << 20])));
-        let frame = from_server.receive(test_deadline).unwrap().unwrap();
+        let frame = match from_server.receive(test_deadline) {
+            Ok(Some(frame)) => frame,
+            other => panic!(
+                "receive: {:?}; send: {:?}",
+                other.map(|frame| frame.map(|frame| frame.encoded_length())),
+                sent.join()
+            ),
+        };
         assert_eq!(frame.encoded_length(), 6 + 3 + (4 << 20));
         sent.join().unwrap().unwrap();
         assert!(to_server
