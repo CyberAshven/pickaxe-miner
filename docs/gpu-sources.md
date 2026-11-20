@@ -92,7 +92,6 @@ tool's numbering could differ from the engine's.
 | `reference/shared-t2/` | WGSL generated from the shared Rust T2 filter; never edited by hand | `tools/shared-gpu-proof/sync_filter.py --write` | |
 | `reference/shared-stages/` | WGSL generated from the shared Rust stages: signing (A, B, C1), T2 preparation and the non-T2 hash and winner stages (C2, C3); never edited by hand. `pickaxe_shared_stages.wgsl` runs on Vulkan and Chromium; `pickaxe_shared_stages_dx12_metal.wgsl`, the same code with loop values kept for naga's HLSL and MSL writers, runs on DirectX 12, Metal and other browsers | `tools/shared-gpu-proof/sync_filter.py --write` | |
 | `src/wgpu_t2.wgsl`, `src/wgpu_target.wgsl` | Glue for the original stages: T2 preparation and the target check | Included by `src/wgpu_photon.rs` | |
-| `reference/legacy-engine-by-cyberashven/` | Historic engine snapshot | Not built | |
 
 ## Checks that keep the builds equal
 

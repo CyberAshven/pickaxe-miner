@@ -105,8 +105,8 @@ comparisons were unavailable. The original CTest invocation was not fully green,
 and no native source/test policy was altered to hide this limitation.
 
 The validated upstream-derived Rust CUDA backend is selected by default. The
-independent historical sources are preserved in
-`reference/legacy-engine-by-cyberashven/`. Upstream acceptance and moving the
+independent historical sources were kept in
+`reference/legacy-engine-by-cyberashven/` (removed on 2026-11-20; see commit 9985f7c, the last dev commit that has it). Upstream acceptance and moving the
 fork pin to an accepted upstream revision remain separate steps. This work
 does not establish a CPU performance improvement or replace the existing
 constant-time Rust signer.
