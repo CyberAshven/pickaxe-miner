@@ -1042,6 +1042,7 @@ mod tests {
             binary: home.join("p2poolv2"),
             sha256: String::new(),
             installed_at: 0,
+            signed: false,
             previous: None,
         };
         let mut cfg = RuntimeConfig {
