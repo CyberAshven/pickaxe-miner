@@ -1,8 +1,0 @@
-out/**/*.map
-out/**/tests/**
-out/docs/
-out/.tsbuildinfo
-src/
-.gitignore
-tsconfig.json
-README.md
