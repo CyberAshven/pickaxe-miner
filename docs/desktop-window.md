@@ -60,7 +60,12 @@ the same steps, rows, words, checks and saved profiles:
   node has its own **Remove** (and a node its **Cookie file**), with **Other
   PC**, **Tailscale** and **Yes** for a public address below. A node or
   server found on this or another computer is added with a click. **Done**
-  goes back to the settings.
+  goes back to the settings. As in the terminal, a synced node on this
+  computer is used first while no node is saved, and a Fulcrum server there
+  before the built-in ones (see
+  [Chain connections](../README.md#chain-connections)); the BCH node and
+  Fulcrum rows say so, and Start waits a moment, behind a spinner, for a
+  look at this computer still under way.
 
 A click on a row does what Enter does there, and the status line shows
 what the terminal's would. Where the terminal's hint says more than its

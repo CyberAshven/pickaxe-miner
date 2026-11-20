@@ -1107,6 +1107,12 @@ struct SetupFlow {
     local_node: LocalNodeCheck,
     /// How the check looks; tests replace it.
     probe_local_node: fn(MiningNetwork) -> crate::node::LocalNode,
+    /// #### Local sources first: the network and start of the last look at
+    /// this computer (its node and its usual ports), and the node and
+    /// Fulcrum server from here that `apply_connections` last put on the
+    /// config.
+    looked_here: Option<(MiningNetwork, Instant)>,
+    applied_here: (Option<String>, Option<String>),
     /// #### PR #42: each saved node's check by URL, where running checks
     /// report, and how a node is checked (tests replace it).
     node_checks: std::collections::HashMap<String, crate::node::NodeCheck>,
@@ -1177,10 +1183,75 @@ fn same_endpoint(a: &str, b: &str) -> bool {
 /// The check for a BCH node on this computer runs in the background, so the
 /// BCH node list never waits on it (a refused connection takes about two
 /// seconds on Windows).
+/// #### Local sources first: with a synced node's full check (its chain by
+/// the fork block, its login, gettxout).
 enum LocalNodeCheck {
     Idle,
-    Running(MiningNetwork, mpsc::Receiver<crate::node::LocalNode>),
-    Done(MiningNetwork, crate::node::LocalNode),
+    Running(MiningNetwork, mpsc::Receiver<LocalLook>),
+    Done(
+        MiningNetwork,
+        crate::node::LocalNode,
+        Option<crate::node::NodeCheck>,
+    ),
+}
+
+/// What the check of this computer's node sends back.
+type LocalLook = (crate::node::LocalNode, Option<crate::node::NodeCheck>);
+
+// #### Local sources first
+// What: when the setup opens, a profile opens or a new one starts, or the
+// network changes, this computer is looked at for the network: BCHN on its
+// default port (checked in full once synced) and the usual ports of
+// `node_find` (a node on another port such as Knuth's, a Fulcrum server).
+// With no node saved for the network and none named on the command line,
+// the first node there that is synced, proven on the network and logged in
+// to (its cookie) is put on the session's config: GPU tokens take their
+// jobs from it, falling back to the Fulcrum servers, when it answers
+// gettxout; ASICs and pools take their templates from it, Knuth included. A
+// Fulcrum server there that is proven on the network is tried after the
+// saved servers and before the built-in ones, unless --fulcrum names them.
+// Nothing is saved: the lists, the profiles and other profiles stay as they
+// are, and saving the node from the list keeps it. A syncing node is not
+// used and the row shows its progress; the first session started after it
+// is synced uses it (a running session never switches). Start waits a
+// moment for a look still under way.
+// Why: a node or Fulcrum server on the same computer was used only once
+// added by hand; the public servers stay the fallback.
+// Look here if: a node or Fulcrum server on this computer is used, or not
+// used, unexpectedly.
+/// How long Start waits for a look at this computer still under way.
+const LOCAL_LOOK_WAIT: Duration = Duration::from_secs(5);
+/// A look at this computer this recent is used again when a profile opens.
+const LOCAL_LOOK_FRESH: Duration = Duration::from_secs(60);
+
+/// What a profile needs a node for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeUse {
+    /// GPU token jobs: the token's state, which needs gettxout.
+    TokenJobs,
+    /// BCH block templates for ASICs and pools.
+    Templates,
+}
+
+/// A node on this computer that answered on the selected network.
+#[derive(Debug, Clone, Copy)]
+struct NodeHere<'a> {
+    url: &'a str,
+    info: &'a crate::node::NodeInfo,
+    /// Synced, proven on the network and logged in to, with whether it
+    /// answers gettxout; `None` otherwise (syncing, or its check failed).
+    ready: Option<bool>,
+}
+
+/// Takes a result from `receive`, waiting at most `wait`.
+fn receive_within<T>(receive: &mpsc::Receiver<T>, wait: Duration) -> Result<T, mpsc::TryRecvError> {
+    if wait.is_zero() {
+        return receive.try_recv();
+    }
+    receive.recv_timeout(wait).map_err(|error| match error {
+        mpsc::RecvTimeoutError::Timeout => mpsc::TryRecvError::Empty,
+        mpsc::RecvTimeoutError::Disconnected => mpsc::TryRecvError::Disconnected,
+    })
 }
 
 /// The GPUs that mine unless chosen otherwise: every discrete GPU, or every
@@ -1295,6 +1366,8 @@ impl SetupFlow {
             probe_local_node: crate::node::probe_local_node,
             #[cfg(test)]
             probe_local_node: |_| crate::node::LocalNode::Missing,
+            looked_here: None,
+            applied_here: (None, None),
             node_checks: std::collections::HashMap::new(),
             node_checks_rx: None,
             #[cfg(not(test))]
@@ -1333,24 +1406,87 @@ impl SetupFlow {
     /// #### PR #40
     /// Starts looking for a BCH node on this computer.
     fn check_local_node(&mut self) {
-        let (send, receive) = mpsc::channel();
-        let network = self.config.network;
-        let probe = self.probe_local_node;
-        thread::spawn(move || {
-            let _ = send.send(probe(network));
-        });
-        self.local_node = LocalNodeCheck::Running(network, receive);
+        self.probe_here();
         // #### PR #42: and every saved node of the network, and the rest of
         // this computer.
         self.check_saved_nodes();
         self.find_here_start();
     }
 
+    /// Asks BCHN's default address on this computer, on its own thread.
+    fn probe_here(&mut self) {
+        let (send, receive) = mpsc::channel();
+        let network = self.config.network;
+        let (probe, check) = (self.probe_local_node, self.check_node);
+        thread::spawn(move || {
+            let found = probe(network);
+            // #### Local sources first: a synced node of the network is
+            // checked in full before the setup uses it unasked.
+            let check = match &found {
+                crate::node::LocalNode::Found(info)
+                    if info.network() == Some(network) && info.synced() =>
+                {
+                    Some(check(crate::node::local_node_url(network), network))
+                }
+                _ => None,
+            };
+            let _ = send.send((found, check));
+        });
+        self.local_node = LocalNodeCheck::Running(network, receive);
+    }
+
+    /// #### Local sources first: looks at this computer for the selected
+    /// network (its node, and what answers at the usual ports), unless such
+    /// a look started within `LOCAL_LOOK_FRESH`.
+    fn look_here(&mut self) {
+        let network = self.config.network;
+        let node_looked = matches!(&self.local_node,
+            LocalNodeCheck::Running(at, _) | LocalNodeCheck::Done(at, ..) if *at == network);
+        let ports_looked = self.finder.as_ref().is_some_and(|(at, _)| *at == network)
+            || self.found.as_ref().is_some_and(|(at, _)| *at == network);
+        if node_looked
+            && ports_looked
+            && self
+                .looked_here
+                .is_some_and(|(at, started)| at == network && started.elapsed() < LOCAL_LOOK_FRESH)
+        {
+            return;
+        }
+        self.looked_here = Some((network, Instant::now()));
+        if !self.finder.as_ref().is_some_and(|(at, _)| *at == network) {
+            self.found = None;
+        }
+        self.probe_here();
+        self.find_here_start();
+    }
+
+    /// Whether `code` presses Start on the settings page.
+    fn presses_start(&self, code: KeyCode) -> bool {
+        code == KeyCode::Enter
+            && self.step == SetupStep::Settings
+            && self.editing.is_none()
+            && !self.pot_view
+            && !self.share_editing
+            && self.current_row() == SettingsRow::Start
+    }
+
+    /// Whether a look at this computer for the selected network is under
+    /// way.
+    fn looking_here(&self) -> bool {
+        let network = self.config.network;
+        matches!(&self.local_node, LocalNodeCheck::Running(at, _) if *at == network)
+            || self.finder.as_ref().is_some_and(|(at, _)| *at == network)
+    }
+
     /// #### PR #42: looks for nodes on other ports, Fulcrum servers and ZMQ
     /// on this computer, on its own thread.
     fn find_here_start(&mut self) {
         let network = self.config.network;
-        if self.finder.is_some() || self.found.as_ref().is_some_and(|(at, _)| *at == network) {
+        // #### Local sources first: a search for the other network is
+        // dropped, since the network changed.
+        if self.finder.as_ref().is_some_and(|(at, _)| *at == network)
+            || self.found.as_ref().is_some_and(|(at, _)| *at == network)
+        {
             return;
         }
         let (send, receive) = mpsc::channel();
@@ -1361,13 +1497,19 @@ impl SetupFlow {
         self.finder = Some((network, receive));
     }
 
-    /// Takes what the search found, once it is done.
-    fn poll_finder(&mut self) {
+    /// Takes what the search found, once it is done, waiting at most `wait`
+    /// for a search of the selected network.
+    fn poll_finder(&mut self, wait: Duration) {
         let Some((network, receive)) = &self.finder else {
             return;
         };
         let network = *network;
-        match receive.try_recv() {
+        let wait = if network == self.config.network {
+            wait
+        } else {
+            Duration::ZERO
+        };
+        match receive_within(receive, wait) {
             Ok(found) => {
                 self.found = Some((network, found));
                 self.finder = None;
@@ -1654,19 +1796,46 @@ impl SetupFlow {
     fn poll_local_node(&mut self) {
         // #### PR #42: the saved nodes' checks and the search too.
         self.poll_node_checks();
-        self.poll_finder();
         self.poll_finder_there();
         self.poll_tailscale();
+        if let Err(error) = self.take_looks_here(Duration::ZERO) {
+            self.status_line = error;
+        }
+    }
+
+    /// #### Local sources first: takes the check of this computer's node
+    /// and the search of this computer once they are in, waiting at most
+    /// `wait` for them; when what the session would use from here (for the
+    /// profile as it is now) is not what the config has, the connections
+    /// go on the config again.
+    fn take_looks_here(&mut self, wait: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + wait;
+        self.take_local_node(wait);
+        self.poll_finder(deadline.saturating_duration_since(Instant::now()));
+        if self.sources_here() == self.applied_here {
+            return Ok(());
+        }
+        self.apply_connections()
+    }
+
+    /// Takes the check of this computer's node, waiting at most `wait` for
+    /// a check of the selected network.
+    fn take_local_node(&mut self, wait: Duration) {
         let LocalNodeCheck::Running(network, receive) = &self.local_node else {
             return;
         };
         let network = *network;
-        let result = match receive.try_recv() {
+        let wait = if network == self.config.network {
+            wait
+        } else {
+            Duration::ZERO
+        };
+        let (result, check) = match receive_within(receive, wait) {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => crate::node::LocalNode::Missing,
+            Err(mpsc::TryRecvError::Disconnected) => (crate::node::LocalNode::Missing, None),
         };
-        self.local_node = LocalNodeCheck::Done(network, result);
+        self.local_node = LocalNodeCheck::Done(network, result, check);
         let count = self
             .sources
             .list(self.config.network, ConnectionKind::Node)
@@ -1685,7 +1854,7 @@ impl SetupFlow {
     fn local_node_offer(&self) -> Option<&crate::node::NodeInfo> {
         let network = self.config.network;
         match &self.local_node {
-            LocalNodeCheck::Done(checked, crate::node::LocalNode::Found(info))
+            LocalNodeCheck::Done(checked, crate::node::LocalNode::Found(info), _)
                 if *checked == network
                     && self.connection_kind == ConnectionKind::Node
                     && info.network() == Some(network)
@@ -1699,6 +1868,267 @@ impl SetupFlow {
             }
             _ => None,
         }
+    }
+
+    /// #### Local sources first: what the profile needs a node for, if
+    /// anything: GPU tokens their jobs, ASICs and pools their templates. A
+    /// GPU joining a pool or farm, an ASIC-exclusive token and an ASIC
+    /// joining a pool with its jobs need none.
+    fn node_use(&self) -> Option<NodeUse> {
+        match self.mode {
+            MiningMode::Gpu if self.gpu_join => None,
+            MiningMode::Gpu => Some(NodeUse::TokenJobs),
+            MiningMode::Pool if self.pool_target != 0 => Some(NodeUse::TokenJobs),
+            MiningMode::Pool => Some(NodeUse::Templates),
+            MiningMode::Asic if self.asic_target != 0 => None,
+            MiningMode::Asic
+                if self.asic_mining == AsicMining::JoinPool
+                    && self.job_declaration.is_none()
+                    && !(self.pool_kind == PoolKind::P2PoolV2 && self.own_p2pool) =>
+            {
+                None
+            }
+            MiningMode::Asic => Some(NodeUse::Templates),
+        }
+    }
+
+    /// Whether the miner chose the network's node: saved for the network,
+    /// or named on the command line; for token jobs `--source fulcrum` too.
+    fn node_chosen(&self, node_use: NodeUse) -> bool {
+        self.overrides.node_rpc.is_some()
+            || !self
+                .sources
+                .list(self.config.network, ConnectionKind::Node)
+                .is_empty()
+            || (node_use == NodeUse::TokenJobs
+                && self.overrides.source.as_deref().is_some_and(|source| {
+                    matches!(
+                        crate::config::JobSource::parse(source),
+                        Ok(crate::config::JobSource::Fulcrum)
+                    )
+                }))
+    }
+
+    /// The nodes on this computer that answered on the selected network:
+    /// BCHN on its default port first, then those on the other usual ports.
+    fn nodes_here(&self) -> Vec<NodeHere<'_>> {
+        use crate::node::{LocalNode, NodeCheck};
+        let network = self.config.network;
+        let mut nodes = Vec::new();
+        if let LocalNodeCheck::Done(checked, LocalNode::Found(info), check) = &self.local_node {
+            if *checked == network && info.network() == Some(network) {
+                nodes.push(NodeHere {
+                    url: crate::node::local_node_url(network),
+                    info,
+                    ready: match check {
+                        Some(NodeCheck::Ready {
+                            info: checked,
+                            follows_photon,
+                        }) if info.synced() && checked.synced() => Some(*follows_photon),
+                        _ => None,
+                    },
+                });
+            }
+        }
+        for found in self.found_here() {
+            if let crate::node_find::Found::Node {
+                url,
+                check:
+                    NodeCheck::Ready {
+                        info,
+                        follows_photon,
+                    },
+                ..
+            } = found
+            {
+                nodes.push(NodeHere {
+                    url,
+                    info,
+                    ready: info.synced().then_some(*follows_photon),
+                });
+            }
+        }
+        nodes
+    }
+
+    /// The node on this computer the session uses unasked: none chosen for
+    /// the network, and the first node here that is ready for what the
+    /// profile needs it for (gettxout for token jobs).
+    fn node_used_here(&self) -> Option<NodeHere<'_>> {
+        let node_use = self.node_use()?;
+        if self.node_chosen(node_use) {
+            return None;
+        }
+        self.nodes_here()
+            .into_iter()
+            .find(|node| match (node.ready, node_use) {
+                (Some(follows_photon), NodeUse::TokenJobs) => follows_photon,
+                (Some(_), NodeUse::Templates) => true,
+                (None, _) => false,
+            })
+    }
+
+    /// The Fulcrum server on this computer the session tries after the
+    /// saved ones and before the built-in ones: the first one found that is
+    /// on the network and not saved, unless --fulcrum names the servers.
+    fn fulcrum_used_here(&self) -> Option<&str> {
+        if self.overrides.fulcrum.is_some() {
+            return None;
+        }
+        let saved = self
+            .sources
+            .list(self.config.network, ConnectionKind::Fulcrum);
+        self.found_here().into_iter().find_map(|found| match found {
+            crate::node_find::Found::Fulcrum { url, report: Ok(_) }
+                if !saved.iter().any(|entry| same_endpoint(entry, url)) =>
+            {
+                Some(url.as_str())
+            }
+            _ => None,
+        })
+    }
+
+    /// What the session uses unasked from this computer: its node and its
+    /// Fulcrum server.
+    fn sources_here(&self) -> (Option<String>, Option<String>) {
+        (
+            self.node_used_here().map(|node| node.url.to_owned()),
+            self.fulcrum_used_here().map(str::to_owned),
+        )
+    }
+
+    /// The GPU token as the Token row names it.
+    fn token_label(&self) -> String {
+        if self.split {
+            "the hash split".into()
+        } else if self.electric {
+            "ELECTRIC".into()
+        } else {
+            self.config.token.as_str().to_owned()
+        }
+    }
+
+    /// The BCH node row: the saved nodes, or else this computer's node when
+    /// the session uses it, cannot, or not yet.
+    fn node_row(&self) -> String {
+        let network = self.config.network;
+        let label = network_label(network);
+        let gpu = self.mode == MiningMode::Gpu;
+        if self.overrides.node_rpc.is_some() {
+            return if gpu {
+                "named on the command line; jobs come from it first".into()
+            } else {
+                "named on the command line".into()
+            };
+        }
+        if let Some(here) = self.node_here_row() {
+            return here;
+        }
+        // #### PR #65: GPU mining takes its token jobs from a saved node
+        // first, and from the Fulcrum servers without one.
+        match (self.sources.list(network, ConnectionKind::Node).len(), gpu) {
+            (0, true) => format!("none saved for {label}; jobs come from the Fulcrum servers"),
+            (0, false) => format!("none saved for {label}"),
+            (nodes, true) => format!("{nodes} saved for {label}; jobs come from your node first"),
+            (nodes, false) => format!("{nodes} saved for {label}"),
+        }
+    }
+
+    /// The node row for this computer's node while none is chosen: used,
+    /// unable to follow the token, syncing, wanting its login, or still
+    /// looked for; `None` otherwise.
+    fn node_here_row(&self) -> Option<String> {
+        let node_use = self.node_use()?;
+        if self.node_chosen(node_use) {
+            return None;
+        }
+        let label = network_label(self.config.network);
+        if let Some(node) = self.node_used_here() {
+            let name = node.info.client_name();
+            return Some(match node_use {
+                NodeUse::TokenJobs => format!(
+                    "this computer's {name} (synced): used first; Fulcrum servers as fallback"
+                ),
+                NodeUse::Templates => {
+                    format!("this computer's {name} (synced): its templates are used")
+                }
+            });
+        }
+        let nodes = self.nodes_here();
+        // A synced node without gettxout (Knuth) cannot follow the token.
+        if let Some(node) = nodes.iter().find(|node| node.ready == Some(false)) {
+            return Some(format!(
+                "this computer's {} (synced) has no gettxout, which {} needs: jobs come from the \
+                 Fulcrum servers",
+                node.info.client_name(),
+                self.token_label()
+            ));
+        }
+        if let Some(node) = nodes.iter().find(|node| !node.info.synced()) {
+            let (name, percent) = (node.info.client_name(), node.info.sync_percent());
+            return Some(match node_use {
+                NodeUse::TokenJobs => format!(
+                    "this computer's {name} (syncing {percent}%): jobs come from the Fulcrum \
+                     servers until it is synced"
+                ),
+                NodeUse::Templates => {
+                    format!("this computer's {name} (syncing {percent}%): used once it is synced")
+                }
+            });
+        }
+        if self.looking_here() {
+            return Some(format!("none saved for {label}; looking at this computer…"));
+        }
+        let network = self.config.network;
+        matches!(&self.local_node,
+            LocalNodeCheck::Done(at, crate::node::LocalNode::NeedsLogin, _) if *at == network)
+        .then(|| format!("none saved for {label}; the node on this computer wants its RPC login"))
+    }
+
+    /// The Fulcrum row: the saved servers, this computer's when the session
+    /// tries it, then the built-in ones.
+    fn fulcrum_row(&self) -> String {
+        let network = self.config.network;
+        let label = network_label(network);
+        let builtin = match network {
+            MiningNetwork::Mainnet => crate::protocol::FULCRUM_WSS_BOOTSTRAP.len(),
+            MiningNetwork::Chipnet => crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP.len(),
+        };
+        let yours = self.sources.list(network, ConnectionKind::Fulcrum).len();
+        match (self.fulcrum_used_here(), yours) {
+            (None, _) => format!("{builtin} built-in + {yours} yours ({label})"),
+            (Some(_), 0) => {
+                format!("this computer's Fulcrum first, then {builtin} built-in ({label})")
+            }
+            (Some(_), _) => format!(
+                "{yours} yours, then this computer's Fulcrum, then {builtin} built-in ({label})"
+            ),
+        }
+    }
+
+    /// The BCH node list's note on this computer's node while none is
+    /// chosen: used unasked, or syncing.
+    fn node_here_note(&self) -> Option<String> {
+        let node_use = self.node_use()?;
+        if self.node_chosen(node_use) {
+            return None;
+        }
+        if let Some(node) = self.node_used_here() {
+            return Some(format!(
+                "Mining uses the node on this PC ({}) while no node is saved; saving it keeps it.",
+                node.url.trim_start_matches("http://")
+            ));
+        }
+        self.nodes_here()
+            .iter()
+            .find(|node| !node.info.synced())
+            .map(|node| {
+                format!(
+                    "The node on this PC is syncing ({}%): mining uses it from the first start \
+                     after it is synced.",
+                    node.info.sync_percent()
+                )
+            })
     }
 
     /// Saves the node on this computer for every profile on the network.
@@ -2948,8 +3378,28 @@ impl SetupFlow {
 
     /// Puts the saved connections of the selected network on the config, then
     /// any command-line connection overrides on top.
+    /// #### Local sources first: with this computer's Fulcrum server and
+    /// node when the session uses them unasked (`fulcrum_used_here`,
+    /// `node_used_here`), on the config only.
     fn apply_connections(&mut self) -> Result<(), String> {
+        // Taken as applied even if a step below fails, so a look's poll
+        // does not try again on every draw.
+        let here = self.sources_here();
+        self.applied_here = here.clone();
         self.sources.apply_to_runtime(&mut self.config)?;
+        let network = self.config.network;
+        if let (_, Some(url)) = &here {
+            let mut servers = self.sources.list(network, ConnectionKind::Fulcrum).to_vec();
+            servers.push(url.clone());
+            // A server here that the config refuses is left out: the saved
+            // ones stay, and the setup is never blocked by it.
+            if self.config.set_fulcrum_url(&servers.join(",")).is_err() {
+                self.sources.apply_to_runtime(&mut self.config)?;
+            }
+        }
+        if let (Some(url), _) = &here {
+            self.config.set_node_url(url)?;
+        }
         if let Some(url) = &self.overrides.fulcrum {
             self.config.set_fulcrum_url(url)?;
         }
@@ -2982,6 +3432,8 @@ impl SetupFlow {
         self.overrides.fulcrum = None;
         self.overrides.node_rpc = None;
         self.overrides.network = None;
+        // #### Local sources first: this computer, for the new network.
+        self.look_here();
         self.status_line = match self.apply_connections() {
             Err(error) => error,
             Ok(()) => format!(
@@ -3096,6 +3548,8 @@ impl SetupFlow {
             }
         }
         self.config = config;
+        // #### Local sources first: this computer, for the profile's network.
+        self.look_here();
         self.apply_connections()?;
         // #### PR #42: the profile reopens in its own mode.
         self.apply_saved_server(profile.settings.server.as_ref());
@@ -3139,6 +3593,8 @@ impl SetupFlow {
     /// Starts a new profile from the launch configuration.
     fn new_profile(&mut self) -> Result<(), String> {
         self.config = self.base_config.clone();
+        // #### Local sources first: this computer, for the new profile.
+        self.look_here();
         self.apply_connections()?;
         self.active_profile = None;
         self.profile_name_input.clear();
@@ -3163,6 +3619,15 @@ impl SetupFlow {
         if let Some(field) = self.editing {
             self.handle_text_key(field, key);
             return SetupAction::Continue;
+        }
+        // #### Local sources first: Start uses what this computer offers for
+        // the profile as it is now, so it waits a moment for a look still
+        // under way.
+        if self.presses_start(key.code) {
+            if let Err(error) = self.take_looks_here(LOCAL_LOOK_WAIT) {
+                self.status_line = error;
+                return SetupAction::Continue;
+            }
         }
         match self.step {
             SetupStep::Profiles => self.handle_profiles_key(key),
@@ -5008,6 +5473,9 @@ impl SetupFlow {
         state.cookies = crate::config::NodeCookies::load_optional(cookies_path);
         state.cookies_path = Some(cookies_path.to_path_buf());
         state.overrides = overrides;
+        // #### Local sources first: this computer, for the first screen's
+        // network (a profile on another network looks again).
+        state.look_here();
         state.apply_connections()?;
         Ok(state)
     }
@@ -5026,7 +5494,8 @@ impl SetupFlow {
         // While the check for a node on this computer runs, wake up to show
         // its result as soon as it is in.
         // #### PR #61: and while the fee pot shows, to show its balance.
-        if self.checking_local_node() || self.watching_pot() {
+        // #### Local sources first: and while this computer is searched.
+        if self.checking_local_node() || self.finder.is_some() || self.watching_pot() {
             EVENT_POLL_INTERVAL
         } else {
             DRAW_INTERVAL
@@ -6594,12 +7063,6 @@ fn settings_kind(state: &SetupFlow, row: SettingsRow) -> ItemKind {
 fn settings_line(state: &SetupFlow, row: SettingsRow) -> (&'static str, Piece, &'static str) {
     let network = state.config.network;
     let label = network_label(network);
-    let builtin = match network {
-        MiningNetwork::Mainnet => crate::protocol::FULCRUM_WSS_BOOTSTRAP.len(),
-        MiningNetwork::Chipnet => crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP.len(),
-    };
-    let fulcrum = state.sources.list(network, ConnectionKind::Fulcrum).len();
-    let nodes = state.sources.list(network, ConnectionKind::Node).len();
     // #### Pool modes: the server runs its own P2Pool.
     let p2pool = state.runs_p2pool();
     match row {
@@ -6870,27 +7333,14 @@ fn settings_line(state: &SetupFlow, row: SettingsRow) -> (&'static str, Piece, &
                 },
             )
         }
-        SettingsRow::Fulcrum => (
-            "Fulcrum",
-            Piece::plain(format!("{builtin} built-in + {fulcrum} yours ({label})")),
-            "[Enter]",
-        ),
+        // #### Local sources first: with this computer's Fulcrum server
+        // when the session tries it before the built-in ones.
+        SettingsRow::Fulcrum => ("Fulcrum", Piece::plain(state.fulcrum_row()), "[Enter]"),
         // #### PR #65: GPU mining takes its token jobs from a saved
         // node first, and from the Fulcrum servers without one.
-        SettingsRow::Node => (
-            "BCH node",
-            Piece::plain(match (nodes, state.mode) {
-                (0, MiningMode::Gpu) => {
-                    format!("none saved for {label}; jobs come from the Fulcrum servers")
-                }
-                (0, _) => format!("none saved for {label}"),
-                (_, MiningMode::Gpu) => {
-                    format!("{nodes} saved for {label}; jobs come from your node first")
-                }
-                _ => format!("{nodes} saved for {label}"),
-            }),
-            "[Enter]",
-        ),
+        // #### Local sources first: or from this computer's synced node,
+        // which the row names.
+        SettingsRow::Node => ("BCH node", Piece::plain(state.node_row()), "[Enter]"),
         // #### PR #42: the Advanced section.
         SettingsRow::Advanced => (
             "Advanced",
@@ -7635,6 +8085,14 @@ fn connection_items(state: &SetupFlow) -> Vec<SetupItem> {
     // #### PR #42: what the searches found that Enter adds.
     let first_offer = saved.len() + 1 + usize::from(state.local_node_offer().is_some());
     for (position, (place, found)) in state.found_offers().iter().enumerate() {
+        // #### Local sources first: the server the session tries unasked.
+        let tried = if state.connection_kind == ConnectionKind::Fulcrum
+            && state.fulcrum_used_here() == Some(found.url())
+        {
+            " · tried before the built-in ones"
+        } else {
+            ""
+        };
         items.push(
             SetupItem::new(
                 Target::Connection(first_offer + position),
@@ -7642,7 +8100,7 @@ fn connection_items(state: &SetupFlow) -> Vec<SetupItem> {
                 format!("Add from {place}"),
                 state.connection_selected == first_offer + position,
             )
-            .with_value(vec![Piece::plain(found.summary())]),
+            .with_value(vec![Piece::plain(format!("{}{tried}", found.summary()))]),
         );
     }
     items
@@ -7693,7 +8151,7 @@ fn connection_notes(state: &SetupFlow) -> Vec<Vec<Piece>> {
                         "Looking for a BCH node on this PC ({local})..."
                     ))])
                 }
-                LocalNodeCheck::Done(checked, result) if *checked == network => match result {
+                LocalNodeCheck::Done(checked, result, _) if *checked == network => match result {
                     crate::node::LocalNode::Found(info) if info.network() == Some(network) => {
                         if state.local_node_offer().is_none() {
                             lines.push(vec![Piece::dim(format!(
@@ -7723,6 +8181,11 @@ fn connection_notes(state: &SetupFlow) -> Vec<Vec<Piece>> {
             // #### PR #42: the rest of this computer: nodes on other ports,
             // Fulcrum servers and ZMQ block notices.
             found_lines(state, &mut lines);
+            // #### Local sources first: the node mining uses unasked, or
+            // will once it is synced.
+            if let Some(note) = state.node_here_note() {
+                lines.push(vec![Piece::plain(note)]);
+            }
             lines.push(vec![Piece::dim(
                 "There are no public nodes: node RPC is private.",
             )]);
@@ -12845,6 +13308,440 @@ mod tests {
         assert!(screen.contains("server=1 and chipnet=1"));
         assert_eq!(setup.handle_key(key(KeyCode::Down)), SetupAction::Continue);
         assert_eq!(setup.connection_selected, 0);
+    }
+
+    // #### Local sources first
+    /// What a Bitcoin Cash Node on this computer says on `network`.
+    fn here_info(
+        network: MiningNetwork,
+        blocks: u64,
+        headers: u64,
+        progress: f64,
+    ) -> crate::node::NodeInfo {
+        crate::node::NodeInfo {
+            client: "Bitcoin Cash Node 29.1.0".into(),
+            chain: match network {
+                MiningNetwork::Mainnet => "main",
+                MiningNetwork::Chipnet => "chip",
+            }
+            .into(),
+            blocks,
+            headers,
+            syncing: blocks < headers,
+            progress,
+        }
+    }
+
+    /// A synced BCHN on this computer at its default port that passes its
+    /// full check (chain, login, gettxout).
+    fn synced_node_here(setup: &mut SetupFlow) {
+        setup.probe_local_node =
+            |network| crate::node::LocalNode::Found(here_info(network, 326_900, 326_900, 1.0));
+        setup.check_node = |url, network| {
+            if url == crate::node::local_node_url(network) {
+                crate::node::NodeCheck::Ready {
+                    info: here_info(network, 326_900, 326_900, 1.0),
+                    follows_photon: true,
+                }
+            } else {
+                crate::node::NodeCheck::NoAnswer("not checked in tests".into())
+            }
+        };
+    }
+
+    /// Waits for the looks at this computer (its node and the search).
+    fn finish_looks_here(setup: &mut SetupFlow) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while setup.looking_here() || setup.checking_local_node() {
+            assert!(Instant::now() < deadline, "the looks here never finished");
+            thread::sleep(Duration::from_millis(2));
+            setup.poll_local_node();
+        }
+    }
+
+    /// The setup drawn wide enough that no row wraps.
+    fn wide_text(setup: &SetupFlow) -> String {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(240, 60)).unwrap();
+        terminal.draw(|frame| render_setup(frame, setup)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
+
+    /// A Chipnet GPU setup whose new profiles start on Chipnet, saving its
+    /// connections at a path that does not exist yet.
+    fn setup_here() -> (SetupFlow, PathBuf) {
+        let mut setup = setup_for(MiningMode::Gpu);
+        setup.base_config = setup.config.clone();
+        let path = std::env::temp_dir().join(format!(
+            "pickaxe-local-first-{}-{}.json",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        setup.sources_path = Some(path.clone());
+        (setup, path)
+    }
+
+    // #### Local sources first
+    // What: a new profile on a computer whose node is synced, proven and
+    // logged in to with its cookie takes its jobs from that node first, the
+    // Fulcrum servers as fallback, and the node row and list say so; nothing
+    // is saved. An ASIC takes its templates from it, so Start needs no node
+    // list, and Start waits for a look still under way.
+    // Look here if: node_used_here, apply_connections, take_looks_here or
+    // node_row change.
+    #[test]
+    fn a_synced_node_on_this_computer_is_used_first_by_a_new_profile() {
+        let (mut setup, path) = setup_here();
+        synced_node_here(&mut setup);
+        setup.new_profile().unwrap();
+        finish_looks_here(&mut setup);
+        assert_eq!(
+            setup.config.custom_node_endpoints(),
+            ["http://127.0.0.1:48332"]
+        );
+        // For the session only: no list, profile or file changes.
+        assert!(setup
+            .sources
+            .list(MiningNetwork::Chipnet, ConnectionKind::Node)
+            .is_empty());
+        assert_eq!(setup.profile_settings().node_rpc, None);
+        assert!(!path.exists());
+        setup.open_settings(SettingsRow::Node);
+        assert_eq!(
+            settings_line(&setup, SettingsRow::Node).1.text,
+            "this computer's Bitcoin Cash Node (synced): used first; Fulcrum servers as fallback"
+        );
+        let screen = wide_text(&setup);
+        assert!(
+            screen.contains(
+                "this computer's Bitcoin Cash Node (synced): used first; Fulcrum servers as fallback"
+            ),
+            "{screen}"
+        );
+        // The node list says so beside the node it offers to save.
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Connections);
+        finish_looks_here(&mut setup);
+        let screen = wide_text(&setup);
+        assert!(
+            screen.contains("Use the node on this PC: Bitcoin Cash Node 29.1.0 · synced"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains(
+                "Mining uses the node on this PC (127.0.0.1:48332) while no node is saved; saving \
+                 it keeps it."
+            ),
+            "{screen}"
+        );
+
+        // An ASIC takes its templates from it: Start needs no node list.
+        setup.mode = MiningMode::Asic;
+        setup.config.payout_address = chipnet_payout(4);
+        assert_eq!(
+            settings_line(&setup, SettingsRow::Node).1.text,
+            "this computer's Bitcoin Cash Node (synced): its templates are used"
+        );
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+        assert_eq!(
+            setup.config.custom_node_endpoints(),
+            ["http://127.0.0.1:48332"]
+        );
+
+        // Start waits for a look still under way and uses what it finds.
+        let (mut setup, _) = setup_here();
+        synced_node_here(&mut setup);
+        setup.probe_local_node = |network| {
+            thread::sleep(Duration::from_millis(300));
+            crate::node::LocalNode::Found(here_info(network, 326_900, 326_900, 1.0))
+        };
+        setup.new_profile().unwrap();
+        setup.mode = MiningMode::Asic;
+        setup.config.payout_address = chipnet_payout(4);
+        assert_eq!(
+            settings_line(&setup, SettingsRow::Node).1.text,
+            "none saved for Chipnet; looking at this computer…"
+        );
+        setup.open_settings(SettingsRow::Start);
+        assert!(setup.looking_here());
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+        assert_eq!(
+            setup.config.custom_node_endpoints(),
+            ["http://127.0.0.1:48332"]
+        );
+    }
+
+    // #### Local sources first
+    // What: a node the miner chose is kept: a node saved for the network or
+    // --node-rpc comes instead of this computer's, which is then not used;
+    // --source fulcrum keeps GPU jobs on Fulcrum, while an ASIC still takes
+    // this computer's templates.
+    // Look here if: node_chosen or node_row change.
+    #[test]
+    fn an_explicit_node_choice_is_kept() {
+        let (mut setup, _) = setup_here();
+        setup
+            .sources
+            .put(
+                MiningNetwork::Chipnet,
+                ConnectionKind::Node,
+                None,
+                "http://192.168.0.55:48332",
+            )
+            .unwrap();
+        synced_node_here(&mut setup);
+        setup.new_profile().unwrap();
+        finish_looks_here(&mut setup);
+        assert_eq!(
+            setup.config.custom_node_endpoints(),
+            ["http://192.168.0.55:48332"]
+        );
+        assert_eq!(
+            settings_line(&setup, SettingsRow::Node).1.text,
+            "1 saved for Chipnet; jobs come from your node first"
+        );
+
+        // --node-rpc wins too.
+        setup
+            .sources
+            .remove(MiningNetwork::Chipnet, ConnectionKind::Node, 0);
+        setup.overrides.node_rpc = Some("http://10.0.0.7:48332".into());
+        setup.apply_connections().unwrap();
+        assert_eq!(
+            setup.config.custom_node_endpoints(),
+            ["http://10.0.0.7:48332"]
+        );
+        assert_eq!(
+            settings_line(&setup, SettingsRow::Node).1.text,
+            "named on the command line; jobs come from it first"
+        );
+
+        // --source fulcrum keeps GPU jobs on Fulcrum.
+        setup.overrides.node_rpc = None;
+        setup.overrides.source = Some("fulcrum".into());
+        setup.apply_connections().unwrap();
+        assert!(setup.config.custom_node_endpoints().is_empty());
+        setup.open_settings(SettingsRow::Node);
+        let screen = wide_text(&setup);
+        assert!(
+            screen.contains("none saved for Chipnet; jobs come from the Fulcrum servers"),
+            "{screen}"
+        );
+        setup.mode = MiningMode::Asic;
+        setup.config.payout_address = chipnet_payout(4);
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+        assert_eq!(
+            setup.config.custom_node_endpoints(),
+            ["http://127.0.0.1:48332"]
+        );
+    }
+
+    // #### Local sources first
+    // What: a node on this computer that is still syncing is not used: the
+    // row and the node list show how far it is, GPU jobs stay on the Fulcrum
+    // servers and an ASIC's Start goes to the node list. Looked at again
+    // once synced (the node list, or the next setup), it is used.
+    // Look here if: nodes_here or node_here_row change.
+    #[test]
+    fn a_syncing_node_on_this_computer_is_not_used_yet() {
+        let (mut setup, _) = setup_here();
+        synced_node_here(&mut setup);
+        setup.probe_local_node =
+            |network| crate::node::LocalNode::Found(here_info(network, 205_000, 326_900, 0.634));
+        setup.new_profile().unwrap();
+        finish_looks_here(&mut setup);
+        assert!(setup.config.custom_node_endpoints().is_empty());
+        setup.open_settings(SettingsRow::Node);
+        let screen = wide_text(&setup);
+        assert!(
+            screen.contains(
+                "this computer's Bitcoin Cash Node (syncing 63%): jobs come from the Fulcrum \
+                 servers until it is synced"
+            ),
+            "{screen}"
+        );
+        setup.handle_key(key(KeyCode::Enter));
+        finish_looks_here(&mut setup);
+        let screen = wide_text(&setup);
+        assert!(
+            screen.contains("syncing, height 205000 of 326900 (63%)"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains(
+                "The node on this PC is syncing (63%): mining uses it from the first start after \
+                 it is synced."
+            ),
+            "{screen}"
+        );
+        // An ASIC waits for it: Start goes to the node list.
+        setup.mode = MiningMode::Asic;
+        setup.config.payout_address = chipnet_payout(4);
+        assert_eq!(
+            settings_line(&setup, SettingsRow::Node).1.text,
+            "this computer's Bitcoin Cash Node (syncing 63%): used once it is synced"
+        );
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Continue);
+        assert_eq!(setup.step, SetupStep::Connections);
+        assert!(setup.config.custom_node_endpoints().is_empty());
+        // Synced now: the node list looks again, and Start uses it.
+        synced_node_here(&mut setup);
+        setup.check_local_node();
+        finish_looks_here(&mut setup);
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+        assert_eq!(
+            setup.config.custom_node_endpoints(),
+            ["http://127.0.0.1:48332"]
+        );
+    }
+
+    // #### Local sources first
+    // What: a Fulcrum server found on this computer is tried after the saved
+    // servers and before the built-in ones, unless --fulcrum names the
+    // servers; the Fulcrum row and list say so, and nothing is saved.
+    // Look here if: fulcrum_used_here or fulcrum_row change.
+    #[test]
+    fn a_fulcrum_on_this_computer_is_tried_before_the_built_in_servers() {
+        let (mut setup, path) = setup_here();
+        setup.find_here = |_| {
+            vec![crate::node_find::Found::Fulcrum {
+                url: "tcp://127.0.0.1:64001".into(),
+                report: Ok(crate::node_find::FulcrumReport {
+                    server: "Fulcrum 2.1.4".into(),
+                    height: 320_000,
+                }),
+            }]
+        };
+        setup.new_profile().unwrap();
+        finish_looks_here(&mut setup);
+        let builtin: Vec<String> = crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP
+            .iter()
+            .map(|url| (*url).to_owned())
+            .collect();
+        let endpoints = setup.config.electrum_endpoints();
+        assert_eq!(endpoints[0], "tcp://127.0.0.1:64001");
+        assert_eq!(endpoints[1..], builtin[..]);
+        assert!(setup
+            .sources
+            .list(MiningNetwork::Chipnet, ConnectionKind::Fulcrum)
+            .is_empty());
+        assert_eq!(setup.profile_settings().fulcrum, None);
+        assert!(!path.exists());
+        setup.open_settings(SettingsRow::Fulcrum);
+        let screen = wide_text(&setup);
+        assert!(
+            screen.contains(&format!(
+                "this computer's Fulcrum first, then {} built-in (Chipnet)",
+                builtin.len()
+            )),
+            "{screen}"
+        );
+        setup.handle_key(key(KeyCode::Enter));
+        let screen = wide_text(&setup);
+        assert!(
+            screen.contains(
+                "Add from this PC: Fulcrum 2.1.4 at tcp://127.0.0.1:64001 · height 320000 · tried \
+                 before the built-in ones"
+            ),
+            "{screen}"
+        );
+
+        // A saved server stays first.
+        setup
+            .sources
+            .put(
+                MiningNetwork::Chipnet,
+                ConnectionKind::Fulcrum,
+                None,
+                "wss://fulcrum.example:50004",
+            )
+            .unwrap();
+        setup.apply_connections().unwrap();
+        assert_eq!(
+            setup.config.electrum_endpoints()[..2],
+            ["wss://fulcrum.example:50004", "tcp://127.0.0.1:64001"]
+        );
+        assert_eq!(
+            settings_line(&setup, SettingsRow::Fulcrum).1.text,
+            format!(
+                "1 yours, then this computer's Fulcrum, then {} built-in (Chipnet)",
+                builtin.len()
+            )
+        );
+
+        // --fulcrum names the servers alone.
+        setup.overrides.fulcrum = Some("wss://cli.example:50004".into());
+        setup.apply_connections().unwrap();
+        assert_eq!(
+            setup.config.custom_fulcrum_endpoints(),
+            ["wss://cli.example:50004"]
+        );
+        assert_eq!(
+            settings_line(&setup, SettingsRow::Fulcrum).1.text,
+            format!("{} built-in + 1 yours (Chipnet)", builtin.len())
+        );
+    }
+
+    // #### Local sources first
+    // What: a synced Knuth node on this computer (another port, no
+    // gettxout) gives an ASIC its templates, but PHOTON keeps the Fulcrum
+    // servers and the row says why.
+    // Look here if: node_use, nodes_here or node_here_row change.
+    #[test]
+    fn knuth_on_this_computer_gives_asic_templates_but_not_photon_jobs() {
+        let (mut setup, _) = setup_here();
+        setup.find_here = |network| {
+            vec![crate::node_find::Found::Node {
+                url: "http://127.0.0.1:8332".into(),
+                who: "Knuth (its default on every network)",
+                check: crate::node::NodeCheck::Ready {
+                    info: crate::node::NodeInfo {
+                        client: "BCH node".into(),
+                        ..here_info(network, 326_900, 326_900, 1.0)
+                    },
+                    follows_photon: false,
+                },
+            }]
+        };
+        setup.new_profile().unwrap();
+        finish_looks_here(&mut setup);
+        assert!(setup.config.custom_node_endpoints().is_empty());
+        setup.open_settings(SettingsRow::Node);
+        let screen = wide_text(&setup);
+        assert!(
+            screen.contains(
+                "this computer's BCH node (synced) has no gettxout, which PHOTON needs: jobs come \
+                 from the Fulcrum servers"
+            ),
+            "{screen}"
+        );
+        // An ASIC takes its templates from it.
+        setup.mode = MiningMode::Asic;
+        setup.config.payout_address = chipnet_payout(4);
+        assert_eq!(
+            settings_line(&setup, SettingsRow::Node).1.text,
+            "this computer's BCH node (synced): its templates are used"
+        );
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+        assert_eq!(
+            setup.config.custom_node_endpoints(),
+            ["http://127.0.0.1:8332"]
+        );
+        // Back to GPU mining: PHOTON's jobs leave it again.
+        setup.mode = MiningMode::Gpu;
+        setup.open_settings(SettingsRow::Start);
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(setup.config.custom_node_endpoints().is_empty());
     }
 
     #[test]

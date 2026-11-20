@@ -329,7 +329,8 @@ fn probe(
     })
 }
 
-/// What a Fulcrum server at `url` says: its version and height.
+/// What a Fulcrum server at `url` says: its version and height, once its
+/// block at the network's fork height proves its chain.
 fn fulcrum_report(url: &str, network: MiningNetwork) -> Result<FulcrumReport, String> {
     let deployment = crate::config::MiningToken::Photon.photon_deployment(network);
     let mut session = crate::electrum::ElectrumSession::connect_failover_for_deployment(
@@ -351,6 +352,29 @@ fn fulcrum_report(url: &str, network: MiningNetwork) -> Result<FulcrumReport, St
         .get("height")
         .and_then(serde_json::Value::as_u64)
         .ok_or("the server gave no height")?;
+    // #### Local sources first
+    // What: a server found is proven on the network by its block at the
+    // fork height (`MiningNetwork::fork_block`), as a node is.
+    // Why: the setup now tries a Fulcrum server found on this computer
+    // before the built-in ones, and the Chipnet search also tries mainnet's
+    // ports.
+    // Look here if: a Fulcrum server on this computer is refused as being
+    // on another network.
+    let (fork, expected) = network.fork_block();
+    if height < u64::from(fork) {
+        return Err(format!(
+            "height {height}, below {}'s fork block at {fork}",
+            network.as_str()
+        ));
+    }
+    let header = session.rpc("blockchain.block.header", serde_json::json!([fork]))?;
+    let hash = crate::live_job::fulcrum_header_hash(&serde_json::json!({ "hex": header }))?;
+    if !hash.eq_ignore_ascii_case(expected) {
+        return Err(format!(
+            "not on {}: its block at {fork} is another chain's",
+            network.as_str()
+        ));
+    }
     Ok(FulcrumReport { server, height })
 }
 
@@ -455,12 +479,14 @@ mod tests {
         assert!(tailscale_peers_from(&serde_json::json!({})).is_empty());
     }
 
-    // #### PR #42
-    // What: a Fulcrum server over plain TCP and a ZMQ publisher are
-    // recognised at their ports, with the server's version and height.
-    // Look here if: probe or fulcrum_report changes.
-    #[test]
-    fn fulcrum_and_zmq_are_recognised() {
+    /// Chipnet's block 115252, its fork block, as Fulcrum serves it.
+    const CHIPNET_FORK_HEADER: &str = "00000020c1ee3ac176c101e20bef0167ad67e4e10447617413081630f246d2bd0000000064f0d94eb502a158a0deac332dbda14d0eb56c8b8e9704257a58319eb3b4c643d03b3963ffff001d0c7572c7";
+    /// Block 0, the genesis block of every Bitcoin chain.
+    const GENESIS_HEADER: &str = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c";
+
+    /// A Fulcrum server over plain TCP at `height` for one probe, answering
+    /// a header request with `header`.
+    fn fulcrum_stub(height: u64, header: &'static str) -> (u16, std::thread::JoinHandle<()>) {
         let fulcrum = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = fulcrum.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
@@ -469,13 +495,16 @@ mod tests {
             let (stream, _) = fulcrum.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut writer = stream;
-            for _ in 0..2 {
+            loop {
                 let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
                 let request: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
                 let result = match request["method"].as_str().unwrap() {
                     "server.version" => serde_json::json!(["Fulcrum 1.12.0", "1.5"]),
-                    _ => serde_json::json!({"height": 951_204, "hex": "00"}),
+                    "blockchain.block.header" => serde_json::json!(header),
+                    _ => serde_json::json!({"height": height, "hex": "00"}),
                 };
                 writeln!(
                     writer,
@@ -485,14 +514,30 @@ mod tests {
                 .unwrap();
             }
         });
-        let found = probe(
+        (port, server)
+    }
+
+    fn probe_fulcrum(port: u16, network: MiningNetwork) -> Found {
+        probe(
             "127.0.0.1",
             port,
             Kind::ElectrumTcp,
-            MiningNetwork::Chipnet,
+            network,
             Duration::from_secs(1),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    // #### PR #42
+    // What: a Fulcrum server over plain TCP and a ZMQ publisher are
+    // recognised at their ports, with the server's version and height.
+    // #### Local sources first: once the server's block at the fork height
+    // proves its chain.
+    // Look here if: probe or fulcrum_report changes.
+    #[test]
+    fn fulcrum_and_zmq_are_recognised() {
+        let (port, server) = fulcrum_stub(951_204, CHIPNET_FORK_HEADER);
+        let found = probe_fulcrum(port, MiningNetwork::Chipnet);
         server.join().unwrap();
         assert_eq!(
             found,
@@ -540,5 +585,32 @@ mod tests {
             Duration::from_millis(300)
         )
         .is_none());
+    }
+
+    // #### Local sources first
+    // What: a Fulcrum server whose block at the fork height is another
+    // chain's, or that is below the fork height (Chipnet's server on a
+    // mainnet port), is one Pickaxe cannot use, so the setup never tries it
+    // first.
+    // Look here if: fulcrum_report's chain proof changes.
+    #[test]
+    fn a_fulcrum_on_another_chain_is_not_usable() {
+        let (port, server) = fulcrum_stub(951_204, GENESIS_HEADER);
+        let found = probe_fulcrum(port, MiningNetwork::Chipnet);
+        server.join().unwrap();
+        assert!(
+            matches!(&found, Found::Fulcrum { report: Err(error), .. }
+                if error.contains("not on chipnet")),
+            "{found:?}"
+        );
+        assert!(found.summary().contains("not a Fulcrum Pickaxe can use"));
+        let (port, server) = fulcrum_stub(320_000, CHIPNET_FORK_HEADER);
+        let found = probe_fulcrum(port, MiningNetwork::Mainnet);
+        server.join().unwrap();
+        assert!(
+            matches!(&found, Found::Fulcrum { report: Err(error), .. }
+                if error.contains("below mainnet's fork block at 478559")),
+            "{found:?}"
+        );
     }
 }

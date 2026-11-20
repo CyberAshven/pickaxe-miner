@@ -52,6 +52,15 @@ can fall back to public Fulcrum servers. `--source node` requires the node to
 work. Native discovery needs no transaction index and supports a pruned node
 that retains the blocks being followed.
 
+The setup also looks at the computer it runs on. With no node saved for the
+network, a synced node there that Pickaxe logs in to (BCHN with its cookie) is
+used first: GPU tokens take their jobs from it, with the public Fulcrum servers
+as the fallback, and ASICs their templates (a Knuth node too; PHOTON needs
+`gettxout`, so it keeps Fulcrum there). A Fulcrum server there is tried before
+the built-in ones. Nothing is saved, and the BCH node and Fulcrum rows say what
+is used; a node still syncing shows its progress and is used from the first
+start after it is synced.
+
 BCH solo mining and embedded P2Pool require your own BCH node. When joining a
 public pool or public P2Pool with its jobs, the upstream supplies the templates.
 Using your own templates at a compatible SV2 pool requires your node and Job
