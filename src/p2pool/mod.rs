@@ -9,6 +9,7 @@ pub mod http;
 pub mod jd;
 pub mod launch;
 pub mod own;
+pub mod peers;
 pub mod release;
 pub mod screen;
 
@@ -58,9 +59,11 @@ pub struct Settings {
     /// release and installs it on `u` or `pickaxe p2pool update`.
     pub auto_update: bool,
     pub share_chain: ShareChain,
-    /// Other P2Pool nodes to join, as P2P addresses such as
-    /// `/ip4/203.0.113.7/tcp/6884`. With none, this node starts its own
-    /// share chain and opens its ports without waiting for peers.
+    /// Your P2Pool nodes to join, as P2P addresses such as
+    /// `/ip4/203.0.113.7/tcp/6884` or `/dns4/pool.example.com/tcp/6884`.
+    /// Always dialed, before the seeds and the peers P2Pool learned
+    /// (`peers.rs`). With nothing to dial, this node starts its own share
+    /// chain and opens its ports without waiting for peers.
     pub peers: Vec<String>,
 }
 
