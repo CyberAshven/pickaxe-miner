@@ -36,3 +36,19 @@ test('raw RPC responses retain integers beyond JavaScript precision across frame
   assert.equal(await unframed, second);
   rpc.close();
 });
+
+test('block and subscribed-script notices are reported; other messages are not', async () => {
+  const socket = { readyState: 1, send() {}, close() {} };
+  const rpc = new Electrum(socket);
+  let notices = 0;
+  rpc.onNotice = () => { notices++; };
+  const line = value => ({ data: JSON.stringify(value) + '\n' });
+  socket.onmessage(line({ jsonrpc: '2.0', method: 'blockchain.headers.subscribe', params: [{ height: 1 }] }));
+  socket.onmessage(line({ jsonrpc: '2.0', method: 'blockchain.scripthash.subscribe', params: ['ab', 'cd'] }));
+  socket.onmessage(line({ method: 'notification', params: [] }));
+  const reply = rpc.rpc('blockchain.headers.subscribe');
+  socket.onmessage(line({ id: 1, result: { height: 2 } }));
+  assert.deepEqual(await reply, { height: 2 });
+  assert.equal(notices, 2);
+  rpc.close();
+});
