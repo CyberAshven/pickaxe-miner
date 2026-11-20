@@ -2761,10 +2761,20 @@ fn serve_device(
                     if let Some(reason) = mining.token_refusal.take() {
                         stats.tokens_refused = Some(reason);
                     }
+                    // A share naming its worker (extension 0x0002) counts
+                    // on that worker's row (`Devices::worker_share`).
                     if let Some(event) = responses.share_event {
-                        stats
-                            .device_stats
-                            .share(device, event, false, Instant::now());
+                        match responses.worker.as_deref() {
+                            Some(worker) => stats.device_stats.worker_share(
+                                device,
+                                worker,
+                                event,
+                                Instant::now(),
+                            ),
+                            None => stats
+                                .device_stats
+                                .share(device, event, false, Instant::now()),
+                        }
                     }
                 }
                 accepted = next_accepted;

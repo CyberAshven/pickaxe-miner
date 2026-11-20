@@ -102,11 +102,15 @@ pub struct MiningSession {
     /// #### merge-mining v2: the client asked for the merge-mining
     /// disclosure extension (`merge::disclosure`).
     merge_disclosure: bool,
+    /// The client was granted Worker-Specific Hashrate Tracking (0x0002):
+    /// its extended shares may name their worker.
+    worker_hashrate: bool,
     /// #### merge-mining v2: leaf log lines (JSON) for jobs on a public
     /// pool's standard channels, taken by the server for its leaf log.
     pub leaf_log: Vec<String>,
 }
 
+#[derive(Default)]
 pub struct Responses {
     pub frames: Vec<SerializedFrame>,
     pub blocks: Vec<ValidatedShare>,
@@ -123,6 +127,9 @@ pub struct Responses {
     /// #### PR #42: accepted shares that win a header-shaped token (never
     /// blocks).
     pub header_wins: Vec<ValidatedShare>,
+    /// The worker the share named (extension 0x0002), for the workers
+    /// table, which shows it as a name only (`telemetry::worker_name`).
+    pub worker: Option<String>,
 }
 
 impl MiningSession {
@@ -163,6 +170,7 @@ impl MiningSession {
             token_refusal: None,
             donation_choice: None,
             merge_disclosure: false,
+            worker_hashrate: false,
             leaf_log: Vec::new(),
         })
     }
@@ -443,45 +451,45 @@ impl MiningSession {
 
     pub fn receive(&mut self, mut frame: SerializedFrame, now: u32) -> Result<Responses, String> {
         let header = frame.header();
-        // #### merge-mining v2: the extensions negotiation (type 0x0001):
-        // the disclosure extension is granted when asked for, every other
-        // extension left out of the answer.
-        if header.ext_type_without_channel_msg() == super::merge::disclosure::NEGOTIATION
-            && header.msg_type() == super::merge::disclosure::REQUEST_EXTENSIONS
-            && !header.channel_msg()
-        {
-            use super::merge::disclosure::{
-                extensions_payload, requested_extensions, EXTENSION, NEGOTIATION,
-                REQUEST_EXTENSIONS_SUCCESS,
+        // #### merge-mining v2: the extensions negotiation (type 0x0001).
+        // What: RequestExtensions after setup grants the merge-mining
+        // disclosure (0x4D4D) and Worker-Specific Hashrate Tracking (0x0002)
+        // when asked, in the order asked; a request for neither gets
+        // RequestExtensions.Error naming what was asked and requiring
+        // nothing. Every other extension frame (an extension this server
+        // does not implement or did not grant, or 0x0001 with the channel
+        // bit) is discarded.
+        // Why: sv2-spec 3.2.1 has a receiver ignore extension messages it
+        // does not know; Knuth answers and discards the same way, so a
+        // Knuth or SRI proxy that asks for 0x0002 keeps its connection.
+        // Look here if: a client that negotiates extensions is closed, or a
+        // worker name is read without the grant.
+        let extension = header.ext_type_without_channel_msg();
+        if extension != 0 {
+            use super::extensions::{
+                negotiation_answer, ExtensionMessage, RequestExtensions, NEGOTIATION,
+                REQUEST_EXTENSIONS, WORKER_HASHRATE,
             };
+            use super::merge::disclosure::EXTENSION as DISCLOSURE;
+            if extension != NEGOTIATION
+                || header.msg_type() != REQUEST_EXTENSIONS
+                || header.channel_msg()
+            {
+                return Ok(Responses::default());
+            }
             if self.setup_flags.is_none() {
                 return Err("extensions requested before setup".into());
             }
-            let (request, asked) =
-                requested_extensions(frame.payload()).ok_or("malformed extensions request")?;
-            let granted: Vec<u16> = asked
-                .into_iter()
-                .filter(|extension| *extension == EXTENSION)
-                .collect();
-            self.merge_disclosure |= !granted.is_empty();
+            let request =
+                RequestExtensions::decode(frame.payload()).ok_or("malformed extensions request")?;
+            self.merge_disclosure |= request.requested.contains(&DISCLOSURE);
+            self.worker_hashrate |= request.requested.contains(&WORKER_HASHRATE);
             return Ok(Responses {
-                frames: vec![extension_frame(
-                    NEGOTIATION,
-                    REQUEST_EXTENSIONS_SUCCESS,
-                    false,
-                    &extensions_payload(request, &granted),
-                )?],
-                blocks: Vec::new(),
-                token_wins: Vec::new(),
-                share_event: None,
-                accepted_work: None,
-                custom_job: None,
-                forward: Vec::new(),
-                header_wins: Vec::new(),
+                frames: vec![negotiation_answer(&request, |extension| {
+                    matches!(extension, DISCLOSURE | WORKER_HASHRATE)
+                })?],
+                ..Responses::default()
             });
-        }
-        if header.ext_type_without_channel_msg() != 0 {
-            return Err("unsupported SV2 extension".into());
         }
         let mut frames = Vec::new();
         let mut blocks = Vec::new();
@@ -566,14 +574,31 @@ impl MiningSession {
                 token_wins,
                 share_event,
                 accepted_work,
-                custom_job: None,
-                forward: Vec::new(),
-                header_wins: Vec::new(),
+                ..Responses::default()
             });
         }
         let flags = self
             .setup_flags
             .ok_or("SetupConnection is required first")?;
+        // What: the bytes after a SubmitSharesExtended's own fields (its
+        // 24 fixed bytes and the B0_32 extranonce) are TLV fields
+        // (sv2-spec 3.4.3), read by `extensions::share_worker`; a
+        // SubmitSharesStandard is exactly its 24 bytes.
+        // Why: the reference parser stops at the message's own fields and
+        // takes any trailing bytes; Knuth closes on bytes that are not whole
+        // fields, and on anything after a standard share.
+        // Look here if: a proxy's named shares close its connection.
+        let payload_len = frame.payload().len();
+        let trailing = if header.msg_type() == MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED {
+            let payload = frame.payload();
+            payload
+                .get(24)
+                .and_then(|extranonce| payload.get(25 + usize::from(*extranonce)..))
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let msg: Mining = (header.msg_type(), frame.payload())
             .try_into()
             .map_err(|_| "malformed mining message")?;
@@ -583,6 +608,7 @@ impl MiningSession {
         let mut custom_job = None;
         let mut forward = Vec::new();
         let mut header_wins = Vec::new();
+        let mut worker = None;
         match msg {
             Mining::OpenStandardMiningChannel(request) => {
                 let maximum = request
@@ -622,6 +648,9 @@ impl MiningSession {
                 }
             }
             Mining::SubmitSharesStandard(request) => {
+                if payload_len != 24 {
+                    return Err("malformed mining message".into());
+                }
                 let share = Share {
                     channel_id: request.channel_id,
                     job_id: request.job_id,
@@ -644,26 +673,43 @@ impl MiningSession {
                 )?);
             }
             Mining::SubmitSharesExtended(request) => {
-                let share = Share {
-                    channel_id: request.channel_id,
-                    job_id: request.job_id,
-                    sequence: request.sequence_number,
-                    version: request.version,
-                    time: request.ntime,
-                    nonce: request.nonce,
-                    extranonce: request.extranonce.as_ref(),
-                };
-                share_event = Some(self.submit(
-                    share,
-                    ChannelKind::Extended,
-                    now,
-                    &mut frames,
-                    &mut blocks,
-                    &mut token_wins,
-                    &mut forward,
-                    &mut header_wins,
-                    &mut accepted_work,
-                )?);
+                // Extension 0x0002: the worker behind the share, once
+                // granted; a name over 32 bytes refuses the share.
+                match super::extensions::share_worker(&trailing, self.worker_hashrate) {
+                    Ok(named) => {
+                        worker = named;
+                        let share = Share {
+                            channel_id: request.channel_id,
+                            job_id: request.job_id,
+                            sequence: request.sequence_number,
+                            version: request.version,
+                            time: request.ntime,
+                            nonce: request.nonce,
+                            extranonce: request.extranonce.as_ref(),
+                        };
+                        share_event = Some(self.submit(
+                            share,
+                            ChannelKind::Extended,
+                            now,
+                            &mut frames,
+                            &mut blocks,
+                            &mut token_wins,
+                            &mut forward,
+                            &mut header_wins,
+                            &mut accepted_work,
+                        )?);
+                    }
+                    Err(Some(code)) => {
+                        self.rejected = self.rejected.saturating_add(1);
+                        frames.push(mining(Mining::SubmitSharesError(SubmitSharesError {
+                            channel_id: request.channel_id,
+                            sequence_number: request.sequence_number,
+                            error_code: code.try_into().map_err(|_| "error code too long")?,
+                        }))?);
+                        share_event = Some(ShareEvent::Rejected(code));
+                    }
+                    Err(None) => return Err("malformed mining message".into()),
+                }
             }
             Mining::UpdateChannel(request) => {
                 let result = self
@@ -758,6 +804,7 @@ impl MiningSession {
             custom_job,
             forward,
             header_wins,
+            worker,
         })
     }
 
@@ -2859,9 +2906,10 @@ mod tests {
             NEGOTIATION
         );
         assert_eq!(reply[0].header().msg_type(), REQUEST_EXTENSIONS_SUCCESS);
+        // Worker-Specific Hashrate Tracking (0x0002) is granted too.
         assert_eq!(
             requested_extensions(reply[0].payload()),
-            Some((5, vec![EXTENSION]))
+            Some((5, vec![EXTENSION, 0x0002]))
         );
         let (channel, _, _) = open_extended(&mut server, "device").unwrap();
         // The next job's frames end with its leaves.
@@ -3113,5 +3161,181 @@ mod tests {
             1,
             "BCH work is unchanged"
         );
+    }
+
+    /// `frame` (a share) with `trailing` bytes after its own fields.
+    fn followed(mut frame: SerializedFrame, trailing: &[u8]) -> SerializedFrame {
+        let header = frame.header();
+        let mut payload = frame.payload().to_vec();
+        payload.extend_from_slice(trailing);
+        extension_frame(
+            header.ext_type_without_channel_msg(),
+            header.msg_type(),
+            header.channel_msg(),
+            &payload,
+        )
+        .unwrap()
+    }
+
+    // What: Knuth's extensions on the mining server. RequestExtensions is
+    // granted for 0x0002 (with 0x4D4D when asked, in the order asked) and
+    // refused with RequestExtensions.Error naming what was asked when it
+    // asks for neither; a frame of an unknown or ungranted extension, and a
+    // RequestExtensions with the channel bit, are discarded without closing;
+    // a malformed RequestExtensions closes.
+    // Look here if: the negotiation in `MiningSession::receive` changes.
+    #[test]
+    fn worker_tracking_is_granted_and_unknown_extensions_are_discarded() {
+        use super::super::extensions::{
+            ExtensionMessage, RequestExtensions, RequestExtensionsError, RequestExtensionsSuccess,
+            NEGOTIATION, REQUEST_EXTENSIONS_ERROR, REQUEST_EXTENSIONS_SUCCESS, WORKER_HASHRATE,
+        };
+        let ask = |requested: Vec<u16>| {
+            RequestExtensions {
+                request_id: 5,
+                requested,
+            }
+            .frame()
+            .unwrap()
+        };
+        let mut server = session();
+        server.receive(setup(4), NOW).unwrap();
+        let mut reply = server
+            .receive(ask(vec![0x0003, WORKER_HASHRATE, 0x4D4D]), NOW)
+            .unwrap()
+            .frames;
+        assert_eq!(reply.len(), 1);
+        assert_eq!(reply[0].header().ext_type(), NEGOTIATION);
+        assert_eq!(reply[0].header().msg_type(), REQUEST_EXTENSIONS_SUCCESS);
+        assert_eq!(
+            RequestExtensionsSuccess::decode(reply[0].payload()),
+            Some(RequestExtensionsSuccess {
+                request_id: 5,
+                supported: vec![WORKER_HASHRATE, 0x4D4D],
+            })
+        );
+        assert!(server.worker_hashrate && server.merge_disclosure);
+        let mut refusing = session();
+        refusing.receive(setup(4), NOW).unwrap();
+        let mut reply = refusing.receive(ask(vec![0x0003]), NOW).unwrap().frames;
+        assert_eq!(reply[0].header().msg_type(), REQUEST_EXTENSIONS_ERROR);
+        assert_eq!(
+            RequestExtensionsError::decode(reply[0].payload()),
+            Some(RequestExtensionsError {
+                request_id: 5,
+                unsupported: vec![0x0003],
+                required: Vec::new(),
+            })
+        );
+        assert!(!refusing.worker_hashrate);
+        // Discarded: another extension's frame, a Knuth JD extension's, the
+        // negotiation with the channel bit, and a client's 0x4D4D frame;
+        // the connection stays.
+        for frame in [
+            extension_frame(0x0003, 0x00, false, &[1, 2, 3]).unwrap(),
+            extension_frame(0x5052, 0x00, false, &[]).unwrap(),
+            extension_frame(NEGOTIATION, 0x00, true, &[5, 0, 1, 0, 2, 0]).unwrap(),
+            extension_frame(0x4D4D, 0x00, true, &[]).unwrap(),
+        ] {
+            let responses = refusing.receive(frame, NOW).unwrap();
+            assert!(responses.frames.is_empty());
+        }
+        assert!(!refusing.worker_hashrate);
+        assert!(refusing
+            .receive(
+                extension_frame(NEGOTIATION, 0x00, false, &[1]).unwrap(),
+                NOW
+            )
+            .is_err());
+        // Before setup it is still refused.
+        assert!(session().receive(ask(vec![WORKER_HASHRATE]), NOW).is_err());
+    }
+
+    // What: TLV fields after SubmitSharesExtended. Without the grant whole
+    // fields are ignored and the share is taken; with it the first
+    // user_identity names the worker (other fields ignored), a share
+    // without one is taken, and one over 32 bytes is refused with
+    // user-identity-too-long (counted, the connection stays). Bytes that are
+    // not whole fields close the connection either way; any byte after a
+    // SubmitSharesStandard closes it.
+    // Look here if: shares from a proxy that names workers are refused or
+    // close its connection.
+    #[test]
+    fn extended_shares_name_their_worker_once_granted() {
+        use super::super::extensions::{
+            ExtensionMessage, RequestExtensions, Tlv, USER_IDENTITY_TOO_LONG, WORKER_HASHRATE,
+        };
+        let field = |tlvs: &[Tlv]| -> Vec<u8> {
+            tlvs.iter().flat_map(|tlv| tlv.encode().unwrap()).collect()
+        };
+        // knuth: src/node/test/sv2_mining_session.cpp:788 (worker-hashrate
+        // head): user_identity "rig-7".
+        let rig = [0x02, 0x00, 0x01, 0x05, 0x00, b'r', b'i', b'g', b'-', b'7'];
+        let named = field(&[
+            Tlv {
+                extension: 0x0003,
+                field: 0x01,
+                value: vec![1, 2],
+            },
+            Tlv::user_identity("rig-7"),
+            Tlv {
+                extension: WORKER_HASHRATE,
+                field: 0x02,
+                value: vec![9],
+            },
+        ]);
+        for granted in [false, true] {
+            let mut server = session();
+            server.receive(setup(4), NOW).unwrap();
+            if granted {
+                let ask = RequestExtensions {
+                    request_id: 1,
+                    requested: vec![WORKER_HASHRATE],
+                };
+                server.receive(ask.frame().unwrap(), NOW).unwrap();
+            }
+            let device = open_device(&mut server, ChannelKind::Extended);
+            let share = |nonce: u32| submit_share(&device, ChannelKind::Extended, nonce, nonce);
+            let taken = server.receive(followed(share(1), &rig), NOW).unwrap();
+            assert!(matches!(taken.share_event, Some(ShareEvent::Accepted(_))));
+            assert_eq!(taken.worker.as_deref(), granted.then_some("rig-7"));
+            let taken = server.receive(followed(share(2), &named), NOW).unwrap();
+            assert!(matches!(taken.share_event, Some(ShareEvent::Accepted(_))));
+            assert_eq!(taken.worker.as_deref(), granted.then_some("rig-7"));
+            let plain = server.receive(share(3), NOW).unwrap();
+            assert!(matches!(plain.share_event, Some(ShareEvent::Accepted(_))));
+            assert_eq!(plain.worker, None);
+            let long = field(&[Tlv {
+                extension: WORKER_HASHRATE,
+                field: 0x01,
+                value: vec![b'w'; 33],
+            }]);
+            let mut refused = server.receive(followed(share(4), &long), NOW).unwrap();
+            if granted {
+                let error: SubmitSharesError =
+                    binary_sv2::from_bytes(refused.frames[0].payload()).unwrap();
+                assert_eq!(error.error_code.as_ref(), USER_IDENTITY_TOO_LONG.as_bytes());
+                assert_eq!(error.sequence_number, 4);
+                assert!(matches!(
+                    refused.share_event,
+                    Some(ShareEvent::Rejected(USER_IDENTITY_TOO_LONG))
+                ));
+            } else {
+                assert!(matches!(refused.share_event, Some(ShareEvent::Accepted(_))));
+            }
+            // knuth: src/node/test/sv2_mining_session.cpp:791-792.
+            for malformed in [
+                &[0x00][..],
+                &[0x02, 0x00, 0x01],
+                &[0x02, 0x00, 0x01, 0x05, 0x00, b'r', b'i'],
+            ] {
+                assert!(server.receive(followed(share(5), malformed), NOW).is_err());
+            }
+            let standard = open_device(&mut server, ChannelKind::Standard);
+            let strict = submit_share(&standard, ChannelKind::Standard, 6, 6);
+            assert!(server.receive(followed(strict, &rig), NOW).is_err());
+            let strict = submit_share(&standard, ChannelKind::Standard, 7, 7);
+            assert!(server.receive(strict, NOW).is_ok());
+        }
     }
 }
