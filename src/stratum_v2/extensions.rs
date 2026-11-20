@@ -1,8 +1,9 @@
 //! SV2 extensions Pickaxe shares with the Knuth node (k-nuth/kth, docs/sv2.md):
 //! Extensions Negotiation (0x0001), Worker-Specific Hashrate Tracking
 //! (0x0002), Requested Payout Outputs (0x5052) and BCH large templates for
-//! Job Declaration (0x4C54). 0x5052 and 0x4C54 are experimental identifiers,
-//! not in the SV2 extension registry; Knuth and Pickaxe use the same ones.
+//! Job Declaration and Template Distribution (0x4C54). 0x5052 and 0x4C54 are
+//! experimental identifiers, not in the SV2 extension registry; Knuth and
+//! Pickaxe use the same ones.
 //!
 //! Every integer is little-endian (sv2-spec 3.1), as Knuth and the reference
 //! implementation write them. Each decoder takes exactly one message: a
@@ -23,7 +24,13 @@
 //! 0x5052 PayoutOutputsStale       (0x03) (empty)
 //! 0x4C54 DeclareMiningJob.Transactions     (0x01) request_id U32 | SEQ0_64K[U256] txids
 //! 0x4C54 ProvideMissingTransactions.Positions (0x02) request_id U32 | SEQ0_64K[U32] positions
+//! 0x4C54 RequestTransactionData.Transactions  (0x03) template_id U64 | SEQ0_64K[B0_16M] transactions
+//! 0x4C54 RequestTransactionData.Kept          (0x04) template_id U64 | U64 base_template_id
+//!                                         | B0_16M kept
 //! ```
+//!
+//! 0x4C54's 0x01 and 0x02 are Job Declaration's, 0x03 and 0x04 Template
+//! Distribution's (Knuth's jd_messages.hpp, k-nuth/kth PR #879).
 
 use super::{template::Hash, wire::extension_frame};
 use stratum_core::codec_sv2::SerializedFrame;
@@ -61,6 +68,15 @@ pub const PROVIDE_MISSING_TRANSACTIONS_POSITIONS: u8 = 0x02;
 /// The most items one SEQ0_64K list holds: a page of transaction ids, and
 /// DeclareMiningJob's own list.
 pub const SEQ_MAX: usize = 65_535;
+/// BCH large templates on Template Distribution: a page of a template's
+/// transactions, and the bitmap that starts a push of only what its base
+/// lacks.
+pub const REQUEST_TRANSACTION_DATA_TRANSACTIONS: u8 = 0x03;
+pub const REQUEST_TRANSACTION_DATA_KEPT: u8 = 0x04;
+/// The most payload one SV2 frame carries: its length is a U24 (sv2-spec
+/// 3.2), Knuth's `jd_frame_max_payload`. Also the most bytes one B0_16M
+/// holds.
+pub const FRAME_MAX: usize = 16_777_215;
 
 /// Reads one message's fields in order.
 struct Reader<'a>(&'a [u8]);
@@ -100,6 +116,11 @@ impl<'a> Reader<'a> {
     fn b0_64k(&mut self) -> Option<&'a [u8]> {
         let length = self.u16()?;
         self.take(usize::from(length))
+    }
+
+    fn b0_16m(&mut self) -> Option<&'a [u8]> {
+        let [low, middle, high] = self.array()?;
+        self.take(u32::from_le_bytes([low, middle, high, 0]) as usize)
     }
 
     /// SEQ0_64K of `N`-byte items, its count bounded by what is left before
@@ -150,6 +171,18 @@ impl Writer {
 
     fn u32(&mut self, value: u32) -> &mut Self {
         self.bytes(&value.to_le_bytes())
+    }
+
+    fn u64(&mut self, value: u64) -> &mut Self {
+        self.bytes(&value.to_le_bytes())
+    }
+
+    fn b0_16m(&mut self, bytes: &[u8]) -> Result<&mut Self, &'static str> {
+        if bytes.len() > FRAME_MAX {
+            return Err("B0_16M field over 16,777,215 bytes");
+        }
+        self.bytes(&(bytes.len() as u32).to_le_bytes()[..3]);
+        Ok(self.bytes(bytes))
     }
 
     fn b0_255(&mut self, bytes: &[u8]) -> Result<&mut Self, &'static str> {
@@ -626,6 +659,131 @@ pub fn pages(txids: &[Hash]) -> (Vec<&[Hash]>, &[Hash]) {
     };
     let (paged, last) = txids.split_at(txids.len() - tail);
     (paged.chunks(SEQ_MAX).collect(), last)
+}
+
+/// RequestTransactionData.Transactions: one page of a template's
+/// transactions in order, at most 65,535 in one frame. The list is every
+/// page in order, then the core RequestTransactionData.Success's own.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RequestTransactionDataTransactions {
+    pub template_id: u64,
+    pub transactions: Vec<Vec<u8>>,
+}
+
+impl RequestTransactionDataTransactions {
+    /// The payload's size: the id, the count and each B0_16M.
+    pub fn size(&self) -> usize {
+        self.transactions
+            .iter()
+            .fold(8 + 2, |size, tx| size.saturating_add(3 + tx.len()))
+    }
+}
+
+impl ExtensionMessage for RequestTransactionDataTransactions {
+    const EXTENSION: u16 = LARGE_TEMPLATES;
+    const MESSAGE_TYPE: u8 = REQUEST_TRANSACTION_DATA_TRANSACTIONS;
+
+    fn encode(&self) -> Result<Vec<u8>, &'static str> {
+        // A page fills at most one frame.
+        if self.size() > FRAME_MAX {
+            return Err("transaction page over one frame");
+        }
+        let mut writer = Writer::default();
+        writer
+            .u64(self.template_id)
+            .count(self.transactions.len())?;
+        for tx in &self.transactions {
+            writer.b0_16m(tx)?;
+        }
+        Ok(writer.done())
+    }
+
+    fn decode(payload: &[u8]) -> Option<Self> {
+        if payload.len() > FRAME_MAX {
+            return None;
+        }
+        let mut reader = Reader(payload);
+        let template_id = reader.u64()?;
+        let count = usize::from(reader.u16()?);
+        // Each item takes at least its 3-byte length.
+        if count > reader.0.len() / 3 {
+            return None;
+        }
+        let transactions = (0..count)
+            .map(|_| reader.b0_16m().map(<[u8]>::to_vec))
+            .collect::<Option<_>>()?;
+        reader.end(Self {
+            template_id,
+            transactions,
+        })
+    }
+}
+
+/// RequestTransactionData.Kept: starts a push of only what the base (the
+/// template whose push finished last) lacks. Bit i, least significant
+/// first, is set when the base's i-th transaction (block order, without
+/// the coinbase) is also in this template; see `kept_bitmap_fits`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RequestTransactionDataKept {
+    pub template_id: u64,
+    pub base_template_id: u64,
+    pub kept: Vec<u8>,
+}
+
+impl ExtensionMessage for RequestTransactionDataKept {
+    const EXTENSION: u16 = LARGE_TEMPLATES;
+    const MESSAGE_TYPE: u8 = REQUEST_TRANSACTION_DATA_KEPT;
+
+    fn encode(&self) -> Result<Vec<u8>, &'static str> {
+        if 8 + 8 + 3 + self.kept.len() > FRAME_MAX {
+            return Err("kept bitmap over one frame");
+        }
+        let mut writer = Writer::default();
+        writer
+            .u64(self.template_id)
+            .u64(self.base_template_id)
+            .b0_16m(&self.kept)?;
+        Ok(writer.done())
+    }
+
+    fn decode(payload: &[u8]) -> Option<Self> {
+        if payload.len() > FRAME_MAX {
+            return None;
+        }
+        let mut reader = Reader(payload);
+        let template_id = reader.u64()?;
+        let base_template_id = reader.u64()?;
+        let kept = reader.b0_16m()?.to_vec();
+        reader.end(Self {
+            template_id,
+            base_template_id,
+            kept,
+        })
+    }
+}
+
+/// The largest Kept bitmap one frame carries, after the two ids and the
+/// U24 length: a base of more transactions is followed by a full push.
+pub const MAX_KEPT: usize = FRAME_MAX - (8 + 8 + 3);
+
+// What: a Kept bitmap over a base of `count` transactions is exactly
+// ceil(count / 8) bytes and its unused high bits are clear.
+// Why: Knuth's docs/sv2.md ("Template flow") and its test client's rebuild
+// (sv2_template_provider.cpp:642-643) hold the bitmap to that length.
+// Look here if: a provider's Kept is refused, or a delta keeps a
+// transaction past the base's end.
+/// Whether `kept` is a Kept bitmap over `count` transactions.
+pub fn kept_bitmap_fits(kept: &[u8], count: usize) -> bool {
+    kept.len() == count.div_ceil(8)
+        && kept
+            .last()
+            .is_none_or(|last| count.is_multiple_of(8) || last >> (count % 8) == 0)
+}
+
+/// Whether bit `index` of a Kept bitmap is set.
+pub fn kept_bit(kept: &[u8], index: usize) -> bool {
+    kept.get(index / 8)
+        .is_some_and(|byte| byte >> (index % 8) & 1 == 1)
 }
 
 #[cfg(test)]

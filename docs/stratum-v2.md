@@ -557,6 +557,7 @@ before setup still close the connection.
 | 0x0002 | Worker-Specific Hashrate Tracking | Granted when asked. The first `user_identity` TLV field (0x0002, field 0x01, at most 32 bytes of UTF-8) after a `SubmitSharesExtended` names that share's worker: its shares count on a row of their own in the workers table, labelled by the name and never by an address (a name that is one counts on the connection's row). Other fields are ignored, a share without one is taken, and one over 32 bytes is refused with `user-identity-too-long`. Without the grant whole fields are ignored. Bytes that are not whole TLV fields close the connection either way, and a `SubmitSharesStandard` must be exactly its 24 bytes. |
 | 0x5052 | Requested Payout Outputs | Job Declaration only ([job-declaration.md](job-declaration.md#extensions)); discarded on a mining connection. |
 | 0x4C54 | BCH large templates (Job Declaration) | Job Declaration only (same); discarded on a mining connection. |
+| 0x4C54 | BCH large templates (Template Distribution) | Template Distribution only: granted by the template server and asked for by the template client ([below](#bch-large-templates-on-template-distribution-0x4c54)); discarded on a mining connection. |
 
 The answer lists the granted extensions in the order asked; a request for
 neither 0x4D4D nor 0x0002 gets `RequestExtensions.Error` naming what was
@@ -568,6 +569,83 @@ implementations use the same identifiers and byte layouts
 (`src/stratum_v2/extensions.rs`, Knuth's `docs/sv2.md`). Every integer is
 little-endian, a TLV field's type and length included, which the
 extension's own examples print big-endian.
+
+#### BCH large templates on Template Distribution (0x4C54)
+
+The same identifier lifts the limits of `RequestTransactionData.Success`
+(one frame, at most 65,535 transactions) on Template Distribution, as the
+Knuth node does (k-nuth/kth PR #879, its `docs/sv2.md`, "Template flow"):
+only the block size limit bounds a template, and each transaction goes to a
+client once. The messages share 0x4C54 with Job Declaration's 0x01 and 0x02
+and have the channel bit clear:
+
+| Message | Type | Fields |
+|---|---|---|
+| `RequestTransactionData.Transactions` | 0x03 | U64 template id, `SEQ0_64K[B0_16M]` transactions |
+| `RequestTransactionData.Kept` | 0x04 | U64 template id, U64 base template id, `B0_16M` bitmap |
+
+Each fills at most one frame (16,777,215 payload bytes).
+
+The template server (`--tp-listen`):
+
+- Answers `RequestExtensions` sent after `SetupConnection.Success` and
+  before `CoinbaseOutputConstraints`. One that lists 0x4C54 gets
+  `RequestExtensions.Success` listing only 0x4C54; one without it gets
+  `RequestExtensions.Error`, every requested extension unsupported and none
+  required, and the session stays standard SV2. The latest request decides.
+  A malformed request, or one after the constraints, closes the session.
+- With the extension on, each template's transactions follow its
+  `NewTemplate` (and `SetNewPrevHash`) unasked. The first push, and the one
+  after an abandoned push, is full: `Transactions` pages of at most 65,535
+  transactions in 1 MiB (counted as the core Success counts them), then the
+  core `RequestTransactionData.Success` with the rest and empty
+  `excess_data`. The list is every page in order, then the Success's.
+- A later push is a delta against the base, the last template whose push
+  finished, on any parent. It starts with `Kept`: bit i, least significant
+  first, is set when the base's i-th transaction (block order, without the
+  coinbase) is also in the new template; the bitmap is exactly
+  ceil(base count / 8) bytes and its unused high bits are clear. Pages and
+  the Success then carry only the transactions the base lacks. A base whose
+  bitmap would not fit one frame (over 134 million transactions) gets a full
+  push instead.
+- Pages are built one at a time as the socket takes them, never a whole
+  template at once, and only when no client frame or new template waits. A
+  new template abandons a push not yet finished: nothing more is sent for
+  it, and the next push is full. So does a template the client can no
+  longer name (16 retained, 10 seconds after its parent is replaced).
+- `RequestTransactionData` is answered after any push under way, with the
+  whole list in pages and the Success, or `stale-template-id` or
+  `template-id-not-found`, never `template-too-large`; it leaves the base
+  alone. Nothing more is read or offered until the answer is sent, so a
+  second request before then closes the session.
+- The extension's messages come only from the server once it is on: a
+  client's close the session. Before the grant they are discarded like any
+  unknown extension's.
+
+The template client (`--template-provider`):
+
+- Sends `RequestExtensions` (request 1, 0x4C54) right after the setup, and
+  its constraints without waiting. `RequestExtensions.Success` listing
+  0x4C54 turns the extension on; `RequestExtensions.Error` leaves it off,
+  unless it requires an extension this client does not implement, which
+  ends the link. A provider that goes on to its templates without answering
+  leaves it off; one that closes the link on the request gets a second link
+  at once, without it.
+- With the extension on it never asks for transaction data. It rebuilds
+  each template's list: a full push's pages in order and the Success's
+  list; a delta's kept base transactions and added ones sorted by
+  transaction id (CTOR). The list must be in strict CTOR order and give the
+  template's merkle path, or the provider broke the protocol: the link
+  closes and the server moves to its next source. A refresh waits 2 seconds
+  for a template's push, 2 more after each frame of it, at most a minute,
+  and there is no 65,535-transaction limit.
+- Without the extension the client works as before: it asks for each
+  template's transactions in one `RequestTransactionData.Success`.
+
+Unlike Knuth, a half-closed client is not sent the rest of a push (Pickaxe's
+transport ends the session on end of input), and the templates a push may
+still finish on are those the client can name, not those of the current and
+the replaced tip.
 
 ### Templates from a provider (Template Distribution client)
 
@@ -602,7 +680,11 @@ provider 1 of 2"), and the status file's `template_source` gives its kind
 - Template ids must rise, a SetNewPrevHash must name a template announced as
   future (at most 8 wait), and a current template needs an earlier
   SetNewPrevHash; a provider that breaks this, or sends no transaction data
-  within 2 seconds, is left for the next source.
+  within 2 seconds, is left for the next source. The client asks for BCH
+  large templates ([Extensions](#bch-large-templates-on-template-distribution-0x4c54));
+  a provider's frames of any other extension are ignored, as SV2 asks of
+  unknown extensions; a Template Distribution message with the channel bit
+  set breaks the protocol.
 - A provider's new parent is confirmed on the selected network before its
   template is mined: by the first configured node, or by the network's
   Fulcrum servers without one.
@@ -641,6 +723,14 @@ What a client gets:
 - `SetupConnection` for protocol 2, version 2 and no flags. Anything else is
   refused with its error code, echoing unsupported flags, and the session
   closes.
+- BCH large templates (0x4C54) when the client asks for it before its
+  constraints ([Extensions](#bch-large-templates-on-template-distribution-0x4c54)).
+  `RequestExtensions` (extension 0x0001) without it is answered with
+  `RequestExtensions.Error`, every requested extension unsupported and none
+  required, so the client goes on without them. Any other extension's frame
+  is ignored, as SV2 asks of unknown extensions. A malformed or late
+  `RequestExtensions`, or a Template Distribution message with the channel
+  bit set, closes the session.
 - After its `CoinbaseOutputConstraints` (within 10 seconds): on a new parent,
   a future `NewTemplate` and at once its `SetNewPrevHash` (the node's current
   time, `nBits`, and the target `compact(nBits)`); on the same parent, a
@@ -657,8 +747,9 @@ What a client gets:
   reserve do not fit beside its transactions within the block size limit.
 - `RequestTransactionData` returns the transactions in block (CTOR) order. A
   template whose parent was replaced answers `stale-template-id`, an unknown
-  one `template-id-not-found`, and one beyond SV2's single frame (16,777,215
-  bytes or 65,535 transactions, possible under ABLA) `template-too-large`.
+  one `template-id-not-found`, and, without BCH large templates, one beyond
+  SV2's single frame (16,777,215 bytes or 65,535 transactions, possible
+  under ABLA) `template-too-large`.
 - A client can name its 16 latest templates; those on a replaced parent
   answer for 10 seconds more. At most 8 clients connect at once. A client
   frame over 64 KiB, or more than four transaction-data requests a second,

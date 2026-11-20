@@ -2,18 +2,27 @@
 //! Templates from an SV2 Template Provider (another Pickaxe's template
 //! server, a node bridge, or a node with one built in), as a
 //! `TemplateSource` the server fails over with, like a node over JSON-RPC.
+//! #### BCH large templates: a provider that grants 0x4C54 pushes each
+//! template's transactions (see `large`).
 
 use super::super::{
     channel::MAX_ACTIVE_JOBS,
+    extensions::{
+        ExtensionMessage, RequestExtensions, RequestExtensionsError, RequestExtensionsSuccess,
+        LARGE_TEMPLATES, NEGOTIATION, REQUEST_EXTENSIONS_ERROR, REQUEST_EXTENSIONS_SUCCESS,
+        REQUEST_TRANSACTION_DATA_KEPT, REQUEST_TRANSACTION_DATA_TRANSACTIONS,
+    },
     journal::PendingBlock,
     provider::{SourceKind, SubmissionOutcome, TemplateSource},
     template::{double_sha256, fold, BchTemplate, Hash, Provided},
     transport::{Limits, Receiver, Sender, Session},
     wire::encoded,
 };
+use super::large::Received;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     net::{TcpStream, ToSocketAddrs},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use stratum_core::{
@@ -39,6 +48,12 @@ const FIRST_TEMPLATE_WAIT: Duration = Duration::from_secs(10);
 const MAX_FUTURES: usize = 8;
 /// Parents remembered to recognise this server's own blocks.
 const CONFIRMED: usize = 64;
+/// #### BCH large templates: the request id of this client's
+/// RequestExtensions.
+const EXTENSIONS_REQUEST: u16 = 1;
+/// #### BCH large templates: the longest a refresh waits for a push that
+/// keeps coming; each of its frames gives `TX_DATA_WAIT` more.
+const PUSH_WAIT: Duration = Duration::from_secs(60);
 
 pub const BROKE_PROTOCOL: &str = "template provider broke the protocol";
 pub const CLOSED: &str = "template provider closed the connection";
@@ -129,8 +144,24 @@ struct Link {
     receiver: Receiver,
 }
 
+/// A template's transactions and excess data, as a provider sent them.
+type Transactions = (Vec<Arc<[u8]>>, Vec<u8>);
+
 /// Transaction data a provider sent, or its error code.
-type Data = Result<(Vec<Vec<u8>>, Vec<u8>), String>;
+type Data = Result<Transactions, String>;
+
+/// #### BCH large templates: 0x4C54 on a provider's link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Negotiation {
+    /// Not asked for: the provider closed the last link on the request.
+    Unasked,
+    /// Asked for, and not answered yet.
+    Asked,
+    /// Granted: the provider pushes each template's transactions.
+    Granted,
+    /// Refused, or the provider went on without answering.
+    Refused,
+}
 
 pub struct TdpSource {
     address: TdpAddress,
@@ -148,6 +179,10 @@ pub struct TdpSource {
     confirmed: VecDeque<Hash>,
     /// The parent `guard` confirmed last, and its time when given.
     guarded: Option<(Hash, Option<u32>)>,
+    /// #### BCH large templates: what the provider answered on this link,
+    /// and its pushes once it granted 0x4C54.
+    negotiation: Negotiation,
+    received: Received,
 }
 
 impl TdpSource {
@@ -169,10 +204,20 @@ impl TdpSource {
             generation: 0,
             confirmed: VecDeque::new(),
             guarded: None,
+            negotiation: Negotiation::Unasked,
+            received: Received::default(),
         }
     }
 
-    fn connect(&mut self) -> Result<(), String> {
+    /// #### BCH large templates: whether this link's provider granted
+    /// 0x4C54.
+    #[cfg(test)]
+    pub(super) fn large_templates(&self) -> bool {
+        self.negotiation == Negotiation::Granted
+    }
+
+    /// Opens a link; with `ask`, asking for BCH large templates.
+    fn connect(&mut self, ask: bool) -> Result<(), String> {
         let address = self
             .address
             .address
@@ -215,8 +260,12 @@ impl TdpSource {
         )?)?;
         let deadline = Instant::now() + FIRST_TEMPLATE_WAIT;
         let reply = loop {
+            // #### Template Distribution extensions: an extension's frame is
+            // not the answer, and is discarded (see `handle`).
             if let Some(frame) = receiver.receive(Duration::from_millis(100))? {
-                break frame;
+                if frame.header().ext_type_without_channel_msg() == 0 {
+                    break frame;
+                }
             }
             if Instant::now() >= deadline {
                 return Err("template provider did not answer the setup".into());
@@ -225,15 +274,40 @@ impl TdpSource {
         if reply.header().msg_type() != common::MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS {
             return Err("template provider refused the setup".into());
         }
-        sender.send(encoded(
-            CoinbaseOutputConstraints {
-                coinbase_output_max_additional_size: self.reserve,
-                coinbase_output_max_additional_sigops: 0,
-            },
-            MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS,
-            false,
-        )?)?;
+        // #### BCH large templates
+        // What: right after the setup the client asks for 0x4C54 (request
+        // 1), then sends its constraints without waiting: a provider that
+        // negotiates answers before it reads them, and one that does not
+        // goes on to its templates, which leaves the extension off.
+        // Why: Knuth's provider takes RequestExtensions only before the
+        // constraints; a provider that ignores it costs no wait.
+        // Look here if: a provider's link never gets the extension, or one
+        // closes it right after the setup.
+        if ask {
+            sender.send(
+                RequestExtensions {
+                    request_id: EXTENSIONS_REQUEST,
+                    requested: vec![LARGE_TEMPLATES],
+                }
+                .frame()?,
+            )?;
+        }
+        sender
+            .send(encoded(
+                CoinbaseOutputConstraints {
+                    coinbase_output_max_additional_size: self.reserve,
+                    coinbase_output_max_additional_sigops: 0,
+                },
+                MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS,
+                false,
+            )?)
+            // A provider that closed on the request, before the constraints
+            // went out.
+            .map_err(|error| if ask { CLOSED.to_owned() } else { error })?;
         self.forget();
+        if ask {
+            self.negotiation = Negotiation::Asked;
+        }
         self.link = Some(Link { sender, receiver });
         Ok(())
     }
@@ -245,6 +319,8 @@ impl TdpSource {
         self.tip = None;
         self.newest = None;
         self.data.clear();
+        self.negotiation = Negotiation::Unasked;
+        self.received = Received::default();
     }
 
     fn close(&mut self) {
@@ -276,17 +352,36 @@ impl TdpSource {
     // #### PR #42: a provider's protocol
     // What: template ids only rise; a future template waits for the
     // SetNewPrevHash naming it (at most 8 wait); a current template needs
-    // an earlier SetNewPrevHash; anything else, an extension or the channel
-    // bit closes the link and the server moves to its next source.
+    // an earlier SetNewPrevHash; anything else or the channel bit closes the
+    // link and the server moves to its next source.
     // Why: a provider that breaks the protocol cannot be trusted with the
     // work of every device.
     // Look here if: a provider's link keeps closing with "broke the
     // protocol".
+    // #### Template Distribution extensions
+    // What: a frame of a non-zero extension type (the channel bit aside) is
+    // an extension's (see `extension`). Template Distribution has no
+    // channel messages, so the channel bit on extension 0 still breaks the
+    // protocol. #### BCH large templates: a Template Distribution message
+    // before the answer to RequestExtensions means the provider went on
+    // without it, which leaves 0x4C54 off.
+    // Why: SV2 requires frames of an unknown extension meant for this end to
+    // be discarded and ignored; closing the link on them left a provider
+    // that sends them for the next source.
+    // Look here if: a provider's extension frames reach the template
+    // handling, or close its link.
     fn handle(&mut self, frame: &mut SerializedFrame) -> Result<(), String> {
         let header = frame.header();
-        if header.channel_msg() || header.ext_type_without_channel_msg() != 0 {
+        if header.ext_type_without_channel_msg() != 0 {
+            return self.extension(frame);
+        }
+        if header.channel_msg() {
             return Err(BROKE_PROTOCOL.into());
         }
+        if self.negotiation == Negotiation::Asked {
+            self.negotiation = Negotiation::Refused;
+        }
+        let granted = self.negotiation == Negotiation::Granted;
         match header.msg_type() {
             MESSAGE_TYPE_NEW_TEMPLATE => {
                 let message: NewTemplate =
@@ -295,6 +390,9 @@ impl TdpSource {
                     return Err(BROKE_PROTOCOL.into());
                 }
                 self.last_id = Some(message.template_id);
+                if granted {
+                    self.received.announced(message.template_id);
+                }
                 let announced = Announced {
                     id: message.template_id,
                     version: message.version,
@@ -344,15 +442,23 @@ impl TdpSource {
             MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_SUCCESS => {
                 let message: RequestTransactionDataSuccess =
                     binary_sv2::from_bytes(frame.payload()).map_err(|_| BROKE_PROTOCOL)?;
+                if granted {
+                    return self.finish_push(&message);
+                }
                 let transactions = message
                     .transaction_list
                     .iter()
-                    .map(|tx| tx.as_ref().to_vec())
+                    .map(|tx| Arc::from(tx.as_ref()))
                     .collect();
                 self.data.insert(
                     message.template_id,
                     Ok((transactions, message.excess_data.as_ref().to_vec())),
                 );
+            }
+            // #### BCH large templates: with 0x4C54 this client asks for
+            // nothing, so no answer comes.
+            MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_ERROR if granted => {
+                return Err(BROKE_PROTOCOL.into())
             }
             MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_ERROR => {
                 let message: RequestTransactionDataError =
@@ -367,8 +473,105 @@ impl TdpSource {
         Ok(())
     }
 
+    // #### BCH large templates
+    // What: an extension's frame. While RequestExtensions is unanswered,
+    // its Success (request 1) grants 0x4C54 when it lists it; its Error
+    // grants nothing, unless it requires an extension this client does not
+    // implement, which ends the link. Once 0x4C54 is granted, its Kept and
+    // pages build the push due, and any other of its messages, or one with
+    // the channel bit, breaks the protocol. Any other extension's frame is
+    // discarded, as before.
+    // Why: Knuth's provider sends only Kept and pages on Template
+    // Distribution, and the client checks what they rebuild before it
+    // mines on it (`Received`).
+    // Look here if: a provider's grant goes unused, or its pushes close the
+    // link.
+    fn extension(&mut self, frame: &mut SerializedFrame) -> Result<(), String> {
+        let header = frame.header();
+        let kind = header.msg_type();
+        match (header.ext_type_without_channel_msg(), self.negotiation) {
+            (NEGOTIATION, Negotiation::Asked)
+                if !header.channel_msg()
+                    && matches!(kind, REQUEST_EXTENSIONS_SUCCESS | REQUEST_EXTENSIONS_ERROR) =>
+            {
+                self.negotiation = if grants_large_templates(kind, frame.payload())? {
+                    Negotiation::Granted
+                } else {
+                    Negotiation::Refused
+                };
+            }
+            (LARGE_TEMPLATES, Negotiation::Granted) => {
+                let read = match kind {
+                    _ if header.channel_msg() => Err("a large templates message on a channel"),
+                    REQUEST_TRANSACTION_DATA_TRANSACTIONS => self.received.page(frame.payload()),
+                    REQUEST_TRANSACTION_DATA_KEPT => self.received.kept(frame.payload()),
+                    _ => Err("a large templates message only a client sends"),
+                };
+                read.map_err(|_| BROKE_PROTOCOL)?;
+            }
+            _ => (),
+        }
+        Ok(())
+    }
+
+    /// #### BCH large templates: the core Success that ends a push, checked
+    /// against its template's merkle path.
+    fn finish_push(&mut self, message: &RequestTransactionDataSuccess<'_>) -> Result<(), String> {
+        if !message.excess_data.as_ref().is_empty() {
+            return Err(BROKE_PROTOCOL.into());
+        }
+        let id = message.template_id;
+        let path = match &self.newest {
+            Some(newest) if newest.id == id => newest.merkle_path.clone(),
+            _ => self
+                .futures
+                .get(&id)
+                .map(|announced| announced.merkle_path.clone())
+                .ok_or(BROKE_PROTOCOL)?,
+        };
+        let last = message
+            .transaction_list
+            .iter()
+            .map(|tx| Arc::from(tx.as_ref()))
+            .collect();
+        self.received
+            .finish(id, last, &path)
+            .map_err(|_| BROKE_PROTOCOL.into())
+    }
+
+    /// #### BCH large templates: waits for the newest template's push,
+    /// while it keeps coming; a newer template's push replaces it.
+    fn await_push(&mut self) -> Result<(), String> {
+        let started = Instant::now();
+        let mut deadline = started + TX_DATA_WAIT;
+        loop {
+            let newest = self
+                .newest
+                .as_ref()
+                .ok_or("template provider sent no template")?
+                .id;
+            if self
+                .current
+                .as_ref()
+                .is_some_and(|ready| ready.id == newest)
+                || self.received.pushed(newest).is_some()
+            {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= deadline || now >= started + PUSH_WAIT {
+                return Err("template provider sent no transaction data in time".into());
+            }
+            let progress = self.received.progress;
+            self.drain(Duration::from_millis(50))?;
+            if self.received.progress != progress {
+                deadline = Instant::now() + TX_DATA_WAIT;
+            }
+        }
+    }
+
     /// The transactions of template `id`, asked for and awaited.
-    fn transactions(&mut self, id: u64) -> Result<(Vec<Vec<u8>>, Vec<u8>), String> {
+    fn transactions(&mut self, id: u64) -> Result<Transactions, String> {
         if !self.data.contains_key(&id) {
             let link = self.link.as_mut().ok_or(CLOSED)?;
             link.sender
@@ -415,17 +618,32 @@ impl TemplateSource for TdpSource {
 
     fn refresh(&mut self) -> Result<(u64, &BchTemplate), String> {
         if self.link.is_none() {
-            self.connect()?;
+            // #### BCH large templates: a provider that closes the link on
+            // RequestExtensions (a Pickaxe before it took extension frames)
+            // is asked nothing on a second one, here or below.
+            match self.connect(true) {
+                Err(error) if error == CLOSED => self.connect(false)?,
+                other => other?,
+            }
             let deadline = Instant::now() + FIRST_TEMPLATE_WAIT;
             while self.newest.is_none() || self.tip.is_none() {
                 if Instant::now() >= deadline {
                     self.close();
                     return Err("template provider sent no template".into());
                 }
-                self.drain(Duration::from_millis(100))?;
+                let unanswered = self.negotiation == Negotiation::Asked;
+                match self.drain(Duration::from_millis(100)) {
+                    Ok(()) => (),
+                    Err(error) if unanswered && error == CLOSED => self.connect(false)?,
+                    Err(error) => return Err(error),
+                }
             }
         }
         self.drain(Duration::from_millis(1))?;
+        let granted = self.negotiation == Negotiation::Granted;
+        if granted {
+            self.await_push()?;
+        }
         let newest = self
             .newest
             .clone()
@@ -439,7 +657,13 @@ impl TemplateSource for TdpSource {
             let ready = self.current.as_ref().ok_or(CLOSED)?;
             return Ok((self.generation, &ready.template));
         }
-        let (transactions, excess) = if newest.merkle_path.is_empty() {
+        let (transactions, excess) = if granted {
+            let pushed = self
+                .received
+                .pushed(newest.id)
+                .ok_or("template provider sent no transaction data in time")?;
+            (pushed.transactions.clone(), Vec::new())
+        } else if newest.merkle_path.is_empty() {
             (Vec::new(), Vec::new())
         } else {
             self.transactions(newest.id)?
@@ -461,13 +685,7 @@ impl TemplateSource for TdpSource {
             merkle_path: &newest.merkle_path,
             reserve: self.reserve,
         })
-        .map_err(|error| {
-            if error == "template too large for SV2" {
-                error
-            } else {
-                "template provider sent an invalid template".to_owned()
-            }
-        })?;
+        .map_err(|_| "template provider sent an invalid template")?;
         // #### PR #42: the network guard
         // What: a provider's new parent is confirmed on this server's
         // network (by the miner's node, or the network's Fulcrum servers)
@@ -571,6 +789,27 @@ impl TemplateSource for TdpSource {
     }
 }
 
+/// #### BCH large templates: whether a provider's answer to
+/// RequestExtensions (`kind`, `payload`) grants 0x4C54, as the Job
+/// Declaration client reads its pool's.
+fn grants_large_templates(kind: u8, payload: &[u8]) -> Result<bool, String> {
+    if kind == REQUEST_EXTENSIONS_SUCCESS {
+        let success = RequestExtensionsSuccess::decode(payload)
+            .filter(|success| success.request_id == EXTENSIONS_REQUEST)
+            .ok_or(BROKE_PROTOCOL)?;
+        return Ok(success.supported.contains(&LARGE_TEMPLATES));
+    }
+    let error = RequestExtensionsError::decode(payload)
+        .filter(|error| error.request_id == EXTENSIONS_REQUEST)
+        .ok_or(BROKE_PROTOCOL)?;
+    match error.required.iter().find(|required| **required != LARGE_TEMPLATES) {
+        Some(missing) => Err(format!(
+            "the template provider requires SV2 extension 0x{missing:04x}, which this client does not implement"
+        )),
+        None => Ok(false),
+    }
+}
+
 /// A saved block's header and coinbase.
 fn block_parts(block: &str) -> Option<([u8; 80], Vec<u8>)> {
     let bytes = hex::decode(block).ok()?;
@@ -588,10 +827,17 @@ fn block_parts(block: &str) -> Option<([u8; 80], Vec<u8>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::{template_tests::rpc_template, transport::Limits, wire::encoded};
+    use super::super::super::{
+        template_tests::rpc_template,
+        transport::Limits,
+        wire::{encoded, extension_frame},
+    };
+    use super::super::large::{tests::template, Pusher};
     use super::*;
     use std::net::TcpListener;
-    use stratum_core::template_distribution_sv2::MESSAGE_TYPE_SET_NEW_PREV_HASH;
+    use stratum_core::template_distribution_sv2::{
+        MESSAGE_TYPE_NEW_TEMPLATE, MESSAGE_TYPE_SET_NEW_PREV_HASH,
+    };
 
     // #### PR #42
     // What: a provider's address is sv2tp://HOST:PORT/KEY; without a key
@@ -622,6 +868,34 @@ mod tests {
 
     /// A provider that answers the setup, then sends `frames`.
     fn scripted(frames: Vec<SerializedFrame>) -> (TdpAddress, std::thread::JoinHandle<()>) {
+        scripted_with(Vec::new(), frames)
+    }
+
+    /// The same, sending `early` before its setup answer. It does not
+    /// negotiate: the client's RequestExtensions is read and ignored, as a
+    /// provider that knows no extension discards it.
+    fn scripted_with(
+        early: Vec<SerializedFrame>,
+        frames: Vec<SerializedFrame>,
+    ) -> (TdpAddress, std::thread::JoinHandle<()>) {
+        provider(
+            move |sender, receiver| {
+                constraints(receiver);
+                for frame in frames {
+                    sender.send(frame).unwrap();
+                }
+                let _ = receiver.receive(Duration::from_secs(2));
+            },
+            early,
+        )
+    }
+
+    /// A provider on loopback that answers one client's setup (after
+    /// `early`), then runs `script` on the link.
+    fn provider(
+        script: impl FnOnce(&mut Sender, &mut Receiver) + Send + 'static,
+        early: Vec<SerializedFrame>,
+    ) -> (TdpAddress, std::thread::JoinHandle<()>) {
         let secret = [21; 32];
         let public = super::super::super::server::authority_public(&secret).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -630,35 +904,58 @@ mod tests {
             authority: Some(public),
         };
         let thread = std::thread::spawn(move || {
-            let session = Session::accept_with(
-                listener.accept().unwrap().0,
-                &public,
-                &secret,
-                Limits::TDP_SERVER,
-            )
-            .unwrap();
-            let (mut sender, mut receiver) = session.split();
-            receiver.receive(Duration::from_secs(5)).unwrap().unwrap();
-            sender
-                .send(
-                    encoded(
-                        stratum_core::common_messages_sv2::SetupConnectionSuccess {
-                            used_version: 2,
-                            flags: 0,
-                        },
-                        common::MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
-                        false,
-                    )
-                    .unwrap(),
-                )
-                .unwrap();
-            receiver.receive(Duration::from_secs(5)).unwrap().unwrap();
-            for frame in frames {
-                sender.send(frame).unwrap();
-            }
-            let _ = receiver.receive(Duration::from_secs(2));
+            let (mut sender, mut receiver) = set_up(&listener, &public, &secret, early);
+            script(&mut sender, &mut receiver);
         });
         (address, thread)
+    }
+
+    /// Accepts the next client on `listener` and answers its setup, after
+    /// `early`.
+    fn set_up(
+        listener: &TcpListener,
+        public: &[u8; 32],
+        secret: &[u8; 32],
+        early: Vec<SerializedFrame>,
+    ) -> (Sender, Receiver) {
+        let session = Session::accept_with(
+            listener.accept().unwrap().0,
+            public,
+            secret,
+            Limits::TDP_SERVER,
+        )
+        .unwrap();
+        let (mut sender, mut receiver) = session.split();
+        receiver.receive(Duration::from_secs(5)).unwrap().unwrap();
+        for frame in early {
+            sender.send(frame).unwrap();
+        }
+        sender
+            .send(
+                encoded(
+                    stratum_core::common_messages_sv2::SetupConnectionSuccess {
+                        used_version: 2,
+                        flags: 0,
+                    },
+                    common::MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+                    false,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        (sender, receiver)
+    }
+
+    /// Reads the client's frames up to its CoinbaseOutputConstraints.
+    fn constraints(receiver: &mut Receiver) {
+        while receiver
+            .receive(Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .header()
+            .msg_type()
+            != MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS
+        {}
     }
 
     // #### PR #42
@@ -674,6 +971,57 @@ mod tests {
         let mut source = TdpSource::new(address, 122, Box::new(|_, _| Ok(None)));
         assert_eq!(source.refresh().err().as_deref(), Some(BROKE_PROTOCOL));
         assert!(source.link.is_none());
+        provider.join().unwrap();
+    }
+
+    // #### Template Distribution extensions
+    // What: a provider's frames of an extension this client never
+    // negotiated, before its setup answer and between templates, with and
+    // without the channel bit, are discarded: the link stays up and the
+    // next template (new bits) arrives. A NewTemplate with the channel bit
+    // still breaks the protocol.
+    // Look here if: TdpSource::handle or the setup's answer changes.
+    #[test]
+    fn a_providers_unknown_extension_frames_are_discarded() {
+        let template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+        let mut raw = rpc_template();
+        raw["bits"] = serde_json::json!("1d00ffff");
+        raw["target"] = serde_json::json!(format!("00000000ffff{}", "00".repeat(26)));
+        let limit = BchTemplate::from_rpc(&raw).unwrap();
+        let unknown = |channel| extension_frame(0x4c54, 0x00, channel, &[0; 8]).unwrap();
+        let (address, provider) = scripted_with(
+            vec![unknown(false)],
+            vec![
+                super::super::convert::new_template(5, true, &template).unwrap(),
+                super::super::convert::set_new_prev_hash(5, &template).unwrap(),
+                unknown(false),
+                unknown(true),
+                super::super::convert::new_template(6, true, &limit).unwrap(),
+                super::super::convert::set_new_prev_hash(6, &limit).unwrap(),
+            ],
+        );
+        let mut source = TdpSource::new(address, 122, Box::new(|_, _| Ok(None)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while source
+            .current()
+            .is_none_or(|(_, current)| current.bits != limit.bits)
+        {
+            assert!(Instant::now() < deadline, "the next template never arrived");
+            source.refresh().unwrap();
+        }
+        assert!(source.link.is_some());
+        provider.join().unwrap();
+        let mut frame = super::super::convert::new_template(5, true, &template).unwrap();
+        let payload = frame.payload().to_vec();
+        let (address, provider) = scripted(vec![extension_frame(
+            0,
+            MESSAGE_TYPE_NEW_TEMPLATE,
+            true,
+            &payload,
+        )
+        .unwrap()]);
+        let mut source = TdpSource::new(address, 122, Box::new(|_, _| Ok(None)));
+        assert_eq!(source.refresh().err().as_deref(), Some(BROKE_PROTOCOL));
         provider.join().unwrap();
     }
 
@@ -783,5 +1131,275 @@ mod tests {
         )
         .unwrap();
         assert_eq!(super::super::reserve(hub.current().as_deref()), 175);
+    }
+
+    /// #### BCH large templates: a provider that answers the client's
+    /// RequestExtensions (checked: request 1 for 0x4C54 alone) with
+    /// `answer`, or ignores it, reads up to the constraints, then sends each
+    /// batch it is given, and stays until the batches end.
+    fn paced(
+        answer: Option<SerializedFrame>,
+    ) -> (
+        TdpAddress,
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Sender<Vec<SerializedFrame>>,
+    ) {
+        let (batches, inbox) = std::sync::mpsc::channel::<Vec<SerializedFrame>>();
+        let (address, thread) = provider(
+            move |sender, receiver| {
+                let mut ask = receiver.receive(Duration::from_secs(5)).unwrap().unwrap();
+                assert_eq!(
+                    (ask.header().ext_type(), ask.header().msg_type()),
+                    (NEGOTIATION, 0x00)
+                );
+                assert_eq!(
+                    RequestExtensions::decode(ask.payload()),
+                    Some(RequestExtensions {
+                        request_id: 1,
+                        requested: vec![LARGE_TEMPLATES],
+                    })
+                );
+                if let Some(answer) = answer {
+                    sender.send(answer).unwrap();
+                }
+                constraints(receiver);
+                for batch in inbox {
+                    for frame in batch {
+                        sender.send(frame).unwrap();
+                    }
+                }
+            },
+            Vec::new(),
+        );
+        (address, thread, batches)
+    }
+
+    fn granted() -> SerializedFrame {
+        RequestExtensionsSuccess {
+            request_id: 1,
+            supported: vec![LARGE_TEMPLATES],
+        }
+        .frame()
+        .unwrap()
+    }
+
+    /// Template `id`'s NewTemplate (and with `future` its SetNewPrevHash),
+    /// then the push `pusher` makes of `data` for it: the provider's bytes.
+    fn announce(
+        pusher: &mut Pusher,
+        id: u64,
+        future: bool,
+        template: &BchTemplate,
+        data: &BchTemplate,
+        frames: Option<usize>,
+    ) -> Vec<SerializedFrame> {
+        let mut sent = vec![super::super::convert::new_template(id, future, template).unwrap()];
+        if future {
+            sent.push(super::super::convert::set_new_prev_hash(id, template).unwrap());
+        }
+        pusher.push(id, data);
+        for _ in 0..frames.unwrap_or(usize::MAX) {
+            match pusher
+                .next_frame(|asked| (asked == id).then_some((data, false)))
+                .unwrap()
+            {
+                Some(frame) => sent.push(frame),
+                None => break,
+            }
+        }
+        sent
+    }
+
+    /// Refreshes `source` until its template has `template`'s transactions.
+    fn refresh_to(source: &mut TdpSource, template: &BchTemplate) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while source
+            .current()
+            .is_none_or(|(_, current)| current.transactions() != template.transactions())
+        {
+            assert!(Instant::now() < deadline, "the template never arrived");
+            source.refresh().unwrap();
+        }
+    }
+
+    // #### BCH large templates
+    // What: a provider that grants 0x4C54 pushes each template; the client
+    // rebuilds and mines it: 65,537 transactions in pages (more than the
+    // core Success carries), then a refresh on the same parent as a delta,
+    // then a push abandoned after its Kept and one page followed by a full
+    // push on a new parent. A push whose list disagrees with its template's
+    // merkle path breaks the protocol and closes the link. The client never
+    // asks for transaction data.
+    // Look here if: TdpSource's negotiation, push handling or refresh wait
+    // changes.
+    #[test]
+    fn a_provider_granting_large_templates_has_its_pushes_rebuilt() {
+        let (address, provider, batches) = paced(Some(granted()));
+        let mut source = TdpSource::new(address, 122, Box::new(|_, _| Ok(None)));
+        let mut pusher = Pusher::default();
+        let big = template(1..=65_537, 0, 0xab);
+        batches
+            .send(announce(&mut pusher, 5, true, &big, &big, None))
+            .unwrap();
+        refresh_to(&mut source, &big);
+        assert_eq!(source.negotiation, Negotiation::Granted);
+        assert_eq!(source.current().unwrap().1.transactions().len(), 65_537);
+        let delta = template(
+            (1..=65_537).filter(|n| n % 7 != 0).chain([70_000, 70_001]),
+            0,
+            0xab,
+        );
+        let frames = announce(&mut pusher, 6, false, &delta, &delta, None);
+        assert_eq!(
+            frames[1].header().msg_type(),
+            super::super::super::extensions::REQUEST_TRANSACTION_DATA_KEPT
+        );
+        batches.send(frames).unwrap();
+        refresh_to(&mut source, &delta);
+        let unfinished = template(1..=2500, 1024, 0xcd);
+        let full = template(1..=2501, 1024, 0xcd);
+        let mut frames = announce(&mut pusher, 7, true, &unfinished, &unfinished, Some(2));
+        let next = announce(&mut pusher, 8, true, &full, &full, None);
+        assert_ne!(
+            next[2].header().msg_type(),
+            super::super::super::extensions::REQUEST_TRANSACTION_DATA_KEPT,
+            "a full push"
+        );
+        frames.extend(next);
+        batches.send(frames).unwrap();
+        refresh_to(&mut source, &full);
+        let other = template(1..=2502, 1024, 0xcd);
+        let wrong = template(1..=2503, 1024, 0xcd);
+        batches
+            .send(announce(&mut pusher, 9, false, &other, &wrong, None))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let error = loop {
+            assert!(Instant::now() < deadline, "the bad push was taken");
+            if let Err(error) = source.refresh() {
+                break error;
+            }
+        };
+        assert_eq!(error, BROKE_PROTOCOL);
+        assert!(source.link.is_none());
+        drop(batches);
+        provider.join().unwrap();
+    }
+
+    // #### BCH large templates
+    // What: a provider that refuses 0x4C54 (RequestExtensions.Error), or
+    // ignores the request and goes on to its templates, is asked for a
+    // template's transactions as before; one that requires an extension
+    // this client does not implement fails the refresh and closes the link.
+    // Look here if: TdpSource's negotiation changes.
+    #[test]
+    fn a_provider_without_large_templates_is_asked_for_data_as_before() {
+        let small = template(1..=3, 0, 0xab);
+        let refused = RequestExtensionsError {
+            request_id: 1,
+            unsupported: vec![LARGE_TEMPLATES],
+            required: Vec::new(),
+        }
+        .frame()
+        .unwrap();
+        for (answer, negotiation) in [
+            (Some(refused), Negotiation::Refused),
+            (None, Negotiation::Refused),
+        ] {
+            let (address, provider) = provider(
+                {
+                    let small = small.clone();
+                    move |sender, receiver| {
+                        receiver.receive(Duration::from_secs(5)).unwrap().unwrap();
+                        if let Some(answer) = answer {
+                            sender.send(answer).unwrap();
+                        }
+                        constraints(receiver);
+                        sender
+                            .send(super::super::convert::new_template(5, true, &small).unwrap())
+                            .unwrap();
+                        sender
+                            .send(super::super::convert::set_new_prev_hash(5, &small).unwrap())
+                            .unwrap();
+                        let ask = receiver.receive(Duration::from_secs(5)).unwrap().unwrap();
+                        assert_eq!(
+                            (ask.header().ext_type(), ask.header().msg_type()),
+                            (0, MESSAGE_TYPE_REQUEST_TRANSACTION_DATA)
+                        );
+                        sender
+                            .send(super::super::convert::transaction_data(5, &small).unwrap())
+                            .unwrap();
+                        let _ = receiver.receive(Duration::from_secs(2));
+                    }
+                },
+                Vec::new(),
+            );
+            let mut source = TdpSource::new(address, 122, Box::new(|_, _| Ok(None)));
+            let (_, refreshed) = source.refresh().unwrap();
+            assert_eq!(refreshed.transactions(), small.transactions());
+            assert_eq!(source.negotiation, negotiation);
+            provider.join().unwrap();
+        }
+        let requires = RequestExtensionsError {
+            request_id: 1,
+            unsupported: vec![LARGE_TEMPLATES],
+            required: vec![0x1234],
+        }
+        .frame()
+        .unwrap();
+        let (address, provider, batches) = paced(Some(requires));
+        let mut source = TdpSource::new(address, 122, Box::new(|_, _| Ok(None)));
+        let error = source.refresh().unwrap_err();
+        assert!(error.contains("requires SV2 extension 0x1234"), "{error}");
+        assert!(source.link.is_none());
+        drop(batches);
+        provider.join().unwrap();
+    }
+
+    // #### BCH large templates
+    // What: a provider that closes the link on RequestExtensions (as a
+    // Pickaxe template server did before it took extension frames) gets a
+    // second link at once, whose first frame after the setup is the
+    // constraints; its template is then mined.
+    // Look here if: TdpSource::refresh's first link changes.
+    #[test]
+    fn a_provider_closing_on_the_request_is_asked_nothing_next() {
+        let secret = [21; 32];
+        let public = super::super::super::server::authority_public(&secret).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = TdpAddress {
+            address: listener.local_addr().unwrap().to_string(),
+            authority: Some(public),
+        };
+        let small = template(1..=3, 0, 0xab);
+        let served = small.clone();
+        let provider = std::thread::spawn(move || {
+            let (_, mut receiver) = set_up(&listener, &public, &secret, Vec::new());
+            let ask = receiver.receive(Duration::from_secs(5)).unwrap().unwrap();
+            assert_eq!(ask.header().ext_type(), NEGOTIATION);
+            drop(receiver);
+            let (mut sender, mut receiver) = set_up(&listener, &public, &secret, Vec::new());
+            let first = receiver.receive(Duration::from_secs(5)).unwrap().unwrap();
+            assert_eq!(
+                (first.header().ext_type(), first.header().msg_type()),
+                (0, MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS)
+            );
+            sender
+                .send(super::super::convert::new_template(5, true, &served).unwrap())
+                .unwrap();
+            sender
+                .send(super::super::convert::set_new_prev_hash(5, &served).unwrap())
+                .unwrap();
+            receiver.receive(Duration::from_secs(5)).unwrap().unwrap();
+            sender
+                .send(super::super::convert::transaction_data(5, &served).unwrap())
+                .unwrap();
+            let _ = receiver.receive(Duration::from_secs(2));
+        });
+        let mut source = TdpSource::new(address, 122, Box::new(|_, _| Ok(None)));
+        let (_, refreshed) = source.refresh().unwrap();
+        assert_eq!(refreshed.transactions(), small.transactions());
+        assert_eq!(source.negotiation, Negotiation::Unasked);
+        provider.join().unwrap();
     }
 }

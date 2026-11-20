@@ -102,6 +102,29 @@ pub fn transaction_data(id: u64, template: &BchTemplate) -> Result<SerializedFra
     .map_err(|_| "template-too-large")
 }
 
+/// #### BCH large templates: `RequestTransactionData.Success` with
+/// `transactions` and empty `excess_data`, the end of a push or of an
+/// answer in pages.
+pub fn transaction_data_success(
+    id: u64,
+    transactions: &[&[u8]],
+) -> Result<SerializedFrame, String> {
+    let list = transactions
+        .iter()
+        .map(|tx| B016M::try_from(*tx))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "transaction over 16 MiB")?;
+    encoded(
+        RequestTransactionDataSuccess {
+            template_id: id,
+            excess_data: (&[][..]).try_into().map_err(|_| "excess data too long")?,
+            transaction_list: list.try_into().map_err(|_| "over 65,535 transactions")?,
+        },
+        MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_SUCCESS,
+        false,
+    )
+}
+
 /// `RequestTransactionData.Error` with `code`.
 pub fn transaction_data_error(id: u64, code: &'static str) -> Result<SerializedFrame, String> {
     encoded(
