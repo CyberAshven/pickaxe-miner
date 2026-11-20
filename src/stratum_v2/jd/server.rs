@@ -1234,7 +1234,7 @@ fn paged_limit(size_limit: Option<u64>) -> usize {
     let fits = size_limit.map_or(MAX_PAGED_TXS, |limit| {
         usize::try_from(limit / 65).unwrap_or(usize::MAX)
     });
-    fits.min(MAX_PAGED_TXS).max(SEQ_MAX)
+    fits.clamp(SEQ_MAX, MAX_PAGED_TXS)
 }
 
 /// DeclareMiningJob.Error for declaration `id`.

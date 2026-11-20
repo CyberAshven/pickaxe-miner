@@ -540,6 +540,32 @@ each. Pickaxe's server groups them:
   before group support (its firmware field was empty); those get one frame
   per channel, as before.
 
+### Extensions
+
+The mining server answers Extensions Negotiation (0x0001,
+`RequestExtensions`) after setup, and discards the frames of any extension
+it does not implement or did not grant, as sv2-spec 3.2.1 says. A malformed
+`RequestExtensions`, a base message with the wrong channel bit and anything
+before setup still close the connection.
+
+| Type | Name | What Pickaxe does |
+|---|---|---|
+| 0x4D4D | Pickaxe merge-mining disclosure | Granted when asked: `JobLeaves` after each job that commits a root, `WinProof` after a winning share ([merge-mining.md](merge-mining.md)). |
+| 0x0002 | Worker-Specific Hashrate Tracking | Granted when asked. The first `user_identity` TLV field (0x0002, field 0x01, at most 32 bytes of UTF-8) after a `SubmitSharesExtended` names that share's worker: its shares count on a row of their own in the workers table, labelled by the name and never by an address (a name that is one counts on the connection's row). Other fields are ignored, a share without one is taken, and one over 32 bytes is refused with `user-identity-too-long`. Without the grant whole fields are ignored. Bytes that are not whole TLV fields close the connection either way, and a `SubmitSharesStandard` must be exactly its 24 bytes. |
+| 0x5052 | Requested Payout Outputs | Job Declaration only ([job-declaration.md](job-declaration.md#extensions)); discarded on a mining connection. |
+| 0x4C54 | BCH large templates (Job Declaration) | Job Declaration only (same); discarded on a mining connection. |
+
+The answer lists the granted extensions in the order asked; a request for
+neither 0x4D4D nor 0x0002 gets `RequestExtensions.Error` naming what was
+asked and requiring nothing, as the Knuth node answers. Unlike Knuth, which
+answers only a `RequestExtensions` sent right after setup, Pickaxe answers
+one at any time after setup. 0x5052 and 0x4C54 are **experimental
+identifiers shared with Knuth**, not in the SV2 extension registry; both
+implementations use the same identifiers and byte layouts
+(`src/stratum_v2/extensions.rs`, Knuth's `docs/sv2.md`). Every integer is
+little-endian, a TLV field's type and length included, which the
+extension's own examples print big-endian.
+
 ### Templates from a provider (Template Distribution client)
 
 #### PR #42
