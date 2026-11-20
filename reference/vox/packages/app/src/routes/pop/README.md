@@ -1,1 +1,0 @@
-Vox is a chat protocol running on Bitcoin Cash. Messages are stored in temporarily NFTs, then burned after a week... for a more stable future. 
