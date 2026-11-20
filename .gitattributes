@@ -14,3 +14,6 @@ reference/shared-t2/*.wgsl whitespace=-blank-at-eol
 packaging/farm-os/** text eol=lf
 tools/farm-os/** text eol=lf
 tools/test_farm_os_packages.py text eol=lf
+
+# The supply-chain scanner runs under bash on every OS, Git Bash included.
+.agents/skills/**/*.sh text eol=lf
