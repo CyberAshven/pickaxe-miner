@@ -15,7 +15,7 @@ Upstream release: `v4.6.0`, commit `540ac5b9c910f089c449177ebf000e4c130cab19`.
 - The user accepts the measured approximately 2% performance loss for upstream adoption, conditional on upstream PR #442 merging. Performance parity is no longer an adoption requirement; the remaining integration and stability gates still apply.
 - Exactly one mining process/window. Stop the live miner normally before exclusive GPU tests, and restore it after testing. Synthetic test keys only; no test broadcasts or funded-key experiments.
 - Upstream contributions may include binding fixes and independently useful PHOTON optimizations, with reproducible evidence. Do not describe a primitive benchmark as a full mining comparison.
-- If a swap is confirmed, preserve the original engine in `reference/legacy-engine-by-cyberashven/`, including source, build instructions, tests, original licensing/attribution, and the exact baseline commit. Until then, keep the original engine active rather than moving it prematurely.
+- If a swap is confirmed, preserve the original engine in `reference/legacy-engine-by-cyberashven/` (done, then removed on 2026-11-20; see commit 9985f7c, the last dev commit that has it), including source, build instructions, tests, original licensing/attribution, and the exact baseline commit. Until then, keep the original engine active rather than moving it prematurely.
 
 ## Current direction: a fully Rust engine
 
@@ -33,7 +33,7 @@ The initial public-API probes do not settle whether an integrated engine can pre
 
 Both integrated candidates pass the full PHOTON correctness oracle and covenant checks, and are 2.4% and 2.1% slower than their matched Pickaxe baselines. The user accepts this approximate 2% tradeoff for adopting the maintained upstream engine, conditional on upstream PR #442 merging. Proceed with the candidate retaining Pickaxe's fixed-key multiplication once that condition is met; its measured 2.1% loss is acceptable and is not a reason to reject the swap. These measurements apply to the tested NVIDIA GPU and do not establish performance on other hardware.
 
-PR #442 contains only the Rust-binding declaration fix, not the Pickaxe mining integration or its optimizations. Before production adoption, pin and revalidate the merged upstream revision, finish production build/runtime integration, and pass live stability validation in the single TUI. Preserve the current engine under `reference/legacy-engine-by-cyberashven/` when the swap is adopted. Master, release, and live TUI continue using the existing engine while the condition and remaining gates are outstanding; experimental selection is currently confined to ignored tests.
+PR #442 contains only the Rust-binding declaration fix, not the Pickaxe mining integration or its optimizations. Before production adoption, pin and revalidate the merged upstream revision, finish production build/runtime integration, and pass live stability validation in the single TUI. Preserve the current engine under `reference/legacy-engine-by-cyberashven/` when the swap is adopted (done; removed on 2026-11-20, see commit 9985f7c). Master, release, and live TUI continue using the existing engine while the condition and remaining gates are outstanding; experimental selection is currently confined to ignored tests.
 
 ## Findings
 
