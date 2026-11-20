@@ -547,6 +547,11 @@ fn token_key(key: KeyEvent, miners: &Miners<'_>, state: &mut TuiState) -> Result
         }
         return Ok(false);
     }
+    // Pickaxe's own update: U downloads it, never restarts this session.
+    if let Some(crate::update::Press::Said(text)) = update_key(key.code, false) {
+        state.status_line = text;
+        return Ok(false);
+    }
     match key.code {
         KeyCode::Char('b' | 'B') => {
             if tokens.split.iter().all(|row| row.share == Some(0)) {
@@ -747,7 +752,7 @@ fn render_miners(frame: &mut Frame<'_>, state: &TuiState) {
                 |e| e.uptime.as_secs_f64()
             ))
         ))
-        .block(Block::bordered()),
+        .block(with_update_notice(Block::bordered())),
         parts[0],
     );
     frame.render_widget(
