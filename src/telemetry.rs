@@ -6,7 +6,6 @@
 use crate::backend::{BackendKind, GpuDevice};
 use serde::Serialize;
 use serde_json::Value;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -100,7 +99,7 @@ pub(crate) fn parse_nvidia_smi_line(line: &str) -> Option<GpuTelemetry> {
 
 /// Samples telemetry from one NVIDIA GPU, by nvidia-smi index or PCI address.
 pub(crate) fn sample_nvidia_telemetry(id: &str) -> Option<GpuTelemetry> {
-    let output = Command::new("nvidia-smi")
+    let output = crate::child_process::command("nvidia-smi")
         .arg(format!("--id={id}"))
         .arg("--query-gpu=utilization.gpu,power.draw,temperature.gpu,memory.used,clocks.gr,clocks.mem,fan.speed")
         .arg("--format=csv,noheader,nounits")
@@ -197,7 +196,7 @@ pub(crate) fn parse_amd_smi_json(stdout: &str) -> Option<GpuTelemetry> {
 
 /// Samples telemetry from one AMD GPU, by amd-smi index or PCI address.
 pub(crate) fn sample_amd_telemetry(id: &str) -> Option<GpuTelemetry> {
-    let output = Command::new("amd-smi")
+    let output = crate::child_process::command("amd-smi")
         .arg("monitor")
         .arg("--gpu")
         .arg(id)

@@ -85,14 +85,22 @@ so the donation is that share of mining work at the pool. See [docs/stratum-v2.m
 
 ### For pool operators
 
-Run a public BCH pool with Pickaxe: SV1 and SV2 miners connect with their own
-payout address, and the blocks they find pay them directly in the coinbase, so
-the pool holds no one's money. You choose your fee and where it comes from (the
-coinbase, mining work, or both) and the address it goes to, including a
-multisig; miners can see every fee in the coinbase. `stratum-v2 serve --public
---pool-fee 2 --pool-fee-address <address>`; see [docs/pool.md](docs/pool.md).
-Run a pool also starts a GPU pool, where each rig mines for its own address and
-your fee is a share of mining time. Press `i` on the dashboard for Connection
+Run a pool lets others mine BCH through your server, in one of three modes;
+none holds anyone's money, as each block's coinbase pays directly:
+
+- **Public Solo Endpoint** (`stratum-v2 serve --public --pool-fee 2
+  --pool-fee-address <address>`): others mine Solo through your server; each
+  miner keeps their own blocks. Your fee comes from the coinbase, mining work,
+  or both, to any address, a multisig included.
+- **Non-custodial Pool** (`--own-p2pool --public --p2pool-standalone`): people
+  on your server share every block by their work; P2Pool runs inside, on your
+  server alone.
+- **P2Pool v2** (`--own-p2pool --public`): the same, linked with other P2Pool
+  servers.
+
+See [docs/pool.md](docs/pool.md).
+Run a pool, **GPU rigs**, is a Public Solo Endpoint for GPU rigs: each rig mines
+for its own address and your fee is a share of mining time. Press `i` on the dashboard for Connection
 info: the addresses (and, for rigs, the command) miners copy, for your network
 and, with [Tailscale](https://tailscale.com), from anywhere.
 
@@ -105,13 +113,16 @@ Run `pickaxe` for the setup, or use the command line.
 | Mine PHOTON on your GPUs | GPU mining | `pickaxe mine --address <yours>` | [Quick start](#quick-start-mainnet-tui) |
 | Mine ELECTRIC on your GPUs | GPU mining, ELECTRIC; fund its fee pot | `pickaxe electric mine --address <yours>` | [docs/electric-token.md](docs/electric-token.md) |
 | Split your GPUs between both tokens | GPU mining, Hash split | `pickaxe split --share photon=80 --share electric=20 --address <yours>` | [docs/hash-split.md](docs/hash-split.md) |
+| Mine GPU tokens from a desktop window | – | `pickaxe gui` (a build with `--features gui`) | [docs/desktop-window.md](docs/desktop-window.md) |
 | Mine with GPUs on many machines | GPU mining; rigs: Join a GPU pool or farm | coordinator `--rigs-listen 0.0.0.0:3340`, rigs `--coordinator HOST:3340 --coordinator-key KEY` | [docs/farm.md](docs/farm.md) |
 | Join someone's GPU pool | GPU mining, Join a GPU pool or farm | `pickaxe mine --coordinator HOST:3340 --coordinator-key KEY --address <yours>` | [docs/farm.md](docs/farm.md) |
 | Mine on HiveOS, mmpOS or RaveOS | – | the release's custom-miner package for your system | [docs/farm-os.md](docs/farm-os.md) |
-| Run a GPU pool | Run a pool, GPU pool | `pickaxe mine --rigs-listen 0.0.0.0:3340 --rigs-only --rigs-public --rigs-fee 2 --address <yours>` | [docs/pool.md](docs/pool.md#a-public-gpu-pool) |
+| Let other people's GPU rigs mine through your computer | Run a pool, GPU rigs (a Public Solo Endpoint for GPU rigs) | `pickaxe mine --rigs-listen 0.0.0.0:3340 --rigs-only --rigs-public --rigs-fee 2 --address <yours>` | [docs/pool.md](docs/pool.md#a-public-solo-endpoint-for-gpu-rigs) |
 | Mine BCH solo with your ASICs | ASIC mining, Solo | `pickaxe stratum-v2 serve` (your BCH node) | [docs/stratum-v2.md](docs/stratum-v2.md) |
 | Point your ASICs at a pool | ASIC mining, Join a pool | `pickaxe stratum-v2 serve --sv1-listen 0.0.0.0:3333 --upstream stratum2+tcp://HOST:PORT/KEY` | [docs/stratum-v2.md](docs/stratum-v2.md) |
-| Run a BCH pool for others | Run a pool, ASIC pool | `pickaxe stratum-v2 serve --public --pool-fee 2 --pool-tag /MyPool/` | [docs/pool.md](docs/pool.md) |
+| Mine your ASICs at your own P2Pool v2 node | ASIC mining, Join a pool, P2Pool; Your templates: your node's | `pickaxe stratum-v2 serve --own-p2pool` | [docs/p2pool.md](docs/p2pool.md) |
+| Let others mine Solo through your server | Run a pool, ASIC, Public Solo Endpoint | `pickaxe stratum-v2 serve --public --pool-fee 2 --pool-tag /MyPool/` | [docs/pool.md](docs/pool.md) |
+| Run a Non-custodial Pool or P2Pool v2 | Run a pool, ASIC, Non-custodial Pool or P2Pool v2 | `pickaxe stratum-v2 serve --own-p2pool --public [--p2pool-standalone] --pool-fee 1` | [docs/pool.md](docs/pool.md#a-non-custodial-pool-or-p2pool-v2) |
 | Mine at a pool with your own node's templates | ASIC mining, Join a pool; Advanced: Job Declaration | `pickaxe stratum-v2 serve --sv1-listen 0.0.0.0:3333 --upstream stratum2+tcp://HOST:PORT/KEY --job-declaration` | [docs/job-declaration.md](docs/job-declaration.md) |
 | Serve your node's templates to SV2 pools and P2Pool | ASIC mining, Solo; Advanced: Serve templates | `pickaxe stratum-v2 serve --tp-listen 0.0.0.0:8442` | [docs/stratum-v2.md](docs/stratum-v2.md#serving-templates-to-a-pool-template-distribution) |
 
@@ -258,7 +269,7 @@ Without `--no-tui`, the miner opens a short setup:
 2. **What to do**: GPU mining, ASIC mining, or run a pool for other miners.
 3. **Network**: Mainnet or Chipnet.
 4. **Token**: the GPU tokens for that network (with ELECTRIC and a Hash split between them, [docs/hash-split.md](docs/hash-split.md)), or for ASIC, "BCH + merge-mined CashTokens" or "ASIC-exclusive CashTokens (SAFA, ...)". Choosing BCH starts the BCH ASIC server, which builds blocks from your own BCH node (see [docs/stratum-v2.md](docs/stratum-v2.md)); the BCH node list finds Bitcoin Cash Node on the same computer, which needs no password. ASIC-exclusive tokens come later.
-5. **Settings + Start**: GPU, payout address, intensity, Fulcrum servers, BCH node and profile name on one page. GPU mining adds a Token row to change the token and a Mining row: solo, or join a GPU pool or farm with its coordinator's address and key (its Connection info shows them), as a rig; a farm's rigs can run HiveOS, mmpOS, RaveOS, SimpleMining OS and the like. ASIC mining adds a Mining row: solo on your node, or join a pool: a normal SV2 pool's address and key, or P2Pool, either a P2Pool node to join or your own P2Pool node that Pickaxe runs with your BCH node ([docs/p2pool.md](docs/p2pool.md)). With ELECTRIC chosen, alone or in a hash split, the settings show its fee pot with a QR code to fund it and its balance as it comes in. Running a pool asks what miners will mine: an ASIC pool asks for the pool type, your node, the pool fee, where it comes from (coinbase, mining work or both) and its address, then starts a public pool; a GPU pool asks for the pool type, the token's servers, the fee (a share of each rig's mining time) and its address, then coordinates the pool's rigs ([docs/pool.md](docs/pool.md)). The Pool row of Join a pool takes the pool's address or its one-line `stratum2+tcp://HOST:PORT/KEY`, which fills the key.
+5. **Settings + Start**: GPU, payout address, intensity, Fulcrum servers, BCH node and profile name on one page. GPU mining adds a Token row to change the token and a Mining row: solo, or join a GPU pool or farm with its coordinator's address and key (its Connection info shows them), as a rig; a farm's rigs can run HiveOS, mmpOS, RaveOS, SimpleMining OS and the like. ASIC mining adds a Mining row: **Solo** (your blocks pay you, from your node), or **Join a pool**: a normal SV2 pool's address and key, or P2Pool, either a P2Pool node to join or your own **P2Pool v2** node that Pickaxe runs with your BCH node ([docs/p2pool.md](docs/p2pool.md)). With ELECTRIC chosen, alone or in a hash split, the settings show its fee pot with a QR code to fund it and its balance as it comes in. Running a pool asks for the miners' hardware: **ASIC** asks for its mode (**Public Solo Endpoint**, **Non-custodial Pool** or **P2Pool v2**), your node, the fee and its address (a Public Solo Endpoint also where the fee comes from; the P2Pool modes P2Pool's own donation, fallback pools and, for P2Pool v2, your peers), then starts that server; **GPU rigs** (a Public Solo Endpoint for GPU rigs) asks for the token's servers, the fee (a share of each rig's mining time) and its address, then coordinates the pool's rigs ([docs/pool.md](docs/pool.md)). The Pool row of Join a pool takes the pool's address or its one-line `stratum2+tcp://HOST:PORT/KEY`, which fills the key.
 
 Fulcrum servers and nodes you add are saved once per network in `config.sources.json`, next to `config.profiles.json`, and shared by every profile on that network. Servers you add that are not built in are tried first; built-in servers, including ones you also saved, are ranked by health. Servers and nodes saved inside older profiles move there automatically. Press `S` while mining to change the address or intensity, or to use another server for the session; `A` opens Advanced settings.
 
@@ -392,6 +403,7 @@ cargo run --release -- benchmark
 - Fulcrum/Electrum connectivity
 - Native BCH node validation and transaction broadcast
 - Interactive Ratatui interface
+- Desktop window for GPU mining (egui, `--features gui`)
 - Headless and JSON operation
 - Persistent, bounded GPU memory architecture
 - Stale-job and generation protection
