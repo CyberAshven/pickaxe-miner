@@ -120,7 +120,10 @@ lock or coordinate unrelated websites.
 
 Browser work uses the compiled token policy and direct payouts. Payout address
 and pending transaction bytes are stored locally. An interrupted submission is
-resolved before new mining; no funded reward key is stored. The experimental
+resolved before new mining; no funded reward key is stored. A claim the server
+refuses as not final yet (its baton is not confirmed) waits for the server's
+next block notice, or 30 s, and is sent again with the same bytes; this does
+not count toward the three failed attempts that stop mining. The experimental
 browser currently uses Fulcrum WSS for jobs and broadcasts, with bounded
 connection retries. Native-node RPC and the native TUI remain desktop features.
 
