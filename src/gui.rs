@@ -26,6 +26,8 @@ mod rig;
 mod session;
 mod setup;
 mod style;
+/// The Updates panel: Pickaxe's own updates and P2Pool v2's.
+mod updates;
 
 /// What the window starts from: the saved settings and the command line, as
 /// the terminal setup reads them, and where they are saved.
@@ -79,6 +81,10 @@ pub fn run(start: Start) -> Result<(), String> {
             cc.egui_ctx.set_fonts(fonts());
             link.set_context(cc.egui_ctx.clone());
             rigs.set_context(cc.egui_ctx.clone());
+            if let Some(updater) = crate::update::updater() {
+                let ctx = cc.egui_ctx.clone();
+                updater.set_waker(Box::new(move || ctx.request_repaint()));
+            }
             #[cfg(feature = "stratum-v2")]
             servers.set_context(cc.egui_ctx.clone());
             Ok(Box::new(App::new(
@@ -165,6 +171,8 @@ struct App {
     /// A stop was asked for before the session could take it; it is asked
     /// again every frame until the session ends.
     stop_asked: bool,
+    /// The Updates panel, opened from any top bar.
+    updates: updates::Panel,
 }
 
 impl App {
@@ -187,6 +195,7 @@ impl App {
             crate::tui::append_tui_log(&format!("event window {error}"));
         }
         Self {
+            updates: updates::Panel::new(&start.config_path),
             start,
             link,
             rigs,
@@ -382,6 +391,12 @@ impl eframe::App for App {
             }
             #[cfg(not(feature = "stratum-v2"))]
             Screen::Mining(launch::Screen::Asic) => without_asic_server(ui),
+        }
+        // Restart into an installed update, only while no session runs:
+        // the window closes and Pickaxe starts again (`update`).
+        if self.updates.show(&ctx, !live) && !live {
+            crate::update::request_restart();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         if live {
             // The worker also asks for a frame whenever the session moves.

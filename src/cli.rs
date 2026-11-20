@@ -85,6 +85,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_tui: bool,
 
+    /// Don't check for, install or apply Pickaxe updates in this run
+    /// (`pickaxe update set --check off` keeps checks off).
+    #[arg(long, global = true)]
+    pub no_update_check: bool,
+
     #[arg(long, global = true)]
     pub json: bool,
 
@@ -219,6 +224,23 @@ pub enum Commands {
         #[command(subcommand)]
         command: P2poolCommand,
     },
+    /// Pickaxe's own updates from its GitHub releases (see docs/updates.md):
+    /// with no subcommand, install the newest release. A release installs
+    /// by itself only when signed with the key built into Pickaxe; an
+    /// unsigned one needs your confirmation. It replaces this version at
+    /// the next start.
+    #[command(args_conflicts_with_subcommands = true)]
+    Update {
+        #[command(subcommand)]
+        command: Option<UpdateCommand>,
+        /// Only say whether a newer release is out.
+        #[arg(long)]
+        check: bool,
+        /// Install an unsigned release without asking (it is still checked
+        /// against the release's SHA256SUMS).
+        #[arg(long)]
+        yes: bool,
+    },
     /// Open the desktop window: the mining setup and dashboard, mining the
     /// same sessions as the terminal (builds with the `gui` feature).
     Gui {
@@ -282,6 +304,28 @@ pub enum P2poolCommand {
         /// dialed; `run --standalone` dials none).
         #[arg(long)]
         no_peers: bool,
+    },
+}
+
+/// `pickaxe update`'s subcommands.
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum UpdateCommand {
+    /// Go back to the Pickaxe version that ran before this one, at the next
+    /// start.
+    Rollback,
+    /// The running, installed and previous versions, the last check and the
+    /// settings (asks GitHub nothing).
+    Status,
+    /// Change the settings: automatic updates and checks.
+    Set {
+        /// on: signed releases install by themselves (the default when
+        /// this build has a signing key); off: a newer release waits for
+        /// `pickaxe update` or U.
+        #[arg(long, value_name = "on|off")]
+        auto_update: Option<String>,
+        /// off: never check for releases.
+        #[arg(long, value_name = "on|off")]
+        check: Option<String>,
     },
 }
 
@@ -756,6 +800,60 @@ mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn update_commands_parse_like_p2pools() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.command);
+        assert_eq!(
+            parse(&["pickaxe", "update", "--check"]).unwrap(),
+            Some(Commands::Update {
+                command: None,
+                check: true,
+                yes: false
+            })
+        );
+        assert_eq!(
+            parse(&["pickaxe", "update", "--yes"]).unwrap(),
+            Some(Commands::Update {
+                command: None,
+                check: false,
+                yes: true
+            })
+        );
+        assert_eq!(
+            parse(&[
+                "pickaxe",
+                "update",
+                "set",
+                "--auto-update",
+                "off",
+                "--check",
+                "on"
+            ])
+            .unwrap(),
+            Some(Commands::Update {
+                command: Some(UpdateCommand::Set {
+                    auto_update: Some("off".into()),
+                    check: Some("on".into()),
+                }),
+                check: false,
+                yes: false
+            })
+        );
+        for command in ["rollback", "status"] {
+            assert!(matches!(
+                parse(&["pickaxe", "update", command]).unwrap(),
+                Some(Commands::Update {
+                    command: Some(UpdateCommand::Rollback | UpdateCommand::Status),
+                    ..
+                })
+            ));
+        }
+        // A flag of `update` itself does not mix with its subcommands.
+        assert!(parse(&["pickaxe", "update", "--yes", "rollback"]).is_err());
+        let cli = Cli::try_parse_from(["pickaxe", "mine", "--no-update-check"]).unwrap();
+        assert!(cli.no_update_check);
+    }
 
     #[test]
     fn p2pool_peer_commands_parse() {
