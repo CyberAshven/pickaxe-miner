@@ -8126,6 +8126,9 @@ pub(crate) fn event_log_text(event: &RuntimeEvent) -> String {
         RuntimeEvent::DirectRewardAccepted { txid, .. } => {
             format!("direct reward accepted: tx={txid}")
         }
+        RuntimeEvent::ClaimWaitsForBlock { txid, height } => {
+            format!("claim waits for a block: tx={txid} not final at h={height}")
+        }
         RuntimeEvent::Error(error) => format!("error: {error}"),
         // #### PR #42
         RuntimeEvent::NodeDown { reason } => format!("node down, mining from Fulcrum: {reason}"),
