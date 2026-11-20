@@ -202,9 +202,10 @@ these steps, and runs them on every proof before keeping it (fail closed):
   identity script (the payout address in their login, with or without
   `.worker`), and its split carries:
   - the **donation slot**: the reward share of the miner's donation (two
-    thirds of their `,donation=` choice, or of the pool's setting without
-    one; see [The login option](#the-login-option)), to the Pickaxe
-    donation's script;
+    thirds of the rate their jobs carry: the higher of the pool's setting
+    and their `,donation=`, less what their own Pickaxe visibly donates;
+    see [The login option](#the-login-option)), to the Pickaxe donation's
+    script;
   - the **fee slot**: the operator's fee from the coinbase, to the fee
     address's script: the whole rate in `coinbase` mode, two thirds in
     `both`, and none in `work`.
@@ -212,8 +213,9 @@ these steps, and runs them on every proof before keeping it (fail closed):
   A donation-work job's leaves pay the donation whole, and a fee-work job's
   (`work` mode, and `both`'s third) pay the operator whole, both with
   `ext = 0`, as their BCH does. The operator's fee reaches tokens as it
-  reaches BCH and the miner cannot remove it; the donation is the miner's to
-  set, down to 0. A token without split support takes both as work: its
+  reaches BCH and the miner cannot remove it; a miner can raise the
+  donation, never lower it below the pool's setting. A token without split
+  support takes both as work: its
   leaves pay the donation whole for the miner's donation share of the work,
   then the operator whole for the fee's share of what the donation leaves
   (fee × (1 − donation)), and the miner otherwise; BCH in those jobs pays as
@@ -224,8 +226,8 @@ these steps, and runs them on every proof before keeping it (fail closed):
   Full-Template only): the declared coinbase carries the commitment as
   output 0 before the pool's outputs. Its leaves bind the miner's own script
   (the pool's first output), and their split is what the coinbase pays: the
-  miner's donation (the PX token's donation rate, which a Pickaxe pool takes
-  from the login: the client names the miner's own setting as
+  miner's donation (the PX token's donation rate: at a Pickaxe pool the
+  higher of its setting and the miner's own, which the client names as
   `,pickaxe-donation=`) and the pool's fee, both whole, as no work
   rotates under Job Declaration. The client discloses the leaves in
   `DeclareMiningJob.excess_data`, and the pool refuses a declaration whose
@@ -285,8 +287,9 @@ and leaves BCH mining unaffected.
 ## Donation
 
 Merge-mined tokens follow the one BCH ASIC donation setting (default 1.5%,
-anything from 0% to 100% in Advanced settings; on a public pool, the miner's
-`,donation=` choice or the pool's setting), split as BCH's is:
+anything from 0% to 100% in Advanced settings; on a public pool, the rate
+the miner's jobs carry, see [The login option](#the-login-option)), split
+as BCH's is:
 
 - **Two thirds from each win:** the reward share (1% at 1.5%,
   `BchDonation::reward_bps`) is the donation slot's rate on every leaf of the
@@ -296,8 +299,9 @@ anything from 0% to 100% in Advanced settings; on a public pool, the miner's
 - A setting of 0% means no donation: no slot and no work.
 
 Under Job Declaration no donation work runs (every local job shares the
-declared coinbase), so the leaves carry the token's whole donation rate (the
-miner's choice at a Pickaxe pool) and the pool's whole fee in the split, as
+declared coinbase), so the leaves carry the token's whole donation rate (at
+a Pickaxe pool, the higher of its setting and the miner's) and the pool's
+whole fee in the split, as
 the declared coinbase pays BCH's. A token whose covenant verifies no split
 takes its whole donation (1.5%) as work instead: every BCH donation-work job,
 and enough other jobs to make up the rest, whose BCH still pays the miner. On
@@ -306,10 +310,15 @@ the donation (see Pool and role rules); under Job Declaration it is refused.
 
 ## The login option
 
-On a Pickaxe public pool a miner chooses their own donation after their
-payout address: `<address>[.worker][,donation=<percent>]`, such as
-`bitcoincash:qq….rig1,donation=0.5`. The same login works as an SV1
+On a Pickaxe public pool (a Public Solo Endpoint, `stratum-v2 serve
+--public`) a miner may name their own donation after their payout address:
+`<address>[.worker][,donation=<percent>]`, such as
+`bitcoincash:qq….rig1,donation=3`. The same login works as an SV1
 username, an SV2 `user_identity` and a Job Declaration `user_identifier`.
+
+The higher of the pool's setting and the login's rate applies, once: pool
+1.5% and `,donation=3` is 3%, not 4.5%; pool 0% and `,donation=1.5` is 1.5%;
+pool 1.5% and `,donation=0` stays 1.5%.
 
 - `<percent>` is 0 to 100 in 0.5% steps, as the BCH donation setting is.
   Anything else (`7.25`, `-1`, `abc`, a second `donation=`) is refused with
@@ -318,16 +327,18 @@ username, an SV2 `user_identity` and a Job Declaration `user_identifier`.
   firmware with that reason, and an ended session under Job Declaration (as
   for any identity the pool cannot read).
 - Without the option the pool's donation setting applies.
-- It sets the miner's whole BCH donation: the coinbase's reward share, the
-  donation work and the donation slot in token leaves; under Job
-  Declaration, the PX token's donation rate. The pool's fee does not change,
-  and is still taken from what the donation leaves.
+- The rate is the miner's whole BCH donation: the coinbase's reward share,
+  the donation work and the donation slot in token leaves; under Job
+  Declaration, the PX token's donation rate, which a custom job's coinbase
+  must pay at least. The pool's fee does not change, and is still taken
+  from what the donation leaves.
 - Options follow the first comma, separated by commas; keys other than
   `donation` are left alone, so BCH P2Pool's `,p2p=<share address>` passes
   through. The payout is the part before the first comma.
 - One connection keeps one choice: its first channel fixes it, and a later
   channel whose login names another donation (or none after one) is refused
-  with `donation-mismatch`, as donation work is allocated per connection.
+  with `donation-mismatch`, as donation work is allocated per connection. A
+  channel paying the donation's own address is exempt (see below).
 - BCH P2Pool reads the same key for its own donation (0 to 10%, apart from
   its operator fee, refused above 10%). Pickaxe does not check P2Pool logins
   itself.
@@ -335,14 +346,17 @@ username, an SV2 `user_identity` and a Job Declaration `user_identifier`.
   Pickaxe pools read it. A login names one or the other, not both.
 
 **One donation at a pool.** Pickaxe's SV1 adapter donates by itself at a
-remote pool: its own donation channel, at the miner's setting. A Pickaxe
-pool would also take its donation from the device's channel, so the adapter
-now names `,pickaxe-donation=0` after the device's login there (unless the
-login already names a donation), and asks once more without it if the pool
-refuses the option. It never names `donation=`: at a BCH P2Pool node that
-key is P2Pool's own donation, which is independent of Pickaxe's and stays
-the miner's choice. Under Job Declaration there is no local donation work,
-so the donation is only the coinbase's, at the rate the login chooses.
+remote pool: its own donation channel, at the miner's setting, on the
+device's SV2 connection under the donation's address. A Pickaxe pool mines
+that channel as donation work (no fee), credits its share of the
+connection's accepted work over the last hour, up to the miner's rate, and
+takes only the rest on the device's channel. The adapter still names
+`,pickaxe-donation=0` on the device's login ("I donate myself", for older
+pools; asked again without it if refused), but text alone lowers nothing.
+At pool 2%, an adapter that visibly mines 1.5% gives 0.5% more through the
+pool. It never names `donation=`: at a BCH P2Pool node that key is
+P2Pool's own donation, independent of Pickaxe's. Under Job Declaration
+nothing is credited: the coinbase pays the whole rate.
 
 ## Coinbase size
 

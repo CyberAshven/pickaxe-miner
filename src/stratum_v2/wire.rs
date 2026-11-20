@@ -99,6 +99,15 @@ pub struct MiningSession {
     /// connection's logins (`None` inside: the pool's setting), fixed by its
     /// first channel.
     donation_choice: Option<Option<crate::donation::bch::BchDonation>>,
+    /// #### one donation, the higher rate: on a public pool, the server's
+    /// donation rate as last given (`public_donation`), and the donation
+    /// this connection's own Pickaxe visibly mines on its donation channels.
+    server_donation: Option<crate::donation::bch::BchDonation>,
+    own_donation: super::own_donation::OwnDonation,
+    /// #### one donation, the higher rate: the target of the latest share
+    /// accepted on a donation channel, taken by the server for the work
+    /// split (such shares repay no quota of the connection's own jobs).
+    pub donation_share: Option<Hash>,
     /// #### merge-mining v2: the client asked for the merge-mining
     /// disclosure extension (`merge::disclosure`).
     merge_disclosure: bool,
@@ -162,6 +171,9 @@ impl MiningSession {
             fixed_version: false,
             token_refusal: None,
             donation_choice: None,
+            server_donation: None,
+            own_donation: Default::default(),
+            donation_share: None,
             merge_disclosure: false,
             leaf_log: Vec::new(),
         })
@@ -215,7 +227,9 @@ impl MiningSession {
     // What: a public pool connection's first channel fixes its donation
     // choice (its login's `,donation=`, or none for the pool's setting); a
     // later channel whose login chooses otherwise is refused with
-    // `donation-mismatch`.
+    // `donation-mismatch`. #### one donation, the higher rate: a donation
+    // channel (one paying the donation's own address) neither fixes nor
+    // needs a choice.
     // Why: the work allocation that makes donation-work jobs runs per
     // connection, at one rate; a proxy carrying miners with different
     // choices would otherwise donate at the wrong rate for some of them.
@@ -223,6 +237,67 @@ impl MiningSession {
     /// The donation this connection's miners chose, if they chose one.
     pub fn donation_choice(&self) -> Option<crate::donation::bch::BchDonation> {
         self.donation_choice.flatten()
+    }
+
+    // #### one donation, the higher rate
+    // What: on a public pool, the rate this connection's miner channels'
+    // jobs carry: the effective rate (the higher of the server's and the
+    // login's, `payout::effective_donation`), less what the connection's own
+    // Pickaxe visibly donates on its donation channel over the last hour
+    // (`own_donation`), the rest taken as a share of the work left on the
+    // miner's own channels. Each miner channel keeps it (`Channel::
+    // set_donation`), so a channel's first job carries it too.
+    // Why: the miner pays the higher rate once; a login's text never lowers
+    // it, only donation work the server sees does.
+    // Look here if: a miner with their own Pickaxe pays twice, or a typed
+    // `,pickaxe-donation=0` lowers what the server takes.
+    /// The rate this public pool connection's miner channels carry, with the
+    /// server's rate `server`; the channels are given it too.
+    pub fn public_donation(
+        &mut self,
+        server: crate::donation::bch::BchDonation,
+    ) -> crate::donation::bch::BchDonation {
+        self.server_donation = Some(server);
+        let rate = self.miner_donation();
+        for channel in self.channels.values_mut() {
+            if !channel.pays_donation() {
+                channel.set_donation(Some(rate));
+            }
+        }
+        rate
+    }
+
+    /// The effective rate: the higher of the server's (as last given, or
+    /// before that the jobs') and this connection's login's.
+    fn effective_donation(&self) -> crate::donation::bch::BchDonation {
+        let server = self.server_donation.unwrap_or(self.payout_policy.donation);
+        super::payout::effective_donation(server, self.donation_choice())
+    }
+
+    /// The rate the server takes on the miner's own channels: the effective
+    /// rate less the verified own donation.
+    fn miner_donation(&self) -> crate::donation::bch::BchDonation {
+        let effective = self.effective_donation();
+        super::own_donation::charged(effective, self.own_donation.credit(effective))
+    }
+
+    /// #### one donation, the higher rate: on a public pool with a miner
+    /// channel open, the effective rate and the own Pickaxe's credit, for
+    /// the workers page; never an address.
+    pub fn donation_terms(
+        &self,
+    ) -> Option<(
+        crate::donation::bch::BchDonation,
+        crate::donation::bch::BchDonation,
+    )> {
+        self.public.as_ref()?;
+        self.channels
+            .values()
+            .any(|channel| !channel.pays_donation())
+            .then(|| {
+                let effective = self.effective_donation();
+                (effective, self.own_donation.credit(effective))
+            })
     }
 
     /// #### PR #42: the server mines a token that fixes the version slot:
@@ -1053,22 +1128,40 @@ impl MiningSession {
         if !meets_target(&template.target, &maximum) {
             return Ok(vec![open_error(request, "max-target-out-of-range")?]);
         }
-        if identity != super::sv1::LOCAL_IDENTITY {
-            self.identity = Some(identity.to_owned());
-        }
         // #### PR #40: in a public pool, the user's own address; ####
         // merge-mining v2: and their donation choice.
-        let (payout, donation) = match &self.public {
-            Some(_) => match super::payout::identity_login(self.network, identity) {
-                Ok(login) => (login.payout, login.donation),
-                Err(error) if error == super::payout::DONATION_OPTION_ERROR => {
-                    return Ok(vec![open_error(request, "invalid-donation")?]);
-                }
-                Err(_) => return Ok(vec![open_error(request, "unknown-user")?]),
-            },
+        let login = self
+            .public
+            .as_ref()
+            .map(|_| super::payout::identity_login(self.network, identity));
+        // #### one donation, the higher rate: the donation's channel
+        // What: on a public pool, a channel whose login pays the Pickaxe
+        // donation's own address (the SV1 adapter's donation channel at a
+        // remote pool, on the device's own connection) mines donation work
+        // only: every job pays the donation whole, with no fee, and its
+        // accepted work is the connection's verified own donation. It
+        // neither fixes nor checks the connection's donation choice, its
+        // login's options are ignored, and it never names the device.
+        // Why: the miner's own Pickaxe donates there; the server credits
+        // that work instead of taking the donation a second time.
+        // Look here if: an adapter's donation channel is refused with
+        // donation-mismatch, or its work is charged a fee.
+        let pays_donation = matches!(
+            &login,
+            Some(Ok(login)) if super::payout::is_donation(self.network, &login.payout)
+        );
+        if identity != super::sv1::LOCAL_IDENTITY && !pays_donation {
+            self.identity = Some(identity.to_owned());
+        }
+        let (payout, donation) = match login {
+            Some(Ok(login)) => (login.payout, login.donation),
+            Some(Err(error)) if error == super::payout::DONATION_OPTION_ERROR => {
+                return Ok(vec![open_error(request, "invalid-donation")?]);
+            }
+            Some(Err(_)) => return Ok(vec![open_error(request, "unknown-user")?]),
             None => (self.payout.clone(), None),
         };
-        if self.public.is_some() {
+        if self.public.is_some() && !pays_donation {
             match self.donation_choice {
                 Some(choice) if choice != donation => {
                     return Ok(vec![open_error(request, "donation-mismatch")?]);
@@ -1089,7 +1182,14 @@ impl MiningSession {
         )?;
         if let Some(public) = &self.public {
             channel.set_operator(Some(&public.address))?;
-            channel.set_donation(donation);
+            // #### one donation, the higher rate: a miner channel's first
+            // job carries the connection's rate with this login's choice
+            // (see `public_donation`); a donation channel's is donation work.
+            if pays_donation {
+                channel.set_pays_donation();
+            } else {
+                channel.set_donation(Some(self.miner_donation()));
+            }
         }
         if let Some(lanes) = &self.lanes {
             channel.set_lane(lanes.next.fetch_add(1, Ordering::Relaxed), compact);
@@ -1217,7 +1317,30 @@ impl MiningSession {
                 // client's (its payout here is a placeholder), so its work
                 // repays no quota and is not counted as anyone's here.
                 if !share.template.is_header_only() && !share.template.is_declared() {
-                    *accepted_work = Some((share.share_target, share.payout));
+                    // #### one donation, the higher rate: on a public pool,
+                    // each share on the server's own jobs counts toward the
+                    // connection's own donation measure: a donation
+                    // channel's as verified donation work, a miner
+                    // channel's with what the credit spared it. A donation
+                    // channel's share repays no quota of the miner's jobs.
+                    let channel = self.channels.get(&id);
+                    let pays_donation = channel.is_some_and(Channel::pays_donation);
+                    if self.public.is_some() && !channel.is_some_and(|channel| channel.custom_only)
+                    {
+                        let forgone = u16::from(self.effective_donation())
+                            .saturating_sub(u16::from(share.payout.donation));
+                        self.own_donation.record(
+                            now,
+                            super::telemetry::expected_hashes(&share.share_target),
+                            pays_donation,
+                            forgone,
+                        );
+                    }
+                    if pays_donation {
+                        self.donation_share = Some(share.share_target);
+                    } else {
+                        *accepted_work = Some((share.share_target, share.payout));
+                    }
                 }
                 // #### PR #42: best share from the carried hash
                 // What: the best-share difficulty uses the hash the channel's
@@ -1734,12 +1857,18 @@ mod tests {
     /// #### PR #42: opens a channel of `kind` and builds its first job as a
     /// device does, from the frames alone.
     fn open_device(server: &mut MiningSession, kind: ChannelKind) -> DeviceJob {
+        open_device_as(server, kind, "device")
+    }
+
+    /// #### one donation, the higher rate: `open_device` under `identity`
+    /// (an extended channel's; a standard channel's is always "device").
+    fn open_device_as(server: &mut MiningSession, kind: ChannelKind, identity: &str) -> DeviceJob {
         let request = match kind {
             ChannelKind::Standard => open(),
             ChannelKind::Extended => mining(Mining::OpenExtendedMiningChannel(
                 OpenExtendedMiningChannel {
                     request_id: 2,
-                    user_identity: "device".try_into().unwrap(),
+                    user_identity: identity.try_into().unwrap(),
                     nominal_hash_rate: 1e12,
                     max_target: (&[255; 32]).into(),
                     min_extranonce_size: DEVICE_EXTRANONCE_SIZE as u16,
@@ -2933,11 +3062,12 @@ mod tests {
     }
 
     // #### merge-mining v2: one donation choice per connection
-    // What: on a public pool a login's `,donation=` is that miner's donation
-    // on every job: at 0 the coinbase pays the miner and the fee, nothing to
-    // the donation, even when the session's policy says 1.5%; a later
-    // channel choosing otherwise is refused (donation-mismatch), and a
-    // malformed choice is refused (invalid-donation).
+    // What: on a public pool a login's `,donation=` is fixed per
+    // connection: a later channel choosing otherwise is refused
+    // (donation-mismatch), and a malformed choice is refused
+    // (invalid-donation). #### one donation, the higher rate: a typed 0
+    // no longer lowers the pool's 1.5%: the coinbase still pays the
+    // donation.
     // Look here if: login options or `donation_choice` change.
     #[test]
     fn a_public_pool_login_chooses_its_donation_per_connection() {
@@ -2963,14 +3093,13 @@ mod tests {
             open_extended(&mut server, &format!("{miner}.rig1,donation=0")).unwrap();
         assert_eq!(server.donation_choice(), Some("0".parse().unwrap()));
         let job = server.channels[&channel].job().unwrap();
-        assert_eq!(u16::from(job.payout.donation), 0);
-        assert!(!job.payout.donation_work);
+        assert_eq!(u16::from(job.payout.donation), 150);
         let tx: stratum_core::bitcoin::Transaction =
             stratum_core::bitcoin::consensus::deserialize(&job.standard_coinbase.bytes).unwrap();
         assert!(tx
             .output
             .iter()
-            .all(|output| output.script_pubkey.as_bytes() != donor.as_slice()));
+            .any(|output| output.script_pubkey.as_bytes() == donor.as_slice()));
         // The same choice may open another channel; another may not.
         assert!(open_extended(&mut server, &format!("{miner}.rig2,donation=0")).is_ok());
         assert_eq!(
@@ -2996,6 +3125,143 @@ mod tests {
         assert_eq!(
             server.channels[&channel].job().unwrap().payout.donation,
             Default::default()
+        );
+    }
+
+    // #### one donation, the higher rate
+    // What: on a public pool the higher of the pool's rate and the login's
+    // applies from a channel's first job (host 0 and miner 1.5% is 1.5%,
+    // host 1.5% and miner 3% is 3%, in the token leaves' donation slot as
+    // well). The SV1 adapter's donation channel opens on the device's own
+    // connection beside a login with `,pickaxe-donation=0` and mines
+    // donation work, without a fee. The typed 0 credits nothing; once a
+    // bucket closes with that channel's accepted work at 1.5% of the
+    // connection's, a 2% host takes 0.51% of the device channel's work
+    // (0.5% of all of it). Donation channel shares repay no quota.
+    // Look here if: `public_donation`, donation channels or the own
+    // donation credit change.
+    #[test]
+    fn a_public_pool_takes_the_higher_rate_once_and_credits_only_donation_work() {
+        use super::super::merge::split::Slot;
+        use crate::donation::bch::BchDonation;
+        let declarator = super::super::jd::server::tests::declarator();
+        let miner = payout();
+        let network = MiningNetwork::Chipnet;
+        let donation = crate::donation::bch::address(network);
+        let donor = crate::tx::cashaddr_to_p2pkh_locking(donation).unwrap();
+        let rate = |text: &str| text.parse::<BchDonation>().unwrap();
+        let public = |server: &mut MiningSession, host: &str| {
+            server.set_public(Some(declarator.public.clone()));
+            server.receive(setup(4), NOW).unwrap();
+            server.public_donation(rate(host));
+        };
+        // Host 0, a login's 1.5%: 1.5% from the first job.
+        let mut server = session();
+        public(&mut server, "0");
+        let identity = format!("{miner}.rig1,donation=1.5");
+        let device = open_device_as(&mut server, ChannelKind::Extended, &identity);
+        let job = server.channels[&device.channel].job().unwrap();
+        assert_eq!(job.payout.donation, rate("1.5"));
+        assert_eq!(server.public_donation(rate("0")), rate("1.5"));
+        // Host 1.5%, a login's 3%: 3%, also in the token leaves' slot (two
+        // thirds of it).
+        let mut server = MiningSession::new(network, payout(), [7; 12], [255; 32]).unwrap();
+        server
+            .set_job(9, 3, Arc::new(token_template(0x207f_ffff, true)))
+            .unwrap();
+        public(&mut server, "1.5");
+        let (channel, _, _) = open_extended(&mut server, &format!("{miner},donation=3")).unwrap();
+        let job = server.channels[&channel].job().unwrap();
+        assert_eq!(job.payout.donation, rate("3"));
+        let split = job.aux.as_ref().unwrap().entries[0].split;
+        assert_eq!(split.donation_slot(), &Slot::new(200, &donor).unwrap());
+        assert_eq!(server.donation_terms(), Some((rate("3"), rate("0"))));
+        // The adapter at a 2% host: a typed `,pickaxe-donation=0` keeps 2%.
+        let mut server = session();
+        public(&mut server, "2");
+        let identity = format!("{miner}.rig1,pickaxe-donation=0");
+        let device = open_device_as(&mut server, ChannelKind::Extended, &identity);
+        assert_eq!(
+            server.channels[&device.channel]
+                .job()
+                .unwrap()
+                .payout
+                .donation,
+            rate("2")
+        );
+        // Its donation channel on the same connection: never a mismatch,
+        // donation work whole, no fee, no worker name.
+        server.identity = None;
+        let own = open_device_as(&mut server, ChannelKind::Extended, donation);
+        assert!(server.identity.is_none());
+        let job = server.channels[&own.channel].job().unwrap();
+        assert!(job.payout.donation_work && !job.payout.fee_work);
+        let tx: stratum_core::bitcoin::Transaction =
+            stratum_core::bitcoin::consensus::deserialize(&job.standard_coinbase.bytes).unwrap();
+        assert!(tx
+            .output
+            .iter()
+            .filter(|output| output.value.to_sat() > 0)
+            .all(|output| output.script_pubkey.as_bytes() == donor.as_slice()));
+        // Device shares alone: the closed bucket credits nothing.
+        let mut typed = session();
+        public(&mut typed, "2");
+        let alone = open_device_as(&mut typed, ChannelKind::Extended, &identity);
+        for nonce in 0..10 {
+            let share = submit_share(&alone, ChannelKind::Extended, nonce, nonce);
+            typed.receive(share, NOW).unwrap();
+        }
+        let share = submit_share(&alone, ChannelKind::Extended, 10, 10);
+        typed.receive(share, NOW + 300).unwrap();
+        assert_eq!(typed.public_donation(rate("2")), rate("2"));
+        assert_eq!(typed.donation_terms(), Some((rate("2"), rate("0"))));
+        // 3 donation shares in every 200: once the bucket closes, 1.5% is
+        // credited and the host takes 0.51% of the device channel's work.
+        let mut sequence = [0u32; 2];
+        for share in 0..200u32 {
+            let (job, index) = if share % 67 == 0 {
+                (&own, 1)
+            } else {
+                (&device, 0)
+            };
+            let frame = submit_share(job, ChannelKind::Extended, sequence[index], sequence[index]);
+            sequence[index] += 1;
+            let responses = server.receive(frame, NOW).unwrap();
+            assert!(matches!(
+                responses.share_event,
+                Some(ShareEvent::Accepted(_))
+            ));
+            // A donation share repays no quota of the miner's jobs.
+            assert_eq!(responses.accepted_work.is_none(), index == 1);
+            assert_eq!(server.donation_share.take().is_some(), index == 1);
+        }
+        assert_eq!(sequence, [197, 3]);
+        assert_eq!(server.public_donation(rate("2")), rate("2"), "before");
+        let frame = submit_share(&device, ChannelKind::Extended, 197, 197);
+        server.receive(frame, NOW + 300).unwrap();
+        let charged = server.public_donation(rate("2"));
+        assert_eq!(u16::from(charged), 51);
+        assert_eq!(server.donation_terms(), Some((rate("2"), rate("1.5"))));
+        let payout = BchPayout {
+            donation: charged,
+            ..BchPayout::default()
+        };
+        let template = Arc::new(BchTemplate::from_rpc(&rpc_template()).unwrap());
+        server.set_job_with_payout(10, 4, template, payout).unwrap();
+        assert_eq!(
+            server.channels[&device.channel]
+                .job()
+                .unwrap()
+                .payout
+                .donation,
+            charged
+        );
+        assert!(
+            server.channels[&own.channel]
+                .job()
+                .unwrap()
+                .payout
+                .donation_work
         );
     }
 

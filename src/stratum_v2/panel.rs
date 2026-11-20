@@ -133,6 +133,9 @@ pub(super) struct DevicePanel {
     offline_for: Option<Duration>,
     /// Model, firmware and power, as the device reports them.
     details: String,
+    /// #### one donation, the higher rate: on a public pool, the miner's
+    /// effective Pickaxe donation and their own Pickaxe's credit.
+    donation: Option<String>,
     /// The make and model asic-rs read while the device was online.
     model: Option<String>,
     target: Result<IpAddr, AddressIssue>,
@@ -314,7 +317,15 @@ impl DevicePanel {
         panel.offline_for = devices
             .offline_for(&row.label, now)
             .filter(|_| !row.connected);
+        panel.set_donation(row.donation_bps, row.own_donation_bps);
         panel
+    }
+
+    /// #### one donation, the higher rate: the miner's effective donation
+    /// and their own Pickaxe's credit, shown under the details.
+    pub(super) fn set_donation(&mut self, effective_bps: Option<u16>, own_bps: Option<u16>) {
+        self.donation = super::telemetry::donation_text(effective_bps, own_bps)
+            .map(|text| text.replace(" · own ", " · own Pickaxe "));
     }
 
     /// #### PR #42: the panel for a row of `stratum-v2 watch`, which reads
@@ -343,6 +354,7 @@ impl DevicePanel {
             online,
             offline_for: None,
             details,
+            donation: None,
             model: None,
             network: target.map_or("", network_class),
             target,
@@ -1011,6 +1023,9 @@ impl DevicePanel {
         let mut text = format!("Worker  {} · {status}\n", self.label);
         if !self.details.is_empty() {
             text.push_str(&format!("{}\n", self.details));
+        }
+        if let Some(donation) = &self.donation {
+            text.push_str(&format!("Pickaxe donation {donation}\n"));
         }
         match self.offer() {
             Offer::Refused(issue) => text.push_str(match issue {
