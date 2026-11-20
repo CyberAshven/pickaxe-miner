@@ -409,7 +409,7 @@ impl MiningSession {
                 if channel.settle(&template.target, None, maximum) {
                     frames.push(mining(Mining::SetTarget(SetTarget {
                         channel_id: channel.id,
-                        maximum_target: (&channel.target).into(),
+                        target: (&channel.target).into(),
                     }))?);
                 }
                 continue;
@@ -426,7 +426,7 @@ impl MiningSession {
             if channel.settle(&template.target, tokens.as_ref(), maximum) {
                 frames.push(mining(Mining::SetTarget(SetTarget {
                     channel_id: channel.id,
-                    maximum_target: (&channel.target).into(),
+                    target: (&channel.target).into(),
                 }))?);
             }
             channel.install_with_payout(id, generation, template.clone(), payout)?;
@@ -438,7 +438,7 @@ impl MiningSession {
                 if tokens.is_some() && channel.drop_token_floor(maximum) {
                     frames.push(mining(Mining::SetTarget(SetTarget {
                         channel_id: channel.id,
-                        maximum_target: (&channel.target).into(),
+                        target: (&channel.target).into(),
                     }))?);
                 }
             }
@@ -489,7 +489,7 @@ impl MiningSession {
             if channel.custom_only {
                 frames.push(mining(Mining::SetTarget(SetTarget {
                     channel_id: channel.id,
-                    maximum_target: (&target).into(),
+                    target: (&target).into(),
                 }))?);
                 continue;
             }
@@ -500,7 +500,7 @@ impl MiningSession {
             *next_id = next_id.checked_add(1).ok_or("job identifiers exhausted")?;
             frames.push(mining(Mining::SetTarget(SetTarget {
                 channel_id: channel.id,
-                maximum_target: (&target).into(),
+                target: (&target).into(),
             }))?);
             channel.install_with_payout(*next_id, generation, template, payout)?;
             if let Some(reason) = channel.take_token_refusal() {
@@ -747,7 +747,7 @@ impl MiningSession {
                     .ok_or("invalid-channel-id")
                     .and_then(|channel| {
                         let maximum: Hash = request
-                            .maximum_target
+                            .max_target
                             .as_ref()
                             .try_into()
                             .map_err(|_| "max-target-out-of-range")?;
@@ -765,7 +765,7 @@ impl MiningSession {
                         self.maximum_targets.insert(request.channel_id, maximum);
                         mining(Mining::SetTarget(SetTarget {
                             channel_id: request.channel_id,
-                            maximum_target: (&target).into(),
+                            target: (&target).into(),
                         }))?
                     }
                     Err(code) => mining(Mining::UpdateChannelError(UpdateChannelError {
@@ -874,13 +874,13 @@ impl MiningSession {
         if (request.version ^ context.version) & !VERSION_ROLLING_MASK != 0 {
             return Err("invalid-version");
         }
-        if request.min_ntime < context.min_time || request.min_ntime > now.saturating_add(600) {
-            return Err("invalid-min-ntime");
+        if request.ntime_start < context.min_time || request.ntime_start > now.saturating_add(600) {
+            return Err("invalid-ntime-start");
         }
         // #### PR #48: on Chipnet, the bits its start time needs: not normal
         // bits past the parent's time plus 1200 s, nor the limit's at or
         // before it while ASERT gives other bits (`BchTemplate::wrong_bits`).
-        if context.wrong_bits(request.min_ntime) {
+        if context.wrong_bits(request.ntime_start) {
             return Err("invalid-nbits");
         }
         let prefix = request.coinbase_prefix.as_ref();
@@ -927,7 +927,7 @@ impl MiningSession {
         let template = Arc::new(BchTemplate::custom(
             &context,
             request.version,
-            request.min_ntime,
+            request.ntime_start,
             merkle_path.clone(),
         ));
         self.channels
@@ -993,11 +993,11 @@ impl MiningSession {
         if (request.version ^ template.version) & !VERSION_ROLLING_MASK != 0 {
             return Err("invalid-version");
         }
-        if request.min_ntime < context.min_time || request.min_ntime > now.saturating_add(600) {
-            return Err("invalid-min-ntime");
+        if request.ntime_start < context.min_time || request.ntime_start > now.saturating_add(600) {
+            return Err("invalid-ntime-start");
         }
         // #### PR #48: the bits its start time needs, as above.
-        if template.wrong_bits(request.min_ntime) {
+        if template.wrong_bits(request.ntime_start) {
             return Err("invalid-nbits");
         }
         let shape = &job.shape;
@@ -1033,7 +1033,7 @@ impl MiningSession {
             return Err("invalid-coinbase-tx");
         }
         let id = self.next_custom_id()?;
-        let template = Arc::new(template.with_header(request.version, request.min_ntime));
+        let template = Arc::new(template.with_header(request.version, request.ntime_start));
         self.channels
             .get_mut(&request.channel_id)
             .ok_or("invalid-channel-id")?
@@ -1455,14 +1455,14 @@ fn frames_for(
         ChannelKind::Standard => Mining::NewMiningJob(NewMiningJob {
             channel_id,
             job_id: job.id,
-            min_ntime: Sv2Option::new(immediate.then_some(job.template.current_time)),
+            ntime_start: Sv2Option::new(immediate.then_some(job.template.current_time)),
             version: job.template.version,
             merkle_root: (&job.standard_coinbase.merkle_root).into(),
         }),
         ChannelKind::Extended => Mining::NewExtendedMiningJob(NewExtendedMiningJob {
             channel_id,
             job_id: job.id,
-            min_ntime: Sv2Option::new(immediate.then_some(job.template.current_time)),
+            ntime_start: Sv2Option::new(immediate.then_some(job.template.current_time)),
             version: job.template.version,
             // #### PR #42: none for a token that fixes the version.
             version_rolling_allowed: job.template.version_mask() != 0,
@@ -1494,7 +1494,7 @@ fn frames_for(
             channel_id,
             job_id: job.id,
             prev_hash: (&job.template.previous_hash).into(),
-            min_ntime: job.template.current_time,
+            ntime_start: job.template.current_time,
             nbits: job.template.bits,
         }))?);
     }
@@ -1650,7 +1650,7 @@ mod tests {
         header[..4].copy_from_slice(&version.to_le_bytes());
         header[4..36].copy_from_slice(prev.prev_hash.as_ref());
         header[36..68].copy_from_slice(&root);
-        header[68..72].copy_from_slice(&prev.min_ntime.to_le_bytes());
+        header[68..72].copy_from_slice(&prev.ntime_start.to_le_bytes());
         header[72..76].copy_from_slice(&prev.nbits.to_le_bytes());
         let target = super::super::template::compact_target(prev.nbits).unwrap();
         let nonce = (0u32..1000)
@@ -1679,7 +1679,7 @@ mod tests {
         assert_eq!(update.len(), 1, "same-tip work must not reset the parent");
         let next: NewMiningJob = binary_sv2::from_bytes(update[0].payload()).unwrap();
         assert!(!next.is_future());
-        assert_eq!(next.min_ntime.into_inner(), Some(1700000025));
+        assert_eq!(next.ntime_start.into_inner(), Some(1700000025));
         let result = server.receive(submit(0), 1700000010).unwrap();
         assert_eq!(result.blocks.len(), 1);
         let solved = &result.blocks[0];
@@ -1881,7 +1881,7 @@ mod tests {
         let (previous, time, bits) = {
             let prev: SetNewPrevHash = binary_sv2::from_bytes(frames[2].payload()).unwrap();
             let previous: Hash = prev.prev_hash.as_ref().try_into().unwrap();
-            (previous, prev.min_ntime, prev.nbits)
+            (previous, prev.ntime_start, prev.nbits)
         };
         let (channel, job, version, root, coinbase) = match kind {
             ChannelKind::Standard => {
@@ -2120,11 +2120,11 @@ mod tests {
         let mut frames = server.set_job(10, 4, Arc::new(plain)).unwrap();
         assert_eq!(frames.len(), 2);
         let set: SetTarget = binary_sv2::from_bytes(frames[0].payload()).unwrap();
-        assert_eq!(set.maximum_target.as_ref(), share_target);
+        assert_eq!(set.target.as_ref(), share_target);
         // ...and with them again, to the floor, which the job carries.
         let mut frames = server.set_job(11, 5, Arc::new(tokens)).unwrap();
         let set: SetTarget = binary_sv2::from_bytes(frames[0].payload()).unwrap();
-        assert_eq!(set.maximum_target.as_ref(), floor);
+        assert_eq!(set.target.as_ref(), floor);
         let channel = server.channels.values().next().unwrap();
         assert_eq!(channel.job().unwrap().target, floor);
     }
@@ -2181,7 +2181,7 @@ mod tests {
         token: Vec<u8>,
         version: u32,
         prev: Hash,
-        min_ntime: u32,
+        ntime_start: u32,
         bits: u32,
         tx_version: u32,
         prefix: Vec<u8>,
@@ -2220,7 +2220,7 @@ mod tests {
                 token,
                 version: 0x2000_0000,
                 prev: [0xab; 32],
-                min_ntime: NOW,
+                ntime_start: NOW,
                 bits: 0x207f_ffff,
                 tx_version: 2,
                 prefix,
@@ -2236,7 +2236,7 @@ mod tests {
                 token: self.token.as_slice().try_into().unwrap(),
                 version: self.version,
                 prev_hash: (&self.prev).into(),
-                min_ntime: self.min_ntime,
+                ntime_start: self.ntime_start,
                 nbits: self.bits,
                 coinbase_tx_version: self.tx_version,
                 coinbase_prefix: self.prefix.as_slice().try_into().unwrap(),
@@ -2315,9 +2315,11 @@ mod tests {
             ("stale-chain-tip", Box::new(|job| job.prev = [0xcd; 32])),
             ("invalid-nbits", Box::new(|job| job.bits = 0x207f_fffe)),
             ("invalid-version", Box::new(|job| job.version ^= 1)),
+            // stratum-core 0.7 renamed SRI's code from `invalid-min-ntime`;
+            // the server's literal must keep matching SRI's.
             (
-                "invalid-min-ntime",
-                Box::new(|job| job.min_ntime = 1_699_999_999),
+                ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_NTIME_START,
+                Box::new(|job| job.ntime_start = 1_699_999_999),
             ),
             (
                 "invalid-coinbase-prefix",
@@ -2409,20 +2411,20 @@ mod tests {
             (MIN_DIFFICULTY_BITS, parent, NOW + 101, None),
             (MIN_DIFFICULTY_BITS, schedule, NOW, None),
         ];
-        for (generation, (bits, parent_time, min_ntime, refused)) in (5..).zip(cases) {
+        for (generation, (bits, parent_time, ntime_start, refused)) in (5..).zip(cases) {
             server
                 .set_job(generation, generation.into(), pool(bits, parent_time))
                 .unwrap();
             let job = CustomJob {
                 bits,
-                min_ntime,
+                ntime_start,
                 ..CustomJob::valid(&declarator)
             };
             let outcome = set_custom(&mut server, channel, &job);
             assert_eq!(
                 outcome.err().as_deref(),
                 refused,
-                "{bits:#x} {parent_time} {min_ntime}"
+                "{bits:#x} {parent_time} {ntime_start}"
             );
         }
     }
@@ -2554,12 +2556,12 @@ mod tests {
             ("invalid-nbits", Box::new(|job| job.bits = 0x207f_fffe)),
             ("invalid-version", Box::new(|job| job.version ^= 1)),
             (
-                "invalid-min-ntime",
-                Box::new(|job| job.min_ntime = 1_699_999_999),
+                ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_NTIME_START,
+                Box::new(|job| job.ntime_start = 1_699_999_999),
             ),
             // #### PR #48: a start past the parent's time plus 1200 s needs
             // the limit's bits (see `BchTemplate::wrong_bits`).
-            ("invalid-nbits", Box::new(|job| job.min_ntime = NOW + 101)),
+            ("invalid-nbits", Box::new(|job| job.ntime_start = NOW + 101)),
             (
                 "invalid-coinbase-tx-version",
                 Box::new(|job| job.tx_version = 1),

@@ -330,7 +330,7 @@ impl TdpSource {
                 self.futures.clear();
                 let tip = Tip {
                     prev: Hash::try_from(message.prev_hash.as_ref()).map_err(|_| BROKE_PROTOCOL)?,
-                    ntime: message.header_timestamp,
+                    ntime: message.ntime_start,
                     bits: message.n_bits,
                     target: Hash::try_from(message.target.as_ref()).map_err(|_| BROKE_PROTOCOL)?,
                 };
@@ -548,8 +548,8 @@ impl TemplateSource for TdpSource {
             SubmitSolution {
                 template_id: id,
                 version: word(0),
-                header_timestamp: word(68),
-                header_nonce: word(76),
+                ntime: word(68),
+                nonce: word(76),
                 coinbase_tx,
             },
             MESSAGE_TYPE_SUBMIT_SOLUTION,
