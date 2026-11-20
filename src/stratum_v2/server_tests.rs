@@ -2088,6 +2088,8 @@ fn sv1_firmware_mines_at_a_remote_sv2_pool_and_the_adapter_counts_its_verdicts()
         public: false,
         prefer: None,
         fixed_version: false,
+        miners: None,
+        serving: None,
     };
     let upstreams = vec![pool_with([3; 32]), pool_with(pool.authority)];
     let thread = {
@@ -2503,6 +2505,8 @@ fn solo_devices_move_to_the_fallback_pool_when_the_node_stops_and_return_when_it
             public: false,
             prefer: Some(preferred),
             fixed_version: false,
+            miners: None,
+            serving: None,
         },
     ];
     let thread = {
@@ -2556,6 +2560,8 @@ fn at_a_remote_pool_the_donation_mines_on_its_own_channel_and_the_pool_accepts_i
         public: false,
         prefer: None,
         fixed_version: false,
+        miners: None,
+        serving: None,
     }];
     let thread = {
         let stop = stop.clone();
@@ -2755,6 +2761,8 @@ fn a_typed_zero_donation_does_not_lower_a_pickaxe_pools_rate() {
         public: false,
         prefer: None,
         fixed_version: false,
+        miners: None,
+        serving: None,
     }];
     let thread = {
         let stop = stop.clone();
@@ -2837,6 +2845,8 @@ fn the_adapters_donation_channel_mines_donation_work_at_a_pickaxe_pool() {
         public: false,
         prefer: None,
         fixed_version: false,
+        miners: None,
+        serving: None,
     }];
     let thread = {
         let stop = stop.clone();
@@ -3000,6 +3010,8 @@ fn real_sv2_pool_sends_work_to_sv1_firmware() {
         public: false,
         prefer: None,
         fixed_version: false,
+        miners: None,
+        serving: None,
     };
     let thread = {
         let stop = stop.clone();
@@ -3086,6 +3098,8 @@ fn a_device_whose_pools_all_fail_still_shows_the_reason() {
             public: false,
             prefer: None,
             fixed_version: false,
+            miners: None,
+            serving: None,
         },
         super::sv1::Upstream {
             address: pool.address.to_string(),
@@ -3096,6 +3110,8 @@ fn a_device_whose_pools_all_fail_still_shows_the_reason() {
             public: false,
             prefer: None,
             fixed_version: false,
+            miners: None,
+            serving: None,
         },
     ];
     let thread = {

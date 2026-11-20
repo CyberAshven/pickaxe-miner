@@ -56,13 +56,30 @@ pub fn run(
     if let StratumV2Command::Watch = action {
         return watch(config_path);
     }
+    // #### Pool modes: the flags that go together, checked before P2Pool
+    // installs or starts.
+    check_pool_flags(&action)?;
     // #### PR #61: your own P2Pool node, started here and mined at as this
     // server's pool under your share address.
-    let own_p2pool = match &action {
-        StratumV2Command::Serve {
-            own_p2pool: true, ..
-        } => Some(crate::p2pool::own::OwnNode::start(config, config_path)?),
-        _ => None,
+    // #### Pool modes: with the operator's settings in P2Pool's own
+    // configuration.
+    let own_p2pool = match own_options(&action, config)? {
+        Some(options) => Some(crate::p2pool::own::OwnNode::start(
+            config,
+            config_path,
+            &options,
+        )?),
+        None => None,
+    };
+    // #### Pool modes: a Non-custodial Pool (or P2Pool v2): your own P2Pool
+    // with --public; each miner mines there under their own payout.
+    let pool_mode =
+        own_p2pool.is_some() && matches!(&action, StratumV2Command::Serve { public: true, .. });
+    let logins = |p2pool: bool| {
+        pool_mode.then_some(super::sv1::MinerLogins {
+            network: config.network,
+            p2pool,
+        })
     };
     // #### PR #40
     // Pool mode: SV1 devices mine at a remote SV2 pool through the adapter,
@@ -73,7 +90,13 @@ pub fn run(
             std::slice::from_ref(&own.url),
             &[],
             Some(&own.identity),
-        )?,
+        )?
+        .into_iter()
+        .map(|pool| super::sv1::Upstream {
+            miners: logins(true),
+            ..pool
+        })
+        .collect(),
         (
             StratumV2Command::Serve {
                 upstream,
@@ -88,9 +111,17 @@ pub fn run(
         _ => Vec::new(),
     };
     // #### PR #42: solo mining's fallback pools.
+    // #### Pool modes: and your own P2Pool node's, where in a pool each
+    // miner mines under their own payout.
     let fallbacks = match &action {
         StratumV2Command::Serve { fallback_pool, .. } if !fallback_pool.is_empty() => {
             fallback_upstreams(config, fallback_pool)?
+                .into_iter()
+                .map(|pool| super::sv1::Upstream {
+                    miners: logins(false),
+                    ..pool
+                })
+                .collect()
         }
         _ => Vec::new(),
     };
@@ -292,13 +323,14 @@ pub fn run(
         .map(|info| info.client);
     // #### PR #42: whether the pool knows this server by another name than
     // the payout address, for the Advanced page.
-    let custom_user = matches!(
-        &action,
-        StratumV2Command::Serve {
-            upstream_user: Some(_),
-            ..
-        }
-    );
+    let custom_user = pool_mode
+        || matches!(
+            &action,
+            StratumV2Command::Serve {
+                upstream_user: Some(_),
+                ..
+            }
+        );
     let StratumV2Command::Serve {
         listen,
         sv1_listen,
@@ -407,9 +439,25 @@ pub fn run(
             Ok(pool)
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let pools = at_pools(pools);
+    let mut pools = at_pools(pools);
     let fallbacks = at_pools(fallbacks);
-    let listener = serving
+    // #### Pool modes: failover for your own P2Pool node
+    // What: with --fallback-pool, devices leave your own P2Pool node once it
+    // has served no work (its light not green) for the solo fallback's 3 s
+    // grace, take the first fallback pool that takes them, and come back
+    // once it has served for 30 s without a break: `sv1::Preferred`, marked
+    // from P2Pool's light by the dashboard loop below.
+    // Why: the solo fallback's rule, with P2Pool as the source devices
+    // prefer.
+    // Look here if: devices stay on a P2Pool node that serves no work, or
+    // bounce off it every 30 s.
+    if own_p2pool.is_some() {
+        for pool in &mut pools {
+            pool.prefer = None;
+            pool.serving = preferred.clone();
+        }
+    }
+    let listener = (serving || pool_mode)
         .then(|| TcpListener::bind(listen))
         .transpose()
         .map_err(|_| "cannot bind mining listener")?;
@@ -439,7 +487,7 @@ pub fn run(
         .map(TcpListener::local_addr)
         .transpose()
         .map_err(|_| "cannot read template listener")?;
-    let authority_secret = serving
+    let authority_secret = (serving || pool_mode)
         .then(|| load_authority(&config_path.with_extension("sv2-key")))
         .transpose()?;
     let public_key = authority_secret
@@ -452,6 +500,8 @@ pub fn run(
     // remains pinned.
     let public_pool = public.clone();
     let upstreams = match (bound, public_key) {
+        // #### Pool modes: your own P2Pool node, then its fallback pools.
+        _ if own_p2pool.is_some() => pools.iter().chain(&fallbacks).cloned().collect(),
         _ if !pools.is_empty() && !declaring => pools.clone(),
         (Some(mut local), Some(public)) => {
             if local.ip().is_unspecified() {
@@ -494,6 +544,15 @@ pub fn run(
     let pool_suffix = public_pool_suffix(public.as_ref());
     // #### PR #61: your own P2Pool node by name, not its local address.
     let pool_address = (!pools.is_empty()).then(|| match &own_p2pool {
+        Some(own) if pool_mode => format!(
+            "your {} ({}; each miner under their own address)",
+            if own.standalone {
+                "Non-custodial Pool"
+            } else {
+                "P2Pool v2 node"
+            },
+            own.tag
+        ),
         Some(own) => format!("your P2Pool node ({})", own.tag),
         None => pools
             .iter()
@@ -617,6 +676,21 @@ pub fn run(
         )),
         (None, None) => None,
     };
+    // #### Pool modes: the SV2 door takes the mining listener.
+    let (listener, door_listener) = if pool_mode {
+        (None, listener)
+    } else {
+        (listener, None)
+    };
+    let door = match (door_listener, authority_secret) {
+        (Some(listener), Some(secret)) => {
+            let (stop, stats, upstreams) = (stop.clone(), stats.clone(), upstreams.clone());
+            Some(thread::spawn(move || {
+                super::door::run(listener, upstreams, secret, stop, stats)
+            }))
+        }
+        _ => None,
+    };
     let worker = match (work, listener, authority_secret) {
         (Some((legacy_sources, sources)), Some(listener), Some(authority_secret)) => {
             // Difficulty 4096 is each device's starting target; vardiff then
@@ -731,7 +805,9 @@ pub fn run(
     // info page (`i`) every address, Tailscale's included, ready to copy.
     let interfaces = crate::reach::Interfaces::detect();
     let devices_hint = device_hint(bound, sv1_bound, interfaces);
-    let serve_mode = if !pools.is_empty() {
+    let serve_mode = if pool_mode {
+        ServeMode::P2PoolPool
+    } else if !pools.is_empty() {
         ServeMode::JoinPool
     } else if public_pool.is_some() {
         ServeMode::Public
@@ -784,8 +860,16 @@ pub fn run(
         while !stop.load(Ordering::Relaxed)
             && worker.as_ref().is_none_or(|worker| !worker.is_finished())
         {
-            if firmware.as_ref().is_some_and(|worker| worker.is_finished()) {
+            if firmware.as_ref().is_some_and(|worker| worker.is_finished())
+                || door.as_ref().is_some_and(|door| door.is_finished())
+            {
                 break;
+            }
+            // #### Pool modes: devices leave your own P2Pool node for a
+            // fallback pool while it is not green, and come back after it
+            // has been green for 30 s.
+            if let (Some(own), Some(preferred)) = (own_p2pool.as_ref(), preferred.as_ref()) {
+                preferred.set(own.serving(), Instant::now());
             }
             let snapshot = stats
                 .lock()
@@ -1117,7 +1201,126 @@ pub fn run(
             .map_err(|_| "mining server stopped unexpectedly")?,
         None => Ok(()),
     };
-    result.and(server_result).and(firmware_result)
+    let door_result = match door {
+        Some(door) => door
+            .join()
+            .map_err(|_| "mining listener stopped unexpectedly")?,
+        None => Ok(()),
+    };
+    result
+        .and(server_result)
+        .and(firmware_result)
+        .and(door_result)
+}
+
+// #### Pool modes: flags that go together
+// What: fallback pools with --public only for a pool that runs your own
+// P2Pool (a Public Solo Endpoint mines your node, whose templates do not
+// fail over); with your own P2Pool, the fee only from the coinbase (P2Pool
+// pays it in each block) and no Job Declaration from miners (P2Pool builds
+// the jobs).
+// Look here if: a Pool-mode command is refused, or a Public Solo Endpoint
+// takes fallback pools.
+fn check_pool_flags(action: &StratumV2Command) -> Result<(), String> {
+    let StratumV2Command::Serve {
+        own_p2pool,
+        public,
+        fallback_pool,
+        pool_fee_mode,
+        accept_job_declaration,
+        ..
+    } = action
+    else {
+        return Ok(());
+    };
+    if *public && !own_p2pool && !fallback_pool.is_empty() {
+        return Err(
+            "--fallback-pool with --public needs --own-p2pool: a Public Solo Endpoint mines \
+             your own node"
+                .into(),
+        );
+    }
+    if *own_p2pool
+        && matches!(
+            pool_fee_mode,
+            Some(crate::donation::bch::FeeMode::Work | crate::donation::bch::FeeMode::Both)
+        )
+    {
+        return Err(
+            "with --own-p2pool, P2Pool pays the fee in the coinbase of each block: use \
+             --pool-fee-mode coinbase (work and both mine the fee as work, which P2Pool \
+             cannot)"
+                .into(),
+        );
+    }
+    if *own_p2pool && accept_job_declaration.is_some() {
+        return Err(
+            "--accept-job-declaration is not taken with --own-p2pool: P2Pool builds the jobs"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// #### Pool modes: what `--own-p2pool`'s flags set in P2Pool: with
+/// --public the operator's fee (`--pool-fee`, `--pool-fee-address`, by
+/// default the payout address), in any mode the pool signature
+/// (`--pool-tag`), and from `config.p2pool` (a profile's, or
+/// `--p2pool-donation`, `--p2pool-standalone`, `--node-p2p`) P2Pool's own
+/// donation (1% by default), standalone or linked, and the node's P2P
+/// port. `None` without `--own-p2pool`.
+fn own_options(
+    action: &StratumV2Command,
+    config: &RuntimeConfig,
+) -> Result<Option<crate::p2pool::own::Options>, String> {
+    let StratumV2Command::Serve {
+        own_p2pool: true,
+        public,
+        pool_fee,
+        pool_fee_address,
+        pool_tag,
+        ..
+    } = action
+    else {
+        return Ok(None);
+    };
+    let config::SavedP2Pool {
+        donation,
+        standalone,
+        node_p2p,
+    } = &config.p2pool;
+    use crate::p2pool::launch::{Operator, DEFAULT_DONATION_BPS};
+    let fee = match pool_fee.filter(|rate| *public && u16::from(*rate) > 0) {
+        Some(rate) => Some((
+            u16::from(rate),
+            config::validate_coinbase_address(
+                config.network,
+                pool_fee_address
+                    .as_deref()
+                    .unwrap_or(config.payout_address.as_str()),
+            )
+            .map_err(|_| "the pool fee address must be a q or p address on this network")?,
+        )),
+        None => None,
+    };
+    let operator = Operator {
+        fee,
+        signature: pool_tag
+            .as_deref()
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_owned),
+        donation: donation.map_or(DEFAULT_DONATION_BPS, u16::from),
+    };
+    operator.validate()?;
+    Ok(Some(crate::p2pool::own::Options {
+        operator: Some(operator),
+        standalone: *standalone,
+        node_p2p: node_p2p
+            .as_deref()
+            .map(config::validate_node_p2p)
+            .transpose()?,
+    }))
 }
 
 // #### PR #61
@@ -1241,6 +1444,8 @@ fn pool_upstreams(
                 public: false,
                 prefer: None,
                 fixed_version: false,
+                miners: None,
+                serving: None,
             })
         })
         .collect()
@@ -1280,6 +1485,8 @@ fn fallback_upstreams(
                 public: false,
                 prefer: None,
                 fixed_version: false,
+                miners: None,
+                serving: None,
             })
         })
         .collect()
@@ -1969,6 +2176,9 @@ enum ServeMode {
     Public,
     /// Devices mine at a remote pool through this computer.
     JoinPool,
+    /// #### Pool modes: a Non-custodial Pool (or P2Pool v2): each miner
+    /// mines at your own P2Pool under their own payout.
+    P2PoolPool,
     /// #### PR #42: devices mine this ASIC-exclusive token instead of BCH.
     Token(&'static str),
 }
@@ -2124,6 +2334,15 @@ fn connect_text(page: &ConnectPage) -> String {
              This computer mines at the pool for you.\nMerge-mined tokens are off at a pool: \
              the pool builds the blocks, so this computer cannot add token commitments. Mine \
              solo, or at a pool with Job Declaration, to merge-mine.\n"
+        }
+        // #### Pool modes
+        ServeMode::P2PoolPool => {
+            "\nUsername: the miner's own BCH address, a q (P2PKH) address because P2Pool \
+             pays shares to a key (the prefix may be left out), optionally followed by \
+             .name. P2Pool runs here: every block found pays everyone mining here by their \
+             work, minus the Pickaxe donation, P2Pool's donation and your fee. Adding \
+             ,donation=<percent> (0 to 100 in 0.5% steps) raises that miner's Pickaxe \
+             donation above yours, never lowers it; it is mined as work.\n"
         }
     });
     // #### PR #42: where miners' own templates go.
@@ -3370,6 +3589,137 @@ pub(crate) fn load_authority(path: &Path) -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #### Pool modes: a `stratum-v2 serve` command line.
+    fn serve(extra: &[&str]) -> StratumV2Command {
+        let mut args = vec![
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--sv1-listen",
+            "127.0.0.1:0",
+        ];
+        args.extend_from_slice(extra);
+        match <crate::cli::Cli as clap::Parser>::try_parse_from(args)
+            .unwrap()
+            .command
+        {
+            Some(crate::cli::Commands::StratumV2 { command }) => command,
+            _ => panic!("not a stratum-v2 command"),
+        }
+    }
+
+    // #### Pool modes: the operator's settings and what P2Pool cannot do
+    // What: --pool-fee and --pool-fee-address (with --public), --pool-tag
+    // and P2Pool's own settings become P2Pool's fee in basis points, fee
+    // address, signature and donation; fee modes work and both, a
+    // signature over 16 bytes, a fee over 10% and miners' own templates
+    // are refused with --own-p2pool, and fallback pools with --public only
+    // with --own-p2pool.
+    // Look here if: `check_pool_flags` or `own_options` change.
+    #[test]
+    fn pool_mode_flags_reach_p2pools_config_and_what_p2pool_cannot_do_is_refused() {
+        let network = config::MiningNetwork::Chipnet;
+        let payout = crate::tx::cashaddr_with_version(0, &[3; 20], network);
+        let fee_address = crate::tx::cashaddr_with_version(8, &[4; 20], network);
+        let mut config = RuntimeConfig {
+            network,
+            payout_address: payout.clone(),
+            ..RuntimeConfig::default()
+        };
+        for mode in ["work", "both"] {
+            let error = check_pool_flags(&serve(&[
+                "--own-p2pool",
+                "--public",
+                "--pool-fee",
+                "2",
+                "--pool-fee-mode",
+                mode,
+            ]))
+            .unwrap_err();
+            assert!(error.contains("coinbase"), "{error}");
+        }
+        check_pool_flags(&serve(&[
+            "--own-p2pool",
+            "--public",
+            "--pool-fee-mode",
+            "coinbase",
+            "--fallback-pool",
+            "stratum2+tcp://a.example:3336/KEY",
+        ]))
+        .unwrap();
+        // A Public Solo Endpoint keeps its own node: no fallback pools.
+        assert!(check_pool_flags(&serve(&[
+            "--public",
+            "--fallback-pool",
+            "stratum2+tcp://a.example:3336/KEY",
+        ]))
+        .unwrap_err()
+        .contains("--own-p2pool"));
+        assert!(check_pool_flags(&serve(&[
+            "--own-p2pool",
+            "--public",
+            "--accept-job-declaration"
+        ]))
+        .is_err());
+        // The operator's settings, as P2Pool takes them.
+        config.p2pool = config::SavedP2Pool {
+            donation: Some("0.5".parse().unwrap()),
+            standalone: true,
+            node_p2p: Some("192.168.1.20:48333".into()),
+        };
+        let options = own_options(
+            &serve(&[
+                "--own-p2pool",
+                "--public",
+                "--pool-fee",
+                "2.5",
+                "--pool-fee-address",
+                &fee_address,
+                "--pool-tag",
+                "/MyPool/",
+            ]),
+            &config,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            options.operator,
+            Some(crate::p2pool::launch::Operator {
+                fee: Some((250, fee_address.clone())),
+                signature: Some("/MyPool/".into()),
+                donation: 50,
+            })
+        );
+        assert!(options.standalone);
+        assert_eq!(options.node_p2p.as_deref(), Some("192.168.1.20:48333"));
+        // For your own devices: no fee; P2Pool's donation defaults to 1%.
+        config.p2pool = config::SavedP2Pool::default();
+        let options = own_options(&serve(&["--own-p2pool"]), &config)
+            .unwrap()
+            .unwrap();
+        let operator = options.operator.unwrap();
+        assert_eq!((operator.fee, operator.donation), (None, 100));
+        assert!(!options.standalone);
+        // P2Pool's limits.
+        assert!(own_options(
+            &serve(&["--own-p2pool", "--pool-tag", "/SeventeenBytes!/"]),
+            &config
+        )
+        .unwrap_err()
+        .contains("16"));
+        assert!(own_options(
+            &serve(&["--own-p2pool", "--public", "--pool-fee", "10.5"]),
+            &config
+        )
+        .unwrap_err()
+        .contains("10%"));
+        config.p2pool.donation = Some("10.5".parse().unwrap());
+        assert!(own_options(&serve(&["--own-p2pool"]), &config)
+            .unwrap_err()
+            .contains("0.5 steps"));
+        assert!(own_options(&serve(&[]), &config).unwrap().is_none());
+    }
 
     /// #### PR #65: the CLI has the same source requirement as setup;
     /// Electrum headers/UTXOs never stand in for a BCH block template.

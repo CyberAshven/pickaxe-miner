@@ -51,6 +51,27 @@ pub struct Cli {
     #[arg(long = "node-zmq", global = true, value_name = "URL")]
     pub node_zmq: Option<String>,
 
+    /// #### Pool modes: the node's P2P port, HOST:PORT, where your own
+    /// P2Pool hears of new blocks from a node without ZMQ notices (Knuth,
+    /// BCHD). Default: the node's host with port 8333 (mainnet) or 48333
+    /// (Chipnet), used when the node gives no ZMQ notices. With
+    /// `stratum-v2 serve --own-p2pool`.
+    #[arg(long = "node-p2p", global = true, value_name = "HOST:PORT")]
+    pub node_p2p: Option<String>,
+
+    /// #### Pool modes: P2Pool's own donation, separate from the Pickaxe
+    /// donation (--donation): 0 to 10 percent in 0.5 steps (default 1,
+    /// P2Pool's own default). With `stratum-v2 serve --own-p2pool`.
+    #[arg(long, global = true, value_name = "PERCENT")]
+    pub p2pool_donation: Option<crate::donation::bch::BchDonation>,
+
+    /// #### Pool modes: run your own P2Pool alone on its own share chain
+    /// (the Non-custodial Pool), its P2P port on this computer only and no
+    /// peers. Without it, P2Pool links with other P2Pool nodes (P2Pool
+    /// v2). With `stratum-v2 serve --own-p2pool`.
+    #[arg(long, global = true)]
+    pub p2pool_standalone: bool,
+
     /// Fulcrum servers for PHOTON jobs, comma-separated: wss:// or ws://,
     /// or #### PR #42: a home server over plain TCP (tcp://HOST:PORT, such
     /// as tcp://umbrel.local:50001), taken only on this computer or the home
@@ -421,20 +442,25 @@ pub enum StratumV2Command {
         /// #### PR #61
         /// Mine at your own BCH P2Pool node, which Pickaxe installs, keeps
         /// updated and runs with --node-rpc, --node-zmq and --address (see
-        /// docs/p2pool.md). SV1 devices connect to --sv1-listen.
-        #[arg(long, requires = "sv1_listen", conflicts_with_all = ["upstream", "public"])]
+        /// docs/p2pool.md). SV1 devices connect to --sv1-listen. With
+        /// --public it is a pool for other people: see --public.
+        #[arg(long, requires = "sv1_listen", conflicts_with = "upstream")]
         own_p2pool: bool,
         /// #### PR #40
         /// Run a public pool: each miner's username is their own payout
         /// address (q or p, optionally with .worker) and the blocks they find
         /// pay them; the Pickaxe donation comes off first, then your fee.
+        /// #### Pool modes: with --own-p2pool, a Non-custodial Pool: miners
+        /// share every block by their work through your P2Pool, each under
+        /// their own P2PKH (q) address; P2Pool pays your fee.
         #[arg(long, conflicts_with = "upstream")]
         public: bool,
         /// The public pool's fee: a percentage of what the donation leaves,
-        /// 0 to 100 (default 0).
+        /// 0 to 100 (default 0). With --own-p2pool, P2Pool's fee: at most 10.
         #[arg(long, requires = "public")]
         pool_fee: Option<crate::donation::bch::BchDonation>,
         /// Where the fee comes from: coinbase, work or both (default coinbase).
+        /// With --own-p2pool only coinbase: P2Pool pays it in each block.
         #[arg(long, requires = "public")]
         pool_fee_mode: Option<crate::donation::bch::FeeMode>,
         /// The fee's address, q or p (such as a multisig); defaults to the
@@ -444,7 +470,8 @@ pub enum StratumV2Command {
         /// #### PR #40
         /// The pool's name, written into the coinbase of every block this
         /// server builds (at most 20 printable characters), such as /MyPool/.
-        /// Not with --upstream: the pool there builds the blocks.
+        /// Not with --upstream: the pool there builds the blocks. With
+        /// --own-p2pool, P2Pool's pool signature: at most 16 characters.
         #[arg(long, value_name = "TEXT", conflicts_with = "upstream")]
         pool_tag: Option<String>,
         /// #### PR #40
@@ -535,12 +562,14 @@ pub enum StratumV2Command {
         /// pool (stratum2+tcp://HOST:PORT/KEY) while your node gives no work,
         /// and come back once it has served for 30 seconds. Repeat for more,
         /// tried in order; the donation works there as at any pool. Needs
-        /// --sv1-listen; not with --upstream or --public.
+        /// --sv1-listen; not with --upstream, nor with --public unless
+        /// --own-p2pool. #### Pool modes: with --own-p2pool, while your
+        /// P2Pool node serves no work.
         #[arg(
             long,
             value_name = "ADDRESS",
             requires = "sv1_listen",
-            conflicts_with_all = ["upstream", "public"]
+            conflicts_with = "upstream"
         )]
         fallback_pool: Vec<String>,
         /// #### PR #42
@@ -638,6 +667,33 @@ pub enum FarmOsCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+}
+
+impl Cli {
+    /// #### Pool modes: --node-p2p, --p2pool-donation and
+    /// --p2pool-standalone are your own P2Pool's settings, taken only by
+    /// `stratum-v2 serve --own-p2pool`.
+    pub fn check_p2pool_flags(&self) -> Result<(), String> {
+        let given =
+            self.node_p2p.is_some() || self.p2pool_donation.is_some() || self.p2pool_standalone;
+        let own = matches!(
+            &self.command,
+            Some(Commands::StratumV2 {
+                command: StratumV2Command::Serve {
+                    own_p2pool: true,
+                    ..
+                },
+            })
+        );
+        if given && !own {
+            return Err(
+                "--node-p2p, --p2pool-donation and --p2pool-standalone go with stratum-v2 \
+                 serve --own-p2pool"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Parses command-line arguments into the supported miner commands;
@@ -1325,7 +1381,8 @@ mod tests {
 
     // #### PR #42
     // What: --fallback-pool needs --sv1-listen, repeats in order, and
-    // conflicts with --upstream and --public.
+    // conflicts with --upstream. #### Pool modes: with --public it parses;
+    // the server refuses it unless --own-p2pool (`command::check_pool_flags`).
     // Look here if: the Serve flags change.
     #[test]
     fn fallback_pools_need_sv1_listen_and_conflict_with_upstream_and_public() {
@@ -1370,7 +1427,70 @@ mod tests {
             "--fallback-pool",
             "stratum2+tcp://a.example:3336/KEY",
         ])
-        .is_err());
+        .is_ok());
+    }
+
+    // #### Pool modes
+    // What: --own-p2pool takes --public and --fallback-pool; P2Pool's own
+    // settings (--p2pool-donation, --p2pool-standalone, --node-p2p) parse
+    // anywhere on the line but go only with serve --own-p2pool.
+    // Look here if: the Pool-mode flags change.
+    #[test]
+    fn your_own_p2pool_takes_public_fallbacks_and_its_own_settings() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(
+                [
+                    "pickaxe",
+                    "stratum-v2",
+                    "serve",
+                    "--sv1-listen",
+                    "0.0.0.0:3333",
+                ]
+                .iter()
+                .chain(args)
+                .collect::<Vec<_>>(),
+            )
+        };
+        let cli = parse(&[
+            "--own-p2pool",
+            "--public",
+            "--pool-fee",
+            "2",
+            "--pool-tag",
+            "/MyPool/",
+            "--fallback-pool",
+            "stratum2+tcp://a.example:3336/KEY",
+            "--p2pool-donation",
+            "0.5",
+            "--p2pool-standalone",
+            "--node-p2p",
+            "192.168.1.20:8333",
+        ])
+        .unwrap();
+        cli.check_p2pool_flags().unwrap();
+        assert_eq!(cli.p2pool_donation, Some("0.5".parse().unwrap()));
+        assert!(cli.p2pool_standalone);
+        assert_eq!(cli.node_p2p.as_deref(), Some("192.168.1.20:8333"));
+        let Some(Commands::StratumV2 {
+            command:
+                StratumV2Command::Serve {
+                    own_p2pool: true,
+                    public: true,
+                    fallback_pool,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("serve options missing")
+        };
+        assert_eq!(fallback_pool.len(), 1);
+        // Not with --upstream, and P2Pool's settings only with your own.
+        assert!(parse(&["--own-p2pool", "--upstream", "pool.example:3336"]).is_err());
+        let solo = parse(&["--p2pool-standalone"]).unwrap();
+        assert!(solo
+            .check_p2pool_flags()
+            .unwrap_err()
+            .contains("--own-p2pool"));
     }
 
     // #### PR #40

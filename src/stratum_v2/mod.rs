@@ -14,6 +14,9 @@ pub mod channel;
 pub mod command;
 #[cfg(feature = "stratum-v2")]
 pub mod device_api;
+// #### Pool modes: the SV2 door of a Non-custodial Pool.
+#[cfg(feature = "stratum-v2")]
+pub mod door;
 #[cfg(feature = "stratum-v2")]
 pub mod fleet;
 // #### PR #42: Job Declaration: miners' own templates at a public pool.
