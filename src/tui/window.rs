@@ -1423,7 +1423,7 @@ mod tests {
         node(&mut clicks.flow);
         clicks.act(SetupInput::Click(item(&clicks, "Run a pool")));
         clicks.act(SetupInput::Click(item(&clicks, "Chipnet")));
-        clicks.act(SetupInput::Click(item(&clicks, "ASIC pool")));
+        clicks.act(SetupInput::Click(item(&clicks, "ASIC")));
         let mode = item(&clicks, "Mode");
         assert_eq!(
             clicks.view().items[mode].kind,

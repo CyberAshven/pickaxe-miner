@@ -45,8 +45,8 @@ pickaxe_miner stratum-v2 serve --config pool.json --listen 0.0.0.0:3336 \
 
 `--accept-job-declaration` alone accepts both modes; `full` or `coinbase`
 accepts one. It is off by default. It shares the pool's SV2 port and key: a
-client pins one key for both of its sessions. In the setup (Run a pool, ASIC
-pool) the **Miner templates** row under Advanced sets it: off, full template
+client pins one key for both of its sessions. In the setup (Run a pool, ASIC,
+Public Solo Endpoint) the **Miner templates** row under Advanced sets it: off, full template
 and coinbase only, full template only, or coinbase only.
 
 With Full-Template, the pool's first node checks declared templates with

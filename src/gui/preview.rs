@@ -486,7 +486,7 @@ fn p2pool_page() -> SetupDriver {
     let mut driver = SetupDriver::preview(preview_gpus(), MiningProfiles::default());
     click(&mut driver, "Run a pool");
     click(&mut driver, "Chipnet");
-    click(&mut driver, "ASIC pool");
+    click(&mut driver, "ASIC");
     step(&mut driver, "Mode");
     step(&mut driver, "Mode");
     click(&mut driver, "Advanced");

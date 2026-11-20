@@ -1,6 +1,6 @@
 # Running a server for other miners
 
-In the setup, **Run a pool**, then **ASIC pool**, offers three modes (the
+In the setup, **Run a pool**, then **ASIC**, offers three modes (the
 **Mode** row; a line under it says what differs):
 
 | Mode | A block pays |
@@ -12,14 +12,14 @@ In the setup, **Run a pool**, then **ASIC pool**, offers three modes (the
 Either way miners connect with their own payout address as the username,
 and each block's coinbase pays directly: there is no pool wallet, no custody
 and no payouts to send. You earn a fee that you choose, after the Pickaxe
-donation. A GPU pool works the same way for GPU rigs; see
-[A public GPU pool](#a-public-gpu-pool).
+donation. **Run a pool**, then **GPU rigs**, is a Public Solo Endpoint for
+GPU rigs; see [below](#a-public-solo-endpoint-for-gpu-rigs).
 
 ## Start a Public Solo Endpoint
 
 The server builds blocks from your own BCH node, as solo mining does (see
 [stratum-v2.md](stratum-v2.md)). In the setup choose **Run a pool**, then
-**ASIC pool**, keep the mode **Public Solo Endpoint**, and set the fee on the
+**ASIC**, keep the mode **Public Solo Endpoint**, and set the fee on the
 settings page. The rest is under **Advanced** on the same page (Enter opens
 it): where the fee comes from and its address, the pool's name, the start
 difficulty, the SV1 and SV2 ports, serving templates, whether miners may use
@@ -215,7 +215,9 @@ paying 3.125 BCH pays the donation 0.03125 BCH (its coinbase part; its work
 part is separate mining work), your fee address 0.061875 BCH, and the miner
 3.031875 BCH.
 
-The dashboard header shows `Public pool, fee 2.00% from coinbase`. With SV2,
+The dashboard header, in the terminal and the window, names the mode and its
+fee: `Public Solo Endpoint, fee 2.00% from coinbase` (or `Non-custodial
+Pool, fee …`, `P2Pool v2, fee …`). With SV2,
 miners see every coinbase output in the jobs they receive, so nobody can hide
 a fee; with SV1 they can decode the coinbase parts of each job.
 
@@ -248,11 +250,12 @@ coinbase; Pickaxe saves each one before sending it to your node and retries
 until the node answers. Details and SRI's configuration lines are in
 [stratum-v2.md](stratum-v2.md#serving-templates-to-a-pool-template-distribution).
 
-## A public GPU pool
+## A Public Solo Endpoint for GPU rigs
 
-In the setup choose **Run a pool**, then **GPU pool**: this computer
+In the setup choose **Run a pool**, then **GPU rigs**: this computer
 coordinates other people's rigs on port 3340, with no GPU of its own. Each rig
-mines for its own address and its wins are claimed to it. A token claim pays
+mines for its own address and its wins are claimed to it, as on a Public Solo
+Endpoint. A token claim pays
 one address, so your fee is a share of each rig's mining time, after the
 donation, paid to a `q` address. Connection info (`I`) shows the command a rig
 runs to join, with its own address in place of `YOUR_BCH_ADDRESS`. From a

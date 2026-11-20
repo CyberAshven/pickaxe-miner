@@ -579,16 +579,17 @@ fn serve(
     };
     // The pools as the dashboard and status show them; never the identity.
     // #### PR #40: a public pool says so on the dashboard, with its fee.
-    let pool_suffix = public_pool_suffix(public.as_ref());
+    // #### Pool modes: by its mode's name.
+    let mode_name = match &own_p2pool {
+        Some(own) if pool_mode && own.standalone => "Non-custodial Pool",
+        Some(_) if pool_mode => "P2Pool v2",
+        _ => "Public Solo Endpoint",
+    };
+    let pool_suffix = public_pool_suffix(public.as_ref(), mode_name);
     // #### PR #61: your own P2Pool node by name, not its local address.
     let pool_address = (!pools.is_empty()).then(|| match &own_p2pool {
         Some(own) if pool_mode => format!(
-            "your {} ({}; each miner under their own address)",
-            if own.standalone {
-                "Non-custodial Pool"
-            } else {
-                "P2Pool v2 node"
-            },
+            "your P2Pool ({}; each miner under their own address)",
             own.tag
         ),
         Some(own) => format!("your P2Pool node ({})", own.tag),
@@ -850,7 +851,9 @@ fn serve(
     // A view has its own Connection info, so no key to name.
     let devices_at = device_addresses(bound, sv1_bound, interfaces);
     let serve_mode = if pool_mode {
-        ServeMode::P2PoolPool
+        ServeMode::P2PoolPool {
+            standalone: own_p2pool.as_ref().is_some_and(|own| own.standalone),
+        }
     } else if !pools.is_empty() {
         ServeMode::JoinPool
     } else if public_pool.is_some() {
@@ -1969,10 +1972,13 @@ impl PageText<'_> {
         let snapshot = self.snapshot;
         let sv1_bound = self.sv1;
         let bound = self.sv2;
+        // #### Pool modes: a Non-custodial Pool or P2Pool v2 names itself
+        // first (the suffix is empty when joining someone's pool).
         if let Some(pool) = self.joined() {
             format!(
-                "{} · Pool {pool} (SV2, encrypted)\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\n{}\nThe pool builds the blocks; the donation is that share of mining work under the donation address at the pool.\nConnection errors: SV1 {}\nSV1 {}",
+                "{}{} · Pool {pool} (SV2, encrypted)\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\n{}\nThe pool builds the blocks; the donation is that share of mining work under the donation address at the pool.\nConnection errors: SV1 {}\nSV1 {}",
                 self.network,
+                self.pool_suffix,
                 snapshot.connections,
                 snapshot.sessions_started,
                 snapshot.shares_accepted,
@@ -2013,8 +2019,9 @@ impl PageText<'_> {
             .sum();
         if let Some(pool) = self.joined() {
             format!(
-                "{} · Pool {pool} (SV2, encrypted) · the pool builds blocks and pays\n{online} of {} workers online · {} · Shares {} accepted / {} rejected\n{devices_hint}",
+                "{}{} · Pool {pool} (SV2, encrypted) · the pool builds blocks and pays\n{online} of {} workers online · {} · Shares {} accepted / {} rejected\n{devices_hint}",
                 self.network,
+                self.pool_suffix,
                 devices.len(),
                 crate::telemetry::format_hash_rate(total_rate),
                 snapshot.shares_accepted,
@@ -2419,9 +2426,9 @@ pub enum ServeMode {
     Public,
     /// Devices mine at a remote pool through this computer.
     JoinPool,
-    /// #### Pool modes: a Non-custodial Pool (or P2Pool v2): each miner
-    /// mines at your own P2Pool under their own payout.
-    P2PoolPool,
+    /// #### Pool modes: a Non-custodial Pool (`standalone`) or P2Pool v2:
+    /// each miner mines at your own P2Pool under their own payout.
+    P2PoolPool { standalone: bool },
     /// #### PR #42: devices mine this ASIC-exclusive token instead of BCH.
     Token(&'static str),
 }
@@ -2641,7 +2648,7 @@ fn connect_notes(page: &ConnectPage) -> String {
              solo, or at a pool with Job Declaration, to merge-mine.\n"
         }
         // #### Pool modes
-        ServeMode::P2PoolPool => {
+        ServeMode::P2PoolPool { .. } => {
             "\nUsername: the miner's own BCH address, a q (P2PKH) address because P2Pool \
              pays shares to a key (the prefix may be left out), optionally followed by \
              .name. P2Pool runs here: every block found pays everyone mining here by their \
@@ -3355,11 +3362,13 @@ fn watch(config_path: &Path) -> Result<(), String> {
 /// #### PR #40
 /// A public pool's note after the donation: each miner's blocks pay them,
 /// and the operator's fee comes off what the donation leaves.
-fn public_pool_suffix(public: Option<&super::payout::PublicPool>) -> String {
+/// #### Pool modes: named by its mode: "Public Solo Endpoint, fee 2.00%
+/// from coinbase", or "Non-custodial Pool" or "P2Pool v2".
+fn public_pool_suffix(public: Option<&super::payout::PublicPool>, mode: &str) -> String {
     match public.map(|public| public.fee) {
         None => String::new(),
-        Some(None) => " · Public pool, no fee".into(),
-        Some(Some(fee)) => format!(" · Public pool, fee {} from {}", fee.rate, fee.mode),
+        Some(None) => format!(" · {mode}, no fee"),
+        Some(Some(fee)) => format!(" · {mode}, fee {} from {}", fee.rate, fee.mode),
     }
 }
 
@@ -5583,6 +5592,77 @@ mod tests {
         super::serve(action, &config, &path, false, false, None, Some(&view)).unwrap();
         assert!(view.frames.lock().unwrap().is_empty());
         assert!(!status_path(&path).exists(), "it never served");
+    }
+
+    // #### Pool modes: the dashboard header names the server's mode and its
+    // fee, in the terminal and in the window (the same `PageText`); joining
+    // someone's pool names none.
+    #[test]
+    fn the_header_names_the_servers_mode_and_fee() {
+        let public = |fee: Option<&str>, mode| super::super::payout::PublicPool {
+            fee: fee.map(|rate| crate::donation::bch::PoolFee {
+                rate: rate.parse().unwrap(),
+                mode,
+            }),
+            address: crate::config::CHIPNET_DONATION_ADDRESS.into(),
+        };
+        let coinbase = crate::donation::bch::FeeMode::Coinbase;
+        assert_eq!(public_pool_suffix(None, "Public Solo Endpoint"), "");
+        assert_eq!(
+            public_pool_suffix(Some(&public(None, coinbase)), "Public Solo Endpoint"),
+            " · Public Solo Endpoint, no fee"
+        );
+        let stats = super::super::server::ServerStats::default();
+        for (mode, pools) in [
+            ("Public Solo Endpoint", None),
+            (
+                "Non-custodial Pool",
+                Some("your P2Pool (v0.1.0; each miner under their own address)"),
+            ),
+            (
+                "P2Pool v2",
+                Some("your P2Pool (v0.1.0; each miner under their own address)"),
+            ),
+        ] {
+            let suffix = public_pool_suffix(Some(&public(Some("2"), coinbase)), mode);
+            let texts = PageText {
+                network: "chipnet",
+                pools,
+                declaring: false,
+                node_client: None,
+                snapshot: &stats,
+                donation: BchDonation::default(),
+                pool_suffix: &suffix,
+                sv2: None,
+                sv1: None,
+                setting_error: None,
+                authority: None,
+            };
+            let named = format!("{mode}, fee 2.00% from coinbase");
+            assert!(
+                texts.header(&[], "").contains(&named),
+                "{}",
+                texts.header(&[], "")
+            );
+            assert!(texts.overview().contains(&named), "{}", texts.overview());
+            assert!(!texts.header(&[], "").contains("Public pool"));
+        }
+        let texts = PageText {
+            network: "chipnet",
+            pools: Some("pool.example:3336"),
+            declaring: false,
+            node_client: None,
+            snapshot: &stats,
+            donation: BchDonation::default(),
+            pool_suffix: "",
+            sv2: None,
+            sv1: None,
+            setting_error: None,
+            authority: None,
+        };
+        assert!(texts
+            .header(&[], "")
+            .starts_with("chipnet · Pool pool.example:3336 (SV2, encrypted)"));
     }
 
     // A view's Connection info is the terminal page's, apart from its keys.

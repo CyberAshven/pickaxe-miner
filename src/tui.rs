@@ -975,7 +975,8 @@ enum TextField {
 /// What an ASIC can mine: BCH (merge-mined tokens as they appear), or an
 /// ASIC-exclusive token instead (#### PR #42: once one is registered).
 /// #### PR #40: what a pool's miners mine: ASIC pools now, GPU pools later.
-const POOL_TARGETS: [&str; 2] = ["ASIC pool", "GPU pool"];
+/// #### Pool modes: named by hardware; each choice's line names its modes.
+const POOL_TARGETS: [&str; 2] = ["ASIC", "GPU rigs"];
 
 const ASIC_TARGETS: [&str; 2] = [
     "BCH + merge-mined CashTokens",
@@ -3607,7 +3608,9 @@ impl SetupFlow {
                     }
                     SettingsRow::RigPort => {
                         self.status_line =
-                            "A GPU pool always takes rigs; press Enter to change its port.".into();
+                            "A Public Solo Endpoint for GPU rigs always takes rigs; press Enter to \
+                             change its port."
+                                .into();
                     }
                     SettingsRow::RigsOnly => self.rigs_only = !self.rigs_only,
                     _ => {}
@@ -3921,7 +3924,7 @@ impl SetupFlow {
                             .is_err()
                         {
                             self.status_line =
-                                "A GPU pool's fee address must be a q address on this network: token claims pay q addresses."
+                                "The fee address for GPU rigs must be a q address on this network: token claims pay q addresses."
                                     .into();
                             self.open_settings(SettingsRow::FeeAddress);
                         } else {
@@ -6156,7 +6159,9 @@ fn profile_summary(
             }
             .name()
         ),
-        SavedMode::GpuPool => format!("GPU pool · {network} · {token}{fee}"),
+        SavedMode::GpuPool => {
+            format!("Public Solo Endpoint for GPU rigs · {network} · {token}{fee}")
+        }
     }
 }
 
@@ -6377,12 +6382,13 @@ fn token_items(state: &SetupFlow) -> Vec<SetupItem> {
         return vec![
             choice(
                 0,
-                "BCH for SHA-256 ASICs over SV1 and SV2: a Public Solo Endpoint, a Non-custodial \
-                 Pool or P2Pool v2.",
+                "Public Solo Endpoint, Non-custodial Pool or P2Pool v2: BCH for SHA-256 ASICs \
+                 over SV1 and SV2.",
             ),
             choice(
                 1,
-                "PHOTON and other GPU tokens, for GPU rigs, each with its own address.",
+                "Public Solo Endpoint for GPU rigs: PHOTON and other GPU tokens, each rig's \
+                 wins claimed to its own address.",
             ),
         ];
     }
@@ -6520,7 +6526,10 @@ fn start_label(state: &SetupFlow) -> Piece {
             Piece::good("Start the ASIC token server")
         }
         MiningMode::Asic => Piece::dim("Start (no ASIC-exclusive token is deployed yet)"),
-        MiningMode::Pool if state.pool_target == 1 => Piece::good("Start the pool"),
+        // #### Pool modes: other people's rigs each keep their own wins.
+        MiningMode::Pool if state.pool_target == 1 => {
+            Piece::good("Start the Public Solo Endpoint for GPU rigs")
+        }
         // #### Pool modes: named as the mode.
         MiningMode::Pool => Piece::good(state.pool_mode.start()),
     }
@@ -9001,7 +9010,7 @@ fn render_advanced_with_scope(
         lines.push(Line::from(format!("Rigs join on {}", rigs.listen)));
         if let Some(fee) = rigs.fee_bps {
             lines.push(Line::from(format!(
-                "Public pool, fee {}.{:02}% of each rig's mining time",
+                "Public Solo Endpoint, fee {}.{:02}% of each rig's mining time",
                 fee / 100,
                 fee % 100
             )));
@@ -9071,7 +9080,7 @@ fn render_connect(
     text.push(Line::from(""));
     if snapshot.rigs.as_ref().is_some_and(|rigs| rigs.public) {
         text.push(dim(
-            "Public pool: each rig puts its own payout address in place of YOUR_BCH_ADDRESS, and its wins are claimed to it.",
+            "Public Solo Endpoint: each rig puts its own payout address in place of YOUR_BCH_ADDRESS, and its wins are claimed to it.",
         ));
     }
     if lines.iter().all(|(place, _)| *place == Place::ThisComputer) {
@@ -11402,8 +11411,12 @@ mod tests {
         let mut setup = setup_for(MiningMode::Pool);
         setup.step = SetupStep::Token;
         let screen = setup_text(&setup);
-        assert!(screen.contains("ASIC pool"), "{screen}");
-        assert!(screen.contains("GPU pool"));
+        // #### Pool modes: named by hardware, each with its modes.
+        assert!(screen.contains("ASIC"), "{screen}");
+        assert!(screen.contains("GPU rigs"));
+        assert!(screen.contains("Public Solo Endpoint, Non-custodial Pool or P2Pool v2"));
+        assert!(screen.contains("Public Solo Endpoint for GPU rigs"));
+        assert!(!screen.contains("ASIC pool") && !screen.contains("GPU pool"));
         assert!(!screen.contains("coming soon"));
         setup.handle_key(key(KeyCode::Enter));
         assert_eq!(setup.current_row(), SettingsRow::PoolMode);
@@ -11461,7 +11474,7 @@ mod tests {
         );
         // #### Pool modes: a GPU pool has one mode, so no mode row.
         assert!(!setup.settings_rows().contains(&SettingsRow::PoolMode));
-        assert!(setup_text(&setup).contains("Start the pool"));
+        assert!(setup_text(&setup).contains("Start the Public Solo Endpoint for GPU rigs"));
         setup.pool_target = 0;
         // A Public Solo Endpoint builds blocks from the operator's own node.
         setup.config.node_url = None;

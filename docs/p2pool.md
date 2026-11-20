@@ -271,7 +271,7 @@ pickaxe stratum-v2 serve --config pool.json --network chipnet \
   needs those in P2Pool (P2Pool's change) before P2Pool runs on it.
 - **Profiles:** a profile keeps `p2pool` (donation, standalone, node_p2p)
   beside its ASIC pool or join server, with fallback pools; the setup sets
-  them (Run a pool, ASIC pool, Mode; see [pool.md](pool.md#a-non-custodial-pool-or-p2pool-v2)).
+  them (Run a pool, ASIC, Mode; see [pool.md](pool.md#a-non-custodial-pool-or-p2pool-v2)).
 
 ## Commands
 

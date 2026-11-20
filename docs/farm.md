@@ -114,7 +114,7 @@ GPU mining keeps its farm values under **Advanced** on the settings page:
   each `stratum2+tcp://HOST:3340/KEY`, tried in order after the main one,
   and **Rig name** names the rig on the coordinator's dashboard (the
   computer's name by default).
-- **Run a pool → GPU pool**: the fee address, the **Rig port** (3340 unless
+- **Run a pool → GPU rigs** (a Public Solo Endpoint for GPU rigs): the fee address, the **Rig port** (3340 unless
   changed) and the donation.
 
 A saved profile keeps them and reopens as a farm ("GPU farm · Chipnet ·

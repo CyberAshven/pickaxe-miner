@@ -715,7 +715,7 @@ fn rigs_panel(ui: &mut egui::Ui, rigs: &crate::rigs::RigSummary, join: &[(String
             );
             if rigs.public {
                 line.push_str(&format!(
-                    " · public pool, fee {:.2}%",
+                    " · Public Solo Endpoint, fee {:.2}%",
                     f64::from(rigs.fee_bps.unwrap_or(0)) / 100.0
                 ));
             }

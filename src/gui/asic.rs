@@ -353,7 +353,8 @@ fn mode_text(frame: &ServerFrame) -> String {
         ServeMode::Public => "Public Solo Endpoint".into(),
         ServeMode::JoinPool if frame.joining => "at a pool".into(),
         ServeMode::JoinPool => "at a pool with your templates".into(),
-        ServeMode::P2PoolPool => "your P2Pool, shared by work".into(),
+        ServeMode::P2PoolPool { standalone: true } => "Non-custodial Pool".into(),
+        ServeMode::P2PoolPool { standalone: false } => "P2Pool v2".into(),
         ServeMode::Token(token) => token.into(),
     }
 }
