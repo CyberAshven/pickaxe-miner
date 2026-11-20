@@ -172,4 +172,4 @@ stability or resolve the earlier
 unexplained PC restart. This document records the earlier independent-engine
 experiment. The subsequent default backend and adoption evidence are described
 in [the upstream-derived Rust evaluation](upstream-rust-port-evaluation.md).
-Historical source is preserved under `reference/legacy-engine-by-cyberashven/`.
+Historical source was kept under `reference/legacy-engine-by-cyberashven/` (removed on 2026-11-20; see commit 9985f7c, the last dev commit that has it).
