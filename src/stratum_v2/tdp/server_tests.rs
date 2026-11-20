@@ -201,7 +201,7 @@ impl Client {
         assert_eq!(target, compact_target(message.n_bits).unwrap());
         let parent = Parent {
             previous: message.prev_hash.as_ref().try_into().unwrap(),
-            time: message.header_timestamp,
+            time: message.ntime_start,
             bits: message.n_bits,
         };
         (template, parent)
@@ -212,8 +212,8 @@ impl Client {
             SubmitSolution {
                 template_id: solved.id,
                 version: solved.version,
-                header_timestamp: solved.time,
-                header_nonce: solved.nonce,
+                ntime: solved.time,
+                nonce: solved.nonce,
                 coinbase_tx: solved.sent.as_slice().try_into().unwrap(),
             },
             MESSAGE_TYPE_SUBMIT_SOLUTION,
