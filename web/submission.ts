@@ -47,11 +47,12 @@ export async function resolveSubmission({ session, snapshot, pending, stopped, w
       await waitForBlock();
     }
   }
-  for (let i = 0; i < 30; i++) {
+  // Re-check every 2 s for 30 s, as the native miner does for an accepted claim.
+  for (let i = 0; i < 15; i++) {
     if (stopped()) return 'pending';
     if ((await snapshot()).baton !== pending.baton) return 'accepted';
     progress('Waiting for the accepted baton update…');
-    await wait(1000);
+    await wait(2000);
   }
   throw new Error('Server has not indexed the accepted baton yet; try another server.');
 }

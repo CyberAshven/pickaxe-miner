@@ -108,7 +108,7 @@ pub enum JobKind {
     Own,
     /// A Job Declaration client's, set with SetCustomMiningJob; shares may
     /// not be older than its start time.
-    Custom { min_ntime: u32 },
+    Custom { ntime_start: u32 },
 }
 
 #[derive(Clone)]
@@ -553,7 +553,7 @@ impl Channel {
         bytes.extend(std::iter::repeat_n(0, self.rollable()));
         bytes.extend_from_slice(&parts.suffix);
         let merkle_root = fold(double_sha256(&bytes), &parts.merkle_path);
-        let min_ntime = template.min_time;
+        let ntime_start = template.min_time;
         self.retain_previous(&template);
         self.job = Some(Job {
             id,
@@ -564,7 +564,7 @@ impl Channel {
             target: self.target,
             payout: BchPayout::default(),
             aux: None,
-            kind: JobKind::Custom { min_ntime },
+            kind: JobKind::Custom { ntime_start },
         });
         Ok(self.job.as_ref().unwrap())
     }
@@ -756,7 +756,7 @@ impl Channel {
             JobKind::Own => share.time > now.saturating_add(60),
             // #### PR #42: a custom job's shares follow the client's start
             // time, up to a minute past it or past now.
-            JobKind::Custom { min_ntime } => share.time > now.max(min_ntime).saturating_add(60),
+            JobKind::Custom { ntime_start } => share.time > now.max(ntime_start).saturating_add(60),
         };
         if share.time < job.template.current_time || late {
             return Err("invalid-ntime");

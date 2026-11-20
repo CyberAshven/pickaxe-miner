@@ -38,12 +38,17 @@ export class Electrum {
     socket.onclose = () => this.close(new Error('Connection closed'));
     socket.onerror = () => this.close(new Error('WebSocket connection failed'));
   }
+  /** Called when the server pushes a new block or a subscribed script's change. */
+  onNotice: (() => void) | undefined;
   receive(value: unknown, raw: string) {
-    if (typeof value === 'object' && value !== null && 'method' in value && value.method === 'blockchain.headers.subscribe'
-        && !('id' in value && value.id != null)) {
-      // Each snapshot read subscribes to headers, so the server pushes every block.
-      this.blockNoticed = true;
-      for (const waiter of [...this.blockWaiters]) waiter(true);
+    if (typeof value === 'object' && value !== null && !('id' in value && value.id != null) && 'method' in value
+        && (value.method === 'blockchain.headers.subscribe' || value.method === 'blockchain.scripthash.subscribe')) {
+      if (value.method === 'blockchain.headers.subscribe') {
+        // The header subscription pushes every block; a claim waiting for one wakes here.
+        this.blockNoticed = true;
+        for (const waiter of [...this.blockWaiters]) waiter(true);
+      }
+      this.onNotice?.();
       return;
     }
     if (typeof value !== 'object' || value === null || !('id' in value) || typeof value.id !== 'number') return;

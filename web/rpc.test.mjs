@@ -61,3 +61,19 @@ test('a pushed block notice wakes a waiting claim once, and a closed connection 
   assert.equal(await closing, false);
   assert.equal(await rpc.nextBlock(60000), false);
 });
+
+test('block and subscribed-script notices are reported; other messages are not', async () => {
+  const socket = { readyState: 1, send() {}, close() {} };
+  const rpc = new Electrum(socket);
+  let notices = 0;
+  rpc.onNotice = () => { notices++; };
+  const line = value => ({ data: JSON.stringify(value) + '\n' });
+  socket.onmessage(line({ jsonrpc: '2.0', method: 'blockchain.headers.subscribe', params: [{ height: 1 }] }));
+  socket.onmessage(line({ jsonrpc: '2.0', method: 'blockchain.scripthash.subscribe', params: ['ab', 'cd'] }));
+  socket.onmessage(line({ method: 'notification', params: [] }));
+  const reply = rpc.rpc('blockchain.headers.subscribe');
+  socket.onmessage(line({ id: 1, result: { height: 2 } }));
+  assert.deepEqual(await reply, { height: 2 });
+  assert.equal(notices, 2);
+  rpc.close();
+});

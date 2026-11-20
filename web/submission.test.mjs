@@ -49,10 +49,16 @@ test('a lost broadcast response does not discard the pending transaction', async
 });
 
 test('unindexed accepted rewards time out without treating a fee change as a new baton', async () => {
+  const waits = [];
+  let reads = 0;
   await assert.rejects(resolveSubmission({ ...defaults,
+    wait: async ms => { waits.push(ms); },
     session: { rpc: async () => pending.transaction },
-    snapshot: async () => ({ baton: pending.baton, context: 'new fee' }),
+    snapshot: async () => { reads++; return { baton: pending.baton, context: 'new fee' }; },
   }), /has not indexed/);
+  // One read before the wait, then a re-check every 2 s for 30 s.
+  assert.equal(reads, 16);
+  assert.deepEqual(waits, Array(15).fill(2000));
 });
 
 test('a competing baton advance drops stale work without broadcasting or counting a win', async () => {
