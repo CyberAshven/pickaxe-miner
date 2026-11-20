@@ -265,8 +265,8 @@ impl BchTemplate {
     /// the prefix a minimal BIP34 height push (at most 8 bytes, its rest the
     /// node's flags), the value within the money supply, the provider's
     /// target no easier than `nBits`'s (the block target is `nBits`'s), the
-    /// transactions full, witness-free and in CTOR order (at most 65,535),
-    /// and their coinbase merkle path the one announced. Its size limit is
+    /// transactions full, witness-free and in CTOR order, and their
+    /// coinbase merkle path the one announced. Its size limit is
     /// the transactions, the header and the largest coinbase the reserve
     /// allows, which `coinbase_with_aux` then keeps to.
     /// Why: TDP carries no size limit and no chain; a provider must not make
@@ -301,9 +301,9 @@ impl BchTemplate {
         if !meets_target(&provided.target, &target) {
             return Err("template provider's target is easier than its bits".into());
         }
-        if provided.transactions.len() > 65_535 {
-            return Err("template too large for SV2".into());
-        }
+        // #### BCH large templates: the core RequestTransactionData.Success
+        // carries at most 65,535 transactions; with 0x4C54 only the block
+        // size limit bounds them.
         let mut hashes = Vec::with_capacity(provided.transactions.len());
         let mut previous_display: Option<Hash> = None;
         let mut size = 0u64;
@@ -340,7 +340,7 @@ impl BchTemplate {
             coinbase_value: provided.value,
             parent_time: None,
             coinbase_flags: prefix[push.len()..].to_vec(),
-            transactions: provided.transactions.into_iter().map(Arc::from).collect(),
+            transactions: provided.transactions.into(),
             txids: hashes.into(),
             index: Default::default(),
             merkle_path: merkle_path.into(),
@@ -715,6 +715,13 @@ impl BchTemplate {
     /// #### PR #42: the transactions' ids, in block order.
     pub fn transaction_ids(&self) -> &[Hash] {
         &self.txids
+    }
+
+    /// #### BCH large templates: the same ids, shared, so a Template
+    /// Distribution connection keeps them as the base of its next push
+    /// without the transactions.
+    pub fn shared_transaction_ids(&self) -> Arc<[Hash]> {
+        self.txids.clone()
     }
 
     /// #### PR #42: the transaction with id `txid`, from an index built on
@@ -1275,7 +1282,9 @@ pub struct Provided<'a> {
     /// The coinbase prefix: the height push, then any flags.
     pub prefix: &'a [u8],
     pub value: u64,
-    pub transactions: Vec<Vec<u8>>,
+    /// #### BCH large templates: shared, so the transactions a provider
+    /// pushed stay the base of its next push without a copy.
+    pub transactions: Vec<Arc<[u8]>>,
     pub merkle_path: &'a [Hash],
     /// The coinbase output bytes this server declared it may add.
     pub reserve: u32,

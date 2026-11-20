@@ -6,6 +6,7 @@
 
 pub mod client;
 pub mod convert;
+pub mod large;
 pub mod server;
 #[cfg(test)]
 mod server_tests;

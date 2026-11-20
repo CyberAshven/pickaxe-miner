@@ -1476,6 +1476,24 @@ fn main() {
         }
         profiles = true;
     }
+    restart_into_update();
+}
+
+/// Restart (U on the profiles, the window's Restart) asked for while no
+/// session ran: once the screens have closed, the installed update takes
+/// this program's place and starts with the same command line.
+fn restart_into_update() {
+    if !pickaxe_miner::update::restart_requested() {
+        return;
+    }
+    let args = cli::parse();
+    let Ok(config_path) = config::config_path(args.config.as_deref()) else {
+        return;
+    };
+    let window = matches!(args.command, Some(cli::Commands::Gui { .. }));
+    if let Some(why) = pickaxe_miner::update::restart_if_asked(&config_path, window) {
+        eprintln!("{why}");
+    }
 }
 
 fn run_application(open_profiles: bool) {
@@ -1551,6 +1569,25 @@ fn run_application(open_profiles: bool) {
             exit_after_error(2);
         }
     };
+
+    // Pickaxe's own updates (docs/updates.md), for the sessions a person
+    // starts: an installed update takes this program's place at the start
+    // (unless another Pickaxe runs or a claim is pending), then the check
+    // runs in the background. `--no-update-check` leaves both out.
+    pickaxe_miner::update::init(&config_path);
+    let window = matches!(args.command, Some(cli::Commands::Gui { .. }));
+    if matches!(
+        args.command,
+        None | Some(cli::Commands::Mine) | Some(cli::Commands::Gui { .. })
+    ) && !args.no_update_check
+    {
+        let waiting = if open_profiles {
+            None
+        } else {
+            pickaxe_miner::update::at_start(&config_path, window)
+        };
+        pickaxe_miner::update::start(&config_path, args.no_tui || args.json, waiting);
+    }
 
     match args.command.clone().unwrap_or(cli::Commands::Mine) {
         // #### PR #40: the read-only view of a miner without a screen.
@@ -1642,6 +1679,19 @@ fn run_application(open_profiles: bool) {
                 Err("this build has no stratum-v2 feature, which P2Pool needs".into())
             };
             if let Err(error) = result {
+                eprintln!("error: {error}");
+                exit_after_error(1);
+            }
+        }
+        // Pickaxe's own updates: check, install, roll back, status, settings.
+        cli::Commands::Update {
+            command,
+            check,
+            yes,
+        } => {
+            if let Err(error) =
+                pickaxe_miner::update::command::run(&config_path, command.as_ref(), check, yes)
+            {
                 eprintln!("error: {error}");
                 exit_after_error(1);
             }

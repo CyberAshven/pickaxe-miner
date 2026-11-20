@@ -219,6 +219,15 @@ fn serve(
         }
         Ok(())
     })();
+    // The connection's channels close at P2Pool, each with its donation
+    // channel, before the link does.
+    for frame in relay.close().unwrap_or_default() {
+        if let Out::Up(frame) = frame {
+            if up_send.send(frame).is_err() {
+                break;
+            }
+        }
+    }
     up_send.close();
     down_send.close();
     result
@@ -307,10 +316,12 @@ mod tests {
     use super::relay::refusal_code;
     use super::*;
     use crate::config::MiningNetwork;
-    use crate::stratum_v2::sv1::{miner_login, MinerLogins, P2PKH_ONLY};
+    use crate::stratum_v2::sv1::{miner_login, DonationRoute, MinerLogins, P2PKH_ONLY};
     use serde_json::{json, Value};
+    use std::collections::BTreeMap;
     use std::io::{BufRead, Write};
     use std::net::SocketAddr;
+    use std::sync::RwLock;
     use stratum_core::common_messages_sv2::SetupConnectionSuccess;
     use stratum_core::mining_sv2::*;
 
@@ -329,17 +340,32 @@ mod tests {
         }
     }
 
+    /// The merkle root of the stand-in P2Pool's standard channel `channel`
+    /// (extranonce prefix `[channel; 8]`): its coinbase alone.
+    fn standard_root(channel: u32) -> [u8; 32] {
+        crate::stratum_v2::template::double_sha256(
+            &[[1u8; 32].as_slice(), &[channel as u8; 8], &[2; 32]].concat(),
+        )
+    }
+
     /// A scripted BCH P2Pool node on an ephemeral port: it answers the
     /// setup, opens every channel it is asked for (keeping the identity it
-    /// was asked under), and gives each extended channel a job and its
-    /// parent.
+    /// was asked under), gives each channel a job and its parent, accepts
+    /// standard shares, and keeps the shares and closes it got.
     struct ScriptedP2Pool {
         address: SocketAddr,
         authority: [u8; 32],
         identities: Arc<Mutex<Vec<String>>>,
+        /// The shares and channel closes it got: message type and channel.
+        received: Received,
         stop: Arc<AtomicBool>,
         thread: Option<thread::JoinHandle<()>>,
     }
+
+    type Received = Arc<Mutex<Vec<(u8, u32)>>>;
+
+    /// The group the stand-in P2Pool puts standard channels in.
+    const GROUP: u32 = 1000;
 
     impl ScriptedP2Pool {
         fn start() -> Self {
@@ -349,22 +375,26 @@ mod tests {
             let address = listener.local_addr().unwrap();
             listener.set_nonblocking(true).unwrap();
             let identities = Arc::new(Mutex::new(Vec::new()));
+            let received = Received::default();
             let stop = Arc::new(AtomicBool::new(false));
             let thread = {
-                let (identities, stop) = (identities.clone(), stop.clone());
+                let (identities, received, stop) =
+                    (identities.clone(), received.clone(), stop.clone());
                 thread::spawn(move || {
                     let mut sessions = Vec::new();
                     while !stop.load(Ordering::Relaxed) {
                         match listener.accept() {
                             Ok((stream, _)) => {
                                 stream.set_nonblocking(false).unwrap();
-                                let (identities, stop) = (identities.clone(), stop.clone());
+                                let (identities, received, stop) =
+                                    (identities.clone(), received.clone(), stop.clone());
                                 sessions.push(thread::spawn(move || {
                                     let _ = Self::serve(
                                         stream,
                                         &authority,
                                         &secret,
                                         &identities,
+                                        &received,
                                         &stop,
                                     );
                                 }));
@@ -381,33 +411,72 @@ mod tests {
                 address,
                 authority,
                 identities,
+                received,
                 stop,
                 thread: Some(thread),
             }
         }
 
+        /// One session: standard channels get standard jobs of their own
+        /// when the setup requires them, and otherwise go in `GROUP`, which
+        /// is sent each new job as an extended job; every share is
+        /// accepted.
         fn serve(
             stream: TcpStream,
             authority: &[u8; 32],
             secret: &[u8; 32],
             identities: &Mutex<Vec<String>>,
+            received: &Mutex<Vec<(u8, u32)>>,
             stop: &AtomicBool,
         ) -> Result<(), String> {
             let (mut send, mut receive) = Session::accept(stream, authority, secret)?.split();
             let mut channels = 0u32;
+            let mut standard_jobs = false;
             while !stop.load(Ordering::Relaxed) {
                 let Some(mut frame) = receive.receive(Duration::from_millis(20))? else {
                     continue;
                 };
-                match frame.header().msg_type() {
-                    MESSAGE_TYPE_SETUP_CONNECTION => send.send(encoded(
-                        SetupConnectionSuccess {
-                            used_version: 2,
-                            flags: 0,
-                        },
-                        MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
-                        false,
-                    )?)?,
+                let kind = frame.header().msg_type();
+                if matches!(
+                    kind,
+                    MESSAGE_TYPE_SUBMIT_SHARES_STANDARD
+                        | MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED
+                        | MESSAGE_TYPE_CLOSE_CHANNEL
+                ) {
+                    let channel = frame.payload().first_chunk::<4>().unwrap();
+                    received
+                        .lock()
+                        .unwrap()
+                        .push((kind, u32::from_le_bytes(*channel)));
+                }
+                match kind {
+                    MESSAGE_TYPE_SETUP_CONNECTION => {
+                        let setup: SetupConnection =
+                            binary_sv2::from_bytes(frame.payload()).unwrap();
+                        standard_jobs = setup.flags & 1 != 0;
+                        send.send(encoded(
+                            SetupConnectionSuccess {
+                                used_version: 2,
+                                flags: 0,
+                            },
+                            MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+                            false,
+                        )?)?
+                    }
+                    MESSAGE_TYPE_SUBMIT_SHARES_STANDARD => {
+                        let share: SubmitSharesStandard =
+                            binary_sv2::from_bytes(frame.payload()).unwrap();
+                        send.send(encoded(
+                            SubmitSharesSuccess {
+                                channel_id: share.channel_id,
+                                last_sequence_number: share.sequence_number,
+                                new_submits_accepted_count: 1,
+                                new_shares_sum: 1,
+                            },
+                            MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
+                            true,
+                        )?)?;
+                    }
                     MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL => {
                         let open: OpenExtendedMiningChannel =
                             binary_sv2::from_bytes(frame.payload()).unwrap();
@@ -466,16 +535,62 @@ mod tests {
                             .unwrap()
                             .push(open.user_identity.as_utf8_or_hex());
                         channels += 1;
+                        let channel_id = channels;
+                        let prefix = [channel_id as u8; 8];
                         send.send(encoded(
                             OpenStandardMiningChannelSuccess {
                                 request_id: open.request_id,
-                                channel_id: channels,
+                                channel_id,
                                 target: (&[0xffu8; 32]).into(),
-                                extranonce_prefix: [9u8; 8].as_slice().try_into().unwrap(),
-                                group_channel_id: 0,
+                                extranonce_prefix: prefix.as_slice().try_into().unwrap(),
+                                group_channel_id: if standard_jobs { 0 } else { GROUP },
                             },
                             MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
                             false,
+                        )?)?;
+                        // A new job, numbered as the channel: for it alone,
+                        // or for the group (each member's own).
+                        let (job, addressed) = if standard_jobs {
+                            let job = encoded(
+                                NewMiningJob {
+                                    channel_id,
+                                    job_id: channel_id,
+                                    ntime_start: binary_sv2::Sv2Option::new(None),
+                                    version: 0x2000_0000,
+                                    merkle_root: (&standard_root(channel_id)).into(),
+                                },
+                                MESSAGE_TYPE_NEW_MINING_JOB,
+                                true,
+                            )?;
+                            (job, channel_id)
+                        } else {
+                            let job = encoded(
+                                NewExtendedMiningJob {
+                                    channel_id: GROUP,
+                                    job_id: channel_id,
+                                    ntime_start: binary_sv2::Sv2Option::new(None),
+                                    version: 0x2000_0000,
+                                    version_rolling_allowed: true,
+                                    merkle_path: Vec::<binary_sv2::U256>::new().try_into().unwrap(),
+                                    coinbase_tx_prefix: [1u8; 32].as_slice().try_into().unwrap(),
+                                    coinbase_tx_suffix: [2u8; 32].as_slice().try_into().unwrap(),
+                                },
+                                MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+                                true,
+                            )?;
+                            (job, GROUP)
+                        };
+                        send.send(job)?;
+                        send.send(encoded(
+                            SetNewPrevHash {
+                                channel_id: addressed,
+                                job_id: channel_id,
+                                prev_hash: (&[0u8; 32]).into(),
+                                ntime_start: 1_700_000_000,
+                                nbits: 0x1d00_ffff,
+                            },
+                            MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+                            true,
                         )?)?;
                     }
                     _ => (),
@@ -486,6 +601,19 @@ mod tests {
 
         fn identities(&self) -> Vec<String> {
             self.identities.lock().unwrap().clone()
+        }
+
+        /// What it got, once `done` holds of it.
+        fn received_until(&self, done: impl Fn(&[(u8, u32)]) -> bool) -> Vec<(u8, u32)> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let received = self.received.lock().unwrap().clone();
+                if done(&received) {
+                    return received;
+                }
+                assert!(Instant::now() < deadline, "only {received:?}");
+                thread::sleep(Duration::from_millis(10));
+            }
         }
 
         /// The identities, once there are `count`.
@@ -633,6 +761,44 @@ mod tests {
     /// An SV2 device at the door: the setup, then a channel opened as
     /// `identity`; the reply's message type.
     fn sv2_open(door: &Listening, authority: [u8; 32], identity: &str, extended: bool) -> u8 {
+        let (mut send, mut receive) = sv2_device(door, authority, if extended { 4 } else { 5 });
+        let maximum = [0xffu8; 32];
+        let frame = if extended {
+            encoded(
+                OpenExtendedMiningChannel {
+                    request_id: 1,
+                    user_identity: identity.try_into().unwrap(),
+                    nominal_hash_rate: 1e12,
+                    max_target: (&maximum).into(),
+                    min_extranonce_size: 8,
+                },
+                MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+                false,
+            )
+        } else {
+            open_standard(identity)
+        };
+        send.send(frame.unwrap()).unwrap();
+        let reply = receive.receive(DEADLINE).unwrap().unwrap();
+        send.close();
+        reply.header().msg_type()
+    }
+
+    fn open_standard(identity: &str) -> Result<SerializedFrame, String> {
+        encoded(
+            OpenStandardMiningChannel {
+                request_id: 1,
+                user_identity: identity.try_into().unwrap(),
+                nominal_hash_rate: 1e12,
+                max_target: (&[0xffu8; 32]).into(),
+            },
+            MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL,
+            false,
+        )
+    }
+
+    /// An SV2 device's session at the door, set up with `flags`.
+    fn sv2_device(door: &Listening, authority: [u8; 32], flags: u32) -> (Sender, Receiver) {
         let (mut send, mut receive) =
             Session::initiate(TcpStream::connect(door.address).unwrap(), authority)
                 .unwrap()
@@ -643,7 +809,7 @@ mod tests {
                     protocol: Protocol::MiningProtocol,
                     min_version: 2,
                     max_version: 2,
-                    flags: if extended { 4 } else { 5 },
+                    flags,
                     endpoint_host: "localhost".try_into().unwrap(),
                     endpoint_port: door.address.port(),
                     vendor: "test".try_into().unwrap(),
@@ -662,35 +828,125 @@ mod tests {
             reply.header().msg_type(),
             MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS
         );
-        let maximum = [0xffu8; 32];
-        let frame = if extended {
-            encoded(
-                OpenExtendedMiningChannel {
-                    request_id: 1,
-                    user_identity: identity.try_into().unwrap(),
-                    nominal_hash_rate: 1e12,
-                    max_target: (&maximum).into(),
-                    min_extranonce_size: 8,
-                },
-                MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
-                false,
+        (send, receive)
+    }
+
+    // #### Pool modes: a standard-channel device through the door
+    // What: an SV2 device on a standard channel, at a P2Pool that sends
+    // standard channels their own jobs (the setup requires standard jobs)
+    // or puts them in a group sent extended jobs: it gets standard jobs on
+    // its own channel, outside any group, then at 100% the donation
+    // channel's (the merkle root over that channel's extranonce prefix);
+    // its share reaches the donation channel at P2Pool and the verdict comes
+    // back under its own channel and sequence number. When the device
+    // leaves, both channels close at P2Pool and no share follows.
+    // Look here if: the door's standard channels or its closing change.
+    #[test]
+    fn a_standard_channel_device_mines_the_donation_through_the_door_and_both_channels_close() {
+        for flags in [5, 4] {
+            let p2pool = ScriptedP2Pool::start();
+            let owner = p2pool_identity(&chipnet(0, 1), None);
+            let logins = MinerLogins {
+                network: MiningNetwork::Chipnet,
+                p2pool: true,
+            };
+            let address = crate::donation::bch::address(MiningNetwork::Chipnet);
+            let upstream = Upstream {
+                donation: Some(DonationRoute {
+                    identity: p2pool_identity(address, None),
+                    rate: Arc::new(RwLock::new("100".parse().unwrap())),
+                    fallback: Some(address.to_owned()),
+                }),
+                ..p2pool.upstream(Some(logins), &owner)
+            };
+            let secret = [9u8; 32];
+            let door = Listening::door(vec![upstream], secret);
+            let key = server::authority_public(&secret).unwrap();
+            let (mut send, mut receive) = sv2_device(&door, key, flags);
+            send.send(open_standard(&chipnet(0, 2)).unwrap()).unwrap();
+            // P2Pool's channel 1 is the device's own, 2 the donation's.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut roots = BTreeMap::new();
+            let mut donation_job = None;
+            while donation_job.is_none() {
+                assert!(Instant::now() < deadline, "{flags}: no donation job");
+                let Some(mut frame) = receive.receive(Duration::from_millis(50)).unwrap() else {
+                    continue;
+                };
+                match frame.header().msg_type() {
+                    MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS => {
+                        let open: OpenStandardMiningChannelSuccess =
+                            binary_sv2::from_bytes(frame.payload()).unwrap();
+                        assert_eq!((open.channel_id, open.group_channel_id), (1, 0));
+                    }
+                    MESSAGE_TYPE_NEW_MINING_JOB => {
+                        let job: NewMiningJob = binary_sv2::from_bytes(frame.payload()).unwrap();
+                        assert_eq!(job.channel_id, 1);
+                        let root: [u8; 32] = job.merkle_root.as_ref().try_into().unwrap();
+                        roots.insert(job.job_id, root);
+                    }
+                    MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH => {
+                        let prev: SetNewPrevHash = binary_sv2::from_bytes(frame.payload()).unwrap();
+                        assert_eq!(prev.channel_id, 1);
+                        let root = roots[&prev.job_id];
+                        if root == standard_root(2) {
+                            donation_job = Some(prev.job_id);
+                        } else {
+                            assert_eq!(root, standard_root(1), "{flags}: its own job");
+                        }
+                    }
+                    _ => (),
+                }
+            }
+            send.send(
+                encoded(
+                    SubmitSharesStandard {
+                        channel_id: 1,
+                        sequence_number: 7,
+                        job_id: donation_job.unwrap(),
+                        nonce: 1,
+                        ntime: 1_700_000_001,
+                        version: 0x2000_0000,
+                    },
+                    MESSAGE_TYPE_SUBMIT_SHARES_STANDARD,
+                    true,
+                )
+                .unwrap(),
             )
-        } else {
-            encoded(
-                OpenStandardMiningChannel {
-                    request_id: 1,
-                    user_identity: identity.try_into().unwrap(),
-                    nominal_hash_rate: 1e12,
-                    max_target: (&maximum).into(),
-                },
-                MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL,
-                false,
-            )
-        };
-        send.send(frame.unwrap()).unwrap();
-        let reply = receive.receive(DEADLINE).unwrap().unwrap();
-        send.close();
-        reply.header().msg_type()
+            .unwrap();
+            let ack = loop {
+                assert!(Instant::now() < deadline, "{flags}: no verdict");
+                let Some(mut frame) = receive.receive(Duration::from_millis(50)).unwrap() else {
+                    continue;
+                };
+                if frame.header().msg_type() == MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS {
+                    let ack: SubmitSharesSuccess = binary_sv2::from_bytes(frame.payload()).unwrap();
+                    break ack;
+                }
+            };
+            assert_eq!((ack.channel_id, ack.last_sequence_number), (1, 7));
+            // The device leaves: both channels close at P2Pool.
+            send.close();
+            drop(receive);
+            let closes = |received: &[(u8, u32)]| {
+                received
+                    .iter()
+                    .filter(|(kind, _)| *kind == MESSAGE_TYPE_CLOSE_CHANNEL)
+                    .map(|(_, channel)| *channel)
+                    .collect::<Vec<_>>()
+            };
+            let received = p2pool.received_until(|received| closes(received).len() >= 2);
+            assert_eq!(
+                received,
+                vec![
+                    (MESSAGE_TYPE_SUBMIT_SHARES_STANDARD, 2),
+                    (MESSAGE_TYPE_CLOSE_CHANNEL, 1),
+                    (MESSAGE_TYPE_CLOSE_CHANNEL, 2),
+                ],
+                "{flags}"
+            );
+            drop(door);
+        }
     }
 
     // #### Pool modes: one upstream channel per miner identity

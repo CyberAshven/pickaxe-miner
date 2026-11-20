@@ -410,6 +410,163 @@ fn gui_preview() {
     save("rig.png", SIZE, |ui| {
         super::rig::show(ui, &rig, true, &|| {})
     });
+    for (name, state) in update_states() {
+        let view = updates_view(state);
+        save(&format!("updates-{name}.png"), [560.0, 560.0], |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                super::updates::pickaxe_section(ui, &view, true, None);
+                #[cfg(feature = "stratum-v2")]
+                {
+                    ui.separator();
+                    super::updates::p2pool_section(ui, &p2pool_view());
+                }
+            });
+        });
+    }
+}
+
+/// Each state of Pickaxe's updates the panel shows, by name.
+fn update_states() -> Vec<(&'static str, crate::update::State)> {
+    use super::updates::tests::offer;
+    use crate::update::{release::Version, State};
+    vec![
+        ("available", State::Available(offer(true))),
+        ("unsigned", State::Available(offer(false))),
+        ("confirm", State::Confirm(offer(false))),
+        (
+            "downloading",
+            State::Downloading {
+                offer: offer(true),
+                percent: 42,
+            },
+        ),
+        (
+            "ready",
+            State::Ready {
+                version: Version(0, 0, 5),
+                signed: true,
+                waiting: None,
+            },
+        ),
+        ("up-to-date", State::UpToDate),
+    ]
+}
+
+fn updates_view(state: crate::update::State) -> super::updates::PickaxeView {
+    super::updates::PickaxeView {
+        running: crate::update::release::Version(0, 0, 4),
+        state,
+        mode: crate::update::Mode::Notify,
+        has_key: false,
+        checking: true,
+    }
+}
+
+#[cfg(feature = "stratum-v2")]
+fn p2pool_view() -> super::updates::P2poolView {
+    super::updates::P2poolView {
+        installed: Some("v0.0.1-alpha (unsigned)".into()),
+        latest: super::updates::P2poolLatest::Available {
+            tag: "v0.0.2".into(),
+            prerelease: true,
+            signature: "unsigned: checked against its published SHA-256 only",
+        },
+        busy: None,
+        answer: None,
+        auto_update: true,
+        can_roll_back: true,
+    }
+}
+
+/// The Updates panel says each state and offers its action; Restart waits
+/// for the session to end, and an unsigned release asks first.
+#[test]
+fn the_updates_panel_shows_each_state() {
+    use super::updates::{pickaxe_section, Action};
+    use egui_kittest::kittest::Queryable;
+    let expected = [
+        ("available", "Update to v0.0.5"),
+        ("unsigned", "Unsigned release: update manually"),
+        ("confirm", "Install an unsigned release?"),
+        ("downloading", "v0.0.5 available"),
+        ("ready", "Updated to v0.0.5 · restart to apply"),
+        ("up-to-date", "v0.0.4 is the newest"),
+    ];
+    for ((name, state), (same, text)) in update_states().into_iter().zip(expected) {
+        assert_eq!(name, same);
+        let view = updates_view(state);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size([560.0, 560.0])
+            .with_context_setup(|ctx| ctx.set_fonts(super::fonts()))
+            .build_ui(|ui| {
+                pickaxe_section(ui, &view, false, None);
+            });
+        harness.run_steps(2);
+        assert!(
+            harness.query_by_label_contains(text).is_some(),
+            "{name}: {text}"
+        );
+        assert!(harness
+            .query_by_label_contains("Auto-update: install signed releases")
+            .is_some());
+        assert!(harness
+            .query_by_label_contains("you confirm each one")
+            .is_some());
+    }
+    // The buttons answer with their actions: Update, and Restart only
+    // between sessions.
+    let available = updates_view(update_states().remove(0).1);
+    let mut clicked = Vec::new();
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size([560.0, 560.0])
+        .build_ui(|ui| clicked.extend(pickaxe_section(ui, &available, true, None)));
+    harness.run_steps(2);
+    harness.get_by_label("Update to v0.0.5").click();
+    harness.run_steps(2);
+    drop(harness);
+    assert!(clicked.contains(&Action::Update), "{clicked:?}");
+    for between_sessions in [false, true] {
+        let ready = updates_view(update_states().remove(4).1);
+        let mut clicked = Vec::new();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size([560.0, 560.0])
+            .build_ui(|ui| clicked.extend(pickaxe_section(ui, &ready, between_sessions, None)));
+        harness.run_steps(2);
+        harness.get_by_label("Restart Pickaxe").click();
+        harness.run_steps(2);
+        drop(harness);
+        assert_eq!(clicked.contains(&Action::Restart), between_sessions);
+    }
+}
+
+/// P2Pool v2's section uses P2Pool's own updater: its version, the newest
+/// release, unsigned as it is, and its own Update and auto-update.
+#[cfg(feature = "stratum-v2")]
+#[test]
+fn the_p2pool_section_offers_its_own_update() {
+    use super::updates::{p2pool_section, Action};
+    use egui_kittest::kittest::Queryable;
+    let view = p2pool_view();
+    let mut clicked = Vec::new();
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size([560.0, 400.0])
+        .build_ui(|ui| clicked.extend(p2pool_section(ui, &view)));
+    harness.run_steps(2);
+    assert!(harness
+        .query_by_label_contains("v0.0.2 available (pre-release)")
+        .is_some());
+    assert!(harness
+        .query_by_label_contains("unsigned: checked against its published SHA-256 only")
+        .is_some());
+    harness.get_by_label("Update P2Pool").click();
+    harness.run_steps(2);
+    harness
+        .get_by_label("Auto-update: install a newer P2Pool before it starts")
+        .click();
+    harness.run_steps(2);
+    drop(harness);
+    assert!(clicked.contains(&Action::P2poolUpdate), "{clicked:?}");
+    assert!(clicked.contains(&Action::P2poolAuto(false)), "{clicked:?}");
 }
 
 /// The GPUs the setup previews list.

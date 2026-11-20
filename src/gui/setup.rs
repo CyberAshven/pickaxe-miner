@@ -160,6 +160,9 @@ impl Setup {
         match outcome {
             SetupOutcome::Continue => None,
             SetupOutcome::Complete(result) => Some(Done::Start(result)),
+            // U on the profiles restarts into an installed update: the
+            // window closes without asking, and Pickaxe starts again.
+            SetupOutcome::Cancel if crate::update::restart_requested() => Some(Done::Quit),
             SetupOutcome::Cancel => {
                 self.quitting = true;
                 None
@@ -426,10 +429,18 @@ fn draw(ui: &mut egui::Ui, view: &SetupView, quitting: bool) -> Vec<SetupInput> 
     let wide = ui.available_width() >= POT_BESIDE;
     egui::Panel::top("setup-bar").show(ui, |ui| {
         ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Pickaxe").size(20.0).strong());
-            ui.separator();
-            ui.label(&view.heading);
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                super::updates::bar_button(ui);
+                ui.with_layout(
+                    egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+                    |ui| {
+                        ui.label(egui::RichText::new("Pickaxe").size(20.0).strong());
+                        ui.separator();
+                        ui.label(&view.heading);
+                    },
+                );
+            });
         });
         ui.add_space(4.0);
     });
