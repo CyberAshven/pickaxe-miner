@@ -2364,6 +2364,9 @@ fn serve_declarator(
             let expired = session.expire(now)?;
             responses.frames.extend(expired.frames);
             responses.refused = expired.refused.or(responses.refused);
+            // Requested Payout Outputs (0x5052): PayoutOutputsStale once
+            // the pool's donation or fee changes (`DeclaratorSession::poll`).
+            responses.frames.extend(session.poll(declarator)?.frames);
             // #### PR #42: a Full-Template session's frames may take 16 MiB
             // (`Limits::JD`); a Coinbase-only one keeps a device's limits.
             if session.full_template() && !raised {

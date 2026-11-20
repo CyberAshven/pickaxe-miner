@@ -217,6 +217,34 @@ impl TokenBook {
         Ok((entry.payout, entry.rates))
     }
 
+    /// The address, rates and serial of `owner`'s allocated token, which
+    /// stays unspent: Requested Payout Outputs (0x5052) names the token
+    /// before DeclareMiningJob or SetCustomMiningJob spends it.
+    pub fn peek(
+        &mut self,
+        token: &[u8],
+        owner: u64,
+        now: Instant,
+    ) -> Result<(String, PoolRates, u64), &'static str> {
+        const INVALID: &str = "invalid-mining-job-token";
+        self.expire(now);
+        let token = PxToken::decode(token).ok_or(INVALID)?;
+        let entry = self.entries.get(&token.serial).ok_or(INVALID)?;
+        if entry.secret != token.secret
+            || entry.owner != owner
+            || !matches!(entry.kind, Kind::Allocated { .. })
+            || token.declared
+        {
+            return Err(INVALID);
+        }
+        Ok((entry.payout.clone(), entry.rates, token.serial))
+    }
+
+    /// The serial of the latest token: every later one is greater.
+    pub fn last_serial(&self) -> u64 {
+        self.next_serial
+    }
+
     /// The token of a declaration the pool checked: `job` is held by the
     /// declaring connection, which keeps its last few.
     pub fn declared(

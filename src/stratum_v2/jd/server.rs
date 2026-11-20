@@ -12,14 +12,22 @@ use super::{
     policy::PayoutRule,
     token::{PoolRates, Redeemed, TokenBook},
     AcceptJd, Refusal, ALLOCATIONS_PER_MINUTE, DECLARATIONS_PER_MINUTE, DECLARED_KEPT,
-    FULL_CHECK_EVERY, MAX_DECLARED_TXS, MAX_MISSING_ROUNDS, MISSING_PER_ROUND, PENDING_EXPIRY,
-    PROVIDED_BYTES, VALIDATIONS_IN_FLIGHT, VALIDATION_WAIT,
+    FULL_CHECK_EVERY, MAX_DECLARED_TXS, MAX_MISSING_ROUNDS, MAX_PAGED_TXS, MISSING_PER_ROUND,
+    PENDING_EXPIRY, PROVIDED_BYTES, VALIDATIONS_IN_FLIGHT, VALIDATION_WAIT,
 };
 use crate::{
     config::MiningNetwork,
     donation::bch::BchDonation,
     stratum_v2::{
         channel::VERSION_ROLLING_MASK,
+        extensions::{
+            negotiation_answer, DeclareMiningJobTransactions, ExtensionMessage, PayoutOutputsStale,
+            ProvideMissingTransactionsPositions, RequestExtensions, RequestPayoutOutputs,
+            RequestPayoutOutputsError, RequestPayoutOutputsSuccess,
+            DECLARE_MINING_JOB_TRANSACTIONS, EXACT_OUTPUTS, LARGE_TEMPLATES, NEGOTIATION,
+            PAYOUT_OUTPUTS, REQUEST_EXTENSIONS, REQUEST_PAYOUT_OUTPUTS, SEQ_MAX,
+            STALE_PAYOUT_OUTPUTS,
+        },
         payout::PublicPool,
         provider::NodeRpc,
         template::{checked_transaction, height_script, BchTemplate, Hash},
@@ -372,8 +380,16 @@ struct Pending {
     txids: Vec<Hash>,
     found: Vec<Option<Arc<[u8]>>>,
     /// The positions asked for in the latest round, in order.
-    asked: Vec<u16>,
+    asked: Vec<u32>,
     provided: bool,
+}
+
+/// DeclareMiningJob.Transactions pages (0x4C54) of the declaration being
+/// paged: its request id and the ids so far, or `None` once they passed the
+/// pool's limit.
+struct Paging {
+    request: u32,
+    txids: Option<Vec<Hash>>,
 }
 
 /// One client's Job Declaration session.
@@ -388,6 +404,16 @@ pub struct DeclaratorSession {
     declared: VecDeque<Arc<DeclaredJob>>,
     /// The parent the node last checked a declaration on, and when.
     checked: Option<(Hash, Instant)>,
+    /// Requested Payout Outputs (0x5052) was granted; the pool's donation
+    /// and fee when the client was last told its payouts; tokens up to this
+    /// serial were allocated before the latest PayoutOutputsStale.
+    payout_outputs: bool,
+    terms: Option<(u16, u16)>,
+    stale_before: u64,
+    /// BCH large templates (0x4C54) were granted, and the declaration being
+    /// paged.
+    large_templates: bool,
+    paging: Option<Paging>,
 }
 
 impl DeclaratorSession {
@@ -401,6 +427,11 @@ impl DeclaratorSession {
             pending: HashMap::new(),
             declared: VecDeque::new(),
             checked: None,
+            payout_outputs: false,
+            terms: None,
+            stale_before: 0,
+            large_templates: false,
+            paging: None,
         }
     }
 
@@ -421,7 +452,10 @@ impl DeclaratorSession {
         now: Instant,
     ) -> Result<JdResponses, String> {
         let header = frame.header();
-        if header.channel_msg() || header.ext_type_without_channel_msg() != 0 {
+        if header.ext_type_without_channel_msg() != 0 {
+            return self.extension(frame, declarator, context, now);
+        }
+        if header.channel_msg() {
             return Err("unexpected Job Declaration frame".into());
         }
         let mut responses = JdResponses::default();
@@ -564,7 +598,7 @@ impl DeclaratorSession {
                 // A reply after its declaration expired finds nothing.
                 if let Some(pending) = self.pending.remove(&id) {
                     if let Err(refusal) =
-                        self.provide(pending, &reply, declarator)
+                        self.provide(pending, &reply, declarator, now)
                             .and_then(|pending| {
                                 self.advance(id, pending, declarator, now, &mut responses)
                             })
@@ -616,6 +650,195 @@ impl DeclaratorSession {
         Ok(responses)
     }
 
+    // What: the extension frames of a Job Declaration session.
+    // RequestExtensions after setup grants Requested Payout Outputs (0x5052)
+    // and, on a Full-Template session, BCH large templates (0x4C54), and is
+    // answered with Error when it asks for neither. Once granted,
+    // RequestPayoutOutputs is answered and DeclareMiningJob.Transactions
+    // pages are kept for their DeclareMiningJob; a granted extension's other
+    // messages (the pool's own) break the protocol. Every other extension
+    // frame, an ungranted one's and any with the channel bit, is discarded.
+    // Why: sv2-spec 3.2.1 has a receiver ignore what it does not know; the
+    // Knuth node negotiates these two right after setup and pages the same
+    // way.
+    // Look here if: a Knuth client's JD connection is closed, or its
+    // payout request or pages go unanswered.
+    fn extension(
+        &mut self,
+        frame: &mut SerializedFrame,
+        declarator: &Declarator,
+        context: &Context<'_>,
+        now: Instant,
+    ) -> Result<JdResponses, String> {
+        let header = frame.header();
+        let mut responses = JdResponses::default();
+        if header.channel_msg() {
+            return Ok(responses);
+        }
+        match (header.ext_type_without_channel_msg(), header.msg_type()) {
+            (NEGOTIATION, REQUEST_EXTENSIONS) => {
+                if !self.set_up {
+                    return Err("extensions requested before setup".into());
+                }
+                let request = RequestExtensions::decode(frame.payload())
+                    .ok_or("malformed extensions request")?;
+                let full = self.full_template;
+                responses
+                    .frames
+                    .push(negotiation_answer(&request, |extension| {
+                        extension == PAYOUT_OUTPUTS || (full && extension == LARGE_TEMPLATES)
+                    })?);
+                if request.requested.contains(&PAYOUT_OUTPUTS) && !self.payout_outputs {
+                    self.payout_outputs = true;
+                    self.terms = Some(terms(declarator)?);
+                }
+                self.large_templates |= full && request.requested.contains(&LARGE_TEMPLATES);
+            }
+            (PAYOUT_OUTPUTS, REQUEST_PAYOUT_OUTPUTS) if self.payout_outputs => {
+                let request = RequestPayoutOutputs::decode(frame.payload())
+                    .ok_or("malformed payout outputs request")?;
+                let answer = match self.payout(&request, declarator, context, now) {
+                    Ok(outputs) => RequestPayoutOutputsSuccess {
+                        request_id: request.request_id,
+                        flags: EXACT_OUTPUTS,
+                        version: 2,
+                        sequence: u32::MAX,
+                        locktime: 0,
+                        outputs,
+                    }
+                    .frame()?,
+                    Err(code) => {
+                        // A stale answer is a race, not a refusal.
+                        if code != STALE_PAYOUT_OUTPUTS {
+                            responses.refused = Some(code);
+                        }
+                        RequestPayoutOutputsError {
+                            request_id: request.request_id,
+                            code: code.into(),
+                        }
+                        .frame()?
+                    }
+                };
+                responses.frames.push(answer);
+            }
+            (LARGE_TEMPLATES, DECLARE_MINING_JOB_TRANSACTIONS) if self.large_templates => {
+                let page = DeclareMiningJobTransactions::decode(frame.payload())
+                    .ok_or("malformed transaction page")?;
+                self.page(page, context);
+            }
+            (PAYOUT_OUTPUTS, _) if self.payout_outputs => {
+                return Err("unexpected Job Declaration message".into());
+            }
+            (LARGE_TEMPLATES, _) if self.large_templates => {
+                return Err("unexpected Job Declaration message".into());
+            }
+            _ => (),
+        }
+        Ok(responses)
+    }
+
+    // What: RequestPayoutOutputs (0x5052) for a token this session
+    // allocated: refused `invalid-mining-job-token` for an unknown, spent,
+    // declared, expired or another connection's token; `stale-payout-outputs`
+    // for one allocated before the latest PayoutOutputsStale, and for a
+    // height, parent or bits that are not the pool's current template's;
+    // otherwise the exact outputs of the token's rule (`exact_outputs`) for
+    // the value asked, which the declaration's check then accepts. The token
+    // is not spent.
+    // Why: the client builds its coinbase from these outputs, the same rule
+    // the pool checks it against; Knuth's client takes
+    // stale-payout-outputs as a race and any other code as a refusal.
+    // Look here if: a payout request is refused, or a coinbase built from
+    // its outputs is.
+    /// The serialized outputs (a count and the outputs) for `request`, or
+    /// the error code.
+    fn payout(
+        &self,
+        request: &RequestPayoutOutputs,
+        declarator: &Declarator,
+        context: &Context<'_>,
+        now: Instant,
+    ) -> Result<Vec<u8>, &'static str> {
+        let (payout, rates, serial) = declarator.book.lock().map_err(|_| "internal-error")?.peek(
+            &request.token,
+            self.owner,
+            now,
+        )?;
+        if serial <= self.stale_before {
+            return Err(STALE_PAYOUT_OUTPUTS);
+        }
+        let current = context.current.ok_or(STALE_PAYOUT_OUTPUTS)?;
+        if (request.height, request.prev_hash, request.nbits)
+            != (current.height, current.previous_hash, current.bits)
+        {
+            return Err(STALE_PAYOUT_OUTPUTS);
+        }
+        if request.available_payout_value > super::codec::MAX_MONEY {
+            return Err("invalid-available-payout-value");
+        }
+        let rule = PayoutRule::from_rates(declarator.network, &payout, &declarator.public, rates)
+            .map_err(|_| "invalid-mining-job-token")?;
+        let outputs = rule.exact_outputs(request.available_payout_value);
+        rule.check(&outputs).map_err(|_| "internal-error")?;
+        Ok(serialize_outputs(&outputs))
+    }
+
+    // What: PayoutOutputsStale (0x5052) once the pool's donation or fee
+    // setting differs from what the session last saw; tokens allocated
+    // before it are stale for RequestPayoutOutputs. Called on every pass of
+    // the connection's loop.
+    // Why: a client that holds tokens and installed jobs learns its payouts
+    // moved, takes new tokens and declares again (Knuth's client does so).
+    // Look here if: a client keeps paying the old donation after the setting
+    // changed, or is told its payouts moved when they did not.
+    /// PayoutOutputsStale when the payouts changed.
+    pub fn poll(&mut self, declarator: &Declarator) -> Result<JdResponses, String> {
+        let mut responses = JdResponses::default();
+        let Some(told) = self.terms.filter(|_| self.payout_outputs) else {
+            return Ok(responses);
+        };
+        let now = terms(declarator)?;
+        if now != told {
+            self.terms = Some(now);
+            self.stale_before = declarator
+                .book
+                .lock()
+                .map_err(|_| "token book unavailable")?
+                .last_serial();
+            responses.frames.push(PayoutOutputsStale.frame()?);
+        }
+        Ok(responses)
+    }
+
+    // What: a DeclareMiningJob.Transactions page (0x4C54) joins the
+    // declaration with its request id; a page for another id starts over.
+    // Ids past the pool's limit (`paged_limit`) are dropped and that
+    // declaration is refused.
+    // Why: Knuth sends full pages right before the DeclareMiningJob they
+    // belong to; a client must not make the pool hold more ids than a block
+    // could carry.
+    // Look here if: a paged declaration is refused for its size.
+    fn page(&mut self, page: DeclareMiningJobTransactions, context: &Context<'_>) {
+        let limit = paged_limit(context.current.map(|template| template.size_limit));
+        let paging = match self.paging.take() {
+            Some(paging) if paging.request == page.request_id => paging,
+            _ => Paging {
+                request: page.request_id,
+                txids: Some(Vec::new()),
+            },
+        };
+        let txids = paging.txids.and_then(|mut txids| {
+            (txids.len() + page.txids.len() <= limit).then(|| {
+                txids.extend(page.txids);
+                txids
+            })
+        });
+        self.paging = Some(Paging {
+            request: page.request_id,
+            txids,
+        });
+    }
+
     /// Refuses declarations whose missing transactions did not arrive
     /// within 30 seconds (`missing-txs`).
     pub fn expire(&mut self, now: Instant) -> Result<JdResponses, String> {
@@ -661,6 +884,12 @@ impl DeclaratorSession {
         now: Instant,
         responses: &mut JdResponses,
     ) -> Result<(), Refusal> {
+        // #### 0x4C54: the pages sent ahead of this declaration, if any.
+        let paged = self
+            .paging
+            .take()
+            .filter(|paging| paging.request == request.request_id)
+            .map(|paging| paging.txids);
         while self
             .declarations
             .front()
@@ -720,12 +949,29 @@ impl DeclaratorSession {
         if request.wtxid_list.len() > MAX_DECLARED_TXS {
             return Err(Refusal::new("invalid-job", "more than 65,535 transactions"));
         }
-        let txids = request
-            .wtxid_list
-            .iter()
-            .map(|txid| Hash::try_from(txid.as_ref()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| Refusal::new("invalid-job", "malformed transaction id"))?;
+        // #### 0x4C54: the declared list is every page, then this one's.
+        let mut txids = match paged {
+            Some(Some(txids)) => txids,
+            Some(None) => {
+                return Err(Refusal::new(
+                    "invalid-job",
+                    "more transactions than a block of this pool's size can hold",
+                ))
+            }
+            None => Vec::new(),
+        };
+        if txids.len() + request.wtxid_list.len() > paged_limit(Some(current.size_limit)) {
+            return Err(Refusal::new(
+                "invalid-job",
+                "more transactions than a block of this pool's size can hold",
+            ));
+        }
+        for txid in request.wtxid_list.iter() {
+            txids.push(
+                Hash::try_from(txid.as_ref())
+                    .map_err(|_| Refusal::new("invalid-job", "malformed transaction id"))?,
+            );
+        }
         if !ctor_ordered(&txids) {
             return Err(Refusal::new(
                 "invalid-job",
@@ -770,18 +1016,27 @@ impl DeclaratorSession {
     }
 
     /// The transactions a client provided for `pending`: each must be the
-    /// one asked for and a plain transaction.
+    /// one asked for and a plain transaction. #### 0x4C54: a session with
+    /// BCH large templates may send the first of them only (those that fit
+    /// one frame); the rest are asked for again, and the wait for them
+    /// starts over.
     fn provide(
         &self,
         mut pending: Pending,
         reply: &ProvideMissingTransactionsSuccess<'_>,
         declarator: &Declarator,
+        now: Instant,
     ) -> Result<Pending, Refusal> {
-        if reply.transaction_list.len() != pending.asked.len() {
+        let count = reply.transaction_list.len();
+        let prefix = self.large_templates && (1..pending.asked.len()).contains(&count);
+        if count != pending.asked.len() && !prefix {
             return Err(Refusal::new(
                 "invalid-job",
                 "the transactions do not match the request",
             ));
+        }
+        if prefix {
+            pending.started = now;
         }
         let mut provided = declarator
             .provided
@@ -795,7 +1050,7 @@ impl DeclaratorSession {
                     "a provided transaction is malformed, a coinbase or segwit",
                 )
             })?;
-            let position = usize::from(*position);
+            let position = *position as usize;
             if pending.txids.get(position) != Some(&txid) {
                 return Err(Refusal::new(
                     "invalid-job",
@@ -819,13 +1074,17 @@ impl DeclaratorSession {
         now: Instant,
         responses: &mut JdResponses,
     ) -> Result<(), Refusal> {
-        let missing: Vec<u16> = pending
+        // #### 0x4C54: a paged declaration is asked by U32 position in the
+        // whole list (ProvideMissingTransactions.Positions), up to 65,535 a
+        // round; the client sends what fits one frame.
+        let paged = pending.txids.len() > SEQ_MAX;
+        let missing: Vec<u32> = pending
             .found
             .iter()
             .enumerate()
             .filter(|(_, tx)| tx.is_none())
-            .map(|(position, _)| position as u16)
-            .take(MISSING_PER_ROUND)
+            .map(|(position, _)| position as u32)
+            .take(if paged { SEQ_MAX } else { MISSING_PER_ROUND })
             .collect();
         if missing.is_empty() {
             return self.finish(id, pending, declarator, now, responses);
@@ -838,20 +1097,28 @@ impl DeclaratorSession {
         }
         pending.rounds += 1;
         responses.missing_rounds += 1;
-        responses.frames.push(
+        let ask = if paged {
+            ProvideMissingTransactionsPositions {
+                request_id: id,
+                positions: missing.clone(),
+            }
+            .frame()
+        } else {
+            let positions: Vec<u16> = missing.iter().map(|position| *position as u16).collect();
             encoded(
                 ProvideMissingTransactions {
                     request_id: id,
-                    unknown_tx_position_list: missing
-                        .clone()
+                    unknown_tx_position_list: positions
                         .try_into()
                         .map_err(|_| Refusal::new("internal-error", "too many positions"))?,
                 },
                 MESSAGE_TYPE_PROVIDE_MISSING_TRANSACTIONS,
                 false,
             )
-            .map_err(|_| Refusal::new("internal-error", "cannot ask for transactions"))?,
-        );
+        };
+        responses
+            .frames
+            .push(ask.map_err(|_| Refusal::new("internal-error", "cannot ask for transactions"))?);
         pending.asked = missing;
         self.pending.insert(id, pending);
         Ok(())
@@ -948,6 +1215,26 @@ impl DeclaratorSession {
             book.drop_owner(self.owner);
         }
     }
+}
+
+/// The pool's donation and fee settings, in hundredths of a percent.
+fn terms(declarator: &Declarator) -> Result<(u16, u16), String> {
+    let donation = *declarator
+        .donation
+        .read()
+        .map_err(|_| "donation setting unavailable")?;
+    let fee = declarator.public.fee.map_or(0, |fee| u16::from(fee.rate));
+    Ok((u16::from(donation), fee))
+}
+
+/// #### 0x4C54: the most transactions a paged declaration may list: as many
+/// of BCH's smallest (65-byte) transactions as a block of `size_limit` bytes
+/// holds, at most `MAX_PAGED_TXS`, never fewer than one SEQ0_64K list.
+fn paged_limit(size_limit: Option<u64>) -> usize {
+    let fits = size_limit.map_or(MAX_PAGED_TXS, |limit| {
+        usize::try_from(limit / 65).unwrap_or(usize::MAX)
+    });
+    fits.min(MAX_PAGED_TXS).max(SEQ_MAX)
 }
 
 /// DeclareMiningJob.Error for declaration `id`.

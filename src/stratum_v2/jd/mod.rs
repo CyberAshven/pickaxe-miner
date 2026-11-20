@@ -41,6 +41,9 @@ pub const ALLOCATIONS_PER_MINUTE: usize = 20;
 pub const DECLARATIONS_PER_MINUTE: usize = 30;
 /// Transactions one declaration may list: SV2 counts them in 16 bits.
 pub const MAX_DECLARED_TXS: usize = 65_535;
+/// Transactions a declaration paged with BCH large templates (0x4C54) may
+/// list at most: 64 MiB of ids.
+pub const MAX_PAGED_TXS: usize = 2 * 1024 * 1024;
 /// Missing transactions the pool asks for in one round.
 pub const MISSING_PER_ROUND: usize = 2_048;
 /// Rounds of missing transactions one declaration may take.
