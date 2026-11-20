@@ -436,7 +436,7 @@ mod tests {
                             NewExtendedMiningJob {
                                 channel_id,
                                 job_id: 1,
-                                min_ntime: binary_sv2::Sv2Option::new(None),
+                                ntime_start: binary_sv2::Sv2Option::new(None),
                                 version: 0x2000_0000,
                                 version_rolling_allowed: true,
                                 merkle_path: Vec::<binary_sv2::U256>::new().try_into().unwrap(),
@@ -451,7 +451,7 @@ mod tests {
                                 channel_id,
                                 job_id: 1,
                                 prev_hash: (&[0u8; 32]).into(),
-                                min_ntime: 1_700_000_000,
+                                ntime_start: 1_700_000_000,
                                 nbits: 0x1d00_ffff,
                             },
                             MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,

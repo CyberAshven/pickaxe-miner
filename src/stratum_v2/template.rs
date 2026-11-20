@@ -362,7 +362,7 @@ impl BchTemplate {
     pub fn custom(
         context: &BchTemplate,
         version: u32,
-        min_ntime: u32,
+        ntime_start: u32,
         merkle_path: Vec<Hash>,
     ) -> Self {
         Self {
@@ -370,8 +370,8 @@ impl BchTemplate {
             version,
             bits: context.bits,
             target: context.target,
-            min_time: min_ntime,
-            current_time: min_ntime,
+            min_time: ntime_start,
+            current_time: ntime_start,
             height: context.height,
             size_limit: context.size_limit,
             coinbase_value: context.coinbase_value,
@@ -574,11 +574,11 @@ impl BchTemplate {
 
     /// #### PR #42: this template for a custom job set on it: the job's
     /// version and start time, the same transactions.
-    pub fn with_header(&self, version: u32, min_ntime: u32) -> Self {
+    pub fn with_header(&self, version: u32, ntime_start: u32) -> Self {
         Self {
             version,
-            min_time: min_ntime,
-            current_time: min_ntime,
+            min_time: ntime_start,
+            current_time: ntime_start,
             ..self.clone()
         }
     }
