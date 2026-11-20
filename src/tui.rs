@@ -286,7 +286,11 @@ pub fn asic_serve_command(
     let mut pool_tag = None;
     // #### PR #61: P2Pool's identity, or your own P2Pool node.
     let mut upstream_user = options.pool_user.clone();
-    let own_p2pool = matches!(server, ServerSetup::OwnP2Pool);
+    // #### Pool modes: a Non-custodial Pool and P2Pool v2 run it too.
+    let own_p2pool = matches!(
+        server,
+        ServerSetup::OwnP2Pool | ServerSetup::P2PoolPool { .. }
+    );
     // The pool, then the backup pools, each with its key in its address.
     let pools = |address: &String, key: &String| {
         let main = if address.contains("://") || key.is_empty() {
@@ -318,10 +322,24 @@ pub fn asic_serve_command(
             pool_tag = tag.clone();
             (Vec::new(), true, Some(*fee), Some(*mode), address.clone())
         }
+        // #### Pool modes: P2Pool pays the fee in each block's coinbase.
+        ServerSetup::P2PoolPool {
+            fee, address, tag, ..
+        } => {
+            pool_tag = tag.clone();
+            (
+                Vec::new(),
+                true,
+                Some(*fee),
+                Some(crate::donation::bch::FeeMode::Coinbase),
+                address.clone(),
+            )
+        }
         ServerSetup::GpuPool { .. } | ServerSetup::JoinGpuPool { .. } => return None,
     };
-    // Your own P2Pool node is a pool on this computer: no templates or
-    // fallback pools here, and the pool sets the difficulty.
+    // Your own P2Pool node is a pool on this computer: no templates here,
+    // and the pool sets the difficulty. Its fallback pools take over while
+    // P2Pool is down.
     let joining = !upstream.is_empty() || own_p2pool;
     let solo = !joining && !public;
     let everywhere = |port: u16| std::net::SocketAddr::from(([0, 0, 0, 0], port));
@@ -350,7 +368,7 @@ pub fn asic_serve_command(
             .map(everywhere),
         accept_job_declaration: options
             .accept_job_declaration
-            .filter(|_| public)
+            .filter(|_| public && !own_p2pool)
             .map(|mode| match mode {
                 crate::config::SavedAccept::Full => crate::cli::AcceptJobDeclaration::Full,
                 crate::config::SavedAccept::Coinbase => crate::cli::AcceptJobDeclaration::Coinbase,
@@ -381,7 +399,7 @@ pub fn asic_serve_command(
         p2pool_prepare_api: options.p2pool_prepare_api.clone().filter(|_| {
             matches!(server, ServerSetup::JoinP2Pool { .. }) && options.job_declaration.is_some()
         }),
-        fallback_pool: if solo && options.asic_token.is_none() {
+        fallback_pool: if (solo && options.asic_token.is_none()) || own_p2pool {
             options.fallback_pools.clone()
         } else {
             Vec::new()
@@ -451,6 +469,8 @@ pub enum ServerSetup {
     /// #### PR #61: your own BCH P2Pool node, which the server installs,
     /// updates and runs with your node.
     OwnP2Pool,
+    /// A Public Solo Endpoint: others mine Solo through your server and
+    /// each keeps the blocks they find; your fee.
     Public {
         fee: crate::donation::bch::BchDonation,
         mode: crate::donation::bch::FeeMode,
@@ -458,6 +478,18 @@ pub enum ServerSetup {
         address: Option<String>,
         /// The pool's name in its blocks' coinbase; `None` writes none.
         tag: Option<String>,
+    },
+    /// #### Pool modes: a Non-custodial Pool (`standalone`: P2Pool on its
+    /// own share chain, alone) or P2Pool v2 (linked with other P2Pool
+    /// servers): people on your server share every block by their work.
+    /// The fee is paid in the coinbase, at most 10%; `tag` is P2Pool's
+    /// pool signature, at most 16 characters.
+    P2PoolPool {
+        fee: crate::donation::bch::BchDonation,
+        /// `None` is the payout address.
+        address: Option<String>,
+        tag: Option<String>,
+        standalone: bool,
     },
     /// #### PR #40: this computer's GPUs join someone's GPU pool or farm as
     /// a rig of its coordinator (`HOST:PORT` and the coordinator's key).
@@ -575,6 +607,94 @@ impl ProfileChoices {
     }
 }
 
+// #### Pool modes: your P2Pool peers in the setup
+// What: P2Pool v2's Peers row edits the peers of your own (P2Pool's
+// `settings.json` beside the configuration, as `pickaxe p2pool set --peer`
+// keeps them), each checked as P2Pool dials it, and says how many seeds
+// this build carries ("no seeds yet" while the lists are empty).
+// Look here if: the Peers row and `pickaxe p2pool peers` disagree.
+/// P2Pool's home beside the profiles (`p2pool::home` of the configuration
+/// they sit beside).
+fn p2pool_home(profiles: &Path) -> PathBuf {
+    profiles.with_file_name("p2pool")
+}
+
+/// Your P2Pool peers; none when P2Pool's settings cannot be read.
+fn load_p2pool_peers(profiles: &Path) -> Vec<String> {
+    #[cfg(feature = "stratum-v2")]
+    {
+        crate::p2pool::Settings::load(&p2pool_home(profiles))
+            .map(|settings| settings.peers)
+            .unwrap_or_default()
+    }
+    #[cfg(not(feature = "stratum-v2"))]
+    {
+        let _ = profiles;
+        Vec::new()
+    }
+}
+
+/// Keeps `peers` as your P2Pool peers, P2Pool's other settings unchanged.
+fn save_p2pool_peers(profiles: &Path, peers: &[String]) -> Result<(), String> {
+    #[cfg(feature = "stratum-v2")]
+    {
+        let home = p2pool_home(profiles);
+        let mut settings = crate::p2pool::Settings::load(&home)?;
+        if settings.peers == peers {
+            return Ok(());
+        }
+        settings.peers = peers.to_vec();
+        settings.save(&home)
+    }
+    #[cfg(not(feature = "stratum-v2"))]
+    {
+        let _ = (profiles, peers);
+        Ok(())
+    }
+}
+
+/// Peers typed on one line (split on spaces or commas), each a P2P address
+/// P2Pool can dial, at most 64.
+fn parse_p2pool_peers(value: &str) -> Result<Vec<String>, String> {
+    let mut peers: Vec<String> = Vec::new();
+    for peer in value
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|text| !text.is_empty())
+    {
+        #[cfg(feature = "stratum-v2")]
+        let dialable = crate::p2pool::peers::is_dial_address(peer);
+        #[cfg(not(feature = "stratum-v2"))]
+        let dialable = false;
+        if !dialable {
+            return Err(format!(
+                "{peer}: give a P2P address such as /ip4/203.0.113.7/tcp/6884 or \
+                 /dns4/pool.example.com/tcp/6884"
+            ));
+        }
+        if !peers.iter().any(|kept| kept == peer) {
+            peers.push(peer.to_owned());
+        }
+    }
+    if peers.len() > 64 {
+        return Err("use at most 64 peers".into());
+    }
+    Ok(peers)
+}
+
+/// The seeds this build's P2Pool dials first on `network`.
+fn p2pool_seed_count(network: MiningNetwork) -> usize {
+    #[cfg(feature = "stratum-v2")]
+    {
+        crate::p2pool::peers::seeds(network).len()
+    }
+    #[cfg(not(feature = "stratum-v2"))]
+    {
+        let _ = network;
+        0
+    }
+}
+// #### end Pool modes ####
+
 /// The profile Start last started, by name, kept beside the profiles
 /// (`last-profile.txt`), so `pickaxe gui --start` starts it again.
 fn last_profile_path(profiles: &Path) -> PathBuf {
@@ -658,12 +778,89 @@ enum AsicMining {
     JoinPool,
 }
 
-/// #### PR #40: the kind of pool to join or run; P2Pool v2 is coming.
+/// #### PR #40: the kind of pool to join: a normal SV2 pool, or P2Pool
+/// (someone's P2Pool node, or your own P2Pool v2 node).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PoolKind {
     Normal,
     P2PoolV2,
 }
+
+// #### Pool modes in the setup
+// What: Run a pool → ASIC pool runs one of three modes, by the owner's
+// names: a Public Solo Endpoint (`serve --public`), a Non-custodial Pool
+// (`serve --own-p2pool --public --p2pool-standalone`) or P2Pool v2
+// (`serve --own-p2pool --public`). The P2Pool modes take a coinbase fee of
+// at most 10%, a pool signature of at most 16 characters, P2Pool's own
+// donation, fallback pools and, linked, your peers.
+// Why: the server ran them (Pool modes) but the setup still said "P2Pool
+// v2 (coming soon)".
+// Look here if: a mode's rows, hint or started server change.
+/// What Run a pool → ASIC pool runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolMode {
+    /// Others mine Solo through your server; each keeps their own blocks.
+    PublicSolo,
+    /// People on your server share every block by their work: P2Pool runs
+    /// inside, on its own share chain, alone.
+    NonCustodial,
+    /// The same, linked with other P2Pool servers.
+    P2PoolV2,
+}
+
+impl PoolMode {
+    const ALL: [Self; 3] = [Self::PublicSolo, Self::NonCustodial, Self::P2PoolV2];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::PublicSolo => "Public Solo Endpoint",
+            Self::NonCustodial => "Non-custodial Pool",
+            Self::P2PoolV2 => "P2Pool v2",
+        }
+    }
+
+    /// What differs, in a few words.
+    fn hint(self) -> &'static str {
+        match self {
+            Self::PublicSolo => {
+                "others mine Solo through your server; each miner keeps their own blocks"
+            }
+            Self::NonCustodial => {
+                "miners share every block by their work; P2Pool on your server alone"
+            }
+            Self::P2PoolV2 => {
+                "miners share every block by their work; linked with other P2Pool servers"
+            }
+        }
+    }
+
+    /// What Start says.
+    fn start(self) -> &'static str {
+        match self {
+            Self::PublicSolo => "Start the Public Solo Endpoint",
+            Self::NonCustodial => "Start the Non-custodial Pool",
+            Self::P2PoolV2 => "Start P2Pool v2",
+        }
+    }
+
+    /// P2Pool runs inside.
+    fn p2pool(self) -> bool {
+        self != Self::PublicSolo
+    }
+
+    fn step(self, forward: bool) -> Self {
+        let index = Self::ALL.iter().position(|mode| *mode == self).unwrap_or(0);
+        let count = Self::ALL.len();
+        Self::ALL[(index + if forward { 1 } else { count - 1 }) % count]
+    }
+}
+
+/// #### Pool modes: P2Pool's own limits on its donation and on your fee
+/// (10%), its default donation (1%, `p2pool::launch::DEFAULT_DONATION_BPS`)
+/// and its pool signature's length.
+const P2POOL_MAX_BPS: u16 = 1_000;
+const P2POOL_DONATION_DEFAULT_BPS: u16 = 100;
+const P2POOL_SIGNATURE_MAX: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SetupAction {
@@ -685,6 +882,8 @@ enum SettingsRow {
     /// a public pool's fee, its source and its address.
     Mining,
     PoolKind,
+    /// #### Pool modes: Run a pool → ASIC pool's mode.
+    PoolMode,
     PoolAddress,
     PoolKey,
     P2PoolApi,
@@ -705,6 +904,11 @@ enum SettingsRow {
     Templates,
     /// #### PR #42: the node's ZMQ block notices.
     NodeZmq,
+    /// #### Pool modes: your own P2Pool's: the node's P2P address (with
+    /// block notices off), P2Pool's own donation, and your peers (linked).
+    NodeP2p,
+    P2PoolDonation,
+    Peers,
     /// Backup pools for Join a pool, in failover order.
     Backups,
     /// The username at the pool (the payout address by default).
@@ -763,6 +967,9 @@ enum TextField {
     CookieFile,
     /// #### PR #42: the node's ZMQ block notices.
     NodeZmq,
+    /// #### Pool modes: the node's P2P address and your P2Pool peers.
+    NodeP2p,
+    Peers,
 }
 
 /// What an ASIC can mine: BCH (merge-mined tokens as they appear), or an
@@ -798,6 +1005,12 @@ struct SetupFlow {
     pool_kind: PoolKind,
     /// A pool to run is for ASICs (0) or GPUs (1).
     pool_target: usize,
+    /// #### Pool modes: what an ASIC pool runs. P2Pool's own donation and
+    /// the node's P2P address are `config.p2pool`'s.
+    pool_mode: PoolMode,
+    /// #### Pool modes: your P2Pool peers (P2Pool's `settings.json`, as
+    /// `pickaxe p2pool set --peer` keeps them), saved by Start.
+    p2pool_peers: Vec<String>,
     join_address: String,
     join_key: String,
     pool_fee: crate::donation::bch::BchDonation,
@@ -1024,6 +1237,8 @@ impl SetupFlow {
             gpu_join: false,
             pool_kind: PoolKind::Normal,
             pool_target: 0,
+            pool_mode: PoolMode::PublicSolo,
+            p2pool_peers: Vec::new(),
             join_address: String::new(),
             join_key: String::new(),
             pool_fee: SetupFlow::server_defaults().0,
@@ -1898,7 +2113,8 @@ impl SetupFlow {
                     SettingsRow::JobDeclaration,
                 ];
                 if self.own_p2pool {
-                    basic.extend([SettingsRow::Address, SettingsRow::Node]);
+                    // #### Pool modes: your own P2Pool v2 node, linked.
+                    basic.extend([SettingsRow::Address, SettingsRow::Node, SettingsRow::Peers]);
                 } else {
                     basic.extend([
                         SettingsRow::PoolAddress,
@@ -1912,11 +2128,15 @@ impl SetupFlow {
                 self.with_advanced(
                     basic,
                     if self.own_p2pool {
-                        vec![
-                            SettingsRow::NodeZmq,
+                        let mut advanced = vec![SettingsRow::NodeZmq];
+                        advanced.extend(self.notices_off().then_some(SettingsRow::NodeP2p));
+                        advanced.extend([
                             SettingsRow::Donation,
+                            SettingsRow::P2PoolDonation,
                             SettingsRow::Sv1Port,
-                        ]
+                            SettingsRow::FallbackPools,
+                        ]);
+                        advanced
                     } else {
                         vec![
                             SettingsRow::Backups,
@@ -1968,9 +2188,9 @@ impl SetupFlow {
             ),
             // #### PR #40: a GPU pool's fee is always mining time.
             // #### PR #42: its fee address, port and donation in Advanced.
+            // #### Pool modes: one kind of GPU pool, so no mode row.
             MiningMode::Pool if self.pool_target == 1 => self.with_advanced(
                 vec![
-                    SettingsRow::PoolKind,
                     SettingsRow::Address,
                     SettingsRow::Fulcrum,
                     SettingsRow::Node,
@@ -1982,9 +2202,36 @@ impl SetupFlow {
                     SettingsRow::TokenDonation,
                 ],
             ),
+            // #### Pool modes: P2Pool builds the jobs and sets the
+            // difficulty, so no fee source, start difficulty, templates or
+            // miners' templates; P2Pool's own donation, fallback pools and,
+            // linked, your peers instead.
+            MiningMode::Pool if self.pool_mode.p2pool() => {
+                let mut basic = vec![
+                    SettingsRow::PoolMode,
+                    SettingsRow::Address,
+                    SettingsRow::Node,
+                    SettingsRow::PoolFee,
+                ];
+                basic.extend((self.pool_mode == PoolMode::P2PoolV2).then_some(SettingsRow::Peers));
+                let mut advanced = vec![
+                    SettingsRow::FeeAddress,
+                    SettingsRow::PoolName,
+                    SettingsRow::Sv1Port,
+                    SettingsRow::Sv2Port,
+                    SettingsRow::NodeZmq,
+                ];
+                advanced.extend(self.notices_off().then_some(SettingsRow::NodeP2p));
+                advanced.extend([
+                    SettingsRow::Donation,
+                    SettingsRow::P2PoolDonation,
+                    SettingsRow::FallbackPools,
+                ]);
+                self.with_advanced(basic, advanced)
+            }
             MiningMode::Pool => self.with_advanced(
                 vec![
-                    SettingsRow::PoolKind,
+                    SettingsRow::PoolMode,
                     SettingsRow::Address,
                     SettingsRow::Node,
                     SettingsRow::PoolFee,
@@ -2224,6 +2471,13 @@ impl SetupFlow {
                 fee: self.pool_fee,
                 address: Some(self.pool_fee_address.trim().to_owned()).filter(|a| !a.is_empty()),
             }),
+            // #### Pool modes
+            MiningMode::Pool if self.pool_mode.p2pool() => Some(ServerSetup::P2PoolPool {
+                fee: self.pool_fee,
+                address: Some(self.pool_fee_address.trim().to_owned()).filter(|a| !a.is_empty()),
+                tag: Some(self.pool_tag.trim().to_owned()).filter(|t| !t.is_empty()),
+                standalone: self.pool_mode == PoolMode::NonCustodial,
+            }),
             MiningMode::Pool => Some(ServerSetup::Public {
                 fee: self.pool_fee,
                 mode: self.pool_fee_mode,
@@ -2232,6 +2486,126 @@ impl SetupFlow {
             }),
         }
     }
+
+    // #### Pool modes: your own P2Pool's settings
+    // What: a Non-custodial Pool, P2Pool v2 and your own P2Pool v2 node
+    // (Join a pool) run P2Pool here: its own donation, the node's P2P
+    // address while block notices are off (Knuth and other nodes without
+    // ZMQ), and, linked, your peers. They reach the server through the
+    // started configuration (`RuntimeConfig::p2pool`) and are saved with
+    // the profile (`SavedConfig::p2pool`); the peers in P2Pool's own
+    // settings.
+    // Why: the server took them as flags (#95) but the setup could not
+    // set them, and it refused block notices off for P2Pool.
+    // Look here if: a P2Pool row has no effect, or does not reopen.
+    /// The setup runs its own P2Pool.
+    fn runs_p2pool(&self) -> bool {
+        matches!(
+            self.server_setup(),
+            Some(ServerSetup::OwnP2Pool | ServerSetup::P2PoolPool { .. })
+        )
+    }
+
+    /// Its own P2Pool is linked with other P2Pool servers (P2Pool v2).
+    fn p2pool_linked(&self) -> bool {
+        match self.server_setup() {
+            Some(ServerSetup::OwnP2Pool) => true,
+            Some(ServerSetup::P2PoolPool { standalone, .. }) => !standalone,
+            _ => false,
+        }
+    }
+
+    /// The node's ZMQ block notices are off.
+    fn notices_off(&self) -> bool {
+        self.node_zmq.trim().eq_ignore_ascii_case("off")
+    }
+
+    /// What the setup's own P2Pool runs with; `None` when it runs none.
+    fn p2pool_settings(&self) -> Option<crate::config::SavedP2Pool> {
+        let standalone = match self.server_setup()? {
+            ServerSetup::P2PoolPool { standalone, .. } => standalone,
+            ServerSetup::OwnP2Pool => false,
+            _ => return None,
+        };
+        Some(crate::config::SavedP2Pool {
+            donation: self.config.p2pool.donation,
+            standalone,
+            node_p2p: self
+                .config
+                .p2pool
+                .node_p2p
+                .clone()
+                .filter(|_| self.notices_off()),
+        })
+    }
+
+    /// P2Pool's own donation: the one set, or its default 1%.
+    fn p2pool_donation(&self) -> crate::donation::bch::BchDonation {
+        self.config.p2pool.donation.unwrap_or_else(|| {
+            crate::donation::bch::BchDonation::try_from(P2POOL_DONATION_DEFAULT_BPS)
+                .expect("P2Pool's default donation")
+        })
+    }
+
+    /// The node's usual P2P address, as P2Pool takes it without one set:
+    /// the first node's host with the network's P2P port (8333, or 48333
+    /// on Chipnet).
+    fn default_node_p2p(&self) -> Option<String> {
+        let url = self.config.custom_node_endpoints().first().copied()?;
+        let (host, _) = crate::node::node_host_port(url).ok()?;
+        let host = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host
+        };
+        let port = match self.config.network {
+            MiningNetwork::Mainnet => 8333,
+            MiningNetwork::Chipnet => 48333,
+        };
+        Some(format!("{host}:{port}"))
+    }
+
+    /// The node's P2P address P2Pool hears of new blocks on: the one set,
+    /// or the usual one.
+    fn node_p2p(&self) -> Option<String> {
+        self.config
+            .p2pool
+            .node_p2p
+            .clone()
+            .or_else(|| self.default_node_p2p())
+    }
+
+    /// P2Pool hears of new blocks: from the node's ZMQ notices, or with
+    /// them off from its P2P port, when that address is known.
+    fn p2pool_hears_blocks(&self) -> bool {
+        !self.notices_off() || self.node_p2p().is_some()
+    }
+
+    /// Start's answer when it does not: the P2P address row, to type it.
+    fn open_node_p2p(&mut self) {
+        self.status_line = "With block notices off, P2Pool hears of new blocks on your node's \
+                            P2P port: enter it as HOST:PORT."
+            .into();
+        self.open_settings(SettingsRow::NodeP2p);
+    }
+
+    /// The first node's client when its check found one P2Pool's startup
+    /// check refuses (anything but Bitcoin Cash Node), such as Knuth.
+    fn p2pool_refused_node(&self) -> Option<String> {
+        let url = self
+            .sources
+            .list(self.config.network, ConnectionKind::Node)
+            .first()?;
+        match self.node_checks.get(url)? {
+            crate::node::NodeCheck::Ready { info, .. }
+                if !info.client.starts_with("Bitcoin Cash Node") =>
+            {
+                Some(info.client.clone())
+            }
+            _ => None,
+        }
+    }
+    // #### end Pool modes ####
 
     // #### PR #42: profiles keep their mode
     // What: the setup's mode and pool values go into the profile, and opening
@@ -2314,6 +2688,8 @@ impl SetupFlow {
                 pool_user: None,
                 ..joining(SavedMode::AsicJoin)
             },
+            // #### Pool modes: with P2Pool's settings beside it
+            // (`profile_settings`), and its fallback pools.
             ServerSetup::OwnP2Pool => SavedServer {
                 join: None,
                 join_key: None,
@@ -2321,7 +2697,27 @@ impl SetupFlow {
                 pool_user: None,
                 job_declaration: None,
                 node_zmq: options.node_zmq.clone(),
+                fallback_pools: options.fallback_pools.clone(),
                 ..joining(SavedMode::AsicJoin)
+            },
+            // #### Pool modes: an ASIC pool with P2Pool's settings beside
+            // it; P2Pool sets the difficulty and builds the jobs.
+            ServerSetup::P2PoolPool {
+                fee, address, tag, ..
+            } => SavedServer {
+                mode: SavedMode::AsicPool,
+                join: None,
+                join_key: None,
+                pool_fee: Some(fee),
+                fee_mode: Some(crate::donation::bch::FeeMode::Coinbase),
+                fee_address: address,
+                pool_tag: tag,
+                start_difficulty: None,
+                backups: Vec::new(),
+                pool_user: None,
+                node_zmq: options.node_zmq.clone(),
+                fallback_pools: options.fallback_pools.clone(),
+                ..joining(SavedMode::AsicPool)
             },
             ServerSetup::Solo => SavedServer {
                 join: None,
@@ -2379,6 +2775,10 @@ impl SetupFlow {
         self.gpu_join = false;
         self.asic_mining = AsicMining::Solo;
         self.pool_target = 0;
+        // #### Pool modes: `apply_saved_p2pool` puts a profile's P2Pool back.
+        self.pool_mode = PoolMode::PublicSolo;
+        self.pool_kind = PoolKind::Normal;
+        self.own_p2pool = false;
         self.join_address.clear();
         self.join_key.clear();
         self.pool_fee = defaults.0;
@@ -2455,8 +2855,34 @@ impl SetupFlow {
         }
     }
 
+    /// #### Pool modes: a profile's own P2Pool puts its mode back: an ASIC
+    /// pool's Non-custodial Pool (standalone) or P2Pool v2, or Join a
+    /// pool's own P2Pool v2 node. Its donation and the node's P2P address
+    /// came back with the configuration.
+    fn apply_saved_p2pool(&mut self, p2pool: Option<&crate::config::SavedP2Pool>) {
+        let Some(p2pool) = p2pool else {
+            return;
+        };
+        match self.mode {
+            MiningMode::Pool if self.pool_target == 0 => {
+                self.pool_mode = if p2pool.standalone {
+                    PoolMode::NonCustodial
+                } else {
+                    PoolMode::P2PoolV2
+                };
+            }
+            MiningMode::Asic if self.asic_mining == AsicMining::JoinPool => {
+                self.pool_kind = PoolKind::P2PoolV2;
+                self.own_p2pool = true;
+                self.job_declaration = None;
+            }
+            _ => {}
+        }
+    }
+
     /// #### PR #42: the profile the setup saves: the configuration, the
     /// mode and pool values, and a token's own donation.
+    /// #### Pool modes: and its own P2Pool's settings.
     fn profile_settings(&self) -> SavedConfig {
         let mut settings =
             SavedConfig::from_effective(self.prefer.as_str(), &self.saved_choice(), &self.config);
@@ -2469,6 +2895,10 @@ impl SetupFlow {
         } else {
             self.saved_server()
         };
+        settings.p2pool = settings
+            .server
+            .as_ref()
+            .and_then(|_| self.p2pool_settings());
         // A token's donation is measured against its own default, not the
         // GPU token's.
         if let Some(token) = self.chosen_asic_token().filter(|_| {
@@ -2668,6 +3098,8 @@ impl SetupFlow {
         self.apply_connections()?;
         // #### PR #42: the profile reopens in its own mode.
         self.apply_saved_server(profile.settings.server.as_ref());
+        // #### Pool modes: with its own P2Pool.
+        self.apply_saved_p2pool(profile.settings.p2pool.as_ref());
         // #### PR #61: and with the choices kept beside it.
         if let Some(path) = self.profile_path.clone() {
             let choices = ProfileChoices::load(&path)
@@ -2880,7 +3312,11 @@ impl SetupFlow {
             match key.code {
                 KeyCode::Esc => self.step = SetupStep::Network,
                 KeyCode::Up | KeyCode::Down => self.pool_target = 1 - self.pool_target,
-                KeyCode::Enter => self.open_settings(SettingsRow::PoolKind),
+                // #### Pool modes: an ASIC pool's mode first.
+                KeyCode::Enter if self.pool_target == 0 => {
+                    self.open_settings(SettingsRow::PoolMode)
+                }
+                KeyCode::Enter => self.open_settings(SettingsRow::Address),
                 _ => {}
             }
             self.status_line.clear();
@@ -3075,7 +3511,26 @@ impl SetupFlow {
                             PoolKind::P2PoolV2 => PoolKind::Normal,
                         };
                     }
+                    // #### Pool modes: the mode, and P2Pool's limits.
+                    SettingsRow::PoolMode => self.pool_mode = self.pool_mode.step(forward),
+                    SettingsRow::PoolFee
+                        if forward
+                            && self.pool_mode.p2pool()
+                            && self.pool_target == 0
+                            && u16::from(self.pool_fee.adjusted(true)) > P2POOL_MAX_BPS =>
+                    {
+                        self.status_line = "P2Pool takes a fee of at most 10%.".into();
+                    }
                     SettingsRow::PoolFee => self.pool_fee = self.pool_fee.adjusted(forward),
+                    SettingsRow::P2PoolDonation => {
+                        let next = self.p2pool_donation().adjusted(forward);
+                        if u16::from(next) > P2POOL_MAX_BPS {
+                            self.status_line = "P2Pool's own donation is at most 10%.".into();
+                        } else {
+                            self.config.p2pool.donation =
+                                (u16::from(next) != P2POOL_DONATION_DEFAULT_BPS).then_some(next);
+                        }
+                    }
                     SettingsRow::FeeFrom => {
                         use crate::donation::bch::FeeMode;
                         self.pool_fee_mode = match (self.pool_fee_mode, forward) {
@@ -3183,6 +3638,16 @@ impl SetupFlow {
                     let value = self.fallback_pools.join(" ");
                     self.begin_edit(TextField::FallbackPools, value);
                 }
+                // #### Pool modes: your P2Pool peers and the node's P2P
+                // address.
+                SettingsRow::Peers => {
+                    let value = self.p2pool_peers.join(" ");
+                    self.begin_edit(TextField::Peers, value);
+                }
+                SettingsRow::NodeP2p => {
+                    let value = self.config.p2pool.node_p2p.clone().unwrap_or_default();
+                    self.begin_edit(TextField::NodeP2p, value);
+                }
                 // #### PR #42: the rigs' port, rigs only, a rig's name.
                 SettingsRow::RigPort => {
                     let value = self.rig_port.unwrap_or(DEFAULT_RIG_PORT).to_string();
@@ -3242,9 +3707,11 @@ impl SetupFlow {
                 }
                 SettingsRow::Mining
                 | SettingsRow::PoolKind
+                | SettingsRow::PoolMode
                 | SettingsRow::PoolFee
                 | SettingsRow::FeeFrom
                 | SettingsRow::Donation
+                | SettingsRow::P2PoolDonation
                 | SettingsRow::AsicToken
                 | SettingsRow::TokenDonation => {
                     self.status_line = "Use Left/Right to change this row.".into();
@@ -3369,11 +3836,9 @@ impl SetupFlow {
                     {
                         self.status_line = "Enter the P2Pool node's preparation URL; its version must support /jd_prepare.".into();
                         self.open_settings(SettingsRow::P2PoolApi);
-                    } else if self.own_p2pool && self.node_zmq.trim().eq_ignore_ascii_case("off") {
-                        self.status_line =
-                            "P2Pool needs your node's ZMQ block notices; set them under Advanced."
-                                .into();
-                        self.open_settings(SettingsRow::NodeZmq);
+                    } else if self.own_p2pool && !self.p2pool_hears_blocks() {
+                        // #### Pool modes: or its P2P address (Knuth).
+                        self.open_node_p2p();
                     } else {
                         return SetupAction::Complete;
                     }
@@ -3430,9 +3895,12 @@ impl SetupFlow {
                     }
                 }
                 // Running a pool needs a payout and a valid fee address, and
-                // an ASIC pool the miner's own node; P2Pool v2 is coming.
+                // an ASIC pool the miner's own node.
+                // #### Pool modes: and P2Pool's limits on the fee and the
+                // pool signature.
                 SettingsRow::Start if self.mode == MiningMode::Pool => {
-                    if self.pool_target != 0 && self.pool_kind == PoolKind::Normal {
+                    let p2pool = self.pool_target == 0 && self.pool_mode.p2pool();
+                    if self.pool_target != 0 {
                         // #### PR #40: a GPU pool pays token claims, which
                         // go to q addresses only.
                         if crate::config::validate_payout_address(
@@ -3459,9 +3927,6 @@ impl SetupFlow {
                         } else {
                             return SetupAction::Complete;
                         }
-                    } else if self.pool_kind == PoolKind::P2PoolV2 {
-                        self.status_line =
-                            "P2Pool v2 is coming soon; run a normal pool for now.".into();
                     } else if crate::config::validate_payout_address(
                         self.config.network,
                         &self.config.payout_address,
@@ -3481,6 +3946,16 @@ impl SetupFlow {
                         self.status_line =
                             "The fee address must be a q or p address on this network.".into();
                         self.open_settings(SettingsRow::FeeAddress);
+                    } else if p2pool && u16::from(self.pool_fee) > P2POOL_MAX_BPS {
+                        self.status_line =
+                            "P2Pool takes a fee of at most 10%, from the coinbase; lower the fee."
+                                .into();
+                        self.open_settings(SettingsRow::PoolFee);
+                    } else if p2pool && self.pool_tag.trim().len() > P2POOL_SIGNATURE_MAX {
+                        self.status_line = format!(
+                            "P2Pool's pool signature is at most {P2POOL_SIGNATURE_MAX} characters; shorten the pool name."
+                        );
+                        self.open_settings(SettingsRow::PoolName);
                     } else if self.config.custom_node_endpoints().is_empty() {
                         self.connection_kind = ConnectionKind::Node;
                         self.connection_selected = self
@@ -3489,8 +3964,14 @@ impl SetupFlow {
                             .len();
                         self.step = SetupStep::Connections;
                         self.check_local_node();
-                        self.status_line =
-                            "A pool builds blocks from your own BCH node: add it here.".into();
+                        self.status_line = if p2pool {
+                            "P2Pool takes its templates from your own BCH node: add it here."
+                        } else {
+                            "A Public Solo Endpoint builds blocks from your own BCH node: add it here."
+                        }
+                        .into();
+                    } else if p2pool && !self.p2pool_hears_blocks() {
+                        self.open_node_p2p();
                     } else {
                         return SetupAction::Complete;
                     }
@@ -3762,10 +4243,33 @@ impl SetupFlow {
                 Ok(String::new())
             }
             TextField::PoolName => {
-                if value.len() > 20 || !value.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
-                    return Err("use up to 20 printable characters".into());
+                // #### Pool modes: P2Pool's pool signature is shorter.
+                let (most, what) = if self.mode == MiningMode::Pool && self.pool_mode.p2pool() {
+                    (P2POOL_SIGNATURE_MAX, ": P2Pool's pool signature")
+                } else {
+                    (20, "")
+                };
+                if value.len() > most || !value.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+                    return Err(format!("use up to {most} printable characters{what}"));
                 }
                 self.pool_tag = value;
+                Ok(String::new())
+            }
+            // #### Pool modes: your P2Pool peers and the node's P2P address
+            // (empty: the usual one).
+            TextField::Peers => {
+                self.p2pool_peers = parse_p2pool_peers(&value)?;
+                Ok(String::new())
+            }
+            TextField::NodeP2p => {
+                self.config.p2pool.node_p2p = if value.is_empty() {
+                    None
+                } else {
+                    Some(crate::config::validate_node_p2p(&value).map_err(|_| {
+                        "give the node's P2P address as HOST:PORT, such as 192.168.1.5:8333"
+                            .to_owned()
+                    })?)
+                };
                 Ok(String::new())
             }
             // #### PR #42: the Advanced section's text rows.
@@ -4492,6 +4996,8 @@ impl SetupFlow {
         state.profiles = profiles;
         state.profile_path = Some(profile_path.to_path_buf());
         state.saved_choices = ProfileChoices::load(profile_path);
+        // #### Pool modes: your P2Pool peers, shared by every profile.
+        state.p2pool_peers = load_p2pool_peers(profile_path);
         state.sources = sources;
         state.sources_path = Some(sources_path.to_path_buf());
         // #### PR #42: the cookie files saved for nodes, read again each time
@@ -4551,6 +5057,11 @@ impl SetupFlow {
                     ProfileChoices::rename(&path, &old, None)?;
                 }
                 ProfileChoices::save(&path, &name, &self.profile_choices())?;
+                // #### Pool modes: a linked P2Pool's peers, in P2Pool's
+                // own settings.
+                if self.p2pool_linked() {
+                    save_p2pool_peers(&path, &self.p2pool_peers)?;
+                }
                 save_last_profile(&path, &name)?;
                 Ok(name)
             })?;
@@ -4564,8 +5075,14 @@ impl SetupFlow {
         self.profile_name_input = profile_name.clone();
         self.saved_choices = ProfileChoices::load(&path);
         let own_gpus = self.electric || self.split;
+        // #### Pool modes: the server's own P2Pool runs as the profile
+        // saved it (standalone for a Non-custodial Pool).
+        let mut config = self.config.clone();
+        if let Some(p2pool) = self.p2pool_settings().filter(|_| !own_gpus) {
+            config.p2pool = p2pool;
+        }
         Ok(SetupResult {
-            config: self.config.clone(),
+            config,
             gpus,
             profile_name,
             server: if own_gpus { None } else { self.server_setup() },
@@ -5623,8 +6140,22 @@ fn profile_summary(
             server.asic_token.as_deref().unwrap_or_default()
         ),
         SavedMode::AsicSolo => format!("ASIC solo · {network} · BCH"),
+        // #### Pool modes: named by what runs.
+        SavedMode::AsicJoin
+            if settings.p2pool.is_some() || choices.is_some_and(|choices| choices.own_p2pool) =>
+        {
+            format!("ASIC at your P2Pool v2 · {network} · BCH")
+        }
         SavedMode::AsicJoin => format!("ASIC at a pool · {network} · BCH"),
-        SavedMode::AsicPool => format!("ASIC pool · {network} · BCH{fee}"),
+        SavedMode::AsicPool => format!(
+            "{} · {network} · BCH{fee}",
+            match &settings.p2pool {
+                Some(p2pool) if p2pool.standalone => PoolMode::NonCustodial,
+                Some(_) => PoolMode::P2PoolV2,
+                None => PoolMode::PublicSolo,
+            }
+            .name()
+        ),
         SavedMode::GpuPool => format!("GPU pool · {network} · {token}{fee}"),
     }
 }
@@ -5846,7 +6377,8 @@ fn token_items(state: &SetupFlow) -> Vec<SetupItem> {
         return vec![
             choice(
                 0,
-                "BCH + merge-mined CashTokens, for SHA-256 ASICs over SV1 and SV2.",
+                "BCH for SHA-256 ASICs over SV1 and SV2: a Public Solo Endpoint, a Non-custodial \
+                 Pool or P2Pool v2.",
             ),
             choice(
                 1,
@@ -5988,7 +6520,9 @@ fn start_label(state: &SetupFlow) -> Piece {
             Piece::good("Start the ASIC token server")
         }
         MiningMode::Asic => Piece::dim("Start (no ASIC-exclusive token is deployed yet)"),
-        MiningMode::Pool => Piece::good("Start the pool"),
+        MiningMode::Pool if state.pool_target == 1 => Piece::good("Start the pool"),
+        // #### Pool modes: named as the mode.
+        MiningMode::Pool => Piece::good(state.pool_mode.start()),
     }
 }
 
@@ -6018,9 +6552,11 @@ fn settings_kind(state: &SetupFlow, row: SettingsRow) -> ItemKind {
         | SettingsRow::AsicTarget
         | SettingsRow::Mining
         | SettingsRow::PoolKind
+        | SettingsRow::PoolMode
         | SettingsRow::PoolFee
         | SettingsRow::FeeFrom
         | SettingsRow::Donation
+        | SettingsRow::P2PoolDonation
         | SettingsRow::JobDeclaration
         | SettingsRow::AcceptJd
         | SettingsRow::AsicToken
@@ -6037,6 +6573,8 @@ fn settings_kind(state: &SetupFlow, row: SettingsRow) -> ItemKind {
         | SettingsRow::Backups
         | SettingsRow::PoolUser
         | SettingsRow::FallbackPools
+        | SettingsRow::Peers
+        | SettingsRow::NodeP2p
         | SettingsRow::RigName
         | SettingsRow::Address
         | SettingsRow::ProfileName => ItemKind::Text,
@@ -6053,6 +6591,8 @@ fn settings_line(state: &SetupFlow, row: SettingsRow) -> (&'static str, Piece, &
     };
     let fulcrum = state.sources.list(network, ConnectionKind::Fulcrum).len();
     let nodes = state.sources.list(network, ConnectionKind::Node).len();
+    // #### Pool modes: the server runs its own P2Pool.
+    let p2pool = state.runs_p2pool();
     match row {
         SettingsRow::Network => (
             "Network",
@@ -6165,22 +6705,24 @@ fn settings_line(state: &SetupFlow, row: SettingsRow) -> (&'static str, Piece, &
                 (MiningMode::Gpu, true, _) => {
                     "Join a GPU pool or farm (rigs on HiveOS, mmpOS, RaveOS, ...)"
                 }
-                (_, _, AsicMining::Solo) => "Solo (your BCH node)",
+                // #### Pool modes: the owner's names; the hint line under
+                // the row says what differs.
+                (_, _, AsicMining::Solo) => "Solo",
                 (_, _, AsicMining::JoinPool) => "Join a pool",
             }),
             "< >",
         ),
-        // #### PR #61: P2Pool is ready to join or run for ASICs; running
-        // a P2Pool for other miners is still to come.
+        // #### PR #61: P2Pool is ready to join or run for ASICs.
         SettingsRow::PoolKind => (
             "Pool type",
-            Piece::plain(match (state.pool_kind, state.mode) {
-                (PoolKind::Normal, _) => "Normal pool",
-                (PoolKind::P2PoolV2, MiningMode::Pool) => "P2Pool v2  (coming soon)",
-                (PoolKind::P2PoolV2, _) => "P2Pool",
+            Piece::plain(match state.pool_kind {
+                PoolKind::Normal => "Normal pool",
+                PoolKind::P2PoolV2 => "P2Pool",
             }),
             "< >",
         ),
+        // #### Pool modes: what an ASIC pool runs.
+        SettingsRow::PoolMode => ("Mode", Piece::plain(state.pool_mode.name()), "< >"),
         SettingsRow::PoolAddress => (
             "Pool",
             edit_value(
@@ -6211,6 +6753,14 @@ fn settings_line(state: &SetupFlow, row: SettingsRow) -> (&'static str, Piece, &
             ),
             "[Enter]",
         ),
+        SettingsRow::PoolFee if p2pool => (
+            "Pool fee",
+            Piece::plain(format!(
+                "{} of each block, in its coinbase, after the donations",
+                state.pool_fee
+            )),
+            "< >  at most 10%",
+        ),
         SettingsRow::PoolFee => (
             "Pool fee",
             Piece::plain(if state.pool_target == 1 {
@@ -6231,6 +6781,16 @@ fn settings_line(state: &SetupFlow, row: SettingsRow) -> (&'static str, Piece, &
                 crate::donation::bch::FeeMode::Both => "Both (1/3 work, 2/3 coinbase)",
             }),
             "< >",
+        ),
+        SettingsRow::PoolName if p2pool => (
+            "Pool name",
+            edit_value(
+                state,
+                TextField::PoolName,
+                &state.pool_tag,
+                "P2Pool's pool signature in your blocks, such as /MyPool/",
+            ),
+            "[Enter]  at most 16 characters",
         ),
         SettingsRow::PoolName => (
             "Pool name",
@@ -6332,6 +6892,62 @@ fn settings_line(state: &SetupFlow, row: SettingsRow) -> (&'static str, Piece, &
             }),
             "[Enter] < >",
         ),
+        // #### Pool modes: with P2Pool, the Pickaxe donation is mined as
+        // work, apart from P2Pool's own donation.
+        SettingsRow::Donation if p2pool => (
+            "Pickaxe donation",
+            Piece::plain(format!(
+                "{} of each miner's work, mined for Pickaxe (your server's rate)",
+                state.config.bch_donation
+            )),
+            "< >  0% to 100%",
+        ),
+        SettingsRow::P2PoolDonation => (
+            "P2Pool donation",
+            Piece::plain(format!(
+                "{} of each block, to the P2Pool project (P2Pool's own; default 1%)",
+                state.p2pool_donation()
+            )),
+            "< >  0% to 10%, 0.5% steps",
+        ),
+        SettingsRow::Peers => {
+            let seeds = match p2pool_seed_count(network) {
+                0 => "no seeds yet".to_owned(),
+                1 => "1 seed".to_owned(),
+                count => format!("{count} seeds"),
+            };
+            (
+                "Peers",
+                match state.p2pool_peers.len() {
+                    _ if state.editing == Some(TextField::Peers) => {
+                        Piece::plain(format!("{}_", state.text_input))
+                    }
+                    0 => Piece::dim(format!(
+                        "none of yours · {seeds}; add /ip4/HOST/tcp/PORT lines to link"
+                    )),
+                    count => Piece::plain(format!(
+                        "{count} of yours · {seeds}; P2Pool dials them at each start"
+                    )),
+                },
+                "[Enter]  P2P addresses",
+            )
+        }
+        SettingsRow::NodeP2p => (
+            "Node P2P",
+            match (&state.config.p2pool.node_p2p, state.default_node_p2p()) {
+                _ if state.editing == Some(TextField::NodeP2p) => {
+                    Piece::plain(format!("{}_", state.text_input))
+                }
+                (Some(address), _) => Piece::plain(format!(
+                    "{address}: P2Pool hears of new blocks on your node's P2P port"
+                )),
+                (None, Some(default)) => Piece::dim(format!(
+                    "{default} (your node's host; default): P2Pool hears of new blocks there"
+                )),
+                (None, None) => Piece::warn("unknown; enter your node's P2P address"),
+            },
+            "[Enter]  HOST:PORT",
+        ),
         SettingsRow::Donation => {
             let (work, reward) = state.config.bch_donation.shares();
             (
@@ -6387,6 +7003,10 @@ fn settings_line(state: &SetupFlow, row: SettingsRow) -> (&'static str, Piece, &
                     Piece::plain(format!("{}_", state.text_input))
                 }
                 "" => Piece::dim("from bitcoin.conf (zmqpubhashblock) for a node on this PC"),
+                // #### Pool modes: Knuth and other nodes without ZMQ.
+                "off" if p2pool => {
+                    Piece::dim("off; P2Pool hears of new blocks on your node's P2P port")
+                }
                 "off" => Piece::dim("off; the server asks the node for new blocks"),
                 url => Piece::plain(format!("{url}: new blocks reach devices at once")),
             },
@@ -6429,7 +7049,8 @@ fn settings_line(state: &SetupFlow, row: SettingsRow) -> (&'static str, Piece, &
         SettingsRow::JobDeclaration if state.pool_kind == PoolKind::P2PoolV2 => (
             "Your templates",
             if state.own_p2pool {
-                Piece::plain("your node's: Pickaxe runs your own P2Pool node with it")
+                // #### Pool modes: named P2Pool v2.
+                Piece::plain("your node's: Pickaxe runs your own P2Pool v2 node with it")
             } else if state.job_declaration.is_some() {
                 Piece::plain("public P2Pool; your node's templates required (SV2)")
             } else {
@@ -6481,6 +7102,10 @@ fn settings_line(state: &SetupFlow, row: SettingsRow) -> (&'static str, Piece, &
                     Piece::plain(format!("{}_", state.text_input))
                 }
                 0 => Piece::dim("none; paste stratum2+tcp://HOST:PORT/KEY lines".to_owned()),
+                // #### Pool modes
+                count if p2pool => {
+                    Piece::plain(format!("{count}, used in order while P2Pool is down"))
+                }
                 count => Piece::plain(format!(
                     "{count}, used in order while your node gives no work"
                 )),
@@ -6517,6 +7142,12 @@ fn settings_items(state: &SetupFlow) -> Vec<SetupItem> {
             .with_value(vec![value])
             .with_hint(hint),
         );
+        // #### Pool modes: what each choice means, under its row.
+        if let Some(hint) = choice_hint(state, row) {
+            items.push(SetupItem::info(vec![Piece::dim(format!(
+                "                {hint}"
+            ))]));
+        }
         // #### PR #53: the split's total under its last share.
         if let SettingsRow::Share(index) = row {
             let shares = state.shares();
@@ -6530,10 +7161,36 @@ fn settings_items(state: &SetupFlow) -> Vec<SetupItem> {
         }
     }
     items.push(SetupItem::info(Vec::new()));
+    // #### Pool modes: P2Pool's startup check takes BCHN alone for now.
+    if let Some(client) = state
+        .runs_p2pool()
+        .then(|| state.p2pool_refused_node())
+        .flatten()
+    {
+        items.push(SetupItem::info(vec![Piece::warn(format!(
+            "P2Pool itself needs Bitcoin Cash Node for now: its startup check refuses {client}."
+        ))]));
+    }
     items.push(SetupItem::info(vec![Piece::dim(
         "Servers and nodes you add are saved once per network and shared by every profile.",
     )]));
     items
+}
+
+/// #### Pool modes: the line under an ASIC's Mining row or a pool's Mode
+/// row that says what the choice means.
+fn choice_hint(state: &SetupFlow, row: SettingsRow) -> Option<&'static str> {
+    match row {
+        SettingsRow::PoolMode => Some(state.pool_mode.hint()),
+        SettingsRow::Mining if state.mode == MiningMode::Asic => Some(match state.asic_mining {
+            AsicMining::Solo => "your blocks pay you, from your own BCH node",
+            AsicMining::JoinPool if state.runs_p2pool() => {
+                "your own P2Pool v2 node, linked with other P2Pool servers"
+            }
+            AsicMining::JoinPool => "mining at someone else's server",
+        }),
+        _ => None,
+    }
 }
 
 fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
@@ -9962,7 +10619,7 @@ mod tests {
         assert!(setup_text(&setup).contains("join a P2Pool node, which builds the jobs"));
         setup.handle_key(key(KeyCode::Right));
         assert!(setup.own_p2pool);
-        assert!(setup_text(&setup).contains("Pickaxe runs your own P2Pool node"));
+        assert!(setup_text(&setup).contains("Pickaxe runs your own P2Pool v2 node"));
         let rows = setup.settings_rows();
         assert!(rows.contains(&SettingsRow::Node));
         assert!(!rows.contains(&SettingsRow::PoolAddress) && !rows.contains(&SettingsRow::PoolKey));
@@ -9973,10 +10630,12 @@ mod tests {
         assert_eq!(setup.step, SetupStep::Connections);
         assert!(setup.status_line.contains("your own BCH node"));
         setup.config.node_url = Some("http://user:pass@127.0.0.1:48332".into());
+        // #### Pool modes: with block notices off, P2Pool hears of blocks
+        // on the node's P2P port (`a_p2pool_without_block_notices_...`).
         setup.node_zmq = "off".into();
         setup.open_settings(SettingsRow::Start);
-        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Continue);
-        assert!(setup.status_line.contains("ZMQ block notices"));
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+        assert_eq!(setup.node_p2p().as_deref(), Some("127.0.0.1:48333"));
         setup.node_zmq.clear();
         setup.open_settings(SettingsRow::Start);
         assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
@@ -10696,7 +11355,7 @@ mod tests {
         assert_eq!(reopened.pool_fee_mode, FeeMode::Work);
         assert_eq!(reopened.pool_tag, "/MyPool/");
         assert_eq!(reopened.saved_server().as_ref(), Some(&pool));
-        assert!(setup_text(&reopened).contains("Start the pool"));
+        assert!(setup_text(&reopened).contains("Start the Public Solo Endpoint"));
         reopened.open_profile(1).unwrap();
         assert_eq!((reopened.mode, reopened.gpu_join), (MiningMode::Gpu, true));
         assert_eq!(reopened.join_address, "192.0.2.7:3340");
@@ -10714,7 +11373,12 @@ mod tests {
         // The list names each mode and never shows a pool address or key.
         reopened.step = SetupStep::Profiles;
         let list = setup_text(&reopened);
-        for expected in ["ASIC pool", "fee 1.50%", "GPU rig", "ASIC at a pool"] {
+        for expected in [
+            "Public Solo Endpoint",
+            "fee 1.50%",
+            "GPU rig",
+            "ASIC at a pool",
+        ] {
             assert!(list.contains(expected), "{expected}: {list}");
         }
         for hidden in ["pool.example", "192.0.2.7", "KEY", "/MyPool/"] {
@@ -10742,7 +11406,7 @@ mod tests {
         assert!(screen.contains("GPU pool"));
         assert!(!screen.contains("coming soon"));
         setup.handle_key(key(KeyCode::Enter));
-        assert_eq!(setup.current_row(), SettingsRow::PoolKind);
+        assert_eq!(setup.current_row(), SettingsRow::PoolMode);
         // The fee: 0.5% steps, and where it comes from.
         setup.open_settings(SettingsRow::PoolFee);
         setup.handle_key(key(KeyCode::Right));
@@ -10764,7 +11428,7 @@ mod tests {
         let screen = setup_text(&setup);
         assert!(screen.contains("1.50% after the donation"), "{screen}");
         assert!(screen.contains("Mining work"));
-        assert!(screen.contains("Start the pool"));
+        assert!(screen.contains("Start the Public Solo Endpoint"));
         // #### PR #40: a GPU pool starts with the token's sources (no node
         // of its own), its fee is mining time, and it pays q addresses.
         setup.config.payout_address = chipnet_payout(3);
@@ -10795,18 +11459,11 @@ mod tests {
                 address: None,
             })
         );
-        // P2Pool v2 is the one thing coming.
-        setup.pool_kind = PoolKind::P2PoolV2;
-        setup.open_settings(SettingsRow::Start);
-        setup.handle_key(key(KeyCode::Enter));
-        assert!(setup.status_line.contains("P2Pool v2 is coming soon"));
+        // #### Pool modes: a GPU pool has one mode, so no mode row.
+        assert!(!setup.settings_rows().contains(&SettingsRow::PoolMode));
+        assert!(setup_text(&setup).contains("Start the pool"));
         setup.pool_target = 0;
-        setup.pool_kind = PoolKind::P2PoolV2;
-        setup.open_settings(SettingsRow::Start);
-        setup.handle_key(key(KeyCode::Enter));
-        assert!(setup.status_line.contains("P2Pool v2 is coming soon"));
-        setup.pool_kind = PoolKind::Normal;
-        // A pool builds blocks from the operator's own node.
+        // A Public Solo Endpoint builds blocks from the operator's own node.
         setup.config.node_url = None;
         setup.open_settings(SettingsRow::Start);
         setup.handle_key(key(KeyCode::Enter));
@@ -10824,6 +11481,576 @@ mod tests {
             })
         );
     }
+
+    // #### Pool modes in the setup
+    // What: Run a pool → ASIC pool runs a Public Solo Endpoint, a
+    // Non-custodial Pool or P2Pool v2, each with its rows, a line saying
+    // what differs, the server it starts and the profile it saves; your own
+    // P2Pool v2 node under Join a pool keeps its behaviour under the new
+    // names; a P2Pool with block notices off needs the node's P2P address.
+    // Look here if: `PoolMode`, `p2pool_settings` or a P2Pool row change.
+
+    /// The setup screen, tall enough for every row of the Advanced section.
+    fn tall_text(setup: &SetupFlow) -> String {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(180, 64)).unwrap();
+        terminal.draw(|frame| render_setup(frame, setup)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// A folder of its own for one test's profiles.
+    fn pool_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pickaxe-pool-modes-{name}-{:016x}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// An ASIC pool in `mode` on Chipnet, paid to a P2PKH address, with a
+    /// saved node, saving its profile in `dir`.
+    fn pool_in(mode: PoolMode, dir: &Path) -> SetupFlow {
+        let mut setup = setup_for(MiningMode::Pool);
+        setup.profile_path = Some(dir.join("config.profiles.json"));
+        setup.pool_mode = mode;
+        setup.config.payout_address = chipnet_payout(5);
+        setup
+            .sources
+            .put(
+                MiningNetwork::Chipnet,
+                ConnectionKind::Node,
+                None,
+                "http://192.168.1.20:48332",
+            )
+            .unwrap();
+        setup.apply_connections().unwrap();
+        setup.open_settings(SettingsRow::PoolMode);
+        setup
+    }
+
+    fn start(setup: &mut SetupFlow) -> SetupAction {
+        setup.open_settings(SettingsRow::Start);
+        setup.handle_key(key(KeyCode::Enter))
+    }
+
+    #[test]
+    fn run_a_pool_offers_three_modes_with_their_rows_and_hints() {
+        use SettingsRow::*;
+        let mut setup = setup_for(MiningMode::Pool);
+        setup.step = SetupStep::Token;
+        assert!(setup_text(&setup).contains("Non-custodial"));
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.current_row(), PoolMode);
+        setup.advanced_open = true;
+        let every = [
+            PoolFee, FeeAddress, PoolName, Sv1Port, Sv2Port, Donation, Node, NodeZmq,
+        ];
+        let solo_endpoint = [FeeFrom, StartDifficulty, Templates, AcceptJd];
+        let p2pool = [P2PoolDonation, FallbackPools];
+        for (mode, hint, linked) in [
+            (
+                super::PoolMode::PublicSolo,
+                "each miner keeps their own blocks",
+                false,
+            ),
+            (
+                super::PoolMode::NonCustodial,
+                "P2Pool on your server alone",
+                false,
+            ),
+            (
+                super::PoolMode::P2PoolV2,
+                "linked with other P2Pool servers",
+                true,
+            ),
+        ] {
+            assert_eq!(setup.pool_mode, mode);
+            let rows = setup.settings_rows();
+            let text = tall_text(&setup);
+            assert!(text.contains(mode.name()) && text.contains(hint), "{text}");
+            assert!(!text.contains("coming soon"), "{text}");
+            assert!(text.contains(mode.start()), "{text}");
+            assert_eq!(
+                settings_line(&setup, PoolMode).1.text,
+                mode.name(),
+                "the row reads the owner's name"
+            );
+            for row in every {
+                assert!(rows.contains(&row), "{mode:?} {row:?}");
+            }
+            for row in solo_endpoint {
+                assert_eq!(rows.contains(&row), !mode.p2pool(), "{mode:?} {row:?}");
+            }
+            for row in p2pool {
+                assert_eq!(rows.contains(&row), mode.p2pool(), "{mode:?} {row:?}");
+            }
+            assert_eq!(rows.contains(&Peers), linked, "{mode:?}");
+            if mode.p2pool() {
+                // Two donations, never confused, and P2Pool's limits.
+                for words in [
+                    "Pickaxe donation",
+                    "of each miner's work, mined for Pickaxe",
+                    "P2Pool donation",
+                    "1.00% of each block, to the P2Pool project (P2Pool's own; default 1%)",
+                    "in its coinbase",
+                    "at most 10%",
+                    "at most 16 characters",
+                ] {
+                    assert!(text.contains(words), "{mode:?} {words}: {text}");
+                }
+            } else {
+                assert!(!text.contains("P2Pool donation"), "{text}");
+            }
+            if linked && p2pool_seed_count(MiningNetwork::Chipnet) == 0 {
+                assert!(text.contains("none of yours · no seeds yet"), "{text}");
+            }
+            setup.open_settings(PoolMode);
+            setup.handle_key(key(KeyCode::Right));
+        }
+        assert_eq!(setup.pool_mode, super::PoolMode::PublicSolo, "round again");
+        setup.handle_key(key(KeyCode::Left));
+        assert_eq!(setup.pool_mode, super::PoolMode::P2PoolV2);
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(setup.status_line.contains("Left/Right"));
+    }
+
+    #[test]
+    fn each_pool_mode_starts_its_server_with_its_flags() {
+        use crate::donation::bch::FeeMode;
+        let fallback = "stratum2+tcp://fallback.example:3336/KEY".to_owned();
+        for mode in super::PoolMode::ALL {
+            let dir = pool_dir("start");
+            let mut setup = pool_in(mode, &dir);
+            setup.pool_fee = "2".parse().unwrap();
+            setup.pool_fee_mode = FeeMode::Work;
+            setup.pool_tag = "/MyPool/".into();
+            setup.accept_jd = Some(crate::config::SavedAccept::Both);
+            setup.fallback_pools = vec![fallback.clone()];
+            setup.config.p2pool.donation = Some("0.5".parse().unwrap());
+            assert_eq!(start(&mut setup), SetupAction::Complete, "{mode:?}");
+            let result = setup.finish().unwrap();
+            let server = result.server.clone().unwrap();
+            let expected = match mode {
+                super::PoolMode::PublicSolo => ServerSetup::Public {
+                    fee: "2".parse().unwrap(),
+                    mode: FeeMode::Work,
+                    address: None,
+                    tag: Some("/MyPool/".into()),
+                },
+                _ => ServerSetup::P2PoolPool {
+                    fee: "2".parse().unwrap(),
+                    address: None,
+                    tag: Some("/MyPool/".into()),
+                    standalone: mode == super::PoolMode::NonCustodial,
+                },
+            };
+            assert_eq!(server, expected);
+            let Some(crate::cli::StratumV2Command::Serve {
+                public,
+                own_p2pool,
+                pool_fee,
+                pool_fee_mode,
+                pool_tag,
+                fallback_pool,
+                accept_job_declaration,
+                tp_listen,
+                start_difficulty,
+                upstream,
+                ..
+            }) = asic_serve_command(&server, &result.options)
+            else {
+                panic!("{mode:?} starts no server")
+            };
+            assert!(public && upstream.is_empty(), "{mode:?}");
+            assert_eq!(own_p2pool, mode.p2pool(), "--own-p2pool for {mode:?}");
+            assert_eq!(pool_fee, Some("2".parse().unwrap()));
+            assert_eq!(pool_tag.as_deref(), Some("/MyPool/"));
+            if mode.p2pool() {
+                // P2Pool pays the fee in the coinbase, builds the jobs and
+                // sets the difficulty; its fallback pools go with it.
+                assert_eq!(pool_fee_mode, Some(FeeMode::Coinbase));
+                assert_eq!(fallback_pool, std::slice::from_ref(&fallback));
+                assert!(accept_job_declaration.is_none() && tp_listen.is_none());
+                assert!(start_difficulty.is_none());
+                assert_eq!(
+                    result.config.p2pool,
+                    crate::config::SavedP2Pool {
+                        donation: Some("0.5".parse().unwrap()),
+                        standalone: mode == super::PoolMode::NonCustodial,
+                        node_p2p: None,
+                    },
+                    "--p2pool-standalone and --p2pool-donation for {mode:?}"
+                );
+            } else {
+                assert_eq!(pool_fee_mode, Some(FeeMode::Work));
+                assert!(fallback_pool.is_empty());
+                assert!(accept_job_declaration.is_some());
+                assert!(!result.config.p2pool.standalone);
+            }
+            // The window starts the same server (`gui::launch`): the
+            // same command from the same result.
+            assert!(gpu_launch(result.server.as_ref(), &result.options).is_none());
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn pool_mode_profiles_save_and_reopen_every_field() {
+        let dir = pool_dir("profiles");
+        let path = dir.join("config.profiles.json");
+        let fee_address = chipnet_payout(6);
+        let peer = "/ip4/203.0.113.7/tcp/6884".to_owned();
+        for (name, mode) in [
+            ("Alone", super::PoolMode::NonCustodial),
+            ("Linked", super::PoolMode::P2PoolV2),
+            ("Endpoint", super::PoolMode::PublicSolo),
+        ] {
+            let mut setup = pool_in(mode, &dir);
+            setup.profiles = MiningProfiles::load_optional(&path).unwrap();
+            setup.pool_fee = "2.5".parse().unwrap();
+            setup.pool_fee_address = fee_address.clone();
+            setup.pool_tag = "/MyPool/".into();
+            setup.sv1_port = 4333;
+            setup.sv2_port = 4336;
+            setup.node_zmq = "off".into();
+            setup.config.p2pool.node_p2p = Some("192.168.1.20:48333".into());
+            setup.config.bch_donation = "2".parse().unwrap();
+            setup.config.p2pool.donation = Some("0.5".parse().unwrap());
+            setup.fallback_pools = vec!["stratum2+tcp://fallback.example:3336/KEY".into()];
+            setup.p2pool_peers = vec![peer.clone()];
+            setup.profile_name_input = name.into();
+            assert_eq!(start(&mut setup), SetupAction::Complete, "{name}");
+            setup.finish().unwrap();
+        }
+        let saved = MiningProfiles::load_optional(&path).unwrap();
+        assert_eq!(saved.profiles.len(), 3);
+        for (index, mode) in [
+            super::PoolMode::NonCustodial,
+            super::PoolMode::P2PoolV2,
+            super::PoolMode::PublicSolo,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut reopened = pool_in(super::PoolMode::PublicSolo, &dir);
+            reopened.mode = MiningMode::Gpu;
+            reopened.profiles = saved.clone();
+            reopened.p2pool_peers = load_p2pool_peers(&path);
+            reopened.open_profile(index).unwrap();
+            assert_eq!(
+                (reopened.mode, reopened.pool_target, reopened.pool_mode),
+                (MiningMode::Pool, 0, mode)
+            );
+            assert_eq!(reopened.pool_fee.to_string(), "2.50%");
+            assert_eq!(reopened.pool_fee_address, fee_address);
+            assert_eq!(reopened.pool_tag, "/MyPool/");
+            assert_eq!((reopened.sv1_port, reopened.sv2_port), (4333, 4336));
+            assert_eq!(reopened.node_zmq, "off");
+            assert_eq!(reopened.config.bch_donation.to_string(), "2.00%");
+            if mode.p2pool() {
+                assert_eq!(
+                    reopened.config.p2pool.donation,
+                    Some("0.5".parse().unwrap())
+                );
+                assert_eq!(
+                    reopened.config.p2pool.node_p2p.as_deref(),
+                    Some("192.168.1.20:48333")
+                );
+                assert_eq!(reopened.fallback_pools.len(), 1);
+                assert!(tall_text(&reopened).contains(mode.name()));
+            } else {
+                // A Public Solo Endpoint keeps no P2Pool settings.
+                assert!(saved.profiles[index].settings.p2pool.is_none());
+                assert!(reopened.fallback_pools.is_empty());
+            }
+            // The list names each mode.
+            reopened.step = SetupStep::Profiles;
+            assert!(setup_text(&reopened).contains(mode.name()));
+        }
+        // Your peers, in P2Pool's own settings (`pickaxe p2pool peers`).
+        #[cfg(feature = "stratum-v2")]
+        assert_eq!(
+            crate::p2pool::Settings::load(&dir.join("p2pool"))
+                .unwrap()
+                .peers,
+            std::slice::from_ref(&peer)
+        );
+        // Your own P2Pool v2 node under Join a pool saves and reopens too.
+        let mut own = pool_in(super::PoolMode::PublicSolo, &dir);
+        own.profiles = saved;
+        own.mode = MiningMode::Asic;
+        own.asic_mining = AsicMining::JoinPool;
+        own.pool_kind = PoolKind::P2PoolV2;
+        own.own_p2pool = true;
+        own.config.p2pool.donation = Some("2".parse().unwrap());
+        own.fallback_pools = vec!["stratum2+tcp://fallback.example:3336/KEY".into()];
+        own.profile_name_input = "Own".into();
+        assert_eq!(start(&mut own), SetupAction::Complete);
+        let result = own.finish().unwrap();
+        assert_eq!(result.server, Some(ServerSetup::OwnP2Pool));
+        assert!(!result.config.p2pool.standalone);
+        let saved = MiningProfiles::load_optional(&path).unwrap();
+        let mut reopened = pool_in(super::PoolMode::PublicSolo, &dir);
+        reopened.profiles = saved;
+        reopened.open_profile(3).unwrap();
+        assert_eq!(reopened.server_setup(), Some(ServerSetup::OwnP2Pool));
+        assert_eq!(reopened.config.p2pool.donation, Some("2".parse().unwrap()));
+        assert_eq!(reopened.fallback_pools.len(), 1);
+        reopened.step = SetupStep::Profiles;
+        assert!(setup_text(&reopened).contains("ASIC at your P2Pool v2"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_p2pool_without_block_notices_needs_the_nodes_p2p_address() {
+        let dir = pool_dir("knuth");
+        for mode in [super::PoolMode::NonCustodial, super::PoolMode::P2PoolV2] {
+            let mut setup = pool_in(mode, &dir);
+            setup.advanced_open = true;
+            assert!(!setup.settings_rows().contains(&SettingsRow::NodeP2p));
+            setup.open_settings(SettingsRow::NodeZmq);
+            setup.handle_key(key(KeyCode::Right));
+            assert!(setup.notices_off());
+            // Off: the P2P address row, with the node's host by default.
+            assert!(setup.settings_rows().contains(&SettingsRow::NodeP2p));
+            let text = tall_text(&setup);
+            assert!(
+                text.contains("192.168.1.20:48333 (your node's host; default)"),
+                "{text}"
+            );
+            assert!(text.contains("P2Pool hears of new blocks on your node's P2P port"));
+            assert_eq!(start(&mut setup), SetupAction::Complete, "{mode:?}");
+            assert_eq!(setup.p2pool_settings().unwrap().node_p2p, None);
+            // One typed in is checked, then started with.
+            setup.open_settings(SettingsRow::NodeP2p);
+            setup.handle_key(key(KeyCode::Enter));
+            type_text(&mut setup, "node.lan");
+            setup.handle_key(key(KeyCode::Enter));
+            assert!(
+                setup.status_line.contains("HOST:PORT"),
+                "{}",
+                setup.status_line
+            );
+            setup.handle_key(key(KeyCode::Esc));
+            setup.open_settings(SettingsRow::NodeP2p);
+            setup.handle_key(key(KeyCode::Enter));
+            type_text(&mut setup, "10.0.0.5:48333");
+            setup.handle_key(key(KeyCode::Enter));
+            assert_eq!(start(&mut setup), SetupAction::Complete);
+            assert_eq!(
+                setup.p2pool_settings().unwrap().node_p2p.as_deref(),
+                Some("10.0.0.5:48333")
+            );
+            // A node whose host Pickaxe cannot read gives no address.
+            setup.config.p2pool.node_p2p = None;
+            setup.config.node_url = Some("http://[fd7a::5".into());
+            assert_eq!(start(&mut setup), SetupAction::Continue);
+            assert_eq!(setup.current_row(), SettingsRow::NodeP2p);
+            assert!(
+                setup.status_line.contains("P2P port"),
+                "{}",
+                setup.status_line
+            );
+            assert!(tall_text(&setup).contains("unknown; enter your node's P2P address"));
+            // With notices on, the address is neither asked for nor kept.
+            setup.config.p2pool.node_p2p = Some("10.0.0.5:48333".into());
+            setup.node_zmq.clear();
+            assert!(!setup.settings_rows().contains(&SettingsRow::NodeP2p));
+            assert_eq!(start(&mut setup), SetupAction::Complete);
+            assert_eq!(setup.p2pool_settings().unwrap().node_p2p, None);
+        }
+        // Your own P2Pool v2 node under Join a pool: the same.
+        let mut own = pool_in(super::PoolMode::PublicSolo, &dir);
+        own.mode = MiningMode::Asic;
+        own.asic_mining = AsicMining::JoinPool;
+        own.pool_kind = PoolKind::P2PoolV2;
+        own.own_p2pool = true;
+        own.node_zmq = "off".into();
+        own.advanced_open = true;
+        assert!(own.settings_rows().contains(&SettingsRow::NodeP2p));
+        assert_eq!(start(&mut own), SetupAction::Complete);
+        own.config.node_url = Some("http://[fd7a::5".into());
+        assert_eq!(start(&mut own), SetupAction::Continue);
+        assert_eq!(own.current_row(), SettingsRow::NodeP2p);
+        // A Public Solo Endpoint asks its node for new blocks itself.
+        let mut endpoint = pool_in(super::PoolMode::PublicSolo, &dir);
+        endpoint.node_zmq = "off".into();
+        endpoint.advanced_open = true;
+        assert!(!endpoint.settings_rows().contains(&SettingsRow::NodeP2p));
+        endpoint.config.node_url = Some("http://[fd7a::5".into());
+        assert_eq!(start(&mut endpoint), SetupAction::Complete);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn p2pool_modes_keep_p2pools_limits() {
+        let dir = pool_dir("limits");
+        let mut setup = pool_in(super::PoolMode::NonCustodial, &dir);
+        // The fee: at most 10%, from the coinbase; no fee source row.
+        setup.pool_fee = "10".parse().unwrap();
+        setup.open_settings(SettingsRow::PoolFee);
+        setup.handle_key(key(KeyCode::Right));
+        assert_eq!(setup.pool_fee.to_string(), "10.00%");
+        assert!(setup.status_line.contains("at most 10%"));
+        assert!(!setup.settings_rows().contains(&SettingsRow::FeeFrom));
+        // P2Pool's own donation: 0% to 10% in 0.5% steps, 1% by default.
+        assert_eq!(setup.p2pool_donation().to_string(), "1.00%");
+        setup.open_settings(SettingsRow::P2PoolDonation);
+        setup.handle_key(key(KeyCode::Left));
+        assert_eq!(setup.p2pool_donation().to_string(), "0.50%");
+        for _ in 0..3 {
+            setup.handle_key(key(KeyCode::Left));
+        }
+        assert_eq!(setup.config.p2pool.donation, Some("0".parse().unwrap()));
+        for _ in 0..30 {
+            setup.handle_key(key(KeyCode::Right));
+        }
+        assert_eq!(setup.p2pool_donation().to_string(), "10.00%");
+        assert!(setup.status_line.contains("at most 10%"));
+        // Back at 1%, nothing is kept: P2Pool's default.
+        for _ in 0..18 {
+            setup.handle_key(key(KeyCode::Left));
+        }
+        assert_eq!(setup.config.p2pool.donation, None);
+        // The pool name is P2Pool's pool signature: 16 characters.
+        setup.open_settings(SettingsRow::PoolName);
+        setup.handle_key(key(KeyCode::Enter));
+        type_text(&mut setup, "/SeventeenBytes!/");
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(
+            setup.status_line.contains("16 printable"),
+            "{}",
+            setup.status_line
+        );
+        setup.handle_key(key(KeyCode::Esc));
+        // A fee or a name a Public Solo Endpoint takes is refused at Start.
+        setup.pool_mode = super::PoolMode::PublicSolo;
+        setup.pool_fee = "12".parse().unwrap();
+        setup.pool_tag = "/EighteenBytes!!/".into();
+        assert_eq!(start(&mut setup), SetupAction::Complete);
+        setup.pool_mode = super::PoolMode::P2PoolV2;
+        assert_eq!(start(&mut setup), SetupAction::Continue);
+        assert_eq!(setup.current_row(), SettingsRow::PoolFee);
+        assert!(setup.status_line.contains("at most 10%"));
+        setup.pool_fee = "10".parse().unwrap();
+        assert_eq!(start(&mut setup), SetupAction::Continue);
+        assert_eq!(setup.current_row(), SettingsRow::PoolName);
+        assert!(setup.status_line.contains("16 characters"));
+        setup.pool_tag = "/MyPool/".into();
+        // Peers: P2P addresses P2Pool dials, each once.
+        setup.open_settings(SettingsRow::Peers);
+        setup.handle_key(key(KeyCode::Enter));
+        type_text(&mut setup, "203.0.113.7:6884");
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(setup.status_line.contains("/ip4/"), "{}", setup.status_line);
+        setup.handle_key(key(KeyCode::Esc));
+        #[cfg(feature = "stratum-v2")]
+        {
+            setup.open_settings(SettingsRow::Peers);
+            setup.handle_key(key(KeyCode::Enter));
+            type_text(
+                &mut setup,
+                "/ip4/203.0.113.7/tcp/6884 /dns4/pool.example.com/tcp/6884,/ip4/203.0.113.7/tcp/6884",
+            );
+            setup.handle_key(key(KeyCode::Enter));
+            assert_eq!(
+                setup.p2pool_peers,
+                [
+                    "/ip4/203.0.113.7/tcp/6884",
+                    "/dns4/pool.example.com/tcp/6884"
+                ]
+            );
+            assert!(tall_text(&setup).contains("2 of yours"));
+        }
+        assert_eq!(start(&mut setup), SetupAction::Complete);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_p2pool_says_it_needs_bchn_when_the_node_is_not() {
+        let dir = pool_dir("bchn");
+        let mut setup = pool_in(super::PoolMode::NonCustodial, &dir);
+        let node = |client: &str| crate::node::NodeCheck::Ready {
+            info: crate::node::NodeInfo {
+                client: client.into(),
+                chain: "chip".into(),
+                blocks: 300_000,
+                headers: 300_000,
+                syncing: false,
+                progress: 1.0,
+            },
+            follows_photon: false,
+        };
+        let url = setup
+            .sources
+            .list(MiningNetwork::Chipnet, ConnectionKind::Node)[0]
+            .clone();
+        let note = "P2Pool itself needs Bitcoin Cash Node for now: its startup check refuses Knuth";
+        setup.node_checks.insert(url.clone(), node("Knuth 0.70.0"));
+        assert!(tall_text(&setup).contains(note));
+        setup.pool_mode = super::PoolMode::PublicSolo;
+        assert!(
+            !tall_text(&setup).contains(note),
+            "a Public Solo Endpoint mines on Knuth"
+        );
+        setup.pool_mode = super::PoolMode::P2PoolV2;
+        setup
+            .node_checks
+            .insert(url, node("Bitcoin Cash Node 29.1.0"));
+        assert!(!tall_text(&setup).contains("needs Bitcoin Cash Node"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn asic_mining_reads_solo_or_join_a_pool() {
+        let mut setup = setup_for(MiningMode::Asic);
+        setup.open_settings(SettingsRow::Mining);
+        assert_eq!(settings_line(&setup, SettingsRow::Mining).1.text, "Solo");
+        assert!(setup_text(&setup).contains("your blocks pay you"));
+        setup.handle_key(key(KeyCode::Right));
+        assert_eq!(
+            settings_line(&setup, SettingsRow::Mining).1.text,
+            "Join a pool"
+        );
+        assert!(setup_text(&setup).contains("mining at someone else's server"));
+        // Your node's templates at P2Pool: your own P2Pool v2 node.
+        setup.pool_kind = PoolKind::P2PoolV2;
+        setup.own_p2pool = true;
+        let text = tall_text(&setup);
+        assert!(
+            text.contains("your own P2Pool v2 node, linked with other P2Pool servers"),
+            "{text}"
+        );
+        assert!(text.contains("Pickaxe runs your own P2Pool v2 node with it"));
+        assert!(setup.settings_rows().contains(&SettingsRow::Peers));
+        // The GPU modes keep their own words.
+        let gpu = setup_for(MiningMode::Gpu);
+        assert!(settings_line(&gpu, SettingsRow::Mining)
+            .1
+            .text
+            .starts_with("Solo (claims"));
+    }
+
+    #[cfg(feature = "stratum-v2")]
+    #[test]
+    fn the_setups_p2pool_limits_are_p2pools() {
+        assert_eq!(
+            P2POOL_DONATION_DEFAULT_BPS,
+            crate::p2pool::launch::DEFAULT_DONATION_BPS
+        );
+        assert_eq!(
+            P2POOL_SIGNATURE_MAX,
+            crate::p2pool::launch::MAX_SIGNATURE_BYTES
+        );
+        assert_eq!(P2POOL_MAX_BPS, crate::p2pool::launch::MAX_CUT_BPS);
+    }
+    // #### end Pool modes ####
 
     #[test]
     /// Checks that a new setup reaches Settings in three choices.

@@ -36,7 +36,8 @@ the same steps, rows, words, checks and saved profiles:
   and **Delete** (Delete asks first: **Delete** or **Keep**); a click on a
   profile opens it too, with Start selected. **+ New profile** starts the
   steps below.
-- **Hardware**: GPU mining, ASIC mining or running a pool.
+- **Hardware**: GPU mining, ASIC mining (**Solo** or **Join a pool**) or
+  running a pool.
 - **Network**: Mainnet or Chipnet.
 - **Token**: the GPU tokens, ELECTRIC and the hash split, with the search
   box; an ASIC's target; or what a pool's miners mine.
@@ -50,7 +51,10 @@ the same steps, rows, words, checks and saved profiles:
   Start) checks the settings as the terminal does and saves the profile.
   With ELECTRIC, its fee pot shows beside the rows, or under them in a
   narrow window, with its balance, address and QR code; **Pot QR** shows it
-  full-size to scan.
+  full-size to scan. Running a pool for ASICs, the **Mode** row's **<**
+  **>** choose a **Public Solo Endpoint**, a **Non-custodial Pool** or
+  **P2Pool v2**, with a line under it saying what differs, and Start starts
+  that server ([pool.md](pool.md)).
 - **GPUs**, **Fulcrum servers** and **BCH nodes**: the same lists. Each
   GPU's checkbox ticks it, and **All** ticks them all; each saved server or
   node has its own **Remove** (and a node its **Cookie file**), with **Other
@@ -185,8 +189,9 @@ carry the names they will read.
 
 `cargo test --features gui-preview -- --ignored gui_preview` draws the
 window's screens offscreen with made-up data (the setup's profiles,
-hardware, token, settings, an open field and the Fulcrum list, reached by
-clicks; the token, coordinator and rig dashboards; and, with
-`gui_preview_asic`, the ASIC server's pages and Device panel) and saves them
-as PNG files in `target/gui-preview` (or `PICKAXE_GUI_PREVIEW_DIR`). The
-same renderer checks that every control has a name a screen reader can read.
+hardware, token, settings, an open field, the Fulcrum list and Run a pool in
+P2Pool v2, reached by clicks; the token, coordinator and rig dashboards;
+and, with `gui_preview_asic`, the ASIC server's pages and Device panel) and
+saves them as PNG files in `target/gui-preview` (or
+`PICKAXE_GUI_PREVIEW_DIR`). The same renderer checks that every control has
+a name a screen reader can read.

@@ -466,6 +466,69 @@ fn click(driver: &mut SetupDriver, label: &str) {
     driver.act(SetupInput::Click(item));
 }
 
+/// Steps the item called `label` on the setup's screen, as its > does.
+fn step(driver: &mut SetupDriver, label: &str) {
+    let item = driver
+        .view()
+        .items
+        .iter()
+        .position(|item| item.label == label)
+        .unwrap_or_else(|| panic!("no {label:?} on the screen"));
+    driver.act(SetupInput::Step {
+        item,
+        forward: true,
+    });
+}
+
+/// #### Pool modes: Run a pool, Chipnet, ASIC pool, then P2Pool v2 (two
+/// steps past a Public Solo Endpoint) with the Advanced section open.
+fn p2pool_page() -> SetupDriver {
+    let mut driver = SetupDriver::preview(preview_gpus(), MiningProfiles::default());
+    click(&mut driver, "Run a pool");
+    click(&mut driver, "Chipnet");
+    click(&mut driver, "ASIC pool");
+    step(&mut driver, "Mode");
+    step(&mut driver, "Mode");
+    click(&mut driver, "Advanced");
+    driver
+}
+
+/// #### Pool modes: the Run a pool page in P2Pool v2 names every control,
+/// with its two donations apart.
+#[test]
+fn the_pool_modes_page_names_every_control() {
+    use egui_kittest::kittest::Queryable;
+    let driver = p2pool_page();
+    let view = driver.view();
+    let mode = view
+        .items
+        .iter()
+        .find(|item| item.label == "Mode")
+        .expect("the Mode row");
+    assert_eq!(mode.value_text(), "P2Pool v2");
+    for label in [
+        "Peers",
+        "Pickaxe donation",
+        "P2Pool donation",
+        "Fallback pools",
+    ] {
+        assert!(view.items.iter().any(|item| item.label == label), "{label}");
+    }
+    let mut setup = Setup::ready(driver);
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(TALL)
+        .with_context_setup(|ctx| ctx.set_fonts(super::fonts()))
+        .build_ui(|ui| {
+            setup.show(ui);
+        });
+    harness.run_steps(4);
+    assert!(harness
+        .query_by_label_contains("linked with other P2Pool servers")
+        .is_some());
+    assert!(harness.query_by_label_contains("Start P2Pool v2").is_some());
+    harness.check_accessibility();
+}
+
 /// Clicks and the terminal's keys move the window's setup, with no GPU.
 #[test]
 fn the_setup_answers_clicks_and_keys() {
@@ -576,6 +639,8 @@ fn setup_previews() {
     let mut driver = settings();
     click(&mut driver, "Fulcrum");
     shot("setup-connections.png", SIZE, driver);
+    // #### Pool modes: Run a pool with P2Pool v2 chosen.
+    shot("setup-run-p2pool.png", TALL, p2pool_page());
     // The window's smallest size.
     let mut driver = settings();
     click(&mut driver, "Address");

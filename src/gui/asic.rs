@@ -350,10 +350,10 @@ pub fn state_text(board: &AsicBoard) -> String {
 fn mode_text(frame: &ServerFrame) -> String {
     match frame.mode {
         ServeMode::Solo => "solo".into(),
-        ServeMode::Public => "public pool".into(),
+        ServeMode::Public => "Public Solo Endpoint".into(),
         ServeMode::JoinPool if frame.joining => "at a pool".into(),
         ServeMode::JoinPool => "at a pool with your templates".into(),
-        ServeMode::P2PoolPool => "P2Pool here, shared by work".into(),
+        ServeMode::P2PoolPool => "your P2Pool, shared by work".into(),
         ServeMode::Token(token) => token.into(),
     }
 }

@@ -1115,7 +1115,9 @@ impl SavedServer {
         }
         let join = self.join.as_deref().map(str::trim).unwrap_or("");
         if self.mode.joins() {
-            if join.is_empty() {
+            // #### Pool modes: your own P2Pool, which ASICs join here, has
+            // no address to save.
+            if join.is_empty() && !(self.mode == SavedMode::AsicJoin && p2pool.is_some()) {
                 return Err("a profile that joins a pool needs the pool's address".into());
             }
         } else if self.join.is_some() || self.join_key.is_some() {
@@ -3062,6 +3064,19 @@ mod tests {
         )
         .validate()
         .unwrap();
+        // Your own P2Pool has no address to save; another pool needs one.
+        let own = SavedServer {
+            mode: SavedMode::AsicJoin,
+            join: None,
+            pool_fee: None,
+            fee_mode: None,
+            pool_tag: None,
+            ..pool.clone()
+        };
+        with(Some(own.clone()), Some(SavedP2Pool::default()))
+            .validate()
+            .unwrap();
+        assert!(with(Some(own), None).validate().is_err());
         for (server, p2pool, why) in [
             (
                 Some(SavedServer {

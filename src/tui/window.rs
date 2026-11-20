@@ -1377,6 +1377,109 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    // #### Pool modes: the window chooses a pool's mode with < > and
+    // starts what the terminal's keys start, P2Pool's settings included.
+    #[test]
+    fn a_pool_mode_starts_from_the_window_as_from_the_keys() {
+        const CHIPNET: &str = crate::config::CHIPNET_DONATION_ADDRESS;
+        let node = |flow: &mut SetupFlow| {
+            flow.sources
+                .put(
+                    MiningNetwork::Chipnet,
+                    ConnectionKind::Node,
+                    None,
+                    "http://192.168.1.20:48332",
+                )
+                .unwrap();
+        };
+        // The terminal's keys: Run a pool, Chipnet, ASIC pool, then the
+        // mode, the address, the profile's name and Start.
+        let keys_dir = folder("pool-keys");
+        let mut keys = flow(&keys_dir);
+        node(&mut keys);
+        keys.handle_key(key(KeyCode::Down));
+        keys.handle_key(key(KeyCode::Down));
+        keys.handle_key(key(KeyCode::Enter));
+        keys.handle_key(key(KeyCode::Down));
+        keys.handle_key(key(KeyCode::Enter));
+        keys.handle_key(key(KeyCode::Enter));
+        assert_eq!(keys.current_row(), SettingsRow::PoolMode);
+        keys.handle_key(key(KeyCode::Right));
+        keys.open_settings(SettingsRow::Address);
+        keys.handle_key(key(KeyCode::Enter));
+        type_keys(&mut keys, CHIPNET);
+        keys.handle_key(key(KeyCode::Enter));
+        keys.open_settings(SettingsRow::ProfileName);
+        keys.handle_key(key(KeyCode::Enter));
+        type_keys(&mut keys, "Shared");
+        keys.handle_key(key(KeyCode::Enter));
+        keys.open_settings(SettingsRow::Start);
+        assert_eq!(keys.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+        let by_keys = keys.finish().unwrap();
+
+        // The same with clicks.
+        let clicks_dir = folder("pool-clicks");
+        let mut clicks = driver(&clicks_dir);
+        node(&mut clicks.flow);
+        clicks.act(SetupInput::Click(item(&clicks, "Run a pool")));
+        clicks.act(SetupInput::Click(item(&clicks, "Chipnet")));
+        clicks.act(SetupInput::Click(item(&clicks, "ASIC pool")));
+        let mode = item(&clicks, "Mode");
+        assert_eq!(
+            clicks.view().items[mode].kind,
+            ItemKind::Cycle { enter: None }
+        );
+        assert_eq!(
+            clicks.view().items[mode].value_text(),
+            "Public Solo Endpoint"
+        );
+        clicks.act(SetupInput::Step {
+            item: mode,
+            forward: true,
+        });
+        let view = clicks.view();
+        assert_eq!(view.items[mode].value_text(), "Non-custodial Pool");
+        // The line under it says what differs.
+        assert_eq!(view.items[mode + 1].kind, ItemKind::Info);
+        assert!(view.items[mode + 1]
+            .value_text()
+            .contains("P2Pool on your server alone"));
+        clicks.act(SetupInput::Click(item(&clicks, "Address")));
+        clicks.act(SetupInput::SetText(CHIPNET.into()));
+        clicks.act(SetupInput::Commit);
+        clicks.act(SetupInput::Click(item(&clicks, "Advanced")));
+        for label in ["Pickaxe donation", "P2Pool donation", "Fallback pools"] {
+            item(&clicks, label);
+        }
+        clicks.act(SetupInput::Click(item(&clicks, "Profile name")));
+        clicks.act(SetupInput::SetText("Shared".into()));
+        clicks.act(SetupInput::Commit);
+        let start = clicks
+            .view()
+            .items
+            .iter()
+            .position(|item| item.kind == ItemKind::Start)
+            .unwrap();
+        assert_eq!(
+            clicks.view().items[start].value_text(),
+            "Start the Non-custodial Pool"
+        );
+        let by_clicks = complete(clicks.act(SetupInput::Click(start)));
+
+        assert_eq!(started(&by_clicks), started(&by_keys));
+        assert!(matches!(
+            by_clicks.server,
+            Some(ServerSetup::P2PoolPool {
+                standalone: true,
+                ..
+            })
+        ));
+        assert!(by_clicks.config.p2pool.standalone);
+        for dir in [keys_dir, clicks_dir] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
     #[test]
     fn the_driver_moves_to_another_thread() {
         fn sends<T: Send>() {}
