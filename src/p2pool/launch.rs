@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Ports of the P2Pool node Pickaxe runs, apart from P2Pool's defaults
@@ -48,9 +48,12 @@ pub struct Plan {
     /// What the operator writes into P2Pool's configuration, set after
     /// `plan()` returns; `None` leaves P2Pool's own defaults.
     pub operator: Option<Operator>,
-    /// The Non-custodial Pool: P2Pool's own share chain, alone. Without it
-    /// the node is linked with other P2Pool nodes (P2Pool v2).
+    /// Alone on its own share chain (the Non-custodial Pool): no peers
+    /// dialed and the P2P port on this computer only, so no other server
+    /// links in. False (linked, P2Pool v2) from `plan()`; set it after.
     pub standalone: bool,
+    /// The peers this start dials, checked once (`dial_peers`).
+    pub(super) dial: OnceLock<Vec<String>>,
 }
 
 /// P2Pool's fee, as its configuration caps it: at most 10% (1,000 basis
@@ -195,6 +198,7 @@ pub fn plan(
         node_p2p,
         operator: None,
         standalone: false,
+        dial: OnceLock::new(),
     })
 }
 
@@ -232,25 +236,43 @@ impl Plan {
         Ok(format!("stratum2+tcp://127.0.0.1:{SV2_PORT}/{public}"))
     }
 
+    /// The peers P2Pool dials at this start: none when standalone, else
+    /// `peers::dial_list`, whose check runs at the first call of each plan.
+    pub fn dial_peers(&self) -> &[String] {
+        if self.standalone {
+            return &[];
+        }
+        self.dial.get_or_init(|| {
+            super::peers::dial_list(self.network, &self.settings.peers, false, &self.home)
+        })
+    }
+
     /// P2Pool's config.toml. Secrets stay out of it: the SV2 secret key and
-    /// the node's login go in the environment (`environment`).
+    /// the node's login go in the environment (`environment`). Linked, its
+    /// peers are `dial_peers`, checked at the first call.
     pub fn config_toml(&self) -> Result<String, String> {
         let (public, _) = authority_texts(&self.authority_secret)?;
         let (_, store, logs) = self.files();
         let path = |path: &Path| toml_string(&path.display().to_string().replace('\\', "/"));
-        let peers = self
-            .settings
-            .peers
+        let dial = self.dial_peers();
+        let peers = dial
             .iter()
             .map(|peer| toml_string(peer))
             .collect::<Vec<_>>()
             .join(", ");
+        // Standalone, the P2P port takes no other server: discovery could
+        // otherwise link one in.
+        let listen = if self.standalone {
+            "127.0.0.1"
+        } else {
+            "0.0.0.0"
+        };
         Ok(format!(
             "# Written by Pickaxe for P2Pool {tag} at each start; changes here are replaced.
 # Pickaxe passes the node's login and the SV2 secret key in the environment.
 
 [network]
-listen_address = \"/ip4/0.0.0.0/tcp/{P2P_PORT}\"
+listen_address = \"/ip4/{listen}/tcp/{P2P_PORT}\"
 dial_peers = [{peers}]
 max_pending_incoming = 10
 max_pending_outgoing = 10
@@ -308,7 +330,7 @@ port = {API_PORT}
             chain = self.settings.share_chain.as_str(),
             // With no peers this node is the share chain; waiting for a
             // current chain would keep its ports closed for good.
-            wait = !self.settings.peers.is_empty(),
+            wait = !dial.is_empty(),
             public = toml_string(&public),
             node = toml_string(&self.node_url),
             log = path(&logs.join(format!("{}.log", self.network.as_str()))),
@@ -372,6 +394,9 @@ port = {API_PORT}
             args: vec!["--config".into(), config.display().to_string()],
             env: self.environment()?,
             dir: self.home.clone(),
+            learner: (!self.standalone).then(|| {
+                super::peers::Learner::new(self.network, &self.settings.peers, &self.home)
+            }),
         })
     }
 }
@@ -401,6 +426,9 @@ pub struct Command {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub dir: PathBuf,
+    /// Keeps the peers P2Pool dials out to for the next start (none when
+    /// standalone).
+    pub learner: Option<super::peers::Learner>,
 }
 
 /// What P2Pool is doing, as its light shows it.
@@ -521,8 +549,9 @@ pub(crate) struct Probe {
     pub peers: Option<usize>,
 }
 
-/// Asks P2Pool's API whether it is up, its share-chain tip and its peers.
-fn probe(api_port: u16) -> Probe {
+/// Asks P2Pool's API whether it is up, its share-chain tip and its peers,
+/// with the addresses of those it dialed out to.
+fn probe(api_port: u16) -> (Probe, Vec<String>) {
     let get = |path: &str| {
         super::http::get(
             &format!("http://127.0.0.1:{api_port}{path}"),
@@ -534,17 +563,27 @@ fn probe(api_port: u16) -> Probe {
         .filter(|response| response.status == 200)
     };
     let Some(_) = get("/health") else {
-        return Probe::default();
+        return Default::default();
     };
     let json = |path: &str| {
         get(path)
             .and_then(|response| serde_json::from_slice::<serde_json::Value>(&response.body).ok())
     };
-    Probe {
-        api: true,
-        tip: json("/chain_info").and_then(|info| info["chain_tip_height"].as_u64()),
-        peers: json("/peers").and_then(|peers| peers.as_array().map(Vec::len)),
-    }
+    let tip = json("/chain_info").and_then(|info| info["chain_tip_height"].as_u64());
+    let peers = json("/peers");
+    (
+        Probe {
+            api: true,
+            tip,
+            peers: peers
+                .as_ref()
+                .and_then(|peers| peers.as_array().map(Vec::len)),
+        },
+        peers
+            .as_ref()
+            .map(super::peers::outbound)
+            .unwrap_or_default(),
+    )
 }
 
 /// The state from what the log said and the API answered.
@@ -777,6 +816,7 @@ fn supervise(
     restart: &AtomicBool,
 ) {
     let mut failures = 0usize;
+    let mut learned = super::peers::Learned::default();
     while !stop.load(Ordering::SeqCst) {
         restart.store(false, Ordering::SeqCst);
         lock(shared).seen = Seen::default();
@@ -828,7 +868,10 @@ fn supervise(
             }
             if probed.is_none_or(|at| at.elapsed() >= Duration::from_secs(2)) {
                 probed = Some(Instant::now());
-                let answer = api_port.map(probe).unwrap_or_default();
+                let (answer, outbound) = api_port.map(probe).unwrap_or_default();
+                if let Some(learner) = &command.learner {
+                    learner.learn(&outbound, &mut learned);
+                }
                 let state = assess(&lock(shared).seen, &answer, Instant::now());
                 set(shared, state);
                 if lock(shared)
@@ -916,6 +959,7 @@ mod tests {
             node_p2p: None,
             operator: None,
             standalone: false,
+            dial: OnceLock::new(),
         }
     }
 
@@ -928,7 +972,7 @@ mod tests {
     #[test]
     fn the_operator_sets_the_fee_donation_and_signature_in_p2pools_config() {
         let home = PathBuf::from("/tmp/p2pool");
-        let mut plan = plan_for(&home, vec![], None);
+        let mut plan = dialing(plan_for(&home, vec![], None), &[]);
         let plain = plan.config_toml().unwrap();
         for absent in ["donation", "fee", "pool_signature", "node_p2p_address"] {
             assert!(!plain.contains(absent), "{absent}:\n{plain}");
@@ -1008,13 +1052,13 @@ mod tests {
             ..RuntimeConfig::default()
         };
         let settings = Settings::default();
-        let without = plan(&cfg, &home, &installed, &settings).unwrap();
+        let without = dialing(plan(&cfg, &home, &installed, &settings).unwrap(), &[]);
         assert_eq!(without.node_p2p.as_deref(), Some("192.168.1.20:48333"));
         let toml = without.config_toml().unwrap();
         assert!(toml.contains("\nnode_p2p_address = \"192.168.1.20:48333\"\n"));
         assert!(toml.contains(&format!("zmqpubhashblock = \"{UNUSED_ZMQ}\"")));
         cfg.node_zmq = NodeZmq::At("tcp://192.168.1.20:28332".into());
-        let with = plan(&cfg, &home, &installed, &settings).unwrap();
+        let with = dialing(plan(&cfg, &home, &installed, &settings).unwrap(), &[]);
         assert_eq!(with.node_p2p, None);
         assert!(!with.config_toml().unwrap().contains("node_p2p_address"));
         // The network's usual P2P port, and IPv6 hosts kept in brackets.
@@ -1033,10 +1077,21 @@ mod tests {
         std::fs::remove_dir_all(home).unwrap();
     }
 
+    /// `plan` with its peer check already made: these are what it dials.
+    fn dialing(plan: Plan, dial: &[&str]) -> Plan {
+        plan.dial
+            .set(dial.iter().map(|peer| (*peer).to_owned()).collect())
+            .unwrap();
+        plan
+    }
+
     #[test]
     fn the_config_names_the_node_ports_and_chain_and_keeps_secrets_out() {
         let home = PathBuf::from("C:\\Users\\miner\\Pickaxe\\p2pool");
-        let plan = plan_for(&home, vec![], Some(("p2pool".into(), "s3cret".into())));
+        let plan = dialing(
+            plan_for(&home, vec![], Some(("p2pool".into(), "s3cret".into()))),
+            &[],
+        );
         let toml = plan.config_toml().unwrap();
         let (public, secret) = authority_texts(&plan.authority_secret).unwrap();
         for expected in [
@@ -1064,12 +1119,78 @@ mod tests {
         assert!(env.contains(&("P2POOL_BITCOINRPC__USERNAME".into(), "p2pool".into())));
         assert!(env.contains(&("P2POOL_BITCOINRPC__PASSWORD".into(), "s3cret".into())));
         // Joining peers waits for their share chain.
-        let joined = plan_for(&home, vec!["/ip4/203.0.113.7/tcp/6884".into()], None)
-            .config_toml()
-            .unwrap();
+        let joined = dialing(
+            plan_for(&home, vec!["/ip4/203.0.113.7/tcp/6884".into()], None),
+            &["/ip4/203.0.113.7/tcp/6884"],
+        )
+        .config_toml()
+        .unwrap();
         assert!(joined.contains("dial_peers = [\"/ip4/203.0.113.7/tcp/6884\"]"));
         assert!(joined.contains("wait_for_chain_sync = true"));
         assert_eq!(toml_string("a\"b\\c\n"), "\"a\\\"b\\\\c\\n\"");
+    }
+
+    #[test]
+    fn standalone_listens_on_this_computer_alone_and_linked_dials_its_peers() {
+        let home = super::super::test_dir("launch-standalone");
+        let yours = "/ip4/203.0.113.7/tcp/6884".to_owned();
+        // Standalone: your peers are not dialed, the P2P port is local and
+        // nothing waits for peers; P2Pool's peers are not learned either.
+        let mut alone = plan_for(&home, vec![yours.clone()], None);
+        alone.standalone = true;
+        let toml = alone.config_toml().unwrap();
+        for expected in [
+            "listen_address = \"/ip4/127.0.0.1/tcp/6860\"",
+            "dial_peers = []",
+            "wait_for_chain_sync = false",
+        ] {
+            assert!(toml.contains(expected), "{expected}:\n{toml}");
+        }
+        assert!(alone.dial.get().is_none());
+        assert!(alone.command().unwrap().learner.is_none());
+        assert!(!super::super::peers::file(MiningNetwork::Chipnet, &home).exists());
+        // Linked: the checked list, DNS names as written, on every
+        // interface, waiting for the share chain.
+        let linked = dialing(
+            plan_for(&home, vec![yours.clone()], None),
+            &[&yours, "/dns4/pool.example.com/tcp/6884"],
+        );
+        let toml = linked.config_toml().unwrap();
+        for expected in [
+            "listen_address = \"/ip4/0.0.0.0/tcp/6860\"",
+            "dial_peers = [\"/ip4/203.0.113.7/tcp/6884\", \"/dns4/pool.example.com/tcp/6884\"]",
+            "wait_for_chain_sync = true",
+        ] {
+            assert!(toml.contains(expected), "{expected}:\n{toml}");
+        }
+        assert!(linked.command().unwrap().learner.is_some());
+        // Linked with nothing to dial: its own chain, without waiting.
+        let toml = dialing(plan_for(&home, vec![], None), &[])
+            .config_toml()
+            .unwrap();
+        assert!(toml.contains("listen_address = \"/ip4/0.0.0.0/tcp/6860\""));
+        assert!(toml.contains("dial_peers = []") && toml.contains("wait_for_chain_sync = false"));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_linked_start_checks_its_peers_once() {
+        let home = super::super::test_dir("launch-check");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let yours = format!(
+            "/dns4/localhost/tcp/{}",
+            listener.local_addr().unwrap().port()
+        );
+        let plan = plan_for(&home, vec![yours.clone()], None);
+        let toml = plan.config_toml().unwrap();
+        assert!(toml.contains(&format!("dial_peers = [{}]", toml_string(&yours))));
+        assert_eq!(plan.dial.get(), Some(&vec![yours.clone()]));
+        // The check was kept for `pickaxe p2pool peers`.
+        let kept =
+            super::super::peers::load(&super::super::peers::file(MiningNetwork::Chipnet, &home));
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].address == yours && kept[0].millis.is_some());
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -1198,6 +1319,7 @@ mod tests {
             ],
             env: vec![(FAKE.into(), spec)],
             dir: std::env::temp_dir(),
+            learner: None,
         }
     }
 
@@ -1269,6 +1391,7 @@ mod tests {
 
     #[test]
     fn a_node_whose_api_answers_after_sv2_opens_is_green_and_stops_on_request() {
+        let peers = r#"[{"peer_id": "12D3KooWX", "address": "/ip4/203.0.113.9/tcp/6884/p2p/12D3KooWX", "direction": "Outbound", "connected_secs": 3}]"#;
         let port = super::super::http::tests::serve(
             (0..30)
                 .flat_map(|_| {
@@ -1276,15 +1399,23 @@ mod tests {
                         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".to_vec(),
                         b"HTTP/1.1 200 OK\r\nContent-Length: 26\r\n\r\n{\"chain_tip_height\": 1234}"
                             .to_vec(),
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n[{}]".to_vec(),
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{peers}",
+                            peers.len()
+                        )
+                        .into_bytes(),
                     ]
                 })
                 .collect(),
         );
-        let supervisor = Supervisor::start(
-            script(&["Stratum V2 listening on 127.0.0.1:3361"], true),
-            Some(port),
-        );
+        let home = super::super::test_dir("launch-learn");
+        let mut command = script(&["Stratum V2 listening on 127.0.0.1:3361"], true);
+        command.learner = Some(super::super::peers::Learner::new(
+            MiningNetwork::Chipnet,
+            &[],
+            &home,
+        ));
+        let supervisor = Supervisor::start(command, Some(port));
         let state = wait_for(&supervisor, "green", State::is_running);
         assert_eq!(
             state,
@@ -1294,8 +1425,14 @@ mod tests {
             }
         );
         assert!(supervisor.running_for().is_some());
+        // The peer it dialed out to is kept for the next start.
+        let kept =
+            super::super::peers::load(&super::super::peers::file(MiningNetwork::Chipnet, &home));
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].learned && kept[0].address == "/ip4/203.0.113.9/tcp/6884");
         let started = Instant::now();
         supervisor.stop();
         assert!(started.elapsed() < Duration::from_secs(5));
+        std::fs::remove_dir_all(home).unwrap();
     }
 }

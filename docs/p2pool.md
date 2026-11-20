@@ -76,15 +76,16 @@ bchtest:...` writes `p2pool/<network>.toml` at each start:
   the file and the secret in the environment. Devices on this computer reach
   P2Pool at `stratum2+tcp://127.0.0.1:3361/<public key>`, shown on the screen.
 - **Ports:** Stratum V1 3360 and V2 3361 and the API 46860 on this computer
-  only; P2P 6860 on every interface. They differ from P2Pool's defaults so a
-  node run by hand and Pickaxe's ASIC server can run beside it.
+  only; P2P 6860 on every interface (on this computer only when standalone).
+  They differ from P2Pool's defaults so a node run by hand and Pickaxe's
+  ASIC server can run beside it.
 - **Share chain:** mini by default (shares 256 times easier, for smaller
   miners) or main: `pickaxe p2pool set --share-chain main`. Each network and
   chain has its own store in `p2pool/`.
-- **Peers:** `pickaxe p2pool set --peer /ip4/HOST/tcp/PORT` (repeatable;
-  `--no-peers` forgets them). With peers, P2Pool waits for their share chain
-  before taking miners. With none, it starts its own and takes miners at
-  once (it would otherwise wait for good).
+- **Peers:** as "Finding other P2Pool servers" below says. With peers
+  to dial, P2Pool waits for their share chain before taking miners. With
+  none, it starts its own and takes miners at once (it would otherwise wait
+  for good).
 
 When P2Pool exits, Pickaxe starts it again after 5, 10, 30, then 60 seconds,
 and back to 5 once it ran for a minute. P2Pool exits at start when the node
@@ -98,6 +99,45 @@ The secrets reach P2Pool as `P2POOL_STRATUM__SV2_AUTHORITY_SECRET_KEY`,
 `P2POOL_BITCOINRPC__USERNAME` and `P2POOL_BITCOINRPC__PASSWORD`: `P2POOL_`
 and the key path with `__` between levels, as P2Pool's loader reads them.
 (P2Pool's sample config names `P2POOL__STRATUM__...`, which it ignores.)
+
+## Finding other P2Pool servers
+
+The owner's names: a **Non-custodial Pool** is a P2Pool running alone on its
+own share chain; **P2Pool v2** is one linked with other servers.
+
+P2Pool dials only the `dial_peers` of its configuration: there are no
+Bitcoin Cash P2Pool DNS seeds, and a Bitcoin Cash node never asks any. After
+its first connection it finds the others itself (libp2p identify and
+Kademlia), so one server that answers is enough. Pickaxe gives it that
+first contact from three lists (`src/p2pool/peers.rs`):
+
+- **Seeds:** compiled into Pickaxe per network, `SEEDS_MAINNET` and
+  `SEEDS_CHIPNET`. **None yet.** The owner adds one as a libp2p address,
+  `/ip4/A.B.C.D/tcp/PORT`, `/ip6/.../tcp/PORT` or a DNS name
+  `/dns4/pool.example.com/tcp/PORT` (looked up at each start, so the server
+  can move), without `/p2p/<id>`; the next release carries it.
+- **Yours:** `pickaxe p2pool set --peer ADDRESS` (repeatable, same forms;
+  `--no-peers` forgets them). Always dialed, first.
+- **Known:** the servers P2Pool dialed out to, read from its API's
+  `GET /peers` (outbound peers only: an inbound peer's address is the port it
+  connected from). Kept in `p2pool/peers-<network>.json`: addresses and
+  times only, at most 64, each dropped after a week without an answer.
+
+**The check**, as Gupaxx checks its node list: before each start (and on
+`pickaxe p2pool peers --check`), one TCP connect to each entry, DNS names
+looked up first, 2 s each, 16 at once, 10 s in all. All of your peers are
+dialed first, then the seeds and known servers that answered, fastest
+first, up to 8 in all. When none answers, all of them are written anyway, so P2Pool keeps
+trying them. Nothing is checked on a timer while mining.
+
+**Standalone** (`pickaxe p2pool run --standalone`, the Non-custodial Pool):
+no peers dialed, the P2P port on `127.0.0.1` only so discovery cannot link
+another server in, and no waiting for a share chain.
+
+`pickaxe p2pool peers` lists the three lists with each entry's last check;
+`pickaxe p2pool status` shows their counts; the screen's Chain line says
+"alone (standalone)" or how many peers the start dials, and "no seeds yet"
+while the network has none.
 
 ## The lights
 
@@ -199,7 +239,7 @@ pickaxe stratum-v2 serve --config pool.json --network chipnet \
 | `--pool-fee`, `--pool-fee-address` (with `--public`) | `fee` (basis points), `fee_address` | at most 10%; paid in the coinbase, so `--pool-fee-mode work` or `both` is refused |
 | `--pool-tag` | `pool_signature` | at most 16 characters |
 | `--p2pool-donation PERCENT` | `donation` (basis points) | 0 to 10 in 0.5 steps; default 1, P2Pool's own |
-| `--p2pool-standalone` | its own share chain, P2P on this computer, no peers | without it, linked (P2Pool v2); written by the peers change |
+| `--p2pool-standalone` | its own share chain, P2P on this computer, no peers | without it, linked (P2Pool v2), as `p2pool run --standalone` (see "Finding other P2Pool servers") |
 | `--node-p2p HOST:PORT` | `node_p2p_address` | see Knuth below |
 
 - **Failover:** `--fallback-pool` works with every `--own-p2pool` mode, by
@@ -226,10 +266,11 @@ pickaxe stratum-v2 serve --config pool.json --network chipnet \
 
 | Command | Does |
 |---|---|
-| `pickaxe p2pool run [--no-update]` | runs P2Pool with the screen (see above) |
+| `pickaxe p2pool run [--no-update] [--standalone]` | runs P2Pool with the screen (see above); standalone alone on its own share chain |
 | `pickaxe p2pool update [--check]` | installs the newest release, or only says whether one is out |
 | `pickaxe p2pool rollback` | goes back to the version before |
-| `pickaxe p2pool status` | the installed and newest versions and the settings |
+| `pickaxe p2pool status` | the installed and newest versions, the settings and the peer counts |
+| `pickaxe p2pool peers [--check]` | the seeds, your peers and the known ones with their last check; `--check` checks them now |
 | `pickaxe p2pool set ...` | `--auto-update on/off`, `--share-chain main/mini`, `--peer ADDRESS`, `--no-peers` |
 
 ## Not in this change
@@ -312,8 +353,15 @@ and a real ASIC at it.
   the environment, the SV2 keys in the form P2Pool parses, the lights from
   P2Pool's log lines and API, a real child process restarted after it exits
   with the reason, and one turning green and stopping on request.
-- `p2pool::screen`: both lights, the version and update line, where devices
-  connect and the log.
+- `p2pool::screen`: both lights, the version and update line, linked or
+  alone, where devices connect and the log; the `peers` listing.
+- `p2pool::peers`: the dial list (standalone empty, yours first, answering
+  before silent, the cap, all of them when nothing answers, DNS names as
+  written) against local listeners; the known-peers file (round trip, the
+  week, the cap, addresses and times only); learning from `GET /peers`.
+- `p2pool::launch`: standalone and linked configurations (listen address,
+  peers, wait), the check made once per start, and the supervisor keeping
+  the peers P2Pool dialed out to.
 - #### PR #61: `tui::tests::an_asic_can_join_a_pool_or_a_p2pool_node` and
   `tui::tests::an_asic_can_mine_at_its_own_p2pool_node` (the rows, Start's
   checks, the serve command for each, the profile and its kept choices), and
