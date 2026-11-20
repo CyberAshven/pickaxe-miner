@@ -305,14 +305,18 @@ impl Receiver {
         let deadline = Instant::now() + self.limits.frame_deadline;
         let mut bytes_read = 0usize;
         loop {
-            let len = self.decoder.writable_len();
+            let len = self.decoder.read_len();
             bytes_read = bytes_read
                 .checked_add(len)
                 .ok_or("SV2 frame size overflow")?;
             if bytes_read > self.limits.wire_budget() {
                 return Err("SV2 frame exceeds size limit".into());
             }
-            read_until(&mut self.stream, self.decoder.writable(), deadline)?;
+            // The window is filled whole before the decoder counts it.
+            read_until(&mut self.stream, self.decoder.read_buf(), deadline)?;
+            self.decoder
+                .advance(len)
+                .map_err(|_| "SV2 authentication or framing failed")?;
             let state = self.state.take().ok_or("SV2 connection is closed")?;
             match self
                 .decoder
@@ -326,7 +330,7 @@ impl Receiver {
                     self.state = Some(state);
                     return Ok(Some(frame));
                 }
-                Decrypted::Incomplete(_, state) => self.state = Some(state),
+                Decrypted::Incomplete(state) => self.state = Some(state),
             }
         }
     }
