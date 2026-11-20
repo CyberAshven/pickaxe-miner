@@ -986,11 +986,11 @@ pub fn broadcast_raw(endpoints: &[String], raw_tx_hex: &str) -> Result<(String, 
             Err(e) => failures.push(format!("{}: {e}", redact_url(url))),
         }
     }
-    Err(format!(
-        "All node sendrawtransaction failed (ban-safe):\n{}",
-        failures.join("\n")
-    ))
+    Err(format!("{SENDRAW_FAILED}\n{}", failures.join("\n")))
 }
+
+/// How a failed `broadcast_raw` begins; one `endpoint: error` line per node follows.
+pub(crate) const SENDRAW_FAILED: &str = "All node sendrawtransaction failed (ban-safe):";
 
 /// Strips credentials from a node URL before reporting errors.
 pub fn redact_url(url: &str) -> String {

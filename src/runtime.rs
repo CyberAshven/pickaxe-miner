@@ -387,6 +387,66 @@ fn broadcast_reports_known(error: &str) -> bool {
     .any(|known| lower.contains(known))
 }
 
+// #### Claims that wait for a block
+// What: a node that refuses a claim's parent because it is not final yet
+// answers with one of these reasons: `non-BIP68-final` (the baton it spends
+// needs a confirmation first), `bad-txns-nonfinal` or `non-final` (a lock
+// time not reached yet). Fulcrum passes it on as `rpc error: {"code":1,
+// "message":"the transaction was rejected by network rules.\n\n
+// non-BIP68-final (code 64)\n"}`, a node's `sendrawtransaction` as
+// `rpc error: {"code":-26,"message":"non-BIP68-final (code 64)"}`, and
+// `testmempoolaccept` as that `reject-reason`.
+// Why: such a refusal is an answer, not a lost reply: no server holds the
+// claim, and the same bytes become valid after the next block. The claim waits
+// for that block on the same connection and is sent again; a timeout, a lost
+// connection or any other refusal keeps the attempted-and-unknown handling.
+// Look here if: a claim refused as not final is never sent again, or a lost
+// reply is treated as a refusal.
+const NOT_FINAL_REASONS: [&str; 3] = ["non-bip68-final", "bad-txns-nonfinal", "non-final"];
+
+/// Reports whether a node's reason text says the transaction is not final yet.
+fn reason_is_not_final(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    NOT_FINAL_REASONS
+        .iter()
+        .any(|not_final| lower.contains(not_final))
+}
+
+/// Reports whether one server's JSON-RPC error answer refuses a transaction
+/// as not final yet. `answer` is the error object (or its bare message).
+fn rpc_answer_is_not_final(answer: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(answer.trim()) {
+        Ok(serde_json::Value::String(message)) => reason_is_not_final(&message),
+        Ok(value) => value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(reason_is_not_final),
+        Err(_) => false,
+    }
+}
+
+/// Reports whether a broadcast error is a not-final refusal from every server
+/// that was asked: a Fulcrum or node `rpc error`, or the node failover's list
+/// with one such answer per node. A transport failure, a timeout or any other
+/// answer anywhere in it makes the outcome unknown.
+fn refused_as_not_final(error: &str) -> bool {
+    let error = error.trim();
+    if let Some(answers) = error.strip_prefix(crate::node::SENDRAW_FAILED) {
+        let mut answers = answers
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .peekable();
+        return answers.peek().is_some()
+            && answers.all(|line| {
+                line.split_once(": rpc error: ")
+                    .is_some_and(|(_, answer)| rpc_answer_is_not_final(answer))
+            });
+    }
+    error
+        .strip_prefix("rpc error: ")
+        .is_some_and(rpc_answer_is_not_final)
+}
+
 const DIRECT_SUBMISSION_JOURNAL_VERSION: u8 = 5;
 const DIRECT_SUBMISSION_RESOLUTION_VERSION: u8 = 3;
 const SUBMISSION_JOURNAL_VERSION: u8 = 3;
@@ -636,6 +696,11 @@ impl PendingSubmission {
         Self::marker_path(journal_path, ".parent-accepted")
     }
 
+    /// Returns the record path for a parent refused as not final yet.
+    fn parent_not_final_path(journal_path: &Path) -> PathBuf {
+        Self::marker_path(journal_path, ".parent-not-final")
+    }
+
     /// Checks whether a durable marker names the expected parent transaction.
     fn marker_present(path: &Path, expected_parent_txid: &str) -> Result<bool, String> {
         let marker = match fs::read_to_string(path) {
@@ -739,6 +804,118 @@ impl PendingSubmission {
     fn mark_parent_accepted(&self, journal_path: &Path) -> Result<(), String> {
         self.mark_parent_attempted(journal_path)?;
         Self::persist_marker(&Self::parent_accepted_path(journal_path), &self.parent_txid)
+    }
+
+    // #### Claims that wait for a block: the journal record
+    // What: `<journal>.parent-not-final` says the latest send (or node
+    // mempool check) of the journaled parent was refused as not final yet,
+    // so no server holds it. It is one line, `<parent txid> <tip height>`,
+    // the height the refusal was seen at; the same bytes go out again once
+    // the tip is higher. It is removed before every send and written again
+    // only after another such refusal, so a crash or lost reply during a
+    // send leaves the claim attempted and unknown, as before. The journal
+    // itself and `.parent-attempted` keep their format and meaning: an older
+    // Pickaxe ignores this file, and a record naming another parent, or one
+    // that cannot be read, allows nothing.
+    // Look here if: a claim waiting for a block is sent again too early, or
+    // never.
+    /// The tip height of the parent's latest not-final refusal, when that
+    /// refusal is its latest outcome.
+    fn parent_not_final(&self, journal_path: &Path) -> Result<Option<u32>, String> {
+        let path = Self::parent_not_final_path(journal_path);
+        let record = match fs::read_to_string(&path) {
+            Ok(record) => record,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "read pending-submission not-final record {}: {error}",
+                    path.display()
+                ))
+            }
+        };
+        let mut fields = record.split_whitespace();
+        Ok(
+            match (
+                fields.next(),
+                fields.next().map(str::parse::<u32>),
+                fields.next(),
+            ) {
+                (Some(txid), Some(Ok(height)), None)
+                    if txid.eq_ignore_ascii_case(&self.parent_txid) =>
+                {
+                    Some(height)
+                }
+                _ => None,
+            },
+        )
+    }
+
+    /// Durably records that the parent was refused as not final at `height`.
+    fn mark_parent_not_final(&self, journal_path: &Path, height: u32) -> Result<(), String> {
+        let path = Self::parent_not_final_path(journal_path);
+        let parent = path
+            .parent()
+            .ok_or("pending-submission not-final record has no parent directory")?;
+        let temporary = Self::marker_path(&path, ".tmp");
+        let _ = fs::remove_file(&temporary);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| {
+                format!(
+                    "create pending-submission not-final record {}: {error}",
+                    temporary.display()
+                )
+            })?;
+        if let Err(error) = file
+            .write_all(format!("{} {height}\n", self.parent_txid).as_bytes())
+            .and_then(|()| file.sync_all())
+        {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!(
+                "write pending-submission not-final record {}: {error}",
+                temporary.display()
+            ));
+        }
+        drop(file);
+        Self::clear_parent_not_final(journal_path)?;
+        if let Err(error) = fs::rename(&temporary, &path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!(
+                "commit pending-submission not-final record {}: {error}",
+                path.display()
+            ));
+        }
+        Self::sync_committed(&path, parent)
+    }
+
+    /// Removes the not-final record before a send whose outcome is not known
+    /// yet, or with the journal.
+    fn clear_parent_not_final(journal_path: &Path) -> Result<(), String> {
+        let path = Self::parent_not_final_path(journal_path);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "remove pending-submission not-final record {}: {error}",
+                    path.display()
+                ))
+            }
+        }
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| {
+                    format!(
+                        "sync pending-submission journal directory {}: {error}",
+                        parent.display()
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     /// Constructs a pending submission from verified winner and baton data.
@@ -1027,6 +1204,10 @@ impl PendingSubmission {
                 ));
             }
         }
+        // A not-final record left by an earlier claim (an older Pickaxe
+        // removes a resolved journal without it) only ever allows resending
+        // that claim's own bytes; this new claim has never been sent.
+        Self::clear_parent_not_final(path)?;
 
         let temporary = path.with_extension("json.tmp");
         if temporary.exists() {
@@ -1094,6 +1275,7 @@ impl PendingSubmission {
 
     /// Removes the durable journal after submission resolution.
     fn remove(path: &Path) -> Result<(), String> {
+        Self::clear_parent_not_final(path)?;
         for marker in [
             Self::parent_accepted_path(path),
             Self::parent_attempted_path(path),
@@ -1462,6 +1644,16 @@ enum SubmissionAttempt {
     Complete(Box<LiveJob>),
     StaleUnbroadcast(Box<LiveJob>),
     AwaitingBaton(String),
+    /// The parent was refused as not final at this tip height and no server
+    /// holds it; the same bytes are sent again after the next block.
+    AwaitingBlock(u32),
+}
+
+/// Describes a claim that waits for a block, for logs and the TUI.
+fn not_final_wait_message(parent_txid: &str, height: u32) -> String {
+    format!(
+        "PHOTON claim {parent_txid} is not final until its baton confirms (refused at height {height}); the same transaction is sent again after the next block"
+    )
 }
 
 /// Checks whether the live job directly names the resulting baton.
@@ -1704,13 +1896,39 @@ fn ensure_broadcast_txid(label: &str, expected: &str, returned: &str) -> Result<
     }
 }
 
+/// Why a broadcast through the preferred source and its fallback failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BroadcastFailure {
+    message: String,
+    /// Every source that was asked refused the transaction as not final yet.
+    not_final: bool,
+}
+
+impl BroadcastFailure {
+    /// A failure of the one source that was asked.
+    fn from_source(message: String) -> Self {
+        Self {
+            not_final: refused_as_not_final(&message),
+            message,
+        }
+    }
+
+    /// A failure of the preferred source and of its fallback.
+    fn from_both(message: String, first: &str, fallback: &str) -> Self {
+        Self {
+            not_final: refused_as_not_final(first) && refused_as_not_final(fallback),
+            message,
+        }
+    }
+}
+
 /// Broadcasts through the preferred source with the configured fallback.
 fn broadcast_with_preference<F, N>(
     source: JobSource,
     node_configured: bool,
     mut fulcrum: F,
     mut node: N,
-) -> Result<String, String>
+) -> Result<String, BroadcastFailure>
 where
     F: FnMut() -> Result<String, String>,
     N: FnMut() -> Result<String, String>,
@@ -1719,20 +1937,28 @@ where
         JobSource::Node if node_configured => match node() {
             Ok(txid) => Ok(txid),
             Err(node_error) => fulcrum().map_err(|fulcrum_error| {
-                format!(
-                    "native-node broadcast failed: {node_error}; Fulcrum fallback failed: {fulcrum_error}"
+                BroadcastFailure::from_both(
+                    format!(
+                        "native-node broadcast failed: {node_error}; Fulcrum fallback failed: {fulcrum_error}"
+                    ),
+                    &node_error,
+                    &fulcrum_error,
                 )
             }),
         },
-        JobSource::Node => fulcrum(),
+        JobSource::Node => fulcrum().map_err(BroadcastFailure::from_source),
         JobSource::Fulcrum => match fulcrum() {
             Ok(txid) => Ok(txid),
             Err(fulcrum_error) if node_configured => node().map_err(|node_error| {
-                format!(
-                    "Fulcrum broadcast failed: {fulcrum_error}; native-node fallback failed: {node_error}"
+                BroadcastFailure::from_both(
+                    format!(
+                        "Fulcrum broadcast failed: {fulcrum_error}; native-node fallback failed: {node_error}"
+                    ),
+                    &fulcrum_error,
+                    &node_error,
                 )
             }),
-            Err(fulcrum_error) => Err(fulcrum_error),
+            Err(fulcrum_error) => Err(BroadcastFailure::from_source(fulcrum_error)),
         },
     }
 }
@@ -1743,6 +1969,15 @@ fn broadcast_pending_transaction(
     cfg: &RuntimeConfig,
     raw_tx_hex: &str,
 ) -> Result<String, String> {
+    broadcast_classified(session, cfg, raw_tx_hex).map_err(|failure| failure.message)
+}
+
+/// Broadcasts a prepared transaction, telling a not-final refusal apart.
+fn broadcast_classified(
+    session: &mut ElectrumSession,
+    cfg: &RuntimeConfig,
+    raw_tx_hex: &str,
+) -> Result<String, BroadcastFailure> {
     // #### PR #42
     // What: a Chipnet claim is broadcast as a mainnet one: Fulcrum or the
     // miner's node by the source preference, falling back to the other.
@@ -1798,6 +2033,20 @@ fn preflight_pending_transaction(
     expected_txid: &str,
     raw_tx_hex: &str,
 ) -> Result<(), String> {
+    match preflight_not_final(cfg, label, expected_txid, raw_tx_hex)? {
+        None => Ok(()),
+        Some(refusal) => Err(refusal),
+    }
+}
+
+/// Runs the node mempool gate. `Ok(Some(refusal))` when the node refuses the
+/// exact transaction only because it is not final yet.
+fn preflight_not_final(
+    cfg: &RuntimeConfig,
+    label: &str,
+    expected_txid: &str,
+    raw_tx_hex: &str,
+) -> Result<Option<String>, String> {
     // #### PR #42
     // What: a Chipnet claim takes the same node mempool gate as a mainnet
     // one when the miner saved a node.
@@ -1809,14 +2058,27 @@ fn preflight_pending_transaction(
     // testmempoolaccept, or rejects a valid PHOTON tx, must not block the
     // Fulcrum broadcast the miner already uses.
     if cfg.node_url.is_none() {
-        return Ok(());
+        return Ok(None);
     }
     let endpoints = cfg.node_endpoints();
     if endpoints.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let (endpoint, acceptance) = crate::node::test_mempool_accept(&endpoints, raw_tx_hex)?;
-    validate_node_mempool_acceptance(label, expected_txid, &endpoint, &acceptance)
+    match validate_node_mempool_acceptance(label, expected_txid, &endpoint, &acceptance) {
+        Ok(()) => Ok(None),
+        Err(refusal)
+            if acceptance.txid.eq_ignore_ascii_case(expected_txid)
+                && !acceptance.allowed
+                && acceptance
+                    .reject_reason
+                    .as_deref()
+                    .is_some_and(reason_is_not_final) =>
+        {
+            Ok(Some(refusal))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Broadcasts the self-funded settlement after parent acceptance.
@@ -1843,6 +2105,95 @@ fn broadcast_settlement(
     )
 }
 
+/// How one send of a claim's parent ended.
+enum ParentSend {
+    /// A server returned its txid or reported that it already has it.
+    Accepted,
+    /// Every server that answered refused it as not final yet.
+    NotFinal,
+    /// Anything else, a lost reply included: whether a server holds it is
+    /// unknown.
+    Unknown(String),
+}
+
+/// Sends the journaled parent through the preferred source, and a copy
+/// through the relay.
+fn send_parent(
+    session: &mut ElectrumSession,
+    cfg: &RuntimeConfig,
+    pending: &PendingSubmission,
+    relay: Option<&ClaimRelay>,
+) -> Result<ParentSend, String> {
+    if let Some(relay) = relay {
+        relay.submit(&pending.parent_hex);
+    }
+    match broadcast_classified(session, cfg, &pending.parent_hex) {
+        Ok(returned) => {
+            ensure_broadcast_txid("PHOTON parent", &pending.parent_txid, &returned)?;
+            Ok(ParentSend::Accepted)
+        }
+        Err(failure) if broadcast_reports_known(&failure.message) => Ok(ParentSend::Accepted),
+        Err(failure) if failure.not_final => Ok(ParentSend::NotFinal),
+        Err(failure) => Ok(ParentSend::Unknown(failure.message)),
+    }
+}
+
+/// Sends the parent once the state checks found its baton still live: a
+/// claim never sent, or one refused as not final before the current tip.
+fn send_parent_after_checks(
+    session: &mut ElectrumSession,
+    cfg: &RuntimeConfig,
+    pending: &PendingSubmission,
+    journal_path: &Path,
+    claim: Option<ClaimContext<'_>>,
+    fresh: LiveJob,
+) -> Result<SubmissionAttempt, String> {
+    if preflight_not_final(
+        cfg,
+        "PHOTON parent",
+        &pending.parent_txid,
+        &pending.parent_hex,
+    )?
+    .is_some()
+    {
+        pending.mark_parent_not_final(journal_path, fresh.height)?;
+        return Ok(SubmissionAttempt::AwaitingBlock(fresh.height));
+    }
+    // Both before the send: a lost reply or a crash leaves the claim
+    // attempted and unknown, never recorded as refused.
+    pending.mark_parent_attempted(journal_path)?;
+    PendingSubmission::clear_parent_not_final(journal_path)?;
+    match send_parent(
+        session,
+        cfg,
+        pending,
+        claim.and_then(|context| context.relay),
+    )? {
+        ParentSend::Accepted => {}
+        ParentSend::NotFinal => {
+            pending.mark_parent_not_final(journal_path, fresh.height)?;
+            return Ok(SubmissionAttempt::AwaitingBlock(fresh.height));
+        }
+        ParentSend::Unknown(error) => {
+            return Err(format!("PHOTON parent broadcast was not accepted: {error}"));
+        }
+    }
+    pending.mark_parent_accepted(journal_path)?;
+    if claim.is_some() {
+        // The server accepted the parent, so its output-0 baton is spendable.
+        let successor = successor_live_job(pending, &fresh, cfg)?;
+        return Ok(SubmissionAttempt::Complete(Box::new(successor)));
+    }
+    let next = session.fetch_live_job()?;
+    resolve_post_broadcast_baton(
+        pending,
+        next,
+        "PHOTON parent was accepted; waiting for authoritative baton advance",
+        "PHOTON parent was accepted but live baton is not proven descendant",
+        |fresh| resulting_baton_is_authoritative_or_descendant(session, pending, fresh),
+    )
+}
+
 fn attempt_parent_only_submission(
     session: &mut ElectrumSession,
     cfg: &RuntimeConfig,
@@ -1858,38 +2209,40 @@ fn attempt_parent_only_submission(
     let claim = claim.filter(|_| pending.is_direct());
     let mut broadcast_error = None;
     if let Some(context) = claim {
-        if !pending.parent_attempted(journal_path)? {
+        // A claim refused as not final has raced already: it goes out again
+        // only after the state checks below.
+        if !pending.parent_attempted(journal_path)?
+            && pending.parent_not_final(journal_path)?.is_none()
+        {
             // A never-broadcast claim cannot be known yet, and a stale one is
             // rejected by the server anyway, so no state round trip is needed
             // before racing it onto the network.
-            preflight_pending_transaction(
+            if preflight_not_final(
                 cfg,
                 "PHOTON parent",
                 &pending.parent_txid,
                 &pending.parent_hex,
-            )?;
-            pending.mark_parent_attempted(journal_path)?;
-            if let Some(relay) = context.relay {
-                relay.submit(&pending.parent_hex);
-            }
-            let accepted = match broadcast_pending_transaction(session, cfg, &pending.parent_hex) {
-                Ok(returned) => {
-                    ensure_broadcast_txid("PHOTON parent", &pending.parent_txid, &returned)?;
-                    true
+            )?
+            .is_some()
+            {
+                pending.mark_parent_not_final(journal_path, context.live.height)?;
+            } else {
+                pending.mark_parent_attempted(journal_path)?;
+                match send_parent(session, cfg, pending, context.relay)? {
+                    ParentSend::Accepted => {
+                        pending.mark_parent_accepted(journal_path)?;
+                        let successor = successor_live_job(pending, context.live, cfg)?;
+                        return Ok(SubmissionAttempt::Complete(Box::new(successor)));
+                    }
+                    ParentSend::NotFinal => {
+                        pending.mark_parent_not_final(journal_path, context.live.height)?;
+                    }
+                    ParentSend::Unknown(error) => broadcast_error = Some(error),
                 }
-                Err(error) => {
-                    let known = broadcast_reports_known(&error);
-                    broadcast_error = Some(error);
-                    known
-                }
-            };
-            if accepted {
-                pending.mark_parent_accepted(journal_path)?;
-                let successor = successor_live_job(pending, context.live, cfg)?;
-                return Ok(SubmissionAttempt::Complete(Box::new(successor)));
             }
-            // Rejected or unknown outcome: the checks below prove acceptance
-            // or a conflicting spend, or keep the journal for retry.
+            // Refused or unknown outcome: the checks below prove acceptance
+            // or a conflicting spend, wait for a block, or keep the journal
+            // for retry.
         }
     }
     let parent_known = session.transaction_known(&pending.parent_txid)?;
@@ -1913,48 +2266,29 @@ fn attempt_parent_only_submission(
         }
         return Err("PHOTON parent is known but live baton is not proven descendant".into());
     }
-    if pending.parent_attempted(journal_path)? {
-        // The server does not know this direct claim and the baton it spent
-        // now belongs to another transaction, so it cannot confirm. Its
-        // reward output pays the recipient directly if it ever does.
-        if pending.is_direct() && !pending.expected_baton_is_current(&fresh) && !indexer_lags {
-            return Ok(SubmissionAttempt::StaleUnbroadcast(Box::new(fresh)));
-        }
-        return Err(match broadcast_error {
-            Some(error) => format!("PHOTON parent broadcast was not accepted: {error}"),
-            None => {
-                "PHOTON parent broadcast was attempted; awaiting authoritative acceptance".into()
-            }
-        });
-    }
-    // A lagging indexer still lists an older baton this miner spent; the
+    // The server does not know this direct claim and the baton it spends now
+    // belongs to another transaction, so it cannot confirm; its reward output
+    // pays the recipient directly if it ever does. A lagging indexer that
+    // still lists an older baton this miner spent is not such a change: the
     // expected baton is then this miner's own unconfirmed successor.
     if !pending.expected_baton_is_current(&fresh) && !indexer_lags {
         return Ok(SubmissionAttempt::StaleUnbroadcast(Box::new(fresh)));
     }
-    preflight_pending_transaction(
-        cfg,
-        "PHOTON parent",
-        &pending.parent_txid,
-        &pending.parent_hex,
-    )?;
-    pending.mark_parent_attempted(journal_path)?;
-    let returned = broadcast_pending_transaction(session, cfg, &pending.parent_hex)?;
-    ensure_broadcast_txid("PHOTON parent", &pending.parent_txid, &returned)?;
-    pending.mark_parent_accepted(journal_path)?;
-    if mine_successor {
-        // The server accepted the parent, so its output-0 baton is spendable.
-        let successor = successor_live_job(pending, &fresh, cfg)?;
-        return Ok(SubmissionAttempt::Complete(Box::new(successor)));
+    match pending.parent_not_final(journal_path)? {
+        // No block since the refusal: there is nothing to send yet.
+        Some(refused_at) if fresh.height <= refused_at => {
+            Ok(SubmissionAttempt::AwaitingBlock(refused_at))
+        }
+        // A block since the refusal: the same bytes go out again.
+        Some(_) => send_parent_after_checks(session, cfg, pending, journal_path, claim, fresh),
+        None if pending.parent_attempted(journal_path)? => Err(match broadcast_error {
+            Some(error) => format!("PHOTON parent broadcast was not accepted: {error}"),
+            None => {
+                "PHOTON parent broadcast was attempted; awaiting authoritative acceptance".into()
+            }
+        }),
+        None => send_parent_after_checks(session, cfg, pending, journal_path, claim, fresh),
     }
-    let next = session.fetch_live_job()?;
-    resolve_post_broadcast_baton(
-        pending,
-        next,
-        "PHOTON parent was accepted; waiting for authoritative baton advance",
-        "PHOTON parent was accepted but live baton is not proven descendant",
-        |fresh| resulting_baton_is_authoritative_or_descendant(session, pending, fresh),
-    )
 }
 
 /// Attempts the journaled parent and settlement submission safely.
@@ -2117,18 +2451,132 @@ fn prepare_submission_for_network(
     Ok(pending)
 }
 
+/// How often a claim waiting for a block is read without a notice: a node at
+/// its usual cadence, a Fulcrum server (which pushes each block) every 30 s.
+fn not_final_recheck(session: &ElectrumSession) -> Duration {
+    if session.is_node() {
+        PHOTON_STATE_RECHECK
+    } else {
+        PHOTON_WATCHED_RECHECK
+    }
+}
+
+/// When a claim that waits for a block is tried again: one recheck after the
+/// last try, or sooner on a pushed notice (a block, or a change to the
+/// covenant), but never sooner than `NOTICE_REFRESH_GAP` after the last try.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockWait {
+    last_attempt: Instant,
+    next_attempt: Instant,
+}
+
+impl BlockWait {
+    /// Starts the wait after a try that ended at `now`.
+    fn after_attempt(now: Instant, recheck: Duration) -> Self {
+        Self {
+            last_attempt: now,
+            next_attempt: now + recheck,
+        }
+    }
+
+    /// Brings the next try forward for a notice seen at `now`.
+    fn notice(&mut self, now: Instant) {
+        self.next_attempt = self
+            .next_attempt
+            .min((self.last_attempt + NOTICE_REFRESH_GAP).max(now));
+    }
+
+    /// Whether the next try is due at `now`.
+    fn due(&self, now: Instant) -> bool {
+        now >= self.next_attempt
+    }
+}
+
+/// Waits on the same session until the claim's next try; `false` when stop
+/// is requested first. Only notices the server already pushed are read.
+fn wait_for_claim_retry(
+    session: &mut ElectrumSession,
+    mut wait: BlockWait,
+    stop: &dyn Fn() -> bool,
+) -> Result<bool, String> {
+    loop {
+        if stop() {
+            return Ok(false);
+        }
+        let now = Instant::now();
+        if session.take_change()? {
+            wait.notice(now);
+        }
+        if wait.due(now) {
+            return Ok(true);
+        }
+        thread::sleep(NOTICE_CHECK.min(wait.next_attempt.saturating_duration_since(now)));
+    }
+}
+
+/// Sleeps for `duration` unless stop is requested first; `false` on stop.
+fn sleep_unless_stopped(duration: Duration, stop: &dyn Fn() -> bool) -> bool {
+    let end = Instant::now() + duration;
+    loop {
+        if stop() {
+            return false;
+        }
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        thread::sleep(NOTICE_CHECK.min(left));
+    }
+}
+
 /// Resolves any outstanding submission before allowing new GPU work.
 fn resolve_pending_before_search(
     session: &mut ElectrumSession,
     cfg: &RuntimeConfig,
     journal_path: &Path,
 ) -> Result<(), String> {
+    let recheck = not_final_recheck(session);
+    resolve_pending_until_stopped(
+        session,
+        cfg,
+        journal_path,
+        recheck,
+        &crate::session_control::stop_signalled,
+    )
+}
+
+// #### Claims that wait for a block: at startup
+// What: a journaled claim refused as not final waits for the next block on
+// the start's own connection and is sent again, as in a running session;
+// waiting for an accepted claim's baton keeps its 2 s cadence. Both waits
+// end on Ctrl+C (`stop`), leaving the journal for the next start. A claim
+// that was sent with an unknown outcome still fails the start at once, as
+// before: nothing here can prove it, and no loop holds the start.
+// Look here if: a start waits on a claim and does not stop, or fails on a
+// claim that only needs a block.
+fn resolve_pending_until_stopped(
+    session: &mut ElectrumSession,
+    cfg: &RuntimeConfig,
+    journal_path: &Path,
+    block_recheck: Duration,
+    stop: &dyn Fn() -> bool,
+) -> Result<(), String> {
     let Some(pending) = PendingSubmission::load(journal_path)? else {
         return Ok(());
     };
     pending.require_network(cfg.network)?;
+    let stopped = || {
+        format!(
+            "stopped while the previous winner's claim {} was pending; its journal is kept and the claim resumes at the next start",
+            pending.parent_txid
+        )
+    };
     let mut next_wait_report = Instant::now();
+    let mut reported_block_wait = None;
     loop {
+        if stop() {
+            return Err(stopped());
+        }
         match attempt_pending_submission(session, cfg, &pending, journal_path, None)? {
             SubmissionAttempt::Complete(fresh) => {
                 return resolve_confirmed_submission(&pending, &fresh, journal_path);
@@ -2142,7 +2590,22 @@ fn resolve_pending_before_search(
                     eprintln!("{message}");
                     next_wait_report = now + Duration::from_secs(30);
                 }
-                thread::sleep(ACCEPTED_BATON_RECHECK);
+                if !sleep_unless_stopped(ACCEPTED_BATON_RECHECK, stop) {
+                    return Err(stopped());
+                }
+            }
+            SubmissionAttempt::AwaitingBlock(refused_at) => {
+                if reported_block_wait != Some(refused_at) {
+                    eprintln!(
+                        "{}",
+                        not_final_wait_message(&pending.parent_txid, refused_at)
+                    );
+                    reported_block_wait = Some(refused_at);
+                }
+                let wait = BlockWait::after_attempt(Instant::now(), block_recheck);
+                if !wait_for_claim_retry(session, wait, stop)? {
+                    return Err(stopped());
+                }
             }
         }
     }
@@ -2579,6 +3042,13 @@ pub enum RuntimeEvent {
     DirectRewardAccepted {
         txid: String,
         recipient: String,
+    },
+    /// A claim was refused as not final at `height` (its baton is not
+    /// confirmed yet); the same transaction goes out again after the next
+    /// block. Repeated once per refusal height.
+    ClaimWaitsForBlock {
+        txid: String,
+        height: u32,
     },
     Error(String),
     /// #### PR #42: the job source fell back to Fulcrum while a node is
@@ -3035,6 +3505,9 @@ fn run_supervisor(
     let mut last_state_refresh = Instant::now();
     let mut submission_backoff = RECONNECT_MIN;
     let mut next_submission_retry = Instant::now();
+    // The journaled claim was refused as not final at this height and waits
+    // for a block on the current session.
+    let mut claim_block_wait: Option<(u32, BlockWait)> = None;
     let mut stop = false;
     let initial_search_stats = search.snapshot();
     // This SearchHandle is new for this supervisor. Start at zero so a GPU
@@ -3255,13 +3728,21 @@ fn run_supervisor(
             break;
         }
         // A reported change (a claim or a new block) brings the next refresh
-        // forward; a broken connection shows up in that refresh.
-        if let Some(active) = session.as_mut().filter(|active| active.watching()) {
+        // forward; a broken connection shows up in that refresh. A claim
+        // waiting for a block takes the block notices of any Fulcrum session.
+        if let Some(active) = session
+            .as_mut()
+            .filter(|active| active.watching() || (claim_block_wait.is_some() && !active.is_node()))
+        {
             if Instant::now() >= next_notice_check {
                 next_notice_check = Instant::now() + NOTICE_CHECK;
                 if active.take_change().unwrap_or(true) {
                     next_state_refresh = next_state_refresh
                         .min((last_state_refresh + NOTICE_REFRESH_GAP).max(Instant::now()));
+                    if let Some((_, wait)) = claim_block_wait.as_mut() {
+                        wait.notice(Instant::now());
+                        next_submission_retry = wait.next_attempt;
+                    }
                 }
             }
         }
@@ -3537,7 +4018,47 @@ fn run_supervisor(
                         relay: relay.as_ref(),
                     }),
                 );
+                // Only another not-final refusal keeps the claim waiting for
+                // a block; every other outcome ends that wait.
+                let reported_block_wait = claim_block_wait.take().map(|(height, _)| height);
                 match attempt {
+                    Ok(SubmissionAttempt::AwaitingBlock(refused_at)) => {
+                        // #### Claims that wait for a block: in a session
+                        // What: a refusal by node policy is an answer, not a
+                        // transport failure, so this session stays: the next
+                        // try follows a pushed notice (a block, or another
+                        // claim on the covenant), or one read per 30 s on
+                        // Fulcrum (2 s on a node), and the same bytes go out
+                        // once the tip is past the refusal. The GPUs keep
+                        // mining this winner's successor meanwhile.
+                        // Look here if: a claim refused as not final makes
+                        // the session reconnect, or is not sent again after
+                        // a block.
+                        if reported_block_wait != Some(refused_at) {
+                            emit(
+                                &event_tx,
+                                RuntimeEvent::ClaimWaitsForBlock {
+                                    txid: pending.parent_txid.clone(),
+                                    height: refused_at,
+                                },
+                            );
+                        }
+                        let active = session.as_ref().expect("checked session above");
+                        let wait =
+                            BlockWait::after_attempt(Instant::now(), not_final_recheck(active));
+                        claim_block_wait = Some((refused_at, wait));
+                        next_submission_retry = wait.next_attempt;
+                        submission_backoff = RECONNECT_MIN;
+                        last_error = None;
+                        // `pending_winners` is 0 once the successor
+                        // generation is the job; a user pause stays.
+                        if search_resume_allowed(&shutdown, user_paused, pending_winners) {
+                            let _ = search.apply_control(SearchCommand::Resume);
+                            state = SupervisorState::Mining;
+                        } else {
+                            state = SupervisorState::Paused;
+                        }
+                    }
                     Ok(SubmissionAttempt::AwaitingBaton(_)) => {
                         last_error = None;
                         state = SupervisorState::Paused;
@@ -8047,5 +8568,851 @@ mod tests {
             }
             server.join().unwrap();
         }
+    }
+
+    // #### Claims that wait for a block: tests
+    // What: a claim refused as not final waits for the next block on the same
+    // connection and is sent again with the same bytes; another claim taking
+    // the baton resolves it as stale; a lost reply keeps the attempted and
+    // unknown handling; a start with such a claim resolves it after a block,
+    // ends on stop, and reads at most once a second while notices flood in.
+    // Look here if: attempt_parent_only_submission, the not-final record or
+    // BlockWait changes.
+
+    /// The 80-byte header every scripted Fulcrum reply carries.
+    const SCRIPTED_HEADER: &str = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c";
+    /// Fulcrum's answer to a claim whose baton is not confirmed yet.
+    const FULCRUM_NOT_FINAL: &str =
+        "the transaction was rejected by network rules.\n\nnon-BIP68-final (code 64)\n";
+    /// A covenant commitment the indexer parser accepts for the live baton.
+    const LISTED_COMMITMENT: &str =
+        "000000000101010101010101010101010101010101010101010101010101010101010101";
+
+    /// One scripted Fulcrum answer.
+    enum Scripted {
+        Result(serde_json::Value),
+        Error(serde_json::Value),
+        /// Answers, waits, then pushes a notice.
+        ResultThenNotice(serde_json::Value, Duration, serde_json::Value),
+        /// Drops the connection without an answer.
+        Hangup,
+    }
+
+    type ScriptedLog = (Vec<(String, serde_json::Value)>, bool);
+
+    /// Serves one WebSocket client through `script`. The handle returns each
+    /// request's method and params, and whether anything connected again.
+    fn scripted_fulcrum<F>(mut script: F) -> (String, thread::JoinHandle<ScriptedLog>)
+    where
+        F: FnMut(&str, &serde_json::Value) -> Scripted + Send + 'static,
+    {
+        use tungstenite::Message;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let mut requests = Vec::new();
+            while let Ok(message) = ws.read() {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let request: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+                let method = request["method"].as_str().unwrap().to_owned();
+                requests.push((method.clone(), request["params"].clone()));
+                let reply = |field: &str, value: serde_json::Value| {
+                    let mut reply = serde_json::json!({"jsonrpc": "2.0", "id": request["id"]});
+                    reply[field] = value;
+                    Message::Text(format!("{reply}\n").into())
+                };
+                let sent = match script(&method, &request["params"]) {
+                    Scripted::Result(result) => ws.send(reply("result", result)),
+                    Scripted::Error(error) => ws.send(reply("error", error)),
+                    Scripted::ResultThenNotice(result, delay, notice) => {
+                        ws.send(reply("result", result)).and_then(|()| {
+                            thread::sleep(delay);
+                            ws.send(Message::Text(format!("{notice}\n").into()))
+                        })
+                    }
+                    Scripted::Hangup => break,
+                };
+                if sent.is_err() {
+                    break;
+                }
+            }
+            drop(ws);
+            listener.set_nonblocking(true).unwrap();
+            (requests, listener.accept().is_ok())
+        });
+        (url, server)
+    }
+
+    fn scripted_header(height: u32) -> serde_json::Value {
+        serde_json::json!({"height": height, "hex": SCRIPTED_HEADER})
+    }
+
+    fn block_notice(height: u32) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.headers.subscribe",
+            "params": [scripted_header(height)],
+        })
+    }
+
+    fn fulcrum_error(message: &str) -> serde_json::Value {
+        serde_json::json!({"code": 1, "message": message})
+    }
+
+    fn unknown_transaction() -> serde_json::Value {
+        serde_json::json!({
+            "code": 2,
+            "message": "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.",
+        })
+    }
+
+    /// The covenant's one baton as Fulcrum lists it.
+    fn listed_baton(
+        cfg: &RuntimeConfig,
+        txid: &str,
+        height: u32,
+        value: u64,
+        amount: u128,
+        commitment: &str,
+    ) -> serde_json::Value {
+        serde_json::json!([{
+            "tx_hash": txid,
+            "tx_pos": 0,
+            "height": height,
+            "value": value,
+            "token_data": {
+                "category": cfg.token.photon_deployment(cfg.network).category_hex,
+                "amount": amount.to_string(),
+                "nft": {"capability": "mutable", "commitment": commitment},
+            },
+        }])
+    }
+
+    fn methods(requests: &[(String, serde_json::Value)]) -> Vec<&str> {
+        requests.iter().map(|(method, _)| method.as_str()).collect()
+    }
+
+    fn broadcasts(requests: &[(String, serde_json::Value)]) -> Vec<serde_json::Value> {
+        requests
+            .iter()
+            .filter(|(method, _)| method == "blockchain.transaction.broadcast")
+            .map(|(_, params)| params[0].clone())
+            .collect()
+    }
+
+    /// A journaled Chipnet direct claim for the miner, signed as a GPU winner
+    /// is, for the job at `job.height`.
+    fn direct_claim_fixture() -> (RuntimeConfig, LiveJob, PendingSubmission, PathBuf) {
+        use num_bigint::BigUint;
+        let network = MiningNetwork::Chipnet;
+        let (mut cfg, mut job, _, _, _, journal) = preflight_fixture();
+        cfg.network = network;
+        cfg.payout_address = crate::config::reprefix_p2pkh_payout(TEST_PAYOUT, network).unwrap();
+        job.age = 1;
+        let mut target = (BigUint::from(1u32) << 253u32).to_bytes_le();
+        target.resize(32, 0);
+        job.target_le_hex = hex::encode(target);
+        let deployment = cfg.token.photon_deployment(network);
+        let payout = cfg
+            .token
+            .fee_policy(network)
+            .payouts(network, &cfg.payout_address)
+            .unwrap()[crate::donation::Recipient::Miner as usize]
+            .clone();
+        let secret = [1u8; 32]; // Synthetic offline signer, never a reward key.
+        let public = secp256k1::PublicKey::from_secret_key(
+            &secp256k1::SecretKey::from_secret_bytes(secret).unwrap(),
+        )
+        .serialize();
+        let context = tx::ReferenceJobContext {
+            prev_txid: job.baton_txid.clone(),
+            prev_vout: job.baton_vout,
+            age: job.age,
+            target_le_hex: job.target_le_hex.clone(),
+            contract_value_sats: job.baton_value_sats,
+            relay_fee_sats_per_kb: job.relay_fee_sats_per_kb,
+            contract_token_amount: job.token_amount,
+            reward_raw: job.reward_raw,
+        };
+        let winner = (0..1024)
+            .find_map(|nonce| {
+                let message = tx::photon_message_sha256(nonce, &job.target_le_hex).unwrap();
+                let signature = crate::crypto::bch_schnorr_sign(&secret, &message).unwrap();
+                tx::apply_reference_signature_for_deployment(
+                    &context,
+                    &payout,
+                    &hex::encode(public),
+                    nonce,
+                    &hex::encode(signature),
+                    deployment,
+                )
+                .ok()
+                .map(|transaction| VerifiedWinner {
+                    generation_id: cfg.generation_id,
+                    height: job.height,
+                    baton_txid: job.baton_txid.clone(),
+                    baton_vout: job.baton_vout,
+                    job_reward_raw: job.reward_raw,
+                    nonce,
+                    public_key: public,
+                    signature,
+                    digest: crate::search::hash256(&transaction),
+                    transaction,
+                    payout: None,
+                })
+            })
+            .expect("a nonce the covenant accepts");
+        let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
+        production_preflight_local(&cfg, &job, &journal, 1_000).unwrap();
+        let pending =
+            prepare_submission_for_network(&winner, &cfg, &job, &settlement, &journal).unwrap();
+        assert!(pending.is_direct());
+        (cfg, job, pending, journal)
+    }
+
+    fn connect_scripted(cfg: &RuntimeConfig, url: String) -> ElectrumSession {
+        ElectrumSession::connect_failover_for_deployment(
+            &[url],
+            cfg.token.photon_deployment(cfg.network),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn only_a_not_final_answer_from_every_server_is_a_refusal() {
+        let fulcrum = format!("rpc error: {}", fulcrum_error(FULCRUM_NOT_FINAL));
+        let node = r#"rpc error: {"code":-26,"message":"non-BIP68-final (code 64)"}"#;
+        for refused in [
+            fulcrum.as_str(),
+            node,
+            r#"rpc error: {"code":-26,"message":"bad-txns-nonfinal, non-final transaction (code 64)"}"#,
+            r#"rpc error: {"code":-26,"message":"non-final"}"#,
+            r#"rpc error: "non-BIP68-final""#,
+            "All node sendrawtransaction failed (ban-safe):\nhttp://***@127.0.0.1:8332: rpc error: {\"code\":-26,\"message\":\"non-BIP68-final (code 64)\"}\nhttp://10.0.0.2:8332: rpc error: {\"code\":-26,\"message\":\"non-BIP68-final (code 64)\"}",
+        ] {
+            assert!(refused_as_not_final(refused), "{refused}");
+        }
+        for unknown in [
+            "transport: socket closed",
+            "transport: read: non-BIP68-final",
+            "timeout: rpc waiting for id=7 (blockchain.transaction.broadcast)",
+            "non-BIP68-final",
+            r#"rpc error: {"code":1,"message":"txn-mempool-conflict (code 18)"}"#,
+            r#"rpc error: {"code":1,"message":"bad-txns-inputs-missingorspent"}"#,
+            r#"rpc error: {"code":1,"message":"txn-already-known"}"#,
+            "rpc error: not json non-BIP68-final",
+            "All node sendrawtransaction failed (ban-safe):\nhttp://127.0.0.1:8332: rpc error: {\"code\":-26,\"message\":\"non-BIP68-final (code 64)\"}\nhttp://10.0.0.2:8332: connect: connection refused",
+            "All node sendrawtransaction failed (ban-safe):\n",
+        ] {
+            assert!(!refused_as_not_final(unknown), "{unknown}");
+        }
+
+        // With a fallback, both sources must refuse; one lost reply makes the
+        // outcome unknown whichever source went first.
+        let refusal = || Err::<String, String>(fulcrum.clone());
+        let down = || Err::<String, String>("connect: connection refused".into());
+        for source in [JobSource::Fulcrum, JobSource::Node] {
+            assert!(
+                broadcast_with_preference(source, true, refusal, refusal)
+                    .unwrap_err()
+                    .not_final
+            );
+            assert!(
+                !broadcast_with_preference(source, true, refusal, down)
+                    .unwrap_err()
+                    .not_final
+            );
+            assert!(
+                !broadcast_with_preference(source, true, down, refusal)
+                    .unwrap_err()
+                    .not_final
+            );
+        }
+        let alone = broadcast_with_preference(JobSource::Fulcrum, false, refusal, || {
+            panic!("no node is configured")
+        })
+        .unwrap_err();
+        assert!(alone.not_final);
+        assert_eq!(alone.message, fulcrum);
+    }
+
+    #[test]
+    fn a_node_mempool_check_refusing_a_claim_as_not_final_is_told_apart() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let txid = "11".repeat(32);
+        let server = {
+            let txid = txid.clone();
+            thread::spawn(move || {
+                for reason in ["non-BIP68-final", "dust"] {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut request = [0u8; 4096];
+                    let read = std::io::Read::read(&mut stream, &mut request).unwrap();
+                    assert!(String::from_utf8_lossy(&request[..read]).contains("testmempoolaccept"));
+                    let body = format!(
+                        "{{\"result\":[{{\"txid\":\"{txid}\",\"allowed\":false,\"reject-reason\":\"{reason}\"}}],\"error\":null,\"id\":\"pickaxe\"}}"
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
+                }
+            })
+        };
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_network(MiningNetwork::Chipnet);
+        cfg.set_node_url(&format!("http://{address}")).unwrap();
+        let refusal = preflight_not_final(&cfg, "PHOTON parent", &txid, "0200")
+            .unwrap()
+            .expect("a not-final refusal");
+        assert!(refusal.contains("non-BIP68-final"), "{refusal}");
+        let error = preflight_not_final(&cfg, "PHOTON parent", &txid, "0200").unwrap_err();
+        assert!(error.contains("dust"), "{error}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn the_not_final_record_names_its_parent_and_goes_with_the_journal() {
+        let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
+        let record = PendingSubmission::parent_not_final_path(&journal);
+        // A record left by an earlier claim does not survive a new journal.
+        fs::write(&record, format!("{} 7\n", "aa".repeat(32))).unwrap();
+        let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
+        let winner = signed_winner(cfg.generation_id, &job, &mining_payout);
+        let pending = prepare_pending_submission(
+            &winner,
+            &cfg,
+            &job,
+            &secret,
+            &public,
+            &settlement,
+            &journal,
+        )
+        .unwrap();
+        assert!(!record.exists());
+        assert_eq!(pending.parent_not_final(&journal).unwrap(), None);
+
+        pending.mark_parent_not_final(&journal, 1_000).unwrap();
+        assert_eq!(pending.parent_not_final(&journal).unwrap(), Some(1_000));
+        pending.mark_parent_not_final(&journal, 1_001).unwrap();
+        assert_eq!(
+            fs::read_to_string(&record).unwrap(),
+            format!("{} 1001\n", pending.parent_txid)
+        );
+        let restarted = PendingSubmission::load(&journal).unwrap().unwrap();
+        assert_eq!(restarted.parent_not_final(&journal).unwrap(), Some(1_001));
+        // The attempted marker keeps its own meaning and format.
+        assert!(!pending.parent_attempted(&journal).unwrap());
+
+        // Another parent's record, or one that cannot be read, allows nothing.
+        for other in [
+            format!("{} 1001\n", "aa".repeat(32)),
+            "unreadable".into(),
+            format!("{} next\n", pending.parent_txid),
+            format!("{} 1001 1002\n", pending.parent_txid),
+        ] {
+            fs::write(&record, other).unwrap();
+            assert_eq!(pending.parent_not_final(&journal).unwrap(), None);
+        }
+
+        pending.mark_parent_not_final(&journal, 1_002).unwrap();
+        PendingSubmission::clear_parent_not_final(&journal).unwrap();
+        assert!(!record.exists());
+        PendingSubmission::clear_parent_not_final(&journal).unwrap();
+        pending.mark_parent_not_final(&journal, 1_002).unwrap();
+        PendingSubmission::remove(&journal).unwrap();
+        assert!(!record.exists());
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn a_claim_waiting_for_a_block_reads_once_a_second_on_notices_and_once_per_recheck_without() {
+        let start = Instant::now();
+        let tick = Duration::from_millis(100);
+        for (notices, expected) in [(false, 120), (true, 3_600)] {
+            let mut wait = BlockWait::after_attempt(start, PHOTON_WATCHED_RECHECK);
+            let mut tries = 0u32;
+            let mut now = start;
+            while now < start + Duration::from_secs(3_600) {
+                now += tick;
+                if notices {
+                    wait.notice(now);
+                }
+                if wait.due(now) {
+                    tries += 1;
+                    wait = BlockWait::after_attempt(now, PHOTON_WATCHED_RECHECK);
+                }
+            }
+            assert!(
+                (expected - 1..=expected).contains(&tries),
+                "notices={notices}: {tries} tries in an hour"
+            );
+        }
+        let mut wait = BlockWait::after_attempt(start, PHOTON_WATCHED_RECHECK);
+        assert!(!wait.due(start + Duration::from_secs(29)));
+        wait.notice(start + Duration::from_millis(300));
+        assert_eq!(wait.next_attempt, start + NOTICE_REFRESH_GAP);
+        wait.notice(start + Duration::from_secs(5));
+        assert_eq!(wait.next_attempt, start + NOTICE_REFRESH_GAP);
+        let node = BlockWait::after_attempt(start, PHOTON_STATE_RECHECK);
+        assert!(node.due(start + PHOTON_STATE_RECHECK));
+        assert!(!sleep_unless_stopped(Duration::from_secs(60), &|| true));
+    }
+
+    #[test]
+    fn a_claim_refused_as_not_final_is_sent_again_after_the_next_block_on_the_same_connection() {
+        let (cfg, job, pending, journal) = direct_claim_fixture();
+        let parent_hex = pending.parent_hex.clone();
+        let parent_txid = pending.parent_txid.clone();
+        let baton = listed_baton(
+            &cfg,
+            &job.baton_txid,
+            0,
+            job.baton_value_sats,
+            job.token_amount,
+            LISTED_COMMITMENT,
+        );
+        let mut height = job.height;
+        let mut sends = 0;
+        let mut headers_since_refusal = None;
+        let (url, server) = scripted_fulcrum(move |method, params| match method {
+            "server.version" => Scripted::Result(serde_json::json!(["Fulcrum 1.12.0", "1.5"])),
+            "blockchain.transaction.broadcast" => {
+                assert_eq!(params[0], parent_hex.as_str(), "only the journaled bytes");
+                sends += 1;
+                if sends == 1 {
+                    headers_since_refusal = Some(0);
+                    Scripted::Error(fulcrum_error(FULCRUM_NOT_FINAL))
+                } else {
+                    Scripted::Result(serde_json::json!(parent_txid))
+                }
+            }
+            "blockchain.transaction.get" => Scripted::Error(unknown_transaction()),
+            "blockchain.scripthash.subscribe" => Scripted::Result(serde_json::Value::Null),
+            "blockchain.scripthash.listunspent" => Scripted::Result(baton.clone()),
+            "blockchain.headers.subscribe" => {
+                let header = scripted_header(height);
+                match headers_since_refusal.as_mut() {
+                    // The read after the refusal ends; a block follows.
+                    Some(seen) if *seen == 1 => {
+                        headers_since_refusal = None;
+                        height += 1;
+                        Scripted::ResultThenNotice(
+                            header,
+                            Duration::from_millis(300),
+                            block_notice(height),
+                        )
+                    }
+                    Some(seen) => {
+                        *seen += 1;
+                        Scripted::Result(header)
+                    }
+                    None => Scripted::Result(header),
+                }
+            }
+            other => panic!("unexpected {other}"),
+        });
+        let mut session = connect_scripted(&cfg, url);
+        let unindexed = UnindexedSpends::default();
+        let context = ClaimContext {
+            unindexed: &unindexed,
+            live: &job,
+            relay: None,
+        };
+        let started = Instant::now();
+        let first =
+            attempt_pending_submission(&mut session, &cfg, &pending, &journal, Some(context))
+                .unwrap();
+        assert!(
+            matches!(first, SubmissionAttempt::AwaitingBlock(at) if at == job.height),
+            "a refusal is an answer, not a reason to reconnect"
+        );
+        assert!(pending.parent_attempted(&journal).unwrap());
+        assert_eq!(
+            pending.parent_not_final(&journal).unwrap(),
+            Some(job.height)
+        );
+
+        // The session waits for the block notice; a 60 s recheck shows the
+        // notice, not the timer, brought the next try.
+        let wait = BlockWait::after_attempt(Instant::now(), Duration::from_secs(60));
+        assert!(wait_for_claim_retry(&mut session, wait, &|| false).unwrap());
+        let second =
+            attempt_pending_submission(&mut session, &cfg, &pending, &journal, Some(context))
+                .unwrap();
+        let SubmissionAttempt::Complete(successor) = second else {
+            panic!("the claim is accepted after the block");
+        };
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(successor.baton_txid, pending.parent_txid);
+        assert_eq!(successor.height, job.height + 1);
+        assert!(pending.parent_accepted(&journal).unwrap());
+        assert_eq!(pending.parent_not_final(&journal).unwrap(), None);
+        resolve_confirmed_submission(&pending, &successor, &journal).unwrap();
+        assert!(!PendingSubmission::parent_not_final_path(&journal).exists());
+
+        drop(session);
+        let (requests, reconnected) = server.join().unwrap();
+        assert!(!reconnected);
+        assert_eq!(
+            broadcasts(&requests),
+            vec![serde_json::json!(pending.parent_hex); 2]
+        );
+        assert_eq!(
+            methods(&requests),
+            [
+                "server.version",
+                "blockchain.transaction.broadcast",
+                "blockchain.transaction.get",
+                "blockchain.scripthash.subscribe",
+                "blockchain.headers.subscribe",
+                "blockchain.scripthash.listunspent",
+                "blockchain.headers.subscribe",
+                // Nothing while the claim waits for the block.
+                "blockchain.transaction.get",
+                "blockchain.headers.subscribe",
+                "blockchain.scripthash.listunspent",
+                "blockchain.headers.subscribe",
+                "blockchain.transaction.broadcast",
+            ]
+        );
+        fs::remove_file(ResolvedSubmission::path(&journal)).unwrap();
+    }
+
+    #[test]
+    fn a_claim_waiting_for_a_block_resolves_stale_when_another_claim_takes_the_baton() {
+        let (cfg, job, pending, journal) = direct_claim_fixture();
+        let deployment = cfg.token.photon_deployment(cfg.network);
+        let ours = listed_baton(
+            &cfg,
+            &job.baton_txid,
+            0,
+            job.baton_value_sats,
+            job.token_amount,
+            LISTED_COMMITMENT,
+        );
+        let theirs = listed_baton(
+            &cfg,
+            &"44".repeat(32),
+            0,
+            job.baton_value_sats - 1_500,
+            job.token_amount - job.reward_raw,
+            LISTED_COMMITMENT,
+        );
+        let covenant_notice = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.scripthash.subscribe",
+            "params": [deployment.script_hash_hex, "status"],
+        });
+        let mut taken = false;
+        let mut headers = 0;
+        let (url, server) = scripted_fulcrum(move |method, _| match method {
+            "server.version" => Scripted::Result(serde_json::json!(["Fulcrum 1.12.0", "1.5"])),
+            "blockchain.transaction.broadcast" => Scripted::Error(fulcrum_error(FULCRUM_NOT_FINAL)),
+            "blockchain.transaction.get" => Scripted::Error(unknown_transaction()),
+            "blockchain.scripthash.subscribe" => Scripted::Result(serde_json::Value::Null),
+            "blockchain.headers.subscribe" => {
+                headers += 1;
+                let header = scripted_header(if taken { job.height + 1 } else { job.height });
+                if headers == 2 {
+                    // The first read ends; a block follows with another
+                    // miner's claim on the baton.
+                    taken = true;
+                    Scripted::ResultThenNotice(
+                        header,
+                        Duration::from_millis(300),
+                        covenant_notice.clone(),
+                    )
+                } else {
+                    Scripted::Result(header)
+                }
+            }
+            "blockchain.scripthash.listunspent" => {
+                Scripted::Result(if taken { theirs.clone() } else { ours.clone() })
+            }
+            other => panic!("unexpected {other}"),
+        });
+        let mut session = connect_scripted(&cfg, url);
+        let unindexed = UnindexedSpends::default();
+        let context = ClaimContext {
+            unindexed: &unindexed,
+            live: &job,
+            relay: None,
+        };
+        let first =
+            attempt_pending_submission(&mut session, &cfg, &pending, &journal, Some(context))
+                .unwrap();
+        assert!(matches!(first, SubmissionAttempt::AwaitingBlock(_)));
+        let wait = BlockWait::after_attempt(Instant::now(), Duration::from_secs(60));
+        assert!(wait_for_claim_retry(&mut session, wait, &|| false).unwrap());
+        let second =
+            attempt_pending_submission(&mut session, &cfg, &pending, &journal, Some(context))
+                .unwrap();
+        let SubmissionAttempt::StaleUnbroadcast(fresh) = second else {
+            panic!("another claim spent the baton");
+        };
+        assert_eq!(fresh.baton_txid, "44".repeat(32));
+        resolve_stale_submission(&pending, &fresh, &journal).unwrap();
+        let resolved = ResolvedSubmission::load(&journal).unwrap().unwrap();
+        assert_eq!(resolved.reason, "conflicted");
+        assert!(!journal.exists());
+        assert!(!PendingSubmission::parent_not_final_path(&journal).exists());
+
+        drop(session);
+        let (requests, reconnected) = server.join().unwrap();
+        assert!(!reconnected);
+        assert_eq!(
+            broadcasts(&requests).len(),
+            1,
+            "never sent after the baton moved"
+        );
+        fs::remove_file(ResolvedSubmission::path(&journal)).unwrap();
+    }
+
+    #[test]
+    fn a_lost_reply_to_a_claim_keeps_the_attempted_and_unknown_handling() {
+        let (cfg, job, pending, journal) = direct_claim_fixture();
+        let baton = listed_baton(
+            &cfg,
+            &job.baton_txid,
+            0,
+            job.baton_value_sats,
+            job.token_amount,
+            LISTED_COMMITMENT,
+        );
+        let unindexed = UnindexedSpends::default();
+        let context = ClaimContext {
+            unindexed: &unindexed,
+            live: &job,
+            relay: None,
+        };
+        let serve = |height: u32, hangup_on_send: bool| {
+            let baton = baton.clone();
+            scripted_fulcrum(move |method, _| match method {
+                "server.version" => Scripted::Result(serde_json::json!(["Fulcrum 1.12.0", "1.5"])),
+                "blockchain.transaction.broadcast" if hangup_on_send => Scripted::Hangup,
+                "blockchain.transaction.get" => Scripted::Error(unknown_transaction()),
+                "blockchain.scripthash.subscribe" => Scripted::Result(serde_json::Value::Null),
+                "blockchain.headers.subscribe" => Scripted::Result(scripted_header(height)),
+                "blockchain.scripthash.listunspent" => Scripted::Result(baton.clone()),
+                other => panic!("unexpected {other}"),
+            })
+        };
+
+        // The first send's reply is lost.
+        let (url, server) = serve(job.height, true);
+        let mut session = connect_scripted(&cfg, url);
+        let error =
+            attempt_pending_submission(&mut session, &cfg, &pending, &journal, Some(context))
+                .err()
+                .expect("a lost reply is not an answer");
+        assert!(
+            error.contains("transport") || error.contains("timeout"),
+            "{error}"
+        );
+        drop(session);
+        server.join().unwrap();
+        assert!(pending.parent_attempted(&journal).unwrap());
+        assert_eq!(pending.parent_not_final(&journal).unwrap(), None);
+
+        // A refused claim whose resend after a block loses its reply is
+        // attempted and unknown again: the record goes before the send.
+        PendingSubmission::remove(&journal).unwrap();
+        pending.persist_new(&journal).unwrap();
+        pending.mark_parent_attempted(&journal).unwrap();
+        pending.mark_parent_not_final(&journal, job.height).unwrap();
+        let (url, server) = serve(job.height + 1, true);
+        let mut session = connect_scripted(&cfg, url);
+        assert!(
+            attempt_pending_submission(&mut session, &cfg, &pending, &journal, Some(context))
+                .is_err()
+        );
+        drop(session);
+        let (requests, _) = server.join().unwrap();
+        assert_eq!(broadcasts(&requests).len(), 1);
+        assert!(pending.parent_attempted(&journal).unwrap());
+        assert_eq!(pending.parent_not_final(&journal).unwrap(), None);
+
+        // On a new connection the claim is never sent again, in a session or
+        // at a start, and the start fails at once as before.
+        let (url, server) = serve(job.height + 2, false);
+        let mut session = connect_scripted(&cfg, url);
+        let error =
+            attempt_pending_submission(&mut session, &cfg, &pending, &journal, Some(context))
+                .err()
+                .unwrap();
+        assert!(
+            error.contains("awaiting authoritative acceptance"),
+            "{error}"
+        );
+        let started = Instant::now();
+        let error = resolve_pending_until_stopped(
+            &mut session,
+            &cfg,
+            &journal,
+            Duration::from_secs(60),
+            &|| false,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("awaiting authoritative acceptance"),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        drop(session);
+        let (requests, reconnected) = server.join().unwrap();
+        assert!(!reconnected);
+        assert!(broadcasts(&requests).is_empty());
+        assert!(journal.exists());
+        PendingSubmission::remove(&journal).unwrap();
+    }
+
+    #[test]
+    fn a_start_with_a_claim_refused_as_not_final_resolves_it_after_the_next_block() {
+        let (cfg, job, pending, journal) = direct_claim_fixture();
+        // A previous session sent the claim and recorded the refusal.
+        pending.mark_parent_attempted(&journal).unwrap();
+        pending.mark_parent_not_final(&journal, job.height).unwrap();
+        let ours = listed_baton(
+            &cfg,
+            &job.baton_txid,
+            0,
+            job.baton_value_sats,
+            job.token_amount,
+            LISTED_COMMITMENT,
+        );
+        let successor = successor_live_job(&pending, &job, &cfg).unwrap();
+        let accepted = listed_baton(
+            &cfg,
+            &successor.baton_txid,
+            0,
+            successor.baton_value_sats,
+            successor.token_amount,
+            &successor.commitment_hex,
+        );
+        let parent_hex = pending.parent_hex.clone();
+        let parent_txid = pending.parent_txid.clone();
+        let mut height = job.height;
+        let mut headers = 0;
+        let mut sent = false;
+        let (url, server) = scripted_fulcrum(move |method, params| match method {
+            "server.version" => Scripted::Result(serde_json::json!(["Fulcrum 1.12.0", "1.5"])),
+            "blockchain.transaction.broadcast" => {
+                assert_eq!(params[0], parent_hex.as_str());
+                sent = true;
+                Scripted::Result(serde_json::json!(parent_txid))
+            }
+            "blockchain.transaction.get" => Scripted::Error(unknown_transaction()),
+            "blockchain.scripthash.subscribe" => Scripted::Result(serde_json::Value::Null),
+            "blockchain.scripthash.listunspent" => {
+                Scripted::Result(if sent { accepted.clone() } else { ours.clone() })
+            }
+            "blockchain.headers.subscribe" => {
+                headers += 1;
+                let header = scripted_header(height);
+                if headers == 2 {
+                    // The start's first read ends; a block follows.
+                    height += 1;
+                    Scripted::ResultThenNotice(
+                        header,
+                        Duration::from_millis(300),
+                        block_notice(height),
+                    )
+                } else {
+                    Scripted::Result(header)
+                }
+            }
+            other => panic!("unexpected {other}"),
+        });
+        let mut session = connect_scripted(&cfg, url);
+        let started = Instant::now();
+        resolve_pending_until_stopped(
+            &mut session,
+            &cfg,
+            &journal,
+            Duration::from_secs(60),
+            &|| false,
+        )
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(!journal.exists());
+        assert!(!PendingSubmission::parent_not_final_path(&journal).exists());
+        let resolved = ResolvedSubmission::load(&journal).unwrap().unwrap();
+        assert_eq!(resolved.reason, "confirmed");
+        assert_eq!(resolved.observed_baton_txid, pending.parent_txid);
+        drop(session);
+        let (requests, reconnected) = server.join().unwrap();
+        assert!(!reconnected);
+        assert_eq!(
+            broadcasts(&requests),
+            vec![serde_json::json!(pending.parent_hex)]
+        );
+        fs::remove_file(ResolvedSubmission::path(&journal)).unwrap();
+    }
+
+    #[test]
+    fn a_start_waiting_for_a_block_ends_on_stop_and_reads_at_most_once_a_second() {
+        let (cfg, job, pending, journal) = direct_claim_fixture();
+        pending.mark_parent_attempted(&journal).unwrap();
+        pending.mark_parent_not_final(&journal, job.height).unwrap();
+        let baton = listed_baton(
+            &cfg,
+            &job.baton_txid,
+            0,
+            job.baton_value_sats,
+            job.token_amount,
+            LISTED_COMMITMENT,
+        );
+        // No block comes, but the server pushes a notice after every answer.
+        let (url, server) = scripted_fulcrum(move |method, _| {
+            let result = match method {
+                "server.version" => serde_json::json!(["Fulcrum 1.12.0", "1.5"]),
+                "blockchain.transaction.get" => return Scripted::Error(unknown_transaction()),
+                "blockchain.scripthash.subscribe" => serde_json::Value::Null,
+                "blockchain.headers.subscribe" => scripted_header(job.height),
+                "blockchain.scripthash.listunspent" => baton.clone(),
+                other => panic!("unexpected {other}"),
+            };
+            Scripted::ResultThenNotice(result, Duration::ZERO, block_notice(job.height))
+        });
+        let mut session = connect_scripted(&cfg, url);
+        let started = Instant::now();
+        let stop_at = started + Duration::from_millis(2_500);
+        let error = resolve_pending_until_stopped(
+            &mut session,
+            &cfg,
+            &journal,
+            Duration::from_secs(60),
+            &|| Instant::now() >= stop_at,
+        )
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(error.contains("stopped"), "{error}");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        // The journal and both records stay for the next start.
+        assert!(journal.exists());
+        assert!(pending.parent_attempted(&journal).unwrap());
+        assert_eq!(
+            pending.parent_not_final(&journal).unwrap(),
+            Some(job.height)
+        );
+        drop(session);
+        let (requests, _) = server.join().unwrap();
+        assert!(broadcasts(&requests).is_empty(), "no block, nothing sent");
+        let tries = requests
+            .iter()
+            .filter(|(method, _)| method == "blockchain.transaction.get")
+            .count();
+        assert!((2..=4).contains(&tries), "{tries} tries in {elapsed:?}");
+        // version, then per try one lookup and one three-call read (plus one
+        // covenant subscription).
+        assert_eq!(requests.len(), 2 + tries * 4);
+        PendingSubmission::remove(&journal).unwrap();
     }
 }
