@@ -3348,10 +3348,10 @@ fn coinbase_only_pickaxe_jdc_mines_at_a_pickaxe_jds_on_loopback() {
             && stats.shares_accepted >= 1
     });
     client.wait(|stats| {
-        stats
-            .jd_client
-            .as_ref()
-            .is_some_and(|jd| jd.forwarded >= 1 && jd.accepted >= 1)
+        stats.jd_client.as_ref().is_some_and(|jd| {
+            // The coinbase came from the pool's payout outputs (0x5052).
+            jd.forwarded >= 1 && jd.accepted >= 1 && jd.payout_outputs >= 1
+        })
     });
     let found = pool
         .stats
@@ -3532,7 +3532,11 @@ fn full_template_declares_provides_a_missing_transaction_and_both_nodes_get_the_
     assert_eq!(hash(&miner_node), hash(&pool_node));
     client.wait(|stats| {
         stats.jd_client.as_ref().is_some_and(|jd| {
-            jd.mode == "full-template" && jd.provided == 1 && jd.declared >= 1 && jd.pushed == 1
+            jd.mode == "full-template"
+                && jd.provided == 1
+                && jd.declared >= 1
+                && jd.pushed == 1
+                && jd.payout_outputs >= 1
         })
     });
     let found = pool

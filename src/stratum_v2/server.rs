@@ -1605,9 +1605,10 @@ fn offer(
         own
     });
     template.declare(plan);
-    // #### PR #65: P2Pool coinbases are prepared off this thread (see
+    // #### PR #65: P2Pool coinbases (and the pool's payout outputs, 0x5052)
+    // are prepared off this thread (see
     // `start_preparation`); the offer ends when they are.
-    if template.is_p2pool() {
+    if template.needs_preparation() {
         offered.retry = None;
         offered.waiting = Some(Preparation {
             generation,
@@ -1912,7 +1913,7 @@ fn failed_offer(shared: &Shared, offered: &mut Offered, incoming: &BchTemplate, 
             job.template.previous_hash == incoming.previous_hash
                 && job.template.bits == incoming.bits
                 && job.serial >> 32
-                    == if job.template.is_p2pool() {
+                    == if job.template.needs_preparation() {
                         u64::from(offered.cohort)
                     } else {
                         plan
@@ -2197,7 +2198,7 @@ impl JobAvailability {
                     self.generation.is_some()
                         && self.parent == Some((job.template.previous_hash, job.template.bits))
                         && self.serial.map(|serial| serial >> 32) == Some(job.serial >> 32)
-                        && job.generation > acknowledged
+                        && job.template.declaration_id(job.generation) > acknowledged
                 })
             {
                 return Ok(Vec::new());
@@ -3294,6 +3295,7 @@ mod retry_tests {
                 tokens: Mutex::new(VecDeque::new()),
                 consumed: std::sync::atomic::AtomicUsize::new(0),
             })),
+            payouts: None,
             full_template: true,
         });
         let (events, _receive) = mpsc::sync_channel(1);
@@ -3413,6 +3415,7 @@ mod retry_tests {
                 },
                 pool_target: [255; 32],
                 p2pool: None,
+                payouts: None,
                 full_template: true,
             });
             let mut template =
@@ -3578,6 +3581,7 @@ mod p2pool_tests {
             },
             pool_target: [255; 32],
             p2pool: Some(Arc::new(crate::p2pool::jd::fake::plan(url, owner, tokens))),
+            payouts: None,
             full_template: true,
         })
     }

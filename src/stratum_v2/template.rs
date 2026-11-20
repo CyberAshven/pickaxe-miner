@@ -597,6 +597,8 @@ impl BchTemplate {
 
     /// #### PR #65: obtain P2Pool's exact PPLNS coinbase before publishing.
     /// It cannot change the independently sourced transaction list or revenue.
+    /// Requested Payout Outputs (0x5052): or the pool's outputs for this
+    /// template (`payouts`), asked through the uplink.
     pub fn prepare_p2pool(&mut self) -> Result<(), String> {
         self.p2pool = None;
         // A token set does not stop it: P2Pool's coinbase carries no token
@@ -610,8 +612,50 @@ impl BchTemplate {
                 &self.script_head(),
                 None,
             )?));
+        } else if let (Some(plan), Some(payouts)) = (self.jd.as_ref(), self.payouts()) {
+            self.p2pool = Some(Arc::new(payouts.prepare(
+                self.height,
+                self.bits,
+                self.previous_hash,
+                self.coinbase_value,
+                self.script_head(),
+                plan.upstream_prefix.len() + plan.rollable(),
+                self.min_time,
+            )?));
         }
         Ok(())
+    }
+
+    // What: a Job Declaration template whose pool granted Requested Payout
+    // Outputs (0x5052) takes its coinbase outputs from the pool, prepared
+    // before it is published. One exception: a Full-Template template that
+    // merge-mines tokens at a pool whose tokens carry its rates (a Pickaxe
+    // pool's) builds its outputs from those rates with the commitment as
+    // output 0, as without the extension; exact outputs leave no room for it,
+    // and the pool's check takes both.
+    // Why: the pool's answer is what it pays shares on; merge-mined tokens
+    // at a Pickaxe pool must not stop because the pool also speaks 0x5052.
+    // Look here if: a JD template waits for a payout answer it should not,
+    // or merge-mined tokens stop under Job Declaration.
+    /// The pool's payout door for this template, when its outputs come from
+    /// the pool.
+    pub fn payouts(&self) -> Option<&Arc<super::jd::payouts::Payouts>> {
+        let plan = self.jd.as_ref()?;
+        let payouts = plan.payouts.as_ref()?;
+        let merged = payouts.local_rates && plan.full_template && self.tokens.is_some();
+        (!merged).then_some(payouts)
+    }
+
+    /// Whether this template's coinbase is prepared before it is published:
+    /// P2Pool's, or the pool's Requested Payout Outputs.
+    pub fn needs_preparation(&self) -> bool {
+        self.is_p2pool() || self.payouts().is_some()
+    }
+
+    /// The prepared coinbase (P2Pool's or the pool's payout outputs), once
+    /// prepared.
+    pub fn prepared_coinbase(&self) -> Option<&crate::stratum_v2::jd::declared::CoinbaseShape> {
+        self.p2pool.as_ref().map(|prepared| &prepared.coinbase)
     }
 
     pub fn p2pool_token(&self) -> Option<&[u8]> {
@@ -635,6 +679,9 @@ impl BchTemplate {
     fn check_p2pool_prepared(&self) -> Result<(), String> {
         if self.is_p2pool() && self.p2pool.is_none() {
             return Err("P2Pool coinbase has not been prepared".into());
+        }
+        if self.payouts().is_some() && self.p2pool.is_none() {
+            return Err("the pool's payout outputs have not been prepared".into());
         }
         Ok(())
     }
@@ -730,8 +777,9 @@ impl BchTemplate {
             return Ok(None);
         };
         // #### merge-mining v2: only Full-Template declarations carry the
-        // leaves the pool checks (`merge::disclosure`).
-        if self.is_p2pool() || !plan.full_template {
+        // leaves the pool checks (`merge::disclosure`); the pool's exact
+        // outputs (0x5052) carry no commitment.
+        if self.is_p2pool() || self.payouts().is_some() || !plan.full_template {
             return Ok(None);
         }
         let miner = plan
@@ -826,10 +874,13 @@ impl BchTemplate {
         }
         // #### merge-mining v2: a Coinbase-only declaration cannot show the
         // pool its leaves, so the pool refuses a token commitment there.
-        self.jd
-            .as_ref()
-            .is_some_and(|plan| !plan.full_template)
-            .then_some("Coinbase-only Job Declaration cannot show the pool its token leaves; use Full-Template")
+        if self.jd.as_ref().is_some_and(|plan| !plan.full_template) {
+            return Some("Coinbase-only Job Declaration cannot show the pool its token leaves; use Full-Template");
+        }
+        // The pool's exact outputs (0x5052) leave no room for output 0.
+        self.payouts().map(|_| {
+            "the pool sets this coinbase's outputs exactly (Requested Payout Outputs), so it cannot carry the token commitment"
+        })
     }
 
     // #### merge-mining v2: pool and role rules
@@ -919,9 +970,16 @@ impl BchTemplate {
             if aux.is_some() {
                 return Err("P2Pool coinbase does not carry this token proof format".into());
             }
+            // An extended channel's job coinbase stops before the device's
+            // bytes (its shares rebuild from the parts), so they are zeros
+            // here; a longer extranonce is still refused.
+            let mut whole = extranonce.to_vec();
+            if whole.len() < prepared.coinbase.extranonce_len() {
+                whole.resize(prepared.coinbase.extranonce_len(), 0);
+            }
             let bytes = prepared
                 .coinbase
-                .coinbase(extranonce)
+                .coinbase(&whole)
                 .ok_or("P2Pool extranonce length changed")?;
             self.check_block_size(bytes.len())?;
             return Ok(Coinbase {

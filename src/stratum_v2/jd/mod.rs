@@ -10,6 +10,7 @@
 pub mod client;
 pub mod codec;
 pub mod declared;
+pub mod payouts;
 pub mod plan;
 pub mod policy;
 pub mod server;
