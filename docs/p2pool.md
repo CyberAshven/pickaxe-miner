@@ -244,7 +244,15 @@ pickaxe stratum-v2 serve --config pool.json --network chipnet \
   device that channel's jobs for the donation's share of its accepted work
   (the SV1 adapter's rule), with the pool's extranonce prefix in each job's
   coinbase part; its job ids and shares map back to the channel they came
-  from, and verdicts come back under the device's own channel.
+  from, and verdicts come back under the device's own channel. A device on
+  a standard channel (some Bitaxe firmware) is switched the same way: both
+  its channels are standard ones, and when P2Pool puts them in a group and
+  sends the group extended jobs, the door gives the device each channel's
+  own standard job (the merkle root over that channel's extranonce prefix).
+  When a device closes its channel, P2Pool closes it, or the connection
+  ends, the door closes the donation channel at P2Pool with it (one P2Pool
+  opens after its device channel closed is closed as soon as it is open),
+  and nothing more goes either way on a closed channel.
 - **Your settings, in `p2pool/<network>.toml`:**
 
 | Flag | P2Pool's key | Limit |
@@ -356,7 +364,11 @@ and a real ASIC at it.
   identity, through the SV1 adapter and the SV2 door; an owner-only node
   keeps one identity; failover to a fallback pool and back; an SV2 device
   mines the donation's jobs for its share, its shares reach the right
-  channel, and a joining Pickaxe's visible donation is credited),
+  channel, and a joining Pickaxe's visible donation is credited; the same
+  for a standard channel, with standard jobs of its own or in a group sent
+  extended jobs, through the door to a stand-in P2Pool too; a donation
+  channel closes at P2Pool with its device channel, when the device leaves
+  and when it was opened too late or too small, with nothing more on it),
   `stratum_v2::command` (fee mode work/both and a long signature refused),
   `config` (the profile's P2Pool settings) and `cli`.
 - `p2pool::launch`: the configuration (node, ports, chain, store, logs,
