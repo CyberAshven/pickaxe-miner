@@ -9,8 +9,17 @@ export class SnapshotRefresh<T> {
   private startedAt = -Infinity;
   private deliveredAt = -Infinity;
   private closed = false;
+  private noticed = false;
 
-  constructor(private fetch: () => Promise<T>, private now: () => number, private interval = 1000) {}
+  // `interval`: the safety read's spacing (a number, or read each time).
+  // A server notice brings the next read forward, at most once per `gap`.
+  constructor(private fetch: () => Promise<T>, private now: () => number,
+              private interval: number | (() => number) = 1000, private gap = 1000) {}
+
+  private period(): number { return typeof this.interval === 'number' ? this.interval : this.interval(); }
+
+  /** The server reported a change (a new block or a covenant spend). */
+  notice() { this.noticed = true; }
 
   private start() {
     if (this.closed) throw new Error('Snapshot reader is closed');
@@ -36,11 +45,15 @@ export class SnapshotRefresh<T> {
 
   async beforeBatch(): Promise<T | undefined> {
     if (this.closed) throw new Error('Snapshot reader is closed');
-    if (!this.pending && this.now() - this.startedAt >= this.interval) this.start();
-    if (this.pending && (this.outcome || this.now() - this.deliveredAt >= this.interval)) {
+    const since = this.now() - this.startedAt;
+    if (!this.pending && (since >= this.period() || (this.noticed && since >= this.gap))) {
+      this.noticed = false;
+      this.start();
+    }
+    if (this.pending && (this.outcome || this.now() - this.deliveredAt >= this.period())) {
       await this.pending;
       // A suspended tab or a long shader compile must not make an old reply fresh.
-      if (this.outcome?.ok && this.now() - this.outcome.completedAt >= this.interval) return this.fresh();
+      if (this.outcome?.ok && this.now() - this.outcome.completedAt >= this.period()) return this.fresh();
       return this.take();
     }
     return undefined;
