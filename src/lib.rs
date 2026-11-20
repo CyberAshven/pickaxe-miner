@@ -103,6 +103,10 @@ pub mod tls;
 #[allow(dead_code)]
 pub mod tui;
 pub mod tx;
+// Pickaxe's own updates from its signed GitHub releases (docs/updates.md).
+// Never in the browser build.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod update;
 #[cfg(feature = "portable-wgpu")]
 pub mod wgpu_photon;
 
