@@ -1,0 +1,61 @@
+name: Supply-chain guard
+
+# Scans every pull request and every push to master and dev for injected
+# loaders (see .agents/skills/supply-chain-guard/SKILL.md). The scan reads
+# git objects only: nothing from the tree is installed, built or run.
+
+on:
+  push:
+    branches: [master, dev]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: Scan for injected loaders
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan the head tree and each new commit
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -uo pipefail
+          SCANNER=.agents/skills/supply-chain-guard/scan.sh
+          # The base branch's scanner judges the change, so a pull request
+          # cannot weaken the check that runs on it. The change's own copy is
+          # used only where the base has none yet.
+          if [[ "$BASE" =~ ^[0-9a-f]{40}$ ]] && git cat-file -e "$BASE^{commit}" 2>/dev/null \
+              && git cat-file -e "$BASE:$SCANNER" 2>/dev/null; then
+            git show "$BASE:$SCANNER" > "$RUNNER_TEMP/scan.sh"
+            echo "scanner from $BASE"
+          else
+            git show "$HEAD_SHA:$SCANNER" > "$RUNNER_TEMP/scan.sh"
+            echo "scanner from $HEAD_SHA"
+          fi
+          args=(. "$HEAD_SHA")
+          # A new branch or a force-push has no usable "before" commit; the
+          # head tree is still scanned.
+          if [[ "$BASE" =~ ^[0-9a-f]{40}$ ]] && [[ "$BASE" != 0000000000000000000000000000000000000000 ]] \
+              && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            args+=(--range "$BASE..$HEAD_SHA")
+          fi
+          bash "$RUNNER_TEMP/scan.sh" "${args[@]}"
+          status=$?
+          case $status in
+            0) ;;
+            1) echo "::warning::supply-chain-guard listed items to review; read them in this log before merging" ;;
+            2) echo "::error::supply-chain-guard found an injected loader marker or hidden code; do not merge, build or run this change"
+               exit 2 ;;
+            *) echo "::error::supply-chain-guard could not scan ($status)"
+               exit "$status" ;;
+          esac
