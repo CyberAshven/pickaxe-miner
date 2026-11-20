@@ -3366,6 +3366,17 @@ Branch `feat/merge-mining-v2`, on `dev`.
     at a remote pool, names `,pickaxe-donation=0` for the device's channel
     (asking again without it if refused); a Pickaxe pool reads that key as
     `donation=`, and BCH P2Pool's own donation is never zeroed.
+  - The higher rate, once (2026-11-20): a login's rate can raise a public
+    pool's donation, never lower it (`payout::effective_donation`, used by
+    the connection's jobs and the Job Declaration token). The adapter's
+    donation channel on the device's connection mines donation work with no
+    fee, and the pool credits its accepted work's share over the last hour
+    (`own_donation`, with a bank so the credit never outlives that work),
+    taking only the rest; the workers page and Device panel show the rate
+    and the credit. Host tests: the rate table, a 2% host crediting 1.5%
+    and taking 0.51% of the device channel's work, a typed 0 crediting
+    nothing, Job Declaration refusing a coinbase one satoshi short of the
+    higher rate, and the adapter's donation channel paying a block whole.
   - Evidence: host tests for each rule, including a public pool miner at
     `donation=0` with a 2% coinbase fee (the leaf's split is the fee slot
     alone, and its proof verifies), a declaration with a wrong fee slot

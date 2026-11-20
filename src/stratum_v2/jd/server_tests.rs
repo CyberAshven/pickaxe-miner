@@ -291,10 +291,22 @@ fn coinbase_only_is_offered_and_full_template_is_refused_until_enabled() {
     let token = PxToken::decode(success.mining_job_token.as_ref()).unwrap();
     assert_eq!((token.rates.donation_bps, token.rates.fee_bps), (150, 100));
     assert!(!token.full_template);
-    // #### merge-mining v2: the miner's own donation choice sets the
-    // token's donation rate; the fee stays. At 0 the token names no
-    // donation output, and a malformed choice is refused.
-    for (option, donation_bps, outputs) in [(",donation=0.5", 50, 3), (",donation=0", 0, 2)] {
+    // #### merge-mining v2: the miner's own donation choice is in the
+    // token's donation rate; the fee stays. A malformed choice is refused.
+    // #### one donation, the higher rate: the token carries the higher of
+    // the pool's rate and the login's: a login's 0 or 0.5% leaves the
+    // pool's 1.5%, a login's 3% raises it, and at a pool of 0% a login's
+    // 1.5% is 1.5%; at 0 overall the token names no donation output. A
+    // custom job paying the donation less than the token's rate is refused.
+    for (pool, option, donation_bps, outputs) in [
+        ("1.5", ",donation=0.5", 150, 3),
+        ("1.5", ",donation=0", 150, 3),
+        ("1.5", ",pickaxe-donation=0", 150, 3),
+        ("1.5", ",donation=3", 300, 3),
+        ("0", ",donation=1.5", 150, 3),
+        ("0", "", 0, 2),
+    ] {
+        *declarator.donation.write().unwrap() = pool.parse().unwrap();
         let mut chosen = session
             .receive(
                 &mut allocate(&format!("{miner}.rig1{option}"), 11),
@@ -309,15 +321,37 @@ fn coinbase_only_is_offered_and_full_template_is_refused_until_enabled() {
         assert_eq!(
             (token.rates.donation_bps, token.rates.fee_bps),
             (donation_bps, 100),
-            "{option}"
+            "{pool} {option}"
         );
-        assert_eq!(
-            parse_outputs(success.coinbase_outputs.as_ref())
-                .unwrap()
-                .len(),
-            outputs
+        let allocated = parse_outputs(success.coinbase_outputs.as_ref()).unwrap();
+        assert_eq!(allocated.len(), outputs);
+        if donation_bps == 0 {
+            continue;
+        }
+        let Ok(Custom::CoinbaseOnly(rule)) =
+            declarator.redeem(success.mining_job_token.as_ref(), &miner, now)
+        else {
+            panic!("a Coinbase-only token");
+        };
+        // The miner, the fee and the donation, as allocated: the donation
+        // at the token's rate passes, one satoshi less is refused.
+        let value = 312_500_000u64;
+        let (donation, fee) = rule.minimums(value);
+        assert_eq!(donation, value * u64::from(donation_bps) / 10_000);
+        let paying = |donation: u64| {
+            vec![
+                (value - fee - donation, allocated[0].1.clone()),
+                (fee, allocated[1].1.clone()),
+                (donation, allocated[2].1.clone()),
+            ]
+        };
+        assert_eq!(rule.check(&paying(donation)), Ok(value));
+        assert!(
+            rule.check(&paying(donation - 1)).is_err(),
+            "{pool} {option}"
         );
     }
+    *declarator.donation.write().unwrap() = "1.5".parse().unwrap();
     assert_eq!(
         session
             .receive(
@@ -336,7 +370,7 @@ fn coinbase_only_is_offered_and_full_template_is_refused_until_enabled() {
         declarator.redeem(success.mining_job_token.as_ref(), &miner, now),
         Ok(Custom::CoinbaseOnly(_))
     ));
-    // The chosen-donation tokens above are not redeemed here.
+    // The chosen-donation token at 0% above is not redeemed here.
     session.close(&declarator);
     assert!(session
         .receive(

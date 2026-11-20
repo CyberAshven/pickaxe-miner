@@ -326,7 +326,7 @@ fn safe_name(name: &str) -> String {
 /// which Windows 10 and later, Linux and macOS have; it refuses members
 /// outside the folder.
 fn extract(archive: &Path, into: &Path) -> Result<(), String> {
-    let output = std::process::Command::new("tar")
+    let output = crate::child_process::command("tar")
         .arg("-xf")
         .arg(archive)
         .arg("-C")
@@ -443,7 +443,7 @@ pub(crate) mod tests {
         }
         let name = asset_name().unwrap_or("p2poolv2_node.tar.xz");
         let out = dir.join(name);
-        let mut tar = std::process::Command::new("tar");
+        let mut tar = crate::child_process::command("tar");
         if name.ends_with(".zip") {
             tar.arg("-a").arg("-c").arg("-f");
         } else {

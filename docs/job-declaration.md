@@ -45,8 +45,8 @@ pickaxe_miner stratum-v2 serve --config pool.json --listen 0.0.0.0:3336 \
 
 `--accept-job-declaration` alone accepts both modes; `full` or `coinbase`
 accepts one. It is off by default. It shares the pool's SV2 port and key: a
-client pins one key for both of its sessions. In the setup (Run a pool, ASIC
-pool) the **Miner templates** row under Advanced sets it: off, full template
+client pins one key for both of its sessions. In the setup (Run a pool, ASIC,
+Public Solo Endpoint) the **Miner templates** row under Advanced sets it: off, full template
 and coinbase only, full template only, or coinbase only.
 
 With Full-Template, the pool's first node checks declared templates with
@@ -74,8 +74,8 @@ identity, a token or an address.
   username is at a public pool (an optional `.worker` suffix is allowed),
   optionally followed by `,donation=<percent>`, the miner's own donation
   (0 to 100% in 0.5% steps; see [merge-mining.md](merge-mining.md#the-login-option)).
-  The token's donation rate is that choice, or the pool's setting without
-  one; the fee stays the pool's. One that is not an address, or a malformed
+  The token's donation rate is the higher of that choice and the pool's
+  setting; the fee stays the pool's. One that is not an address, or a malformed
   donation, ends the Job Declaration session, because the spec has no error
   message for it.
 - `coinbase_outputs` names the outputs the coinbase must carry, each worth 0
@@ -338,7 +338,8 @@ counts as the overview line below.
 - The donation is paid in the coinbase, as the pool's rule requires, so there
   is no donation work under Job Declaration, and nothing is donated twice.
   Its rate is the one the pool's tokens carry. At a Pickaxe pool that is the
-  miner's own donation setting, which the client names after the login as
+  higher of the pool's setting and the miner's own, which the client names
+  after the login as
   `,pickaxe-donation=<percent>` (to the 0.5% step below, as of each
   session's start), or a `,donation=` the login names itself
   (`--upstream-user ADDRESS,donation=0.5`). A pool that refuses the option is

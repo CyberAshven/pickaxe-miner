@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Ports of the P2Pool node Pickaxe runs, apart from P2Pool's defaults
@@ -41,7 +41,115 @@ pub struct Plan {
     /// The payout P2Pool's first jobs pay before any share exists.
     pub bootstrap_address: String,
     pub authority_secret: [u8; 32],
+    /// The node's P2P port (`HOST:PORT`), where P2Pool hears of new blocks
+    /// from a node without ZMQ notices (Knuth, BCHD). Set by `plan()` when
+    /// the node gives no ZMQ notices; `--node-p2p` sets it after.
+    pub node_p2p: Option<String>,
+    /// What the operator writes into P2Pool's configuration, set after
+    /// `plan()` returns; `None` leaves P2Pool's own defaults.
+    pub operator: Option<Operator>,
+    /// Alone on its own share chain (the Non-custodial Pool): no peers
+    /// dialed and the P2P port on this computer only, so no other server
+    /// links in. False (linked, P2Pool v2) from `plan()`; set it after.
+    pub standalone: bool,
+    /// The peers this start dials, checked once (`dial_peers`).
+    pub(super) dial: OnceLock<Vec<String>>,
 }
+
+/// P2Pool's fee, as its configuration caps it: at most 10% (1,000 basis
+/// points), and so is its donation.
+pub const MAX_CUT_BPS: u16 = 1_000;
+/// P2Pool's own donation when the operator sets none: 1% (P2Pool's
+/// default). It is not the Pickaxe donation.
+pub const DEFAULT_DONATION_BPS: u16 = 100;
+/// P2Pool's longest pool signature, in bytes.
+pub const MAX_SIGNATURE_BYTES: usize = 16;
+/// The ZMQ address P2Pool's configuration needs even when it hears of
+/// blocks from the node's P2P port: nothing publishes there, so it never
+/// fires (P2Pool's sample says to leave it as it is then).
+const UNUSED_ZMQ: &str = "tcp://127.0.0.1:28332";
+
+// #### Pool modes: the operator's settings in P2Pool's configuration
+// What: the fee (P2Pool's `fee` in basis points and `fee_address`), the
+// pool's signature in its blocks (`pool_signature`) and P2Pool's own
+// donation (`donation`, basis points), each checked against P2Pool's own
+// limits before P2Pool starts.
+// Why: P2Pool refuses to start on a longer signature or a cut above 10%,
+// and pays the fee in the coinbase only; the Pickaxe donation is separate
+// and never written here.
+// Look here if: P2Pool's TOML lacks a setting, or P2Pool refuses one.
+/// What the operator of a server running its own P2Pool sets in P2Pool's
+/// configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Operator {
+    /// The fee in basis points of what P2Pool's donation leaves, and the
+    /// address it pays; `None` takes none.
+    pub fee: Option<(u16, String)>,
+    /// The pool's name in the coinbase of the blocks P2Pool builds.
+    pub signature: Option<String>,
+    /// P2Pool's own donation, in basis points (0 to 1,000 in steps of 50).
+    pub donation: u16,
+}
+
+impl Default for Operator {
+    fn default() -> Self {
+        Self {
+            fee: None,
+            signature: None,
+            donation: DEFAULT_DONATION_BPS,
+        }
+    }
+}
+
+impl Operator {
+    /// Checks each value against P2Pool's limits: a fee and a donation of
+    /// at most 10%, the donation in 0.5% steps, a signature of at most 16
+    /// printable bytes.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some((bps, address)) = &self.fee {
+            if *bps > MAX_CUT_BPS {
+                return Err("P2Pool takes a fee of at most 10%: lower --pool-fee".into());
+            }
+            if address.trim().is_empty() || address.chars().any(|c| c.is_whitespace()) {
+                return Err("P2Pool's fee needs an address".into());
+            }
+        }
+        if self.donation > MAX_CUT_BPS || !self.donation.is_multiple_of(50) {
+            return Err("--p2pool-donation is P2Pool's own donation: 0 to 10 in 0.5 steps".into());
+        }
+        if let Some(signature) = &self.signature {
+            if signature.is_empty()
+                || signature.len() > MAX_SIGNATURE_BYTES
+                || !signature.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+            {
+                return Err(format!(
+                    "--pool-tag is P2Pool's pool signature here: 1 to {MAX_SIGNATURE_BYTES} \
+                     printable characters"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The node's usual P2P address: its RPC host with the network's P2P port
+/// (8333 on mainnet, 48333 on Chipnet). `node_url` is `plan()`'s, with no
+/// login and an IPv6 host in brackets.
+pub fn default_node_p2p(node_url: &str, network: MiningNetwork) -> Option<String> {
+    let authority = node_url.split_once("://")?.1.split(['/', '?']).next()?;
+    let (host, _) = authority.rsplit_once(':')?;
+    if host.is_empty() {
+        return None;
+    }
+    let port = match network {
+        MiningNetwork::Mainnet => 8333,
+        MiningNetwork::Chipnet => 48333,
+    };
+    Some(format!("{host}:{port}"))
+}
+
+/// Checks a `--node-p2p` address: `HOST:PORT`, an IPv6 host in brackets.
+pub use crate::config::validate_node_p2p;
 
 /// The plan for `cfg`'s network, node and payout with the installed binary.
 pub fn plan(
@@ -57,17 +165,19 @@ pub fn plan(
         .copied()
         .ok_or("P2Pool needs your BCH node: give --node-rpc http://HOST:PORT")?;
     let (node_url, login) = crate::node::rpc_endpoint_and_login(node)?;
+    // #### Pool modes: a node without ZMQ notices (Knuth, BCHD, or ZMQ
+    // off) tells P2Pool of new blocks on its P2P port instead.
     let zmq = match &cfg.node_zmq {
-        NodeZmq::At(url) => url.clone(),
-        NodeZmq::Auto => crate::node::zmq_block_url(node).ok_or(
-            "P2Pool needs the node's ZMQ block notices: set zmqpubhashblock in bitcoin.conf \
-             or give --node-zmq tcp://HOST:PORT",
-        )?,
-        NodeZmq::Off => {
-            return Err(
-                "P2Pool needs the node's ZMQ block notices; --node-zmq off cannot run it".into(),
-            )
-        }
+        NodeZmq::At(url) => Some(url.clone()),
+        NodeZmq::Auto => crate::node::zmq_block_url(node),
+        NodeZmq::Off => None,
+    };
+    let node_p2p = match &zmq {
+        Some(_) => None,
+        None => Some(default_node_p2p(&node_url, cfg.network).ok_or(
+            "P2Pool needs the node's ZMQ block notices or its P2P port: give --node-zmq \
+             tcp://HOST:PORT or --node-p2p HOST:PORT",
+        )?),
     };
     crate::config::validate_payout_address(cfg.network, &cfg.payout_address)
         .map_err(|_| "P2Pool needs a payout address for the selected network: give --address")?;
@@ -82,9 +192,13 @@ pub fn plan(
         settings: settings.clone(),
         node_url,
         login,
-        zmq,
+        zmq: zmq.unwrap_or_else(|| UNUSED_ZMQ.to_owned()),
         bootstrap_address: cfg.payout_address.clone(),
         authority_secret,
+        node_p2p,
+        operator: None,
+        standalone: false,
+        dial: OnceLock::new(),
     })
 }
 
@@ -122,25 +236,43 @@ impl Plan {
         Ok(format!("stratum2+tcp://127.0.0.1:{SV2_PORT}/{public}"))
     }
 
+    /// The peers P2Pool dials at this start: none when standalone, else
+    /// `peers::dial_list`, whose check runs at the first call of each plan.
+    pub fn dial_peers(&self) -> &[String] {
+        if self.standalone {
+            return &[];
+        }
+        self.dial.get_or_init(|| {
+            super::peers::dial_list(self.network, &self.settings.peers, false, &self.home)
+        })
+    }
+
     /// P2Pool's config.toml. Secrets stay out of it: the SV2 secret key and
-    /// the node's login go in the environment (`environment`).
+    /// the node's login go in the environment (`environment`). Linked, its
+    /// peers are `dial_peers`, checked at the first call.
     pub fn config_toml(&self) -> Result<String, String> {
         let (public, _) = authority_texts(&self.authority_secret)?;
         let (_, store, logs) = self.files();
         let path = |path: &Path| toml_string(&path.display().to_string().replace('\\', "/"));
-        let peers = self
-            .settings
-            .peers
+        let dial = self.dial_peers();
+        let peers = dial
             .iter()
             .map(|peer| toml_string(peer))
             .collect::<Vec<_>>()
             .join(", ");
+        // Standalone, the P2P port takes no other server: discovery could
+        // otherwise link one in.
+        let listen = if self.standalone {
+            "127.0.0.1"
+        } else {
+            "0.0.0.0"
+        };
         Ok(format!(
             "# Written by Pickaxe for P2Pool {tag} at each start; changes here are replaced.
 # Pickaxe passes the node's login and the SV2 secret key in the environment.
 
 [network]
-listen_address = \"/ip4/0.0.0.0/tcp/{P2P_PORT}\"
+listen_address = \"/ip4/{listen}/tcp/{P2P_PORT}\"
 dial_peers = [{peers}]
 max_pending_incoming = 10
 max_pending_outgoing = 10
@@ -167,7 +299,7 @@ start_difficulty = 10000
 minimum_difficulty = 100
 bootstrap_address = {bootstrap}
 zmqpubhashblock = {zmq}
-network = \"signet\"
+{stratum_extra}network = \"signet\"
 version_mask = \"1fffffe0\"
 chain = \"bitcoin-cash\"
 bitcoin_cash_network = \"{network}\"
@@ -193,16 +325,47 @@ port = {API_PORT}
             store = path(&store),
             bootstrap = toml_string(&self.bootstrap_address),
             zmq = toml_string(&self.zmq),
+            stratum_extra = self.stratum_extra(),
             network = self.network.as_str(),
             chain = self.settings.share_chain.as_str(),
             // With no peers this node is the share chain; waiting for a
             // current chain would keep its ports closed for good.
-            wait = !self.settings.peers.is_empty(),
+            wait = !dial.is_empty(),
             public = toml_string(&public),
             node = toml_string(&self.node_url),
             log = path(&logs.join(format!("{}.log", self.network.as_str()))),
             stats = path(&logs.join(format!("stats-{}", self.network.as_str()))),
         ))
+    }
+
+    /// #### Pool modes: the `[stratum]` lines after the ZMQ address: the
+    /// node's P2P port for a node without ZMQ, and the operator's fee,
+    /// signature and P2Pool donation. Each line ends with a newline.
+    fn stratum_extra(&self) -> String {
+        let mut lines = String::new();
+        if let Some(address) = &self.node_p2p {
+            lines.push_str(&format!(
+                "# New blocks come from the node's P2P port (a node without ZMQ notices).\n\
+                 node_p2p_address = {}\n",
+                toml_string(address)
+            ));
+        }
+        if let Some(operator) = &self.operator {
+            lines.push_str(&format!(
+                "# P2Pool's own donation, apart from the Pickaxe donation.\ndonation = {}\n",
+                operator.donation
+            ));
+            if let Some((bps, address)) = &operator.fee {
+                lines.push_str(&format!(
+                    "fee_address = {}\nfee = {bps}\n",
+                    toml_string(address)
+                ));
+            }
+            if let Some(signature) = &operator.signature {
+                lines.push_str(&format!("pool_signature = {}\n", toml_string(signature)));
+            }
+        }
+        lines
     }
 
     /// The secrets P2Pool reads from its environment: `P2POOL_` and the
@@ -231,6 +394,9 @@ port = {API_PORT}
             args: vec!["--config".into(), config.display().to_string()],
             env: self.environment()?,
             dir: self.home.clone(),
+            learner: (!self.standalone).then(|| {
+                super::peers::Learner::new(self.network, &self.settings.peers, &self.home)
+            }),
         })
     }
 }
@@ -260,6 +426,9 @@ pub struct Command {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub dir: PathBuf,
+    /// Keeps the peers P2Pool dials out to for the next start (none when
+    /// standalone).
+    pub learner: Option<super::peers::Learner>,
 }
 
 /// What P2Pool is doing, as its light shows it.
@@ -380,8 +549,9 @@ pub(crate) struct Probe {
     pub peers: Option<usize>,
 }
 
-/// Asks P2Pool's API whether it is up, its share-chain tip and its peers.
-fn probe(api_port: u16) -> Probe {
+/// Asks P2Pool's API whether it is up, its share-chain tip and its peers,
+/// with the addresses of those it dialed out to.
+fn probe(api_port: u16) -> (Probe, Vec<String>) {
     let get = |path: &str| {
         super::http::get(
             &format!("http://127.0.0.1:{api_port}{path}"),
@@ -393,17 +563,27 @@ fn probe(api_port: u16) -> Probe {
         .filter(|response| response.status == 200)
     };
     let Some(_) = get("/health") else {
-        return Probe::default();
+        return Default::default();
     };
     let json = |path: &str| {
         get(path)
             .and_then(|response| serde_json::from_slice::<serde_json::Value>(&response.body).ok())
     };
-    Probe {
-        api: true,
-        tip: json("/chain_info").and_then(|info| info["chain_tip_height"].as_u64()),
-        peers: json("/peers").and_then(|peers| peers.as_array().map(Vec::len)),
-    }
+    let tip = json("/chain_info").and_then(|info| info["chain_tip_height"].as_u64());
+    let peers = json("/peers");
+    (
+        Probe {
+            api: true,
+            tip,
+            peers: peers
+                .as_ref()
+                .and_then(|peers| peers.as_array().map(Vec::len)),
+        },
+        peers
+            .as_ref()
+            .map(super::peers::outbound)
+            .unwrap_or_default(),
+    )
 }
 
 /// The state from what the log said and the API answered.
@@ -636,11 +816,12 @@ fn supervise(
     restart: &AtomicBool,
 ) {
     let mut failures = 0usize;
+    let mut learned = super::peers::Learned::default();
     while !stop.load(Ordering::SeqCst) {
         restart.store(false, Ordering::SeqCst);
         lock(shared).seen = Seen::default();
         set(shared, State::Starting);
-        let spawned = std::process::Command::new(&command.program)
+        let spawned = crate::child_process::command(&command.program)
             .args(&command.args)
             .envs(command.env.iter().map(|(key, value)| (key, value)))
             .current_dir(&command.dir)
@@ -687,7 +868,10 @@ fn supervise(
             }
             if probed.is_none_or(|at| at.elapsed() >= Duration::from_secs(2)) {
                 probed = Some(Instant::now());
-                let answer = api_port.map(probe).unwrap_or_default();
+                let (answer, outbound) = api_port.map(probe).unwrap_or_default();
+                if let Some(learner) = &command.learner {
+                    learner.learn(&outbound, &mut learned);
+                }
                 let state = assess(&lock(shared).seen, &answer, Instant::now());
                 set(shared, state);
                 if lock(shared)
@@ -772,13 +956,142 @@ mod tests {
             zmq: "tcp://node.example:28332".into(),
             bootstrap_address: "bchtest:qrzq5f9ltv70u4su7d40agd4nlnp8qlgqcma6x2tvp".into(),
             authority_secret: [7; 32],
+            node_p2p: None,
+            operator: None,
+            standalone: false,
+            dial: OnceLock::new(),
         }
+    }
+
+    // #### Pool modes
+    // What: the operator's fee (basis points and address), P2Pool's own
+    // donation and the pool signature reach P2Pool's [stratum] table as
+    // set; without them the TOML has none of those lines (P2Pool's
+    // defaults). Values over P2Pool's limits are refused before it starts.
+    // Look here if: Operator or `stratum_extra` change.
+    #[test]
+    fn the_operator_sets_the_fee_donation_and_signature_in_p2pools_config() {
+        let home = PathBuf::from("/tmp/p2pool");
+        let mut plan = dialing(plan_for(&home, vec![], None), &[]);
+        let plain = plan.config_toml().unwrap();
+        for absent in ["donation", "fee", "pool_signature", "node_p2p_address"] {
+            assert!(!plain.contains(absent), "{absent}:\n{plain}");
+        }
+        plan.operator = Some(Operator {
+            fee: Some((250, "bchtest:pqfeeaddress".into())),
+            signature: Some("/MyPool/".into()),
+            donation: 50,
+        });
+        plan.operator.as_ref().unwrap().validate().unwrap();
+        let toml = plan.config_toml().unwrap();
+        let stratum = toml.split("[stratum]").nth(1).unwrap();
+        let stratum = stratum.split("\n[").next().unwrap();
+        for expected in [
+            "\ndonation = 50\n",
+            "\nfee_address = \"bchtest:pqfeeaddress\"\n",
+            "\nfee = 250\n",
+            "\npool_signature = \"/MyPool/\"\n",
+        ] {
+            assert!(stratum.contains(expected), "{expected}:\n{toml}");
+        }
+        // P2Pool's own donation is written even at its default; no fee
+        // writes no fee lines.
+        plan.operator = Some(Operator::default());
+        let toml = plan.config_toml().unwrap();
+        assert!(toml.contains("\ndonation = 100\n"));
+        assert!(!toml.contains("fee") && !toml.contains("pool_signature"));
+        // P2Pool's limits.
+        let refused = |operator: Operator| operator.validate().unwrap_err();
+        assert!(refused(Operator {
+            fee: Some((1001, "bchtest:q".into())),
+            ..Operator::default()
+        })
+        .contains("at most 10%"));
+        assert!(refused(Operator {
+            signature: Some("seventeen-bytes!!".into()),
+            ..Operator::default()
+        })
+        .contains("1 to 16"));
+        Operator {
+            signature: Some("sixteen-bytes!!!".into()),
+            ..Operator::default()
+        }
+        .validate()
+        .unwrap();
+        for donation in [1050, 125] {
+            assert!(refused(Operator {
+                donation,
+                ..Operator::default()
+            })
+            .contains("0.5 steps"));
+        }
+    }
+
+    // #### Pool modes: Knuth and other nodes without ZMQ
+    // What: with ZMQ notices off (or none found in bitcoin.conf), the plan
+    // no longer refuses: P2Pool hears of blocks on the node's P2P port, by
+    // default the node's host with the network's P2P port, and its ZMQ
+    // address is one nothing publishes on. With ZMQ there is no P2P line
+    // unless --node-p2p sets one.
+    // Look here if: `plan()`'s notices or `default_node_p2p` change.
+    #[test]
+    fn a_node_without_zmq_notices_gives_p2pool_its_p2p_port() {
+        let home = super::super::test_dir("no-zmq");
+        let installed = super::super::release::Installed {
+            tag: "v0.0.1-alpha".into(),
+            binary: home.join("p2poolv2"),
+            sha256: String::new(),
+            installed_at: 0,
+            previous: None,
+        };
+        let mut cfg = RuntimeConfig {
+            network: MiningNetwork::Chipnet,
+            payout_address: "bchtest:qrzq5f9ltv70u4su7d40agd4nlnp8qlgqcma6x2tvp".into(),
+            node_url: Some("http://192.168.1.20:48332".into()),
+            node_zmq: NodeZmq::Off,
+            ..RuntimeConfig::default()
+        };
+        let settings = Settings::default();
+        let without = dialing(plan(&cfg, &home, &installed, &settings).unwrap(), &[]);
+        assert_eq!(without.node_p2p.as_deref(), Some("192.168.1.20:48333"));
+        let toml = without.config_toml().unwrap();
+        assert!(toml.contains("\nnode_p2p_address = \"192.168.1.20:48333\"\n"));
+        assert!(toml.contains(&format!("zmqpubhashblock = \"{UNUSED_ZMQ}\"")));
+        cfg.node_zmq = NodeZmq::At("tcp://192.168.1.20:28332".into());
+        let with = dialing(plan(&cfg, &home, &installed, &settings).unwrap(), &[]);
+        assert_eq!(with.node_p2p, None);
+        assert!(!with.config_toml().unwrap().contains("node_p2p_address"));
+        // The network's usual P2P port, and IPv6 hosts kept in brackets.
+        assert_eq!(
+            default_node_p2p("https://[fd7a::5]:8332", MiningNetwork::Mainnet).as_deref(),
+            Some("[fd7a::5]:8333")
+        );
+        assert_eq!(
+            validate_node_p2p(" node.lan:8333 ").unwrap(),
+            "node.lan:8333"
+        );
+        validate_node_p2p("[fd7a::5]:48333").unwrap();
+        for bad in ["node.lan", "node.lan:0", ":8333", "a b:8333", "[x]:8333"] {
+            assert!(validate_node_p2p(bad).is_err(), "{bad}");
+        }
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    /// `plan` with its peer check already made: these are what it dials.
+    fn dialing(plan: Plan, dial: &[&str]) -> Plan {
+        plan.dial
+            .set(dial.iter().map(|peer| (*peer).to_owned()).collect())
+            .unwrap();
+        plan
     }
 
     #[test]
     fn the_config_names_the_node_ports_and_chain_and_keeps_secrets_out() {
         let home = PathBuf::from("C:\\Users\\miner\\Pickaxe\\p2pool");
-        let plan = plan_for(&home, vec![], Some(("p2pool".into(), "s3cret".into())));
+        let plan = dialing(
+            plan_for(&home, vec![], Some(("p2pool".into(), "s3cret".into()))),
+            &[],
+        );
         let toml = plan.config_toml().unwrap();
         let (public, secret) = authority_texts(&plan.authority_secret).unwrap();
         for expected in [
@@ -806,12 +1119,78 @@ mod tests {
         assert!(env.contains(&("P2POOL_BITCOINRPC__USERNAME".into(), "p2pool".into())));
         assert!(env.contains(&("P2POOL_BITCOINRPC__PASSWORD".into(), "s3cret".into())));
         // Joining peers waits for their share chain.
-        let joined = plan_for(&home, vec!["/ip4/203.0.113.7/tcp/6884".into()], None)
-            .config_toml()
-            .unwrap();
+        let joined = dialing(
+            plan_for(&home, vec!["/ip4/203.0.113.7/tcp/6884".into()], None),
+            &["/ip4/203.0.113.7/tcp/6884"],
+        )
+        .config_toml()
+        .unwrap();
         assert!(joined.contains("dial_peers = [\"/ip4/203.0.113.7/tcp/6884\"]"));
         assert!(joined.contains("wait_for_chain_sync = true"));
         assert_eq!(toml_string("a\"b\\c\n"), "\"a\\\"b\\\\c\\n\"");
+    }
+
+    #[test]
+    fn standalone_listens_on_this_computer_alone_and_linked_dials_its_peers() {
+        let home = super::super::test_dir("launch-standalone");
+        let yours = "/ip4/203.0.113.7/tcp/6884".to_owned();
+        // Standalone: your peers are not dialed, the P2P port is local and
+        // nothing waits for peers; P2Pool's peers are not learned either.
+        let mut alone = plan_for(&home, vec![yours.clone()], None);
+        alone.standalone = true;
+        let toml = alone.config_toml().unwrap();
+        for expected in [
+            "listen_address = \"/ip4/127.0.0.1/tcp/6860\"",
+            "dial_peers = []",
+            "wait_for_chain_sync = false",
+        ] {
+            assert!(toml.contains(expected), "{expected}:\n{toml}");
+        }
+        assert!(alone.dial.get().is_none());
+        assert!(alone.command().unwrap().learner.is_none());
+        assert!(!super::super::peers::file(MiningNetwork::Chipnet, &home).exists());
+        // Linked: the checked list, DNS names as written, on every
+        // interface, waiting for the share chain.
+        let linked = dialing(
+            plan_for(&home, vec![yours.clone()], None),
+            &[&yours, "/dns4/pool.example.com/tcp/6884"],
+        );
+        let toml = linked.config_toml().unwrap();
+        for expected in [
+            "listen_address = \"/ip4/0.0.0.0/tcp/6860\"",
+            "dial_peers = [\"/ip4/203.0.113.7/tcp/6884\", \"/dns4/pool.example.com/tcp/6884\"]",
+            "wait_for_chain_sync = true",
+        ] {
+            assert!(toml.contains(expected), "{expected}:\n{toml}");
+        }
+        assert!(linked.command().unwrap().learner.is_some());
+        // Linked with nothing to dial: its own chain, without waiting.
+        let toml = dialing(plan_for(&home, vec![], None), &[])
+            .config_toml()
+            .unwrap();
+        assert!(toml.contains("listen_address = \"/ip4/0.0.0.0/tcp/6860\""));
+        assert!(toml.contains("dial_peers = []") && toml.contains("wait_for_chain_sync = false"));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_linked_start_checks_its_peers_once() {
+        let home = super::super::test_dir("launch-check");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let yours = format!(
+            "/dns4/localhost/tcp/{}",
+            listener.local_addr().unwrap().port()
+        );
+        let plan = plan_for(&home, vec![yours.clone()], None);
+        let toml = plan.config_toml().unwrap();
+        assert!(toml.contains(&format!("dial_peers = [{}]", toml_string(&yours))));
+        assert_eq!(plan.dial.get(), Some(&vec![yours.clone()]));
+        // The check was kept for `pickaxe p2pool peers`.
+        let kept =
+            super::super::peers::load(&super::super::peers::file(MiningNetwork::Chipnet, &home));
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].address == yours && kept[0].millis.is_some());
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -940,6 +1319,7 @@ mod tests {
             ],
             env: vec![(FAKE.into(), spec)],
             dir: std::env::temp_dir(),
+            learner: None,
         }
     }
 
@@ -960,7 +1340,7 @@ mod tests {
     fn on_windows_p2pool_joins_the_job_that_ends_with_pickaxe() {
         use std::os::windows::io::AsRawHandle;
         let command = script(&[], true);
-        let mut child = std::process::Command::new(&command.program)
+        let mut child = crate::child_process::command(&command.program)
             .args(&command.args)
             .envs(command.env.iter().map(|(key, value)| (key, value)))
             .stdout(std::process::Stdio::null())
@@ -1011,6 +1391,7 @@ mod tests {
 
     #[test]
     fn a_node_whose_api_answers_after_sv2_opens_is_green_and_stops_on_request() {
+        let peers = r#"[{"peer_id": "12D3KooWX", "address": "/ip4/203.0.113.9/tcp/6884/p2p/12D3KooWX", "direction": "Outbound", "connected_secs": 3}]"#;
         let port = super::super::http::tests::serve(
             (0..30)
                 .flat_map(|_| {
@@ -1018,15 +1399,23 @@ mod tests {
                         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".to_vec(),
                         b"HTTP/1.1 200 OK\r\nContent-Length: 26\r\n\r\n{\"chain_tip_height\": 1234}"
                             .to_vec(),
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n[{}]".to_vec(),
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{peers}",
+                            peers.len()
+                        )
+                        .into_bytes(),
                     ]
                 })
                 .collect(),
         );
-        let supervisor = Supervisor::start(
-            script(&["Stratum V2 listening on 127.0.0.1:3361"], true),
-            Some(port),
-        );
+        let home = super::super::test_dir("launch-learn");
+        let mut command = script(&["Stratum V2 listening on 127.0.0.1:3361"], true);
+        command.learner = Some(super::super::peers::Learner::new(
+            MiningNetwork::Chipnet,
+            &[],
+            &home,
+        ));
+        let supervisor = Supervisor::start(command, Some(port));
         let state = wait_for(&supervisor, "green", State::is_running);
         assert_eq!(
             state,
@@ -1036,8 +1425,14 @@ mod tests {
             }
         );
         assert!(supervisor.running_for().is_some());
+        // The peer it dialed out to is kept for the next start.
+        let kept =
+            super::super::peers::load(&super::super::peers::file(MiningNetwork::Chipnet, &home));
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].learned && kept[0].address == "/ip4/203.0.113.9/tcp/6884");
         let started = Instant::now();
         supervisor.stop();
         assert!(started.elapsed() < Duration::from_secs(5));
+        std::fs::remove_dir_all(home).unwrap();
     }
 }

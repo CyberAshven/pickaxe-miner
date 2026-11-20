@@ -63,6 +63,20 @@ pub fn take_profiles_request() -> bool {
     PROFILES.swap(false, Ordering::AcqRel)
 }
 
+/// Stops the running session as Ctrl+C does: the desktop window's Stop for
+/// sessions without a stop control of their own (rig mode, the ASIC server).
+/// It reaches only a session that is running: unlike Ctrl+C, a request with
+/// no session bound is dropped rather than carried into the next one.
+pub fn stop_session() {
+    if let Some(Ok(target)) = STOP.get() {
+        PROFILES.store(false, Ordering::Release);
+        let state = target.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(stop) = state.target.upgrade() {
+            stop.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Install once; the signal follows the active session rather than retaining
 /// a closed worker's stop flag across visits to the profile picker.
 pub fn install_stop(stop: &Arc<AtomicBool>) -> Result<(), String> {

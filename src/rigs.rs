@@ -514,6 +514,74 @@ struct RigStats {
 #[cfg(feature = "stratum-v2")]
 pub use net::{run_rig, RigHub};
 
+/// Shows rig mode's events and status somewhere other than stdout: the
+/// desktop window (`pickaxe gui`). The status file is still written.
+pub trait RigView: Send + Sync {
+    /// One event, as `rig <event>: <detail>` prints it.
+    fn event(&self, event: &str, detail: &serde_json::Value);
+    /// The rig's status, as its status file holds it (`rig_status_json`).
+    fn status(&self, status: &serde_json::Value);
+}
+
+static RIG_VIEW: std::sync::OnceLock<Box<dyn RigView>> = std::sync::OnceLock::new();
+
+/// Sends every later rig session's events and status to `view`.
+pub fn show_rigs_in(view: Box<dyn RigView>) -> Result<(), String> {
+    RIG_VIEW
+        .set(view)
+        .map_err(|_| "rig sessions already have a view".to_owned())
+}
+
+/// Starts this miner's coordinator for its rigs on `listen`, its key kept
+/// at `key_path`. A public GPU pool (`public`: its fee, and the address the
+/// fee goes to, the payout when none) is checked for `network` first.
+pub fn start_coordinator(
+    listen: std::net::SocketAddr,
+    key_path: &std::path::Path,
+    public: Option<(Option<crate::donation::bch::BchDonation>, Option<&str>)>,
+    network: MiningNetwork,
+    payout: &str,
+) -> Result<RigHub, String> {
+    let hub = RigHub::start(listen, key_path)?;
+    if let Some((fee, address)) = public {
+        let address = crate::config::validate_payout_address(network, address.unwrap_or(payout))
+            .map_err(|error| format!("pool fee address: {error}"))?;
+        hub.set_public(Some(PublicRigs {
+            fee_bps: fee.map_or(0, u16::from),
+            address,
+        }));
+    }
+    Ok(hub)
+}
+
+/// Mines as a rig of `coordinators` (each with its key, in order) on `gpus`
+/// until stopped, holding the GPU lock; a public GPU pool claims the rig's
+/// wins to `payout`.
+#[allow(clippy::too_many_arguments)]
+pub fn mine_as_rig(
+    coordinators: &[(String, String)],
+    name: Option<&str>,
+    payout: &str,
+    gpus: &[crate::backend::GpuDevice],
+    intensity: u8,
+    json: bool,
+    status: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let _gpu_lock = crate::mining_lock::acquire_gpu_lock()?;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    crate::session_control::install_stop(&stop)?;
+    run_rig(
+        coordinators,
+        name,
+        Some(payout).filter(|payout| !payout.trim().is_empty()),
+        gpus,
+        intensity,
+        json,
+        stop,
+        status,
+    )
+}
+
 #[cfg(feature = "stratum-v2")]
 mod net {
     use super::*;
@@ -1016,6 +1084,10 @@ mod net {
     }
 
     fn report(json: bool, event: &str, detail: serde_json::Value) {
+        if let Some(view) = RIG_VIEW.get() {
+            view.event(event, &detail);
+            return;
+        }
         if json {
             let mut line = serde_json::json!({"event": event});
             if let (Some(line), Some(detail)) = (line.as_object_mut(), detail.as_object()) {
@@ -1102,11 +1174,16 @@ mod net {
                            rate: f64,
                            winners: u64,
                            devices: &[RigGpu]| {
+            let view = RIG_VIEW.get();
+            if status.is_none() && view.is_none() {
+                return;
+            }
+            let line = rig_status_json(coordinator, mining, rate, winners, started, devices);
             if let Some(path) = status {
-                crate::mine_watch::save(
-                    path,
-                    &rig_status_json(coordinator, mining, rate, winners, started, devices),
-                );
+                crate::mine_watch::save(path, &line);
+            }
+            if let Some(view) = view {
+                view.status(&line);
             }
         };
         while !stop.load(Ordering::Relaxed) {

@@ -32,6 +32,23 @@ pub enum ShareEvent {
     Rejected(&'static str),
 }
 
+/// #### one donation, the higher rate: a public pool miner's effective
+/// Pickaxe donation and the part their own Pickaxe visibly mines, as the
+/// workers page and the Device panel show them: "2.00%", or "2.00% · own
+/// 1.50%". `None` off a public pool.
+pub fn donation_text(effective_bps: Option<u16>, own_bps: Option<u16>) -> Option<String> {
+    let percent = |bps: u16| {
+        crate::donation::bch::BchDonation::try_from(bps)
+            .map(|rate| rate.to_string())
+            .unwrap_or_default()
+    };
+    let effective = percent(effective_bps?);
+    Some(match own_bps.filter(|own| *own > 0) {
+        Some(own) => format!("{effective} · own {}", percent(own)),
+        None => effective,
+    })
+}
+
 /// #### PR #40
 /// The difficulty a share's hash reached (pool difficulty: 1 is one in 2^32
 /// hashes), for best-share records; the target's difficulty is the same
@@ -75,6 +92,11 @@ pub struct DeviceSnapshot {
     pub model: Option<String>,
     pub firmware: Option<String>,
     pub power_w: Option<f64>,
+    /// #### one donation, the higher rate: on a public pool, the miner's
+    /// effective Pickaxe donation and the part their own Pickaxe visibly
+    /// mines (credited), in hundredths of a percent.
+    pub donation_bps: Option<u16>,
+    pub own_donation_bps: Option<u16>,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +143,9 @@ struct Device {
     adapter_error: Option<&'static str>,
     report: Option<DeviceReport>,
     best_share: Option<f64>,
+    /// #### one donation, the higher rate: the effective rate and the own
+    /// Pickaxe's credit, on a public pool.
+    donation: Option<(u16, u16)>,
 }
 
 /// #### PR #42
@@ -233,6 +258,7 @@ impl Device {
             adapter_error: None,
             report: None,
             best_share: None,
+            donation: None,
         }
     }
 }
@@ -294,16 +320,48 @@ impl Devices {
         self.sockets.insert(socket, id);
         self.rows.insert(
             id,
-            Device::new(
-                device_label(self.prefix, None, id),
-                id,
-                None,
-                if adapter { "SV1" } else { "SV2" },
-                now,
-            ),
+            Device {
+                label: device_label(self.prefix, None, id),
+                number: id,
+                worker: None,
+                replaced: Vec::new(),
+                ip: None,
+                protocol: if adapter { "SV1" } else { "SV2" },
+                started: now,
+                ended: None,
+                channels: 0,
+                accepted: 0,
+                rejected: 0,
+                adapter_rejected: 0,
+                last_rejection: None,
+                last_share: None,
+                work: VecDeque::new(),
+                hour: VecDeque::new(),
+                difficulty: None,
+                connection_error: None,
+                adapter_error: None,
+                report: None,
+                best_share: None,
+                donation: None,
+            },
         );
         self.prune();
         id
+    }
+
+    /// #### one donation, the higher rate: a public pool miner's effective
+    /// donation and their own Pickaxe's credit, or none.
+    pub fn set_donation(
+        &mut self,
+        id: u64,
+        terms: Option<(
+            crate::donation::bch::BchDonation,
+            crate::donation::bch::BchDonation,
+        )>,
+    ) {
+        if let Some(row) = self.rows.get_mut(&id) {
+            row.donation = terms.map(|(effective, own)| (u16::from(effective), u16::from(own)));
+        }
     }
 
     /// #### PR #42: removes a connection that turned out to be a Job
@@ -865,6 +923,8 @@ impl Devices {
                     model: row.report.as_ref().and_then(|r| r.model.clone()),
                     firmware: row.report.as_ref().and_then(|r| r.firmware.clone()),
                     power_w: row.report.as_ref().and_then(|r| r.power_w),
+                    donation_bps: row.donation.map(|(effective, _)| effective),
+                    own_donation_bps: row.donation.map(|(_, own)| own),
                 }
             })
             .collect();
