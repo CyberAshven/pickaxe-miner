@@ -717,9 +717,9 @@ fn provided_templates_are_checked_like_a_nodes() {
     let (_, txids) = template_with(3);
     let mut txs: Vec<Value> = (1..=3).map(transaction).collect();
     txs.sort_by_key(|tx| tx["txid"].as_str().unwrap().to_owned());
-    let bytes: Vec<Vec<u8>> = txs
+    let bytes: Vec<std::sync::Arc<[u8]>> = txs
         .iter()
-        .map(|tx| hex::decode(tx["data"].as_str().unwrap()).unwrap())
+        .map(|tx| hex::decode(tx["data"].as_str().unwrap()).unwrap().into())
         .collect();
     let path = coinbase_path(&txids);
     let base = |prefix: &'static [u8]| Provided {
@@ -797,6 +797,7 @@ fn job_declaration_jobs_carry_the_commitment_and_the_pool_rule_accepts_them() {
         },
         pool_target: [0xff; 32],
         p2pool: None,
+        payouts: None,
         full_template: true,
     };
     template.declare(Arc::new(plan.clone()));

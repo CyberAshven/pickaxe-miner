@@ -14,6 +14,10 @@ pub mod channel;
 pub mod command;
 #[cfg(feature = "stratum-v2")]
 pub mod device_api;
+// The SV2 extensions shared with the Knuth node: 0x0001, 0x0002, 0x5052 and
+// 0x4C54.
+#[cfg(feature = "stratum-v2")]
+pub mod extensions;
 // #### Pool modes: the SV2 door of a Non-custodial Pool.
 #[cfg(feature = "stratum-v2")]
 pub mod door;

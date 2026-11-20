@@ -35,13 +35,14 @@ pub fn command(
             match release::check(&home) {
                 Ok(Check::UpToDate(tag)) => println!("newest:    {tag} (up to date)"),
                 Ok(Check::Available { release, .. }) => println!(
-                    "newest:    {}{} (run `pickaxe p2pool update`)",
+                    "newest:    {}{}, {} (run `pickaxe p2pool update`)",
                     release.tag,
                     if release.prerelease {
                         ", pre-release"
                     } else {
                         ""
-                    }
+                    },
+                    release.signature_text()
                 ),
                 Err(error) => println!("newest:    unknown ({error})"),
             }
@@ -697,6 +698,7 @@ mod tests {
             asset_url: String::new(),
             sha256_url: String::new(),
             digest: None,
+            signed_sums: None,
         };
         let update = Update::Available(release);
         let node = NodeCheck::Ready {

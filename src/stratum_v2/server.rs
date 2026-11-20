@@ -1607,9 +1607,10 @@ fn offer(
         own
     });
     template.declare(plan);
-    // #### PR #65: P2Pool coinbases are prepared off this thread (see
+    // #### PR #65: P2Pool coinbases (and the pool's payout outputs, 0x5052)
+    // are prepared off this thread (see
     // `start_preparation`); the offer ends when they are.
-    if template.is_p2pool() {
+    if template.needs_preparation() {
         offered.retry = None;
         offered.waiting = Some(Preparation {
             generation,
@@ -1914,7 +1915,7 @@ fn failed_offer(shared: &Shared, offered: &mut Offered, incoming: &BchTemplate, 
             job.template.previous_hash == incoming.previous_hash
                 && job.template.bits == incoming.bits
                 && job.serial >> 32
-                    == if job.template.is_p2pool() {
+                    == if job.template.needs_preparation() {
                         u64::from(offered.cohort)
                     } else {
                         plan
@@ -2199,7 +2200,7 @@ impl JobAvailability {
                     self.generation.is_some()
                         && self.parent == Some((job.template.previous_hash, job.template.bits))
                         && self.serial.map(|serial| serial >> 32) == Some(job.serial >> 32)
-                        && job.generation > acknowledged
+                        && job.template.declaration_id(job.generation) > acknowledged
                 })
             {
                 return Ok(Vec::new());
@@ -2366,6 +2367,9 @@ fn serve_declarator(
             let expired = session.expire(now)?;
             responses.frames.extend(expired.frames);
             responses.refused = expired.refused.or(responses.refused);
+            // Requested Payout Outputs (0x5052): PayoutOutputsStale once
+            // the pool's donation or fee changes (`DeclaratorSession::poll`).
+            responses.frames.extend(session.poll(declarator)?.frames);
             // #### PR #42: a Full-Template session's frames may take 16 MiB
             // (`Limits::JD`); a Coinbase-only one keeps a device's limits.
             if session.full_template() && !raised {
@@ -2785,10 +2789,20 @@ fn serve_device(
                     if let Some(reason) = mining.token_refusal.take() {
                         stats.tokens_refused = Some(reason);
                     }
+                    // A share naming its worker (extension 0x0002) counts
+                    // on that worker's row (`Devices::worker_share`).
                     if let Some(event) = responses.share_event {
-                        stats
-                            .device_stats
-                            .share(device, event, false, Instant::now());
+                        match responses.worker.as_deref() {
+                            Some(worker) => stats.device_stats.worker_share(
+                                device,
+                                worker,
+                                event,
+                                Instant::now(),
+                            ),
+                            None => stats
+                                .device_stats
+                                .share(device, event, false, Instant::now()),
+                        }
                     }
                 }
                 accepted = next_accepted;
@@ -3305,6 +3319,7 @@ mod retry_tests {
                 tokens: Mutex::new(VecDeque::new()),
                 consumed: std::sync::atomic::AtomicUsize::new(0),
             })),
+            payouts: None,
             full_template: true,
         });
         let (events, _receive) = mpsc::sync_channel(1);
@@ -3424,6 +3439,7 @@ mod retry_tests {
                 },
                 pool_target: [255; 32],
                 p2pool: None,
+                payouts: None,
                 full_template: true,
             });
             let mut template =
@@ -3589,6 +3605,7 @@ mod p2pool_tests {
             },
             pool_target: [255; 32],
             p2pool: Some(Arc::new(crate::p2pool::jd::fake::plan(url, owner, tokens))),
+            payouts: None,
             full_template: true,
         })
     }
