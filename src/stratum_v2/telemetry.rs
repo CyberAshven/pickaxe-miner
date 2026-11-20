@@ -828,6 +828,14 @@ impl Devices {
 // Only static categories leave this module; unknown upstream text may contain
 // an address, credentials or untrusted control characters.
 pub fn connection_reason(error: &str) -> &'static str {
+    // Frame read and write failures name their OS error after this text.
+    let error = [
+        "SV2 frame read failed or timed out",
+        "SV2 frame write failed or timed out",
+    ]
+    .into_iter()
+    .find(|fixed| error.starts_with(fixed))
+    .unwrap_or(error);
     match error {
         "SV1 disconnected" => "device disconnected",
         "SV2 peer disconnected"
