@@ -628,7 +628,11 @@ mod tests {
         )
         .unwrap();
         let (mut to_server, mut from_server) = client.split();
-        let (mut to_client, _) = accepted.join().unwrap().split();
+        // Both halves of the server's session stay open until the client has
+        // read the frame: closing a Windows socket while sent data is still on
+        // its way resets the connection, and the client's read then fails with
+        // ConnectionReset (OS error 10054) although the send succeeded.
+        let (mut to_client, from_client) = accepted.join().unwrap().split();
         to_client.set_limits(Limits {
             frame_deadline: test_deadline,
             ..Limits::TDP_SERVER
@@ -637,17 +641,22 @@ mod tests {
             frame_deadline: test_deadline,
             ..Limits::TDP_CLIENT
         });
-        let sent = thread::spawn(move || to_client.send(big(&vec![7u8; 4 << 20])));
+        let sent = thread::spawn(move || {
+            let result = to_client.send(big(&vec![7u8; 4 << 20]));
+            (result, to_client)
+        });
         let frame = match from_server.receive(test_deadline) {
             Ok(Some(frame)) => frame,
             other => panic!(
                 "receive: {:?}; send: {:?}",
                 other.map(|frame| frame.map(|frame| frame.encoded_length())),
-                sent.join()
+                sent.join().map(|(result, _)| result)
             ),
         };
         assert_eq!(frame.encoded_length(), 6 + 3 + (4 << 20));
-        sent.join().unwrap().unwrap();
+        let (result, _to_client) = sent.join().unwrap();
+        result.unwrap();
+        drop(from_client);
         assert!(to_server
             .send(big(&vec![7u8; Limits::TDP_CLIENT.max_out]))
             .is_err());
