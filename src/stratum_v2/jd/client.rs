@@ -12,15 +12,28 @@
 
 use super::{
     codec::{parse_outputs, serialize_outputs},
+    payouts::{exact_coinbase, PayoutAsk, Payouts, PAYOUT_RESTARTS},
     plan::JdPlan,
     token::PxToken,
     ForwardShare, JdMode, JD_COMPACT_ROLLABLE, JD_ROLLABLE, MAX_DECLARED_TXS,
 };
-use crate::stratum_v2::{
-    sv1::addressed_to,
-    template::{meets_target, BchTemplate, Hash},
-    transport::{Limits, Receiver, Sender, Session},
-    wire::{encoded, mining},
+use crate::{
+    p2pool::jd::Prepared,
+    stratum_v2::{
+        extensions::{
+            pages, DeclareMiningJobTransactions, ExtensionMessage, PayoutOutputsStale,
+            ProvideMissingTransactionsPositions, RequestExtensions, RequestExtensionsError,
+            RequestExtensionsSuccess, RequestPayoutOutputs, RequestPayoutOutputsError,
+            RequestPayoutOutputsSuccess, LARGE_TEMPLATES, NEGOTIATION, PAYOUT_OUTPUTS,
+            PAYOUT_OUTPUTS_STALE, PROVIDE_MISSING_TRANSACTIONS_POSITIONS, REQUEST_EXTENSIONS_ERROR,
+            REQUEST_EXTENSIONS_SUCCESS, REQUEST_PAYOUT_OUTPUTS_ERROR,
+            REQUEST_PAYOUT_OUTPUTS_SUCCESS, STALE_PAYOUT_OUTPUTS,
+        },
+        sv1::addressed_to,
+        template::{meets_target, BchTemplate, Hash},
+        transport::{Limits, Receiver, Sender, Session},
+        wire::{encoded, mining},
+    },
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -170,6 +183,9 @@ pub struct JdClientSummary {
     pub provided: u64,
     pub dropped: u64,
     pub pushed: u64,
+    /// Requested Payout Outputs (0x5052): coinbases built from the pool's
+    /// payout outputs.
+    pub payout_outputs: u64,
 }
 
 pub struct JdStatus {
@@ -523,7 +539,8 @@ fn uplink(
 ) -> Result<(), String> {
     let full = target.mode == JdMode::FullTemplate;
     let login = target.login();
-    let (mut jd, mut jd_replies) = connect(target, if full { Limits::JD } else { Limits::DEVICE })?;
+    let limits = if full { Limits::JD } else { Limits::DEVICE };
+    let (mut jd, mut jd_replies) = connect(target, limits)?;
     setup(
         target,
         &mut jd,
@@ -531,6 +548,37 @@ fn uplink(
         Protocol::JobDeclarationProtocol,
         u32::from(full),
     )?;
+    // What: right after the JD setup, the client asks for Requested Payout
+    // Outputs (0x5052) and, in Full-Template, BCH large templates (0x4C54),
+    // as the Knuth node does. No answer within the answer deadline (or a pool
+    // that closes the connection on the request) is not a refusal: that JD
+    // connection is closed and one new connection sets up without asking. A
+    // refusal leaves both off. A P2Pool session, whose coinbase P2Pool
+    // prepares, does not ask.
+    // Why: Knuth's fallbacks (docs/sv2.md, "Job Declaration"); a pool that
+    // does not know the negotiation must still work.
+    // Look here if: a pool's JD connection is opened twice, or a granted
+    // extension goes unused.
+    let granted = if target.p2pool_prepare_api.is_some() {
+        Granted::default()
+    } else {
+        match negotiate(&mut jd, &mut jd_replies, full, ANSWER_TIMEOUT)? {
+            Some(granted) => granted,
+            None => {
+                jd.close();
+                jd_replies.close();
+                (jd, jd_replies) = connect(target, limits)?;
+                setup(
+                    target,
+                    &mut jd,
+                    &mut jd_replies,
+                    Protocol::JobDeclarationProtocol,
+                    u32::from(full),
+                )?;
+                Granted::default()
+            }
+        }
+    };
     let (mut pool, mut replies) = connect(target, Limits::DEVICE)?;
     setup(
         target,
@@ -589,11 +637,24 @@ fn uplink(
     for _ in 0..TOKENS_AHEAD {
         allocate(&login, &mut jd, &mut requests)?;
     }
-    let mut tokens: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut tokens: VecDeque<Token> = VecDeque::new();
+    // A notice (0x5052) before the first token names no token yet.
+    let mut first = answer(&mut jd_replies, stop)?;
+    while first.header().ext_type_without_channel_msg() != 0 {
+        first = answer(&mut jd_replies, stop)?;
+    }
     let (first, mut scripts) = token_for(
-        &mut answer(&mut jd_replies, stop)?,
+        &mut first,
         target.p2pool_prepare_api.is_some(),
+        granted.payouts,
     )?;
+    let local_rates = first.local_rates;
+    let (payouts, asks) = if granted.payouts {
+        let (door, asks) = Payouts::new(local_rates);
+        (Some(Arc::new(door)), Some(asks))
+    } else {
+        (None, None)
+    };
     let p2pool = target
         .p2pool_prepare_api
         .as_ref()
@@ -607,7 +668,7 @@ fn uplink(
                 api: api.clone(),
                 payout: payout.to_owned(),
                 share_owner: share_owner.to_owned(),
-                tokens: std::sync::Mutex::new(VecDeque::from([first.0.clone()])),
+                tokens: std::sync::Mutex::new(VecDeque::from([first.bytes.clone()])),
                 consumed: std::sync::atomic::AtomicUsize::new(0),
             }))
         })
@@ -626,17 +687,25 @@ fn uplink(
         ],
         compact,
         scripts,
-        rates: first.1,
+        rates: first.rates,
         pool_target,
         p2pool,
+        payouts,
         full_template: full,
     });
     if !plan.is_valid() {
         return Err("the pool's token names outputs it does not list, or rates over 100%".into());
     }
     if plan.p2pool.is_none() {
-        tokens.push_back(first.0);
+        tokens.push_back(first);
     }
+    // #### 0x5052: the preparation asked for now, the notices seen (a
+    // token's epoch is the count when it arrived), and whether a token
+    // since named other rates than the plan's.
+    let mut payout: Option<PayoutWork> = None;
+    let mut epoch = 0u64;
+    let mut next_payout = 1u32;
+    let mut moved = false;
     status.acknowledged.store(0, Ordering::Relaxed);
     status.set_plan(Some(plan.clone()));
     status.update(|summary| {
@@ -663,10 +732,102 @@ fn uplink(
                 allocate(&login, &mut jd, &mut requests)?;
             }
         }
+        // #### 0x5052: the next preparation's request (see `PayoutWork`).
+        if let Some(asks) = asks.as_ref() {
+            if payout.is_none() {
+                payout = asks.try_recv().ok().map(PayoutWork::new);
+            }
+            if let Some(work) = payout.as_mut() {
+                if work.inflight.is_none() {
+                    if let Some(token) = tokens.pop_front() {
+                        allocate(&login, &mut jd, &mut requests)?;
+                        let id = next_payout;
+                        next_payout = next_payout.wrapping_add(1);
+                        jd.send(work.request(id, token)?)?;
+                    } else if work.received.elapsed() >= ANSWER_TIMEOUT {
+                        work.answer(Err("waiting for a Job Declaration token".into()));
+                        payout = None;
+                    }
+                }
+            }
+            if payout
+                .as_ref()
+                .and_then(|work| work.inflight.as_ref())
+                .is_some_and(|inflight| inflight.sent.elapsed() >= ANSWER_TIMEOUT)
+            {
+                return Err("the pool did not answer a payout outputs request".into());
+            }
+        }
         while let Some(mut frame) = jd_replies.receive(Duration::from_millis(5))? {
+            // What: Knuth's extensions' frames on the JD connection: the
+            // pool's payout answers and notices (0x5052) once granted, and
+            // ProvideMissingTransactions.Positions (0x4C54) in Full-Template
+            // once granted. A granted extension's other messages break the
+            // protocol; any other extension frame is discarded.
+            // Look here if: a payout answer or a Positions request is
+            // ignored, or the session ends on one.
+            let header = frame.header();
+            if header.ext_type_without_channel_msg() != 0 {
+                if header.channel_msg() {
+                    continue;
+                }
+                match (header.ext_type_without_channel_msg(), header.msg_type()) {
+                    (
+                        PAYOUT_OUTPUTS,
+                        REQUEST_PAYOUT_OUTPUTS_SUCCESS | REQUEST_PAYOUT_OUTPUTS_ERROR,
+                    ) if granted.payouts => {
+                        let work = payout
+                            .as_mut()
+                            .ok_or("the pool answered a payout request never sent")?;
+                        if let Some(prepared) = work.receive(&mut frame, epoch)? {
+                            payout = None;
+                            if prepared {
+                                status.update(|summary| summary.payout_outputs += 1);
+                            }
+                        }
+                    }
+                    // A notice: every token held is stale; the request in
+                    // flight asks again once answered. The next template
+                    // refresh declares on new outputs.
+                    (PAYOUT_OUTPUTS, PAYOUT_OUTPUTS_STALE) if granted.payouts => {
+                        PayoutOutputsStale::decode(frame.payload())
+                            .ok_or("malformed PayoutOutputsStale")?;
+                        epoch += 1;
+                        for _ in tokens.drain(..) {
+                            allocate(&login, &mut jd, &mut requests)?;
+                        }
+                    }
+                    (LARGE_TEMPLATES, PROVIDE_MISSING_TRANSACTIONS_POSITIONS)
+                        if full && granted.large =>
+                    {
+                        let ask = ProvideMissingTransactionsPositions::decode(frame.payload())
+                            .ok_or("malformed ProvideMissingTransactions.Positions")?;
+                        let positions: Vec<usize> =
+                            ask.positions.iter().map(|at| *at as usize).collect();
+                        supply(
+                            &mut jd,
+                            &mut declaring,
+                            &mut cache,
+                            status,
+                            ask.request_id,
+                            &positions,
+                            true,
+                        )?;
+                    }
+                    (PAYOUT_OUTPUTS, _) if granted.payouts => {
+                        return Err("the pool sent an unexpected payout outputs message".into())
+                    }
+                    (LARGE_TEMPLATES, _) if granted.large => {
+                        return Err("the pool sent an unexpected large template message".into())
+                    }
+                    _ => (),
+                }
+                continue;
+            }
             match frame.header().msg_type() {
                 MESSAGE_TYPE_ALLOCATE_MINING_JOB_TOKEN_SUCCESS => {
-                    let ((bytes, rates), scripts) = token_for(&mut frame, plan.p2pool.is_some())?;
+                    let (mut token, scripts) =
+                        token_for(&mut frame, plan.p2pool.is_some(), granted.payouts)?;
                     if let Some(p2pool) = &plan.p2pool {
                         let mut queued = p2pool
                             .tokens
@@ -675,13 +836,21 @@ fn uplink(
                         if queued.len() >= TOKENS_AHEAD {
                             return Err("unsolicited P2Pool job tokens".into());
                         }
-                        queued.push_back(bytes);
+                        queued.push_back(token.bytes);
                         continue;
                     }
-                    if rates != plan.rates || scripts != plan.scripts {
-                        return Err("the pool's fee or donation changed".into());
+                    // #### 0x5052: under the pool's own outputs a change of
+                    // rates matters only to a template built from them (one
+                    // that merge-mines tokens), which then starts a new
+                    // session.
+                    if token.rates != plan.rates || scripts != plan.scripts {
+                        if plan.payouts.is_none() {
+                            return Err("the pool's fee or donation changed".into());
+                        }
+                        moved |= local_rates;
                     }
-                    tokens.push_back(bytes);
+                    token.epoch = epoch;
+                    tokens.push_back(token);
                 }
                 // #### PR #42: missing transactions
                 // What: the pool names transactions of a declaration it does
@@ -697,31 +866,20 @@ fn uplink(
                     let ask: ProvideMissingTransactions =
                         binary_sv2::from_bytes(frame.payload())
                             .map_err(|_| "malformed missing transactions")?;
-                    let id = ask.request_id;
-                    let positions: Vec<u16> =
-                        ask.unknown_tx_position_list.iter().copied().collect();
-                    let Some(declaration) = declaring.get_mut(&id) else {
-                        continue;
-                    };
-                    match provide(id, &declaration.template, &positions) {
-                        Ok(frame) => {
-                            jd.send(frame)?;
-                            declaration.sent = Instant::now();
-                            status.update(|summary| summary.provided += 1);
-                        }
-                        Err(Unprovided::TooLarge) => {
-                            if let Some(dropped) = declaring.remove(&id) {
-                                cache.remove(&dropped.serial);
-                            }
-                            status.update(|summary| summary.dropped += 1);
-                        }
-                        Err(Unprovided::Unknown) => {
-                            return Err(
-                                "the pool asked for a transaction the template does not have"
-                                    .into(),
-                            )
-                        }
-                    }
+                    let positions: Vec<usize> = ask
+                        .unknown_tx_position_list
+                        .iter()
+                        .map(|at| usize::from(*at))
+                        .collect();
+                    supply(
+                        &mut jd,
+                        &mut declaring,
+                        &mut cache,
+                        status,
+                        ask.request_id,
+                        &positions,
+                        granted.large,
+                    )?;
                 }
                 MESSAGE_TYPE_DECLARE_MINING_JOB_SUCCESS if full => {
                     let success: DeclareMiningJobSuccess = binary_sv2::from_bytes(frame.payload())
@@ -887,26 +1045,39 @@ fn uplink(
                 // #### PR #42: a template over 65,535 transactions is not
                 // declared: SV2 counts a declaration's transactions in 16
                 // bits. Devices keep the custom job on the previous
-                // template of the same parent, if any.
-                if full && !declarable(&template) {
+                // template of the same parent, if any. #### 0x4C54: a pool
+                // that granted BCH large templates takes it in pages.
+                if full && !declarable(&template, granted.large) {
                     status.update(|summary| summary.dropped += 1);
                     continue;
                 }
-                let Some(token) = template
-                    .p2pool_token()
-                    .map(<[u8]>::to_vec)
-                    .or_else(|| tokens.pop_front())
-                else {
-                    status.update(|summary| summary.refused += 1);
-                    continue;
+                // #### 0x5052: a template built from the plan's rates after
+                // the pool named others starts a new session on them.
+                if moved && template.prepared_coinbase().is_none() {
+                    return Err("the pool's fee or donation changed".into());
+                }
+                // A prepared coinbase (P2Pool's, or the pool's payout
+                // outputs) carries its own token, whose replacement was
+                // asked for when it was taken.
+                let (token, queued) = match template.p2pool_token() {
+                    Some(token) => (token.to_vec(), false),
+                    None => match tokens.pop_front() {
+                        Some(token) => (token.bytes, true),
+                        None => {
+                            status.update(|summary| summary.refused += 1);
+                            continue;
+                        }
+                    },
                 };
-                if plan.p2pool.is_none() {
+                if queued && plan.p2pool.is_none() {
                     allocate(&login, &mut jd, &mut requests)?;
                 }
                 if full {
                     let request = next_declaration;
                     next_declaration = next_declaration.wrapping_add(1);
-                    jd.send(declaration(request, &token, &template)?)?;
+                    for frame in declaration(request, &token, &template, granted.large)? {
+                        jd.send(frame)?;
+                    }
                     declaring.insert(
                         request,
                         Declaring {
@@ -996,9 +1167,271 @@ impl Refusals {
 }
 
 /// Whether `template` can be declared: SV2 counts its transactions in 16
-/// bits.
-fn declarable(template: &BchTemplate) -> bool {
-    template.transaction_ids().len() <= MAX_DECLARED_TXS
+/// bits; #### 0x4C54: any number when the pool takes pages (`large`).
+fn declarable(template: &BchTemplate, large: bool) -> bool {
+    large || template.transaction_ids().len() <= MAX_DECLARED_TXS
+}
+
+/// Knuth's extensions a pool granted this session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Granted {
+    /// Requested Payout Outputs (0x5052).
+    payouts: bool,
+    /// BCH large templates (0x4C54), asked for in Full-Template only.
+    large: bool,
+}
+
+/// Asks for Knuth's extensions right after the JD setup: what the pool
+/// granted, or `None` when it did not answer in time or closed the
+/// connection (a pool that does not know the negotiation).
+fn negotiate(
+    jd: &mut Sender,
+    replies: &mut Receiver,
+    full: bool,
+    wait: Duration,
+) -> Result<Option<Granted>, String> {
+    let mut requested = vec![PAYOUT_OUTPUTS];
+    if full {
+        requested.push(LARGE_TEMPLATES);
+    }
+    jd.send(
+        RequestExtensions {
+            request_id: 1,
+            requested: requested.clone(),
+        }
+        .frame()?,
+    )?;
+    let deadline = Instant::now() + wait;
+    let mut reply = loop {
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        match replies.receive(Duration::from_millis(100)) {
+            Ok(Some(frame)) => break frame,
+            Ok(None) => (),
+            Err(_) => return Ok(None),
+        }
+    };
+    granted_by(&mut reply, &requested).map(Some)
+}
+
+// What: the answer to RequestExtensions: Success grants the requested
+// extensions it lists; Error grants none, unless it requires one this client
+// does not implement, which ends the session; any other answer breaks the
+// protocol.
+// Why: Knuth's client reads the answer the same way.
+// Look here if: a pool's grant is not used, or its refusal ends the session.
+/// What `reply` grants of `requested`.
+fn granted_by(reply: &mut SerializedFrame, requested: &[u16]) -> Result<Granted, String> {
+    let header = reply.header();
+    if header.ext_type_without_channel_msg() != NEGOTIATION || header.channel_msg() {
+        return Err("the pool answered RequestExtensions with another message".into());
+    }
+    let supported = match header.msg_type() {
+        REQUEST_EXTENSIONS_SUCCESS => {
+            RequestExtensionsSuccess::decode(reply.payload())
+                .filter(|success| success.request_id == 1)
+                .ok_or("malformed RequestExtensions.Success")?
+                .supported
+        }
+        REQUEST_EXTENSIONS_ERROR => {
+            let error = RequestExtensionsError::decode(reply.payload())
+                .filter(|error| error.request_id == 1)
+                .ok_or("malformed RequestExtensions.Error")?;
+            if let Some(missing) = error
+                .required
+                .iter()
+                .find(|extension| !requested.contains(extension))
+            {
+                return Err(format!(
+                    "the pool requires SV2 extension 0x{missing:04x}, which this client does not implement"
+                ));
+            }
+            Vec::new()
+        }
+        _ => return Err("the pool answered RequestExtensions with another message".into()),
+    };
+    let has = |extension: u16| requested.contains(&extension) && supported.contains(&extension);
+    Ok(Granted {
+        payouts: has(PAYOUT_OUTPUTS),
+        large: has(LARGE_TEMPLATES),
+    })
+}
+
+/// An allocated token: its bytes, its outputs' serialized size (the
+/// reservation a 0x5052 answer must fit), its rates when it is a Pickaxe
+/// pool's, and the PayoutOutputsStale notices seen when it arrived.
+struct Token {
+    bytes: Vec<u8>,
+    reservation: usize,
+    rates: super::token::PoolRates,
+    local_rates: bool,
+    epoch: u64,
+}
+
+/// A RequestPayoutOutputs in flight.
+struct Inflight {
+    id: u32,
+    token: Vec<u8>,
+    reservation: usize,
+    epoch: u64,
+    sent: Instant,
+}
+
+// What: one preparation's payout request (0x5052), served by the uplink: it
+// takes a held token (allocating its replacement), sends RequestPayoutOutputs
+// with the template's revenue, height, parent, bits and script head, and
+// answers the preparation with the coinbase the pool's answer makes
+// (`payouts::exact_coinbase`). One request is in flight at a time. A token
+// from before a PayoutOutputsStale (an answer or stale-payout-outputs on
+// it) asks again with a fresh token, at most 8 times. stale-payout-outputs
+// on a fresh token means the pool's node is on another block: that
+// preparation fails and is offered again shortly, without a fallback. Any
+// other refusal, a malformed answer or no answer within 10 s ends the
+// session (the fallback).
+// Why: Knuth's client follows these rules (docs/sv2.md, "Job Declaration").
+// Look here if: payout requests repeat, or the client falls back on one.
+/// A preparation's payout request the uplink serves.
+struct PayoutWork {
+    ask: PayoutAsk,
+    received: Instant,
+    restarts: u8,
+    inflight: Option<Inflight>,
+}
+
+impl PayoutWork {
+    fn new(ask: PayoutAsk) -> Self {
+        Self {
+            ask,
+            received: Instant::now(),
+            restarts: 0,
+            inflight: None,
+        }
+    }
+
+    /// The request for `token`, now in flight as request `id`.
+    fn request(&mut self, id: u32, token: Token) -> Result<SerializedFrame, String> {
+        let frame = RequestPayoutOutputs {
+            request_id: id,
+            token: token.bytes.clone(),
+            available_payout_value: self.ask.value,
+            height: self.ask.height,
+            prev_hash: self.ask.previous_hash,
+            nbits: self.ask.bits,
+            coinbase_prefix: self.ask.head.clone(),
+        }
+        .frame()?;
+        self.inflight = Some(Inflight {
+            id,
+            token: token.bytes,
+            reservation: token.reservation,
+            epoch: token.epoch,
+            sent: Instant::now(),
+        });
+        Ok(frame)
+    }
+
+    fn answer(&self, result: Result<Prepared, String>) {
+        let _ = self.ask.reply.try_send(result);
+    }
+
+    /// Asks again with a fresh token, within the restarts allowed.
+    fn restart(&mut self) -> Result<Option<bool>, String> {
+        self.restarts += 1;
+        if self.restarts > PAYOUT_RESTARTS {
+            let why = "the pool's payouts kept changing".to_owned();
+            self.answer(Err(why.clone()));
+            return Err(why);
+        }
+        Ok(None)
+    }
+
+    /// Takes the pool's answer `frame`; `Some(prepared)` once the
+    /// preparation has its answer (`None` while it asks again). `epoch` is
+    /// the notices seen so far.
+    fn receive(&mut self, frame: &mut SerializedFrame, epoch: u64) -> Result<Option<bool>, String> {
+        let inflight = self
+            .inflight
+            .take()
+            .ok_or("the pool answered a payout request never sent")?;
+        let stale = inflight.epoch < epoch;
+        if frame.header().msg_type() == REQUEST_PAYOUT_OUTPUTS_SUCCESS {
+            let success = RequestPayoutOutputsSuccess::decode(frame.payload())
+                .filter(|success| success.request_id == inflight.id)
+                .ok_or("malformed RequestPayoutOutputs.Success")?;
+            if stale {
+                return self.restart();
+            }
+            return match exact_coinbase(&success, &self.ask, inflight.reservation) {
+                Ok(coinbase) => {
+                    self.answer(Ok(Prepared {
+                        token: inflight.token,
+                        coinbase,
+                    }));
+                    Ok(Some(true))
+                }
+                Err(why) => {
+                    self.answer(Err(why.clone()));
+                    Err(why)
+                }
+            };
+        }
+        let error = RequestPayoutOutputsError::decode(frame.payload())
+            .filter(|error| error.request_id == inflight.id)
+            .ok_or("malformed RequestPayoutOutputs.Error")?;
+        if error.code == STALE_PAYOUT_OUTPUTS {
+            if stale {
+                return self.restart();
+            }
+            self.answer(Err(
+                "the pool's node is on another block; declaring again shortly".into(),
+            ));
+            return Ok(Some(false));
+        }
+        let code: String = error
+            .code
+            .chars()
+            .filter(|c| c.is_ascii_graphic())
+            .take(64)
+            .collect();
+        let why = format!("the pool refused the payout outputs: {code}");
+        self.answer(Err(why.clone()));
+        Err(why)
+    }
+}
+
+/// Answers the pool's request for declaration `id`'s transactions at
+/// `positions` (`provide`), or drops the declaration when they cannot go.
+#[allow(clippy::too_many_arguments)]
+fn supply(
+    jd: &mut Sender,
+    declaring: &mut HashMap<u32, Declaring>,
+    cache: &mut HashMap<u64, Vec<ForwardShare>>,
+    status: &JdStatus,
+    id: u32,
+    positions: &[usize],
+    large: bool,
+) -> Result<(), String> {
+    let Some(declaration) = declaring.get_mut(&id) else {
+        return Ok(());
+    };
+    match provide(id, &declaration.template, positions, large) {
+        Ok(frame) => {
+            jd.send(frame)?;
+            declaration.sent = Instant::now();
+            status.update(|summary| summary.provided += 1);
+        }
+        Err(Unprovided::TooLarge) => {
+            if let Some(dropped) = declaring.remove(&id) {
+                cache.remove(&dropped.serial);
+            }
+            status.update(|summary| summary.dropped += 1);
+        }
+        Err(Unprovided::Unknown) => {
+            return Err("the pool asked for a transaction the template does not have".into())
+        }
+    }
+    Ok(())
 }
 
 /// The pinned Noise session to the pool.
@@ -1085,58 +1518,95 @@ fn allocate(login: &str, jd: &mut Sender, requests: &mut u32) -> Result<(), Stri
     )?)
 }
 
-/// A token's bytes and rates, and the pool's output scripts in its order.
-#[allow(clippy::type_complexity)]
+/// A token, and the pool's output scripts in its order. #### 0x5052: with
+/// the pool's own outputs (`payouts`) another pool's opaque token serves
+/// too.
 fn token_for(
     frame: &mut SerializedFrame,
     p2pool: bool,
-) -> Result<((Vec<u8>, super::token::PoolRates), Vec<Vec<u8>>), String> {
+    payouts: bool,
+) -> Result<(Token, Vec<Vec<u8>>), String> {
     if frame.header().msg_type() != MESSAGE_TYPE_ALLOCATE_MINING_JOB_TOKEN_SUCCESS {
         return Err("the pool did not allocate a token".into());
     }
     let success: AllocateMiningJobTokenSuccess =
         binary_sv2::from_bytes(frame.payload()).map_err(|_| "malformed token")?;
     let bytes = success.mining_job_token.as_ref().to_vec();
+    let none = super::token::PoolRates {
+        donation_bps: 0,
+        fee_bps: 0,
+        donation_output: None,
+        fee_output: None,
+    };
     // A Pickaxe pool's token carries its rates; another pool's is opaque,
     // and its fee and donation cannot be known, so its custom jobs could
-    // not pay them.
-    let rates = if p2pool {
+    // not pay them, unless the pool names the outputs (0x5052).
+    let (rates, local_rates) = if p2pool {
         if bytes.first() != Some(&1) || !(65..=255).contains(&bytes.len()) {
             return Err("unsupported BCH P2Pool token format".into());
         }
-        super::token::PoolRates {
-            donation_bps: 0,
-            fee_bps: 0,
-            donation_output: None,
-            fee_output: None,
-        }
+        (none, false)
     } else {
-        PxToken::decode(&bytes)
-            .ok_or("the pool's tokens are not a Pickaxe pool's; Job Declaration needs one")?
-            .rates
+        match PxToken::decode(&bytes) {
+            Some(token) => (token.rates, true),
+            None if payouts => (none, false),
+            None => {
+                return Err(
+                    "the pool's tokens are not a Pickaxe pool's; Job Declaration needs one".into(),
+                )
+            }
+        }
     };
     let scripts = parse_outputs(success.coinbase_outputs.as_ref())?
         .into_iter()
         .map(|(_, script)| script)
         .collect();
-    Ok(((bytes, rates), scripts))
+    Ok((
+        Token {
+            bytes,
+            reservation: success.coinbase_outputs.as_ref().len(),
+            rates,
+            local_rates,
+            epoch: 0,
+        },
+        scripts,
+    ))
 }
 
 /// DeclareMiningJob for `template`: the local jobs' coinbase around the
 /// whole extranonce (the pool channel's prefix and the rolled bytes), and
-/// the transaction ids in block order.
+/// the transaction ids in block order. #### 0x4C54: with BCH large
+/// templates (`large`), the ids past one SEQ0_64K list go first as
+/// DeclareMiningJob.Transactions pages (`extensions::pages`), each in its
+/// own frame before the DeclareMiningJob.
 fn declaration(
     request: u32,
     token: &[u8],
     template: &BchTemplate,
-) -> Result<SerializedFrame, String> {
+    large: bool,
+) -> Result<Vec<SerializedFrame>, String> {
     let parts = template.declared_parts()?;
-    let txids: Vec<binary_sv2::U256> = template.transaction_ids().iter().map(Into::into).collect();
+    let (paged, own) = if large {
+        pages(template.transaction_ids())
+    } else {
+        (Vec::new(), template.transaction_ids())
+    };
+    let mut frames = paged
+        .into_iter()
+        .map(|page| {
+            DeclareMiningJobTransactions {
+                request_id: request,
+                txids: page.to_vec(),
+            }
+            .frame()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let txids: Vec<binary_sv2::U256> = own.iter().map(Into::into).collect();
     let excess = template
         .declared_aux()?
         .map(|aux| crate::stratum_v2::merge::disclosure::Disclosure::from_job(&aux).encode())
         .unwrap_or_default();
-    encoded(
+    frames.push(encoded(
         DeclareMiningJob {
             request_id: request,
             mining_job_token: token.try_into().map_err(|_| "token too long")?,
@@ -1161,7 +1631,8 @@ fn declaration(
         },
         MESSAGE_TYPE_DECLARE_MINING_JOB,
         false,
-    )
+    )?);
+    Ok(frames)
 }
 
 /// Why missing transactions cannot be provided.
@@ -1174,11 +1645,15 @@ enum Unprovided {
 }
 
 /// ProvideMissingTransactions.Success for `positions` of `template`, in
-/// one frame.
+/// one frame. #### 0x4C54: with BCH large templates (`large`), when they do
+/// not all fit, the longest prefix that does goes, and the pool asks again
+/// for the rest (a BCH transaction is at most 1,000,000 bytes, so it holds
+/// one at least).
 fn provide(
     request: u32,
     template: &BchTemplate,
-    positions: &[u16],
+    positions: &[usize],
+    large: bool,
 ) -> Result<SerializedFrame, Unprovided> {
     let transactions = template.transactions();
     // The header, the request id and the count, then each transaction with
@@ -1186,13 +1661,14 @@ fn provide(
     let mut size = 6 + 4 + 2;
     let mut list = Vec::with_capacity(positions.len());
     for position in positions {
-        let tx = transactions
-            .get(usize::from(*position))
-            .ok_or(Unprovided::Unknown)?;
-        size += 3 + tx.len();
-        if size > Limits::JD.max_out {
+        let tx = transactions.get(*position).ok_or(Unprovided::Unknown)?;
+        if size + 3 + tx.len() > Limits::JD.max_out {
+            if large && !list.is_empty() {
+                break;
+            }
             return Err(Unprovided::TooLarge);
         }
+        size += 3 + tx.len();
         list.push(binary_sv2::B016M::try_from(&tx[..]).map_err(|_| Unprovided::TooLarge)?);
     }
     encoded(
@@ -1248,6 +1724,14 @@ fn declare(
     // included (`BchTemplate::declared_outputs`).
     let outputs = serialize_outputs(&template.declared_outputs()?);
     let path: Vec<binary_sv2::U256> = template.merkle_path().iter().map(Into::into).collect();
+    // A prepared coinbase (P2Pool's, or the pool's payout outputs) carries
+    // its own version, sequence and lock time; the local one is 2,
+    // 0xffffffff and 0.
+    let (version, sequence, locktime) = template
+        .prepared_coinbase()
+        .map_or((2, u32::MAX, 0), |shape| {
+            (shape.tx_version, shape.sequence, shape.locktime)
+        });
     pool.send(mining(Mining::SetCustomMiningJob(SetCustomMiningJob {
         channel_id: channel,
         request_id: request,
@@ -1256,22 +1740,14 @@ fn declare(
         prev_hash: (&template.previous_hash).into(),
         ntime_start: template.current_time,
         nbits: template.bits,
-        coinbase_tx_version: 2,
+        coinbase_tx_version: version,
         coinbase_prefix: head.as_slice().try_into().map_err(|_| "prefix too long")?,
-        coinbase_tx_input_n_sequence: if template.p2pool_token().is_some() {
-            0xffff_fffe
-        } else {
-            u32::MAX
-        },
+        coinbase_tx_input_n_sequence: sequence,
         coinbase_tx_outputs: outputs
             .as_slice()
             .try_into()
             .map_err(|_| "outputs too long")?,
-        coinbase_tx_locktime: if template.p2pool_token().is_some() {
-            template.height.saturating_sub(1)
-        } else {
-            0
-        },
+        coinbase_tx_locktime: locktime,
         merkle_path: path.try_into().map_err(|_| "merkle path too long")?,
     }))?)
 }
@@ -1546,6 +2022,7 @@ mod tests {
             },
             pool_target: [255; 32],
             p2pool: None,
+            payouts: None,
             full_template: true,
         })));
         donor.status.acknowledged.store(6, Ordering::Relaxed);
@@ -1795,9 +2272,11 @@ mod tests {
     #[test]
     fn templates_over_65535_transactions_are_not_declared() {
         let at_limit = template().with_transactions(vec![vec![0]; MAX_DECLARED_TXS]);
-        assert!(declarable(&at_limit));
+        assert!(declarable(&at_limit, false));
         let over = template().with_transactions(vec![vec![0]; MAX_DECLARED_TXS + 1]);
-        assert!(!declarable(&over));
+        assert!(!declarable(&over, false));
+        // #### 0x4C54: a pool that takes pages takes it.
+        assert!(declarable(&over, true));
     }
 
     // #### PR #42
@@ -1809,14 +2288,371 @@ mod tests {
     #[test]
     fn a_missing_transactions_request_that_cannot_fit_one_frame_drops_the_declaration() {
         let big = template().with_transactions(vec![vec![1; 9_000_000], vec![2; 9_000_000]]);
-        let mut frame = provide(3, &big, &[1]).unwrap();
+        let mut frame = provide(3, &big, &[1], false).unwrap();
         let reply: ProvideMissingTransactionsSuccess =
             binary_sv2::from_bytes(frame.payload()).unwrap();
         assert_eq!(reply.request_id, 3);
         assert_eq!(reply.transaction_list.len(), 1);
         assert_eq!(reply.transaction_list[0].as_ref()[0], 2);
-        assert_eq!(provide(3, &big, &[0, 1]).err(), Some(Unprovided::TooLarge));
-        assert_eq!(provide(3, &big, &[2]).err(), Some(Unprovided::Unknown));
+        assert_eq!(
+            provide(3, &big, &[0, 1], false).err(),
+            Some(Unprovided::TooLarge)
+        );
+        assert_eq!(
+            provide(3, &big, &[2], false).err(),
+            Some(Unprovided::Unknown)
+        );
+        // #### 0x4C54: with BCH large templates the first that fits goes,
+        // and the pool asks again for the rest (Knuth's supply).
+        let mut frame = provide(3, &big, &[1, 0], true).unwrap();
+        let reply: ProvideMissingTransactionsSuccess =
+            binary_sv2::from_bytes(frame.payload()).unwrap();
+        assert_eq!(reply.transaction_list.len(), 1);
+        assert_eq!(reply.transaction_list[0].as_ref()[0], 2);
+        let huge = template().with_transactions(vec![vec![1; 17_000_000]]);
+        assert_eq!(
+            provide(3, &huge, &[0], true).err(),
+            Some(Unprovided::TooLarge),
+            "a transaction over one frame cannot go even with pages"
+        );
+    }
+
+    // #### 0x4C54
+    // What: with BCH large templates a template of 65,537 transactions is
+    // declared as one DeclareMiningJob.Transactions page of the first 65,535
+    // ids, then the DeclareMiningJob with the same request id and the last 2;
+    // without the grant (or at 65,535) there is no page.
+    // Look here if: `declaration` or `extensions::pages` changes.
+    #[test]
+    fn a_large_template_is_declared_in_pages_before_its_declaration() {
+        use crate::stratum_v2::extensions::{DECLARE_MINING_JOB_TRANSACTIONS, SEQ_MAX};
+        let mut large = template().with_transactions(vec![vec![0]; SEQ_MAX + 2]);
+        large.declare(Arc::new(JdPlan {
+            serial: 1,
+            upstream_prefix: vec![9; 4],
+            pad: Vec::new(),
+            compact: false,
+            scripts: vec![vec![0x51]],
+            rates: super::super::token::PoolRates {
+                donation_bps: 0,
+                fee_bps: 0,
+                donation_output: None,
+                fee_output: None,
+            },
+            pool_target: [0xff; 32],
+            p2pool: None,
+            payouts: None,
+            full_template: true,
+        }));
+        let mut frames = declaration(7, &[1; 26], &large, true).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].header().ext_type(), LARGE_TEMPLATES);
+        assert_eq!(
+            frames[0].header().msg_type(),
+            DECLARE_MINING_JOB_TRANSACTIONS
+        );
+        let page = DeclareMiningJobTransactions::decode(frames[0].payload()).unwrap();
+        assert_eq!(page.request_id, 7);
+        assert_eq!(page.txids, large.transaction_ids()[..SEQ_MAX]);
+        assert_eq!(frames[1].header().ext_type(), 0);
+        let declared: DeclareMiningJob = binary_sv2::from_bytes(frames[1].payload()).unwrap();
+        assert_eq!(declared.request_id, 7);
+        let own: Vec<Hash> = declared
+            .wtxid_list
+            .iter()
+            .map(|txid| Hash::try_from(txid.as_ref()).unwrap())
+            .collect();
+        assert_eq!(own, large.transaction_ids()[SEQ_MAX..]);
+        let mut fits = template().with_transactions(vec![vec![0]; SEQ_MAX]);
+        fits.declare(large.jd_plan().unwrap().clone());
+        assert_eq!(declaration(8, &[1; 26], &fits, true).unwrap().len(), 1);
+    }
+
+    // #### 0x5052, 0x4C54
+    // What: the answer to RequestExtensions: Success grants what it lists of
+    // what was asked; Error with nothing required grants nothing; Error
+    // requiring an extension this client lacks ends the session; any other
+    // answer, or one for another request id, breaks the protocol.
+    // Look here if: `granted_by` changes.
+    #[test]
+    fn the_negotiation_answer_decides_the_extensions() {
+        let asked = [PAYOUT_OUTPUTS, LARGE_TEMPLATES];
+        let success = |supported: Vec<u16>| {
+            RequestExtensionsSuccess {
+                request_id: 1,
+                supported,
+            }
+            .frame()
+            .unwrap()
+        };
+        assert_eq!(
+            granted_by(&mut success(vec![LARGE_TEMPLATES, PAYOUT_OUTPUTS]), &asked),
+            Ok(Granted {
+                payouts: true,
+                large: true
+            })
+        );
+        assert_eq!(
+            granted_by(
+                &mut success(vec![PAYOUT_OUTPUTS, 0x0002]),
+                &[PAYOUT_OUTPUTS]
+            ),
+            Ok(Granted {
+                payouts: true,
+                large: false
+            })
+        );
+        assert_eq!(
+            granted_by(&mut success(vec![LARGE_TEMPLATES]), &[PAYOUT_OUTPUTS]),
+            Ok(Granted::default()),
+            "a grant never asked for is not taken"
+        );
+        let error = |required: Vec<u16>| {
+            RequestExtensionsError {
+                request_id: 1,
+                unsupported: asked.to_vec(),
+                required,
+            }
+            .frame()
+            .unwrap()
+        };
+        assert_eq!(
+            granted_by(&mut error(vec![]), &asked),
+            Ok(Granted::default())
+        );
+        assert!(granted_by(&mut error(vec![0x0003]), &asked)
+            .unwrap_err()
+            .contains("0x0003"));
+        let other = RequestExtensionsSuccess {
+            request_id: 2,
+            supported: vec![PAYOUT_OUTPUTS],
+        };
+        assert!(granted_by(&mut other.frame().unwrap(), &asked).is_err());
+        let core = encoded(
+            AllocateMiningJobToken {
+                user_identifier: "x".try_into().unwrap(),
+                request_id: 1,
+            },
+            MESSAGE_TYPE_ALLOCATE_MINING_JOB_TOKEN,
+            false,
+        )
+        .unwrap();
+        let mut core = core;
+        assert!(granted_by(&mut core, &asked).is_err());
+    }
+
+    // #### 0x5052, 0x4C54
+    // What: over a Noise session, the client's RequestExtensions asks for
+    // 0x5052 and, in Full-Template, 0x4C54 (request id 1); a grant turns them
+    // on, a refusal leaves them off, and a pool that closes the connection
+    // or stays silent past the wait gives `None` (the uplink then sets up a
+    // new JD connection without asking).
+    // Look here if: `negotiate` changes.
+    #[test]
+    fn the_client_negotiates_and_takes_silence_as_no_answer() {
+        let secret = [7; 32];
+        let public = crate::stratum_v2::server::authority_public(&secret).unwrap();
+        for (case, full) in [
+            ("granted", true),
+            ("granted", false),
+            ("refused", true),
+            ("closed", true),
+            ("silent", true),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let (mut send, mut receive) =
+                    Session::accept_with(stream, &public, &secret, Limits::JD)
+                        .unwrap()
+                        .split();
+                let mut ask = loop {
+                    if let Some(frame) = receive.receive(Duration::from_millis(50)).unwrap() {
+                        break frame;
+                    }
+                };
+                assert_eq!(ask.header().ext_type(), NEGOTIATION);
+                let request = RequestExtensions::decode(ask.payload()).unwrap();
+                match case {
+                    "granted" => send
+                        .send(
+                            RequestExtensionsSuccess {
+                                request_id: request.request_id,
+                                supported: request.requested.clone(),
+                            }
+                            .frame()
+                            .unwrap(),
+                        )
+                        .unwrap(),
+                    "refused" => send
+                        .send(
+                            RequestExtensionsError {
+                                request_id: request.request_id,
+                                unsupported: request.requested.clone(),
+                                required: Vec::new(),
+                            }
+                            .frame()
+                            .unwrap(),
+                        )
+                        .unwrap(),
+                    "closed" => {
+                        send.close();
+                        receive.close();
+                    }
+                    _ => thread::sleep(Duration::from_millis(600)),
+                }
+                request
+            });
+            let stream = TcpStream::connect(address).unwrap();
+            let (mut jd, mut replies) = Session::initiate_with(stream, public, Limits::JD)
+                .unwrap()
+                .split();
+            let granted =
+                negotiate(&mut jd, &mut replies, full, Duration::from_millis(300)).unwrap();
+            let request = server.join().unwrap();
+            assert_eq!(request.request_id, 1);
+            let expected: &[u16] = if full {
+                &[PAYOUT_OUTPUTS, LARGE_TEMPLATES]
+            } else {
+                &[PAYOUT_OUTPUTS]
+            };
+            assert_eq!(request.requested, expected, "{case}");
+            assert_eq!(
+                granted,
+                match case {
+                    "granted" => Some(Granted {
+                        payouts: true,
+                        large: full
+                    }),
+                    "refused" => Some(Granted::default()),
+                    _ => None,
+                },
+                "{case}"
+            );
+        }
+    }
+
+    // #### 0x5052
+    // What: the uplink's payout request for a preparation: it goes as
+    // RequestPayoutOutputs with the token and the template's revenue,
+    // height, parent, bits and head; the pool's exact answer answers the
+    // preparation with that token and coinbase; an answer on a token from
+    // before a notice asks again (up to 8 times, then the session ends);
+    // stale-payout-outputs on a fresh token fails only the preparation; any
+    // other code fails both.
+    // Look here if: `PayoutWork` changes.
+    #[test]
+    fn a_payout_request_answers_its_preparation() {
+        let (door, asks) = Payouts::new(true);
+        let preparation = thread::spawn(move || {
+            door.prepare(
+                101,
+                0x207f_ffff,
+                [3; 32],
+                1_000,
+                vec![0x01, 0x65],
+                16,
+                1_700_000_000,
+            )
+        });
+        let ask = asks.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut work = PayoutWork::new(ask);
+        let token = |epoch: u64| Token {
+            bytes: vec![0xaa; 26],
+            reservation: 64,
+            rates: super::super::token::PoolRates {
+                donation_bps: 0,
+                fee_bps: 0,
+                donation_output: None,
+                fee_output: None,
+            },
+            local_rates: true,
+            epoch,
+        };
+        let mut sent = work.request(4, token(0)).unwrap();
+        assert_eq!(sent.header().ext_type(), PAYOUT_OUTPUTS);
+        assert_eq!(
+            RequestPayoutOutputs::decode(sent.payload()).unwrap(),
+            RequestPayoutOutputs {
+                request_id: 4,
+                token: vec![0xaa; 26],
+                available_payout_value: 1_000,
+                height: 101,
+                prev_hash: [3; 32],
+                nbits: 0x207f_ffff,
+                coinbase_prefix: vec![0x01, 0x65],
+            }
+        );
+        let outputs = serialize_outputs(&[(1_000, vec![0x51])]);
+        let answer = |id: u32| {
+            RequestPayoutOutputsSuccess {
+                request_id: id,
+                flags: crate::stratum_v2::extensions::EXACT_OUTPUTS,
+                version: 2,
+                sequence: u32::MAX,
+                locktime: 0,
+                outputs: outputs.clone(),
+            }
+            .frame()
+            .unwrap()
+        };
+        // A notice came since the token: the answer is consumed and asked
+        // again on a fresh token.
+        assert_eq!(work.receive(&mut answer(4), 1), Ok(None));
+        assert!(work.inflight.is_none());
+        work.request(5, token(1)).unwrap();
+        assert!(work.receive(&mut answer(4), 1).is_err(), "another request");
+        work.request(6, token(1)).unwrap();
+        assert_eq!(work.receive(&mut answer(6), 1), Ok(Some(true)));
+        let prepared = preparation.join().unwrap().unwrap();
+        assert_eq!(prepared.token, vec![0xaa; 26]);
+        assert_eq!(prepared.coinbase.outputs, vec![(1_000, vec![0x51])]);
+        assert_eq!(prepared.coinbase.head, [0x01, 0x65]);
+        // stale-payout-outputs: on a fresh token only the preparation
+        // fails; any other code ends the session.
+        let error = |id: u32, code: &str| {
+            RequestPayoutOutputsError {
+                request_id: id,
+                code: code.into(),
+            }
+            .frame()
+            .unwrap()
+        };
+        let (reply, answered) = mpsc::sync_channel(1);
+        let ask = |reply| PayoutAsk {
+            height: 101,
+            bits: 0x207f_ffff,
+            previous_hash: [3; 32],
+            value: 1_000,
+            head: vec![0x01, 0x65],
+            extranonce: 16,
+            min_time: 1_700_000_000,
+            reply,
+        };
+        let mut work = PayoutWork::new(ask(reply));
+        work.request(7, token(1)).unwrap();
+        assert_eq!(
+            work.receive(&mut error(7, STALE_PAYOUT_OUTPUTS), 1),
+            Ok(Some(false))
+        );
+        assert!(answered.try_recv().unwrap().is_err());
+        let (reply, answered) = mpsc::sync_channel(1);
+        let mut work = PayoutWork::new(ask(reply));
+        work.request(8, token(1)).unwrap();
+        assert!(work
+            .receive(&mut error(8, "invalid-mining-job-token"), 1)
+            .unwrap_err()
+            .contains("invalid-mining-job-token"));
+        assert!(answered.try_recv().unwrap().is_err());
+        // Eight restarts at most.
+        let (reply, _answered) = mpsc::sync_channel(1);
+        let mut work = PayoutWork::new(ask(reply));
+        for restart in 0..=PAYOUT_RESTARTS {
+            work.request(9, token(0)).unwrap();
+            let result = work.receive(&mut error(9, STALE_PAYOUT_OUTPUTS), 1);
+            assert_eq!(result.is_err(), restart == PAYOUT_RESTARTS, "{restart}");
+        }
     }
 
     // #### PR #42

@@ -27,6 +27,9 @@ pub struct JdPlan {
     pub pool_target: Hash,
     /// PPLNS construction belongs to the independently verified P2Pool node.
     pub p2pool: Option<std::sync::Arc<crate::p2pool::jd::Plan>>,
+    /// The pool granted Requested Payout Outputs (0x5052): templates ask it
+    /// for their coinbase outputs before they are published.
+    pub payouts: Option<std::sync::Arc<super::payouts::Payouts>>,
     /// #### merge-mining v2: the client declares each template's
     /// transactions (Full-Template), so DeclareMiningJob can carry its token
     /// leaves for the pool to check; a Coinbase-only plan merge-mines no
@@ -97,6 +100,15 @@ impl JdPlan {
         if self.p2pool.is_some() {
             return self.upstream_prefix.len() + self.rollable() == 12 && !self.scripts.is_empty();
         }
+        // The pool names the outputs (0x5052); its tokens' rates count only
+        // when they are a Pickaxe pool's.
+        if self
+            .payouts
+            .as_ref()
+            .is_some_and(|payouts| !payouts.local_rates)
+        {
+            return self.upstream_prefix.len() + self.rollable() <= 32;
+        }
         let within = |index: Option<u8>| {
             index.is_none_or(|index| usize::from(index) < self.scripts.len() && index > 0)
         };
@@ -134,6 +146,7 @@ mod tests {
             },
             pool_target: [0xff; 32],
             p2pool: None,
+            payouts: None,
             full_template: true,
         };
         assert!(plan.is_valid());
