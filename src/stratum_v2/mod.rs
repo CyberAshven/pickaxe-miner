@@ -18,6 +18,9 @@ pub mod device_api;
 // 0x4C54.
 #[cfg(feature = "stratum-v2")]
 pub mod extensions;
+// #### Pool modes: the SV2 door of a Non-custodial Pool.
+#[cfg(feature = "stratum-v2")]
+pub mod door;
 #[cfg(feature = "stratum-v2")]
 pub mod fleet;
 // #### PR #42: Job Declaration: miners' own templates at a public pool.
@@ -37,6 +40,10 @@ mod panel;
 // #### PR #42: merge mining for BCH covenant tokens (no token registered yet).
 #[cfg(feature = "stratum-v2")]
 pub mod merge;
+// #### one donation, the higher rate: a miner's own Pickaxe's donation,
+// credited where a Public Solo Endpoint sees it mined.
+#[cfg(feature = "stratum-v2")]
+mod own_donation;
 #[cfg(feature = "stratum-v2")]
 mod payout;
 #[cfg(feature = "stratum-v2")]
@@ -63,6 +70,9 @@ mod template_tests;
 pub mod transport;
 #[cfg(feature = "stratum-v2")]
 pub mod wire;
+// The server shown somewhere other than the terminal (`pickaxe gui`).
+#[cfg(feature = "stratum-v2")]
+pub mod view;
 #[cfg(feature = "stratum-v2")]
 mod work_allocation;
 #[cfg(feature = "stratum-v2")]

@@ -39,8 +39,35 @@ pub(super) struct Tokens {
     photon: Option<RuntimeSnapshot>,
 }
 
+/// Shows token sessions in place of this dashboard: the desktop window
+/// (`pickaxe gui`) reads and steers the same `Miners`, and the session's
+/// workers, claims and saving stay exactly as they are here.
+pub trait SessionView: Send + Sync {
+    /// Shows the session until `finished` or the viewer stops it.
+    fn show(
+        &self,
+        miners: &Miners<'_>,
+        gpus: &[GpuDevice],
+        finished: &dyn Fn() -> bool,
+    ) -> Result<(), String>;
+}
+
+static SESSION_VIEW: std::sync::OnceLock<Box<dyn SessionView>> = std::sync::OnceLock::new();
+
+/// Sends every later token session to `view` instead of the terminal.
+pub fn show_sessions_in(view: Box<dyn SessionView>) -> Result<(), String> {
+    SESSION_VIEW
+        .set(view)
+        .map_err(|_| "token sessions already have a view".to_owned())
+}
+
+/// Whether token sessions show in a view other than the terminal.
+pub fn sessions_shown_elsewhere() -> bool {
+    SESSION_VIEW.get().is_some()
+}
+
 /// The event source may already name its token; label it only once.
-fn label_event(token: &str, message: &str) -> String {
+pub(crate) fn label_event(token: &str, message: &str) -> String {
     if message.strip_prefix(token).is_some_and(|tail| {
         tail.is_empty() || tail.starts_with(char::is_whitespace) || tail.starts_with(':')
     }) {
@@ -70,7 +97,7 @@ pub fn run_electric(
 }
 
 impl Miners<'_> {
-    fn stop(&self) {
+    pub fn stop(&self) {
         if let Some(stop) = self.stop {
             stop.store(true, Ordering::SeqCst);
         }
@@ -80,7 +107,7 @@ impl Miners<'_> {
         // Ownership stays with the caller, which joins and stops supervisors.
     }
 
-    fn pause(&self, paused: bool) -> Result<(), String> {
+    pub fn pause(&self, paused: bool) -> Result<(), String> {
         for (_, runtime) in &self.runtimes {
             if paused {
                 runtime.pause()?;
@@ -94,7 +121,7 @@ impl Miners<'_> {
         Ok(())
     }
 
-    fn intensity(&self, value: u8) -> Result<(), String> {
+    pub fn intensity(&self, value: u8) -> Result<(), String> {
         for (_, runtime) in &self.runtimes {
             runtime.set_intensity(value)?;
         }
@@ -117,6 +144,9 @@ pub fn run_miners(
         }
     }
     let _stop = StopOnExit(miners);
+    if let Some(view) = SESSION_VIEW.get() {
+        return view.show(miners, gpus, finished);
+    }
     let mut terminal = TerminalSession::enter()?;
     crossterm::execute!(io::stdout(), crossterm::event::EnableBracketedPaste)
         .map_err(|e| format!("enable address paste: {e}"))?;

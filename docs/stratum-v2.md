@@ -513,6 +513,9 @@ pickaxe_miner stratum-v2 serve --config mainnet.json --sv1-listen 0.0.0.0:3333 \
   and they come back once Job Declaration has been active for 30 seconds.
 - Native SV2 devices such as a Bitaxe use their own backup pool, which the
   Device panel's Pools page can set.
+- #### Pool modes: the same rule serves `--own-p2pool`, with your P2Pool
+  node in the node's place (green for serving work); see
+  [p2pool.md](p2pool.md#pool-modes).
 - In the setup, ASIC solo mining has a **Fallback pools** row under
   Advanced: paste up to 8 pools, each with its key, separated by spaces or
   commas. A saved profile keeps them; the server's Advanced page lists them.

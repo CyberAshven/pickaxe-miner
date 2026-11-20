@@ -527,8 +527,8 @@ impl DeclaratorSession {
                 responses.not_before = (answer_at > now).then_some(answer_at);
                 let identity = request.user_identifier.as_utf8_or_hex();
                 // #### merge-mining v2: the miner's own donation choice
-                // (`,donation=`) sets the token's donation rate; the pool's
-                // fee stays as it is.
+                // (`,donation=`) can raise the token's donation rate; the
+                // pool's fee stays as it is.
                 let login =
                     crate::stratum_v2::payout::identity_login(declarator.network, &identity)
                         .map_err(|error| {
@@ -540,13 +540,17 @@ impl DeclaratorSession {
                             }
                         })?;
                 let payout = login.payout;
-                let donation = match login.donation {
-                    Some(choice) => choice,
-                    None => *declarator
+                // #### one donation, the higher rate: the token carries the
+                // higher of the pool's rate and the login's, so a custom
+                // job's coinbase pays at least that (no work rotates under
+                // Job Declaration, and nothing is credited).
+                let donation = crate::stratum_v2::payout::effective_donation(
+                    *declarator
                         .donation
                         .read()
                         .map_err(|_| "donation setting unavailable")?,
-                };
+                    login.donation,
+                );
                 let rule = PayoutRule::public_pool(
                     declarator.network,
                     &payout,
