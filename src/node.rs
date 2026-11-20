@@ -211,6 +211,24 @@ impl NativePhotonSession {
         ))
     }
 
+    /// A session on `job`'s baton that has not asked the node anything.
+    #[cfg(test)]
+    pub(crate) fn unverified_for_test(
+        url: &str,
+        deployment: &PhotonDeployment,
+        job: &LiveJob,
+    ) -> Self {
+        Self {
+            url: url.to_owned(),
+            deployment: *deployment,
+            baton: baton_from_live_job(job),
+            snapshot: LiveStateSnapshot {
+                tip_hash: job.tip_hash.clone(),
+                job: job.clone(),
+            },
+        }
+    }
+
     /// Returns the most recently verified native node state.
     pub fn snapshot(&self) -> &LiveStateSnapshot {
         &self.snapshot
@@ -986,11 +1004,11 @@ pub fn broadcast_raw(endpoints: &[String], raw_tx_hex: &str) -> Result<(String, 
             Err(e) => failures.push(format!("{}: {e}", redact_url(url))),
         }
     }
-    Err(format!(
-        "All node sendrawtransaction failed (ban-safe):\n{}",
-        failures.join("\n")
-    ))
+    Err(format!("{SENDRAW_FAILED}\n{}", failures.join("\n")))
 }
+
+/// How a failed `broadcast_raw` begins; one `endpoint: error` line per node follows.
+pub(crate) const SENDRAW_FAILED: &str = "All node sendrawtransaction failed (ban-safe):";
 
 /// Strips credentials from a node URL before reporting errors.
 pub fn redact_url(url: &str) -> String {

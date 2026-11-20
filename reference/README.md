@@ -13,9 +13,8 @@ PHOTON is the PoW / CashToken baton mining path Pickaxe implements.
 
 ## vox (2qx) — Unspent v3 / DeFi building blocks
 
-- Public: https://github.com/2qx/vox
+- Public: https://github.com/2qx/vox (cite it there; it is not mirrored in this tree)
 - License: Unlicense
-- Local clone: `reference/vox/`
 - Description: collection of small BCH decentralized finance apps (CatDex, Dutch, Flash, Locktime, Subscription, Vox chat, …) using Unspent v3 NFT protocol records.
 
 Use as **prior art / covenant patterns** for BCH CashToken + P2S design — not a substitute for the PHOTON mining contract.
