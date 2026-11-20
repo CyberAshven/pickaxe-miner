@@ -4,7 +4,9 @@
 //! and payout, runs it as a child process, restarts it when it exits and
 //! shows whether it runs and whether the BCH node answers. It never changes
 //! or reimplements P2Pool's logic: P2Pool is updated, not integrated.
-pub mod http;
+/// The HTTP client P2Pool's releases and API use; Pickaxe's own updates
+/// (`crate::update`) share it, so it lives at the crate's top.
+pub use crate::http;
 #[cfg(feature = "stratum-v2")]
 pub mod jd;
 pub mod launch;

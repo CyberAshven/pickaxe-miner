@@ -597,12 +597,20 @@ impl SetupDriver {
     /// the fee pot's balance from the network, which can take seconds, so
     /// the window does it away from its drawing.
     pub fn reads_pot(&self, input: &SetupInput) -> bool {
+        self.flow.electric_in_use() && self.presses_start(input)
+    }
+
+    /// #### Local sources first: whether `input` presses Start while this
+    /// computer's node and usual ports are still looked at: Start waits a
+    /// moment for them, so the window does it away from its drawing.
+    pub fn looks_here(&self, input: &SetupInput) -> bool {
+        self.flow.looking_here() && self.presses_start(input)
+    }
+
+    /// Whether `input` presses Start on the settings page.
+    fn presses_start(&self, input: &SetupInput) -> bool {
         let flow = &self.flow;
-        if flow.step != SetupStep::Settings
-            || !flow.electric_in_use()
-            || flow.editing.is_some()
-            || flow.pot_view
-        {
+        if flow.step != SetupStep::Settings || flow.editing.is_some() || flow.pot_view {
             return false;
         }
         match input {
@@ -1478,6 +1486,42 @@ mod tests {
         for dir in [keys_dir, clicks_dir] {
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    // #### Local sources first
+    // What: Start pressed while this computer is still looked at goes to
+    // another thread (it waits a moment for the look), as Start with
+    // ELECTRIC does; once the look is in, Start runs at once.
+    // Look here if: looks_here or presses_start change.
+    #[test]
+    fn start_waits_away_from_the_window_while_this_computer_is_looked_at() {
+        let dir = folder("looks-here");
+        let mut driver = driver(&dir);
+        driver.flow.probe_local_node = |_| {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            crate::node::LocalNode::Missing
+        };
+        driver.flow.look_here();
+        driver.flow.open_settings(SettingsRow::Start);
+        let enter = SetupInput::Key(SetupKey::Enter);
+        assert!(driver.looks_here(&enter));
+        assert!(!driver.reads_pot(&enter));
+        let start = driver
+            .view()
+            .items
+            .iter()
+            .position(|item| item.kind == ItemKind::Start)
+            .unwrap();
+        assert!(driver.looks_here(&SetupInput::Click(start)));
+        assert!(!driver.looks_here(&SetupInput::Key(SetupKey::Down)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while driver.flow.looking_here() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            driver.tick();
+        }
+        assert!(!driver.looks_here(&enter));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -125,6 +125,7 @@ pub fn show(ui: &mut egui::Ui, board: &RigBoard, live: bool, stop: &dyn Fn()) {
                 ui.weak(super::dashboard::clock(started.elapsed()));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                super::updates::bar_button(ui);
                 if live
                     && ui
                         .add_enabled(!stopping, egui::Button::new("Stop"))
