@@ -682,7 +682,7 @@ impl Running {
     }
 
     pub(super) fn wait(&self, condition: impl Fn(&ServerStats) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + PROGRESS_DEADLINE;
         loop {
             if condition(&self.stats.lock().unwrap()) {
                 return;
@@ -695,6 +695,14 @@ impl Running {
         }
     }
 }
+
+/// What: how long a test waits for progress it expects from a server (ready
+/// templates, an accepted block, a counted verdict, a leaf log line).
+/// Why: the waits return as soon as the condition holds; 5 s was too short
+/// for a loaded Windows runner starting a template server, which failed tests
+/// that had nothing wrong.
+/// Look here if: a test fails with "server progress deadline exceeded".
+const PROGRESS_DEADLINE: Duration = Duration::from_secs(30);
 
 impl Drop for Running {
     fn drop(&mut self) {
@@ -2103,7 +2111,7 @@ fn sv1_firmware_mines_at_a_remote_sv2_pool_and_the_adapter_counts_its_verdicts()
         assert_eq!(pool.node.lock().unwrap().tip, hash);
     }
     // The pool's verdicts reach the adapter's own workers page.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PROGRESS_DEADLINE;
     while stats.lock().unwrap().shares_accepted < 2 {
         assert!(Instant::now() < deadline, "pool verdicts not counted");
         thread::sleep(Duration::from_millis(10));
@@ -2587,7 +2595,7 @@ fn at_a_remote_pool_the_donation_mines_on_its_own_channel_and_the_pool_accepts_i
     // device built with the adapter's extranonce is the pool's own.
     pool.wait(|stats| stats.blocks_accepted == 1);
     assert_eq!(pool.node.lock().unwrap().tip, hash);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PROGRESS_DEADLINE;
     while stats.lock().unwrap().shares_accepted < 1 {
         assert!(Instant::now() < deadline, "pool verdict not counted");
         thread::sleep(Duration::from_millis(10));
@@ -2668,7 +2676,7 @@ fn public_pool_miners_can_see_their_leaves() {
     send(json!({"id":2,"method":"mining.subscribe","params":["test"]}));
     assert!(next()["result"].is_array());
     send(json!({"id":3,"method":"mining.authorize","params":[miner.clone()]}));
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PROGRESS_DEADLINE;
     let leaves = loop {
         assert!(Instant::now() < deadline, "no leaves reached the firmware");
         let message = next();
@@ -2690,7 +2698,7 @@ fn public_pool_miners_can_see_their_leaves() {
     // A standard-channel device: the leaf log.
     let log = directory.0.join("leaves.jsonl");
     let device = Device::connect_as(&server, false, &address(4));
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PROGRESS_DEADLINE;
     while !std::fs::read_to_string(&log).is_ok_and(|text| text.lines().count() >= 1) {
         assert!(Instant::now() < deadline, "no leaf log line");
         thread::sleep(Duration::from_millis(10));
@@ -3778,7 +3786,7 @@ fn a_pool_without_job_declaration_leaves_the_local_server_without_work() {
         }],
         stop.clone(),
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PROGRESS_DEADLINE;
     loop {
         let summary = handle.status.summary.lock().unwrap().clone();
         if summary.fallbacks >= 1 {
