@@ -211,6 +211,24 @@ impl NativePhotonSession {
         ))
     }
 
+    /// A session on `job`'s baton that has not asked the node anything.
+    #[cfg(test)]
+    pub(crate) fn unverified_for_test(
+        url: &str,
+        deployment: &PhotonDeployment,
+        job: &LiveJob,
+    ) -> Self {
+        Self {
+            url: url.to_owned(),
+            deployment: *deployment,
+            baton: baton_from_live_job(job),
+            snapshot: LiveStateSnapshot {
+                tip_hash: job.tip_hash.clone(),
+                job: job.clone(),
+            },
+        }
+    }
+
     /// Returns the most recently verified native node state.
     pub fn snapshot(&self) -> &LiveStateSnapshot {
         &self.snapshot

@@ -2468,6 +2468,7 @@ fn not_final_recheck(session: &ElectrumSession) -> Duration {
 struct BlockWait {
     last_attempt: Instant,
     next_attempt: Instant,
+    recheck: Duration,
 }
 
 impl BlockWait {
@@ -2476,6 +2477,7 @@ impl BlockWait {
         Self {
             last_attempt: now,
             next_attempt: now + recheck,
+            recheck,
         }
     }
 
@@ -2492,11 +2494,28 @@ impl BlockWait {
     }
 }
 
-/// Waits on the same session until the claim's next try; `false` when stop
-/// is requested first. Only notices the server already pushed are read.
+// #### Claims that wait for a block: on a node
+// What: a node session has no pushed notices, so a claim waiting there reads
+// only the tip height (one `getblockcount`) every 2 s; the transaction lookup,
+// the state read and the resend run once the tip is past the refusal height.
+// A Fulcrum session's block notices decide instead.
+// Why: the lookup costs a node without a transaction index dozens of calls.
+// Look here if: a node gets busy while a claim waits for a block.
+/// Whether a claim refused at `refused_at` may be tried: on a node, once its
+/// tip is higher; on Fulcrum always (its notices and 30 s reads decide).
+fn tip_passed_refusal(session: &mut ElectrumSession, refused_at: u32) -> Result<bool, String> {
+    Ok(session
+        .node_tip_height()?
+        .is_none_or(|height| height > refused_at))
+}
+
+/// Waits on the same session until the claim refused at `refused_at` is due
+/// another try; `false` when stop is requested first. Only notices the server
+/// already pushed are read, and on a node only its tip height.
 fn wait_for_claim_retry(
     session: &mut ElectrumSession,
     mut wait: BlockWait,
+    refused_at: u32,
     stop: &dyn Fn() -> bool,
 ) -> Result<bool, String> {
     loop {
@@ -2508,7 +2527,11 @@ fn wait_for_claim_retry(
             wait.notice(now);
         }
         if wait.due(now) {
-            return Ok(true);
+            if tip_passed_refusal(session, refused_at)? {
+                return Ok(true);
+            }
+            wait = BlockWait::after_attempt(Instant::now(), wait.recheck);
+            continue;
         }
         thread::sleep(NOTICE_CHECK.min(wait.next_attempt.saturating_duration_since(now)));
     }
@@ -2603,7 +2626,7 @@ fn resolve_pending_until_stopped(
                     reported_block_wait = Some(refused_at);
                 }
                 let wait = BlockWait::after_attempt(Instant::now(), block_recheck);
-                if !wait_for_claim_retry(session, wait, stop)? {
+                if !wait_for_claim_retry(session, wait, refused_at, stop)? {
                     return Err(stopped());
                 }
             }
@@ -4004,6 +4027,18 @@ fn run_supervisor(
                             "successor mining unavailable until the parent resolves: {error}"
                         )),
                     ),
+                }
+            }
+            // On a node, a claim waiting for a block costs one tip read per
+            // recheck until the tip passes the refusal. A failed read leaves
+            // the try due, and the try reports the failure as before.
+            if Instant::now() >= next_submission_retry {
+                if let Some((refused_at, wait)) = claim_block_wait.as_mut() {
+                    let active = session.as_mut().expect("checked session above");
+                    if let Ok(false) = tip_passed_refusal(active, *refused_at) {
+                        *wait = BlockWait::after_attempt(Instant::now(), wait.recheck);
+                        next_submission_retry = wait.next_attempt;
+                    }
                 }
             }
             if Instant::now() >= next_submission_retry {
@@ -9042,7 +9077,7 @@ mod tests {
         // The session waits for the block notice; a 60 s recheck shows the
         // notice, not the timer, brought the next try.
         let wait = BlockWait::after_attempt(Instant::now(), Duration::from_secs(60));
-        assert!(wait_for_claim_retry(&mut session, wait, &|| false).unwrap());
+        assert!(wait_for_claim_retry(&mut session, wait, job.height, &|| false).unwrap());
         let second =
             attempt_pending_submission(&mut session, &cfg, &pending, &journal, Some(context))
                 .unwrap();
@@ -9150,7 +9185,7 @@ mod tests {
                 .unwrap();
         assert!(matches!(first, SubmissionAttempt::AwaitingBlock(_)));
         let wait = BlockWait::after_attempt(Instant::now(), Duration::from_secs(60));
-        assert!(wait_for_claim_retry(&mut session, wait, &|| false).unwrap());
+        assert!(wait_for_claim_retry(&mut session, wait, job.height, &|| false).unwrap());
         let second =
             attempt_pending_submission(&mut session, &cfg, &pending, &journal, Some(context))
                 .unwrap();
@@ -9414,5 +9449,57 @@ mod tests {
         // covenant subscription).
         assert_eq!(requests.len(), 2 + tries * 4);
         PendingSubmission::remove(&journal).unwrap();
+    }
+
+    #[test]
+    fn a_claim_waiting_for_a_block_on_a_node_reads_only_the_tip_once_per_recheck() {
+        const AT_REFUSAL: usize = 10;
+        let job = live_job();
+        let refused_at = job.height;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        // The node answers each call on its own connection; the block comes
+        // after ten reads at the refusal height.
+        let node = thread::spawn(move || {
+            let mut methods = Vec::new();
+            for call in 0..=AT_REFUSAL {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let read = std::io::Read::read(&mut stream, &mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]).into_owned();
+                let body: serde_json::Value =
+                    serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                methods.push(body["method"].as_str().unwrap().to_owned());
+                let height = refused_at + u32::from(call == AT_REFUSAL);
+                let body = format!("{{\"result\":{height},\"error\":null,\"id\":\"pickaxe\"}}");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
+            }
+            listener.set_nonblocking(true).unwrap();
+            (methods, listener.accept().is_ok())
+        });
+        let deployment =
+            crate::config::MiningToken::Photon.photon_deployment(MiningNetwork::Chipnet);
+        let mut session = ElectrumSession::node_for_test(
+            crate::node::NativePhotonSession::unverified_for_test(&url, deployment, &job),
+            deployment,
+        );
+        assert_eq!(not_final_recheck(&session), PHOTON_STATE_RECHECK);
+        // The node cadence, shortened so the test runs in about two seconds.
+        let recheck = Duration::from_millis(200);
+        let started = Instant::now();
+        let wait = BlockWait::after_attempt(started, recheck);
+        assert!(wait_for_claim_retry(&mut session, wait, refused_at, &|| false).unwrap());
+        let elapsed = started.elapsed();
+        let (methods, more) = node.join().unwrap();
+        assert!(!more, "no call after the tip passed the refusal");
+        assert_eq!(methods, vec!["getblockcount"; AT_REFUSAL + 1]);
+        // One tip read per recheck: eleven reads take eleven rechecks.
+        assert!(elapsed >= recheck * 10, "{elapsed:?}");
+        assert!(elapsed < recheck * 30, "{elapsed:?}");
     }
 }
