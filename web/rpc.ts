@@ -33,7 +33,14 @@ export class Electrum {
     socket.onclose = () => this.close(new Error('Connection closed'));
     socket.onerror = () => this.close(new Error('WebSocket connection failed'));
   }
+  /** Called when the server pushes a new block or a subscribed script's change. */
+  onNotice: (() => void) | undefined;
   receive(value: unknown, raw: string) {
+    if (typeof value === 'object' && value !== null && !('id' in value && value.id !== null) && 'method' in value
+        && (value.method === 'blockchain.headers.subscribe' || value.method === 'blockchain.scripthash.subscribe')) {
+      this.onNotice?.();
+      return;
+    }
     if (typeof value !== 'object' || value === null || !('id' in value) || typeof value.id !== 'number') return;
     const request = this.pending.get(value.id);
     if (!request) return;
