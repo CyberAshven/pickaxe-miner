@@ -228,7 +228,7 @@ impl Relayed {
                 job.channel_id = down;
                 job.job_id = job_id;
                 if future {
-                    job.min_ntime = Sv2Option::new(None);
+                    job.ntime_start = Sv2Option::new(None);
                 }
                 (mining(Mining::NewExtendedMiningJob(job))?, pool_job)
             }
@@ -239,7 +239,7 @@ impl Relayed {
                 job.channel_id = down;
                 job.job_id = job_id;
                 if future {
-                    job.min_ntime = Sv2Option::new(None);
+                    job.ntime_start = Sv2Option::new(None);
                 }
                 (mining(Mining::NewMiningJob(job))?, pool_job)
             }
@@ -283,7 +283,7 @@ impl Relayed {
         self.jobs.clear();
         let set = mining(Mining::SetTarget(SetTarget {
             channel_id: down,
-            maximum_target: (&target).into(),
+            target: (&target).into(),
         }))?;
         let job_frame = self.job_out(down, donation, &job, true)?;
         let job_id = self.next_job;
@@ -978,7 +978,7 @@ impl Relay {
                 let set: SetTarget =
                     binary_sv2::from_bytes(&mut bytes).map_err(invalid("invalid target"))?;
                 let target: [u8; 32] = set
-                    .maximum_target
+                    .target
                     .as_ref()
                     .try_into()
                     .map_err(|_| "invalid target")?;
@@ -997,7 +997,7 @@ impl Relay {
                     if current {
                         out.push(Out::Down(mining(Mining::SetTarget(SetTarget {
                             channel_id: down,
-                            maximum_target: (&target).into(),
+                            target: (&target).into(),
                         }))?));
                     }
                 }
@@ -1303,7 +1303,7 @@ mod tests {
         frame(Mining::NewExtendedMiningJob(NewExtendedMiningJob {
             channel_id,
             job_id,
-            min_ntime: Sv2Option::new(None),
+            ntime_start: Sv2Option::new(None),
             version: 0x2000_0000,
             version_rolling_allowed: true,
             merkle_path: Vec::<binary_sv2::U256>::new().try_into().unwrap(),
@@ -1317,7 +1317,7 @@ mod tests {
             channel_id,
             job_id,
             prev_hash: (&[0u8; 32]).into(),
-            min_ntime: 1_700_000_000,
+            ntime_start: 1_700_000_000,
             nbits: 0x1d00_ffff,
         }))
     }
