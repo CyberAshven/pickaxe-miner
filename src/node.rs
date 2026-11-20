@@ -1340,6 +1340,10 @@ fn read_cookie(path: &Path) -> Option<String> {
     (cookie.contains(':') && !cookie.contains(char::is_whitespace)).then(|| cookie.to_owned())
 }
 
+/// #### Local sources first: the headers a synced node may have past its
+/// blocks.
+pub const SYNCED_LAG: u64 = 1;
+
 /// #### PR #40
 /// What a BCH node says about itself: shown when a node is chosen and when
 /// the ASIC server starts.
@@ -1368,16 +1372,36 @@ impl NodeInfo {
         }
     }
 
+    /// #### Local sources first: whether the node has the chain it knows of:
+    /// out of its initial block download, with at most `SYNCED_LAG` header
+    /// past its blocks (a new block's header arrives a moment before it).
+    pub fn synced(&self) -> bool {
+        !self.syncing && self.blocks + SYNCED_LAG >= self.headers
+    }
+
+    /// How much of the chain the node has checked, in whole percent.
+    pub fn sync_percent(&self) -> u8 {
+        (self.progress * 100.0).clamp(0.0, 100.0).floor() as u8
+    }
+
+    /// The client without its version, such as "Bitcoin Cash Node".
+    pub fn client_name(&self) -> &str {
+        match self.client.rsplit_once(' ') {
+            Some((name, version)) if version.starts_with(|ch: char| ch.is_ascii_digit()) => name,
+            _ => &self.client,
+        }
+    }
+
     /// One line for screens, such as
     /// "Bitcoin Cash Node 29.1.0 · synced at height 326900".
     pub fn summary(&self) -> String {
-        if self.syncing || self.blocks < self.headers {
+        if !self.synced() {
             format!(
-                "{} · syncing, height {} of {} ({:.0}%)",
+                "{} · syncing, height {} of {} ({}%)",
                 self.client,
                 self.blocks,
                 self.headers,
-                (self.progress * 100.0).clamp(0.0, 100.0).floor()
+                self.sync_percent()
             )
         } else {
             format!("{} · synced at height {}", self.client, self.blocks)
@@ -2457,12 +2481,29 @@ mod gbt_tests {
             blocks: 120000,
             syncing: true,
             progress: 0.374,
-            ..info
+            ..info.clone()
         };
         assert_eq!(
             syncing.summary(),
             "Bitcoin Cash Node 29.1.0 · syncing, height 120000 of 326900 (37%)"
         );
+        // #### Local sources first: the setup's node row names the client
+        // without its version and a syncing node's progress; a header that
+        // arrived before its block is still synced, two are not.
+        assert!(info.synced() && !syncing.synced());
+        assert_eq!(syncing.sync_percent(), 37);
+        assert_eq!(syncing.client_name(), "Bitcoin Cash Node");
+        let behind = |headers| NodeInfo {
+            headers,
+            ..info.clone()
+        };
+        assert!(behind(info.blocks + SYNCED_LAG).synced());
+        assert!(!behind(info.blocks + SYNCED_LAG + 1).synced());
+        let knuth = NodeInfo {
+            client: "BCH node".into(),
+            ..info
+        };
+        assert_eq!(knuth.client_name(), "BCH node");
         assert_eq!(
             client_from_subversion("/Satoshi:27.0.0/").as_deref(),
             Some("Satoshi 27.0.0")

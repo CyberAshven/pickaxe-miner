@@ -2,6 +2,8 @@
 //! downloads, which redirect to a file host) and for the node's local API.
 //! HTTPS goes through rustls with the system's certificates (`tls`), as for
 //! Fulcrum servers and https nodes; no HTTP library is added for this.
+//! Pickaxe's own updates (`crate::update`) fetch through `fetch`, which also
+//! sends an ETag, limits where redirects may go and reports progress.
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{
@@ -124,9 +126,59 @@ fn resolve(base: &str, location: &str) -> Result<String, String> {
 /// GETs `url`, following redirects, with a body of at most `limit` bytes.
 /// An https URL never redirects to plain http.
 pub fn get(url: &str, accept: &str, limit: usize, timeout: Duration) -> Result<Response, String> {
+    fetch(
+        url,
+        &Fetch {
+            accept,
+            limit,
+            timeout,
+            etag: None,
+            allowed: &|_| Ok(()),
+            progress: None,
+        },
+    )
+}
+
+/// How `fetch` gets a URL.
+pub struct Fetch<'a> {
+    pub accept: &'a str,
+    /// The largest body taken.
+    pub limit: usize,
+    /// The wait for each step (the connection, a read, a write).
+    pub timeout: Duration,
+    /// Sent as `If-None-Match`; a 304 answer then means unchanged.
+    pub etag: Option<&'a str>,
+    /// Whether a URL, the first one and each redirect, may be fetched.
+    pub allowed: &'a dyn Fn(&str) -> Result<(), String>,
+    /// Told the bytes received so far, headers included, as they arrive.
+    pub progress: Option<&'a dyn Fn(usize)>,
+}
+
+/// GETs `url` as `how` says, following redirects that `how.allowed`
+/// accepts. An https URL never redirects to plain http.
+pub fn fetch(url: &str, how: &Fetch<'_>) -> Result<Response, String> {
+    let extra = match how.etag {
+        // A header value never carries a line break or other control
+        // character into the request.
+        Some(etag) if etag.chars().any(char::is_control) => {
+            return Err("the saved ETag is not a header value".into())
+        }
+        Some(etag) => format!("If-None-Match: {etag}\r\n"),
+        None => String::new(),
+    };
     let mut url = url.to_owned();
     for _ in 0..=MAX_REDIRECTS {
-        let response = get_once(&url, accept, limit, timeout)?;
+        (how.allowed)(&url)?;
+        let response = request_once(
+            &url,
+            "GET",
+            how.accept,
+            &extra,
+            None,
+            how.limit,
+            Budget::Each(how.timeout),
+            how.progress,
+        )?;
         if !matches!(response.status, 301 | 302 | 303 | 307 | 308) {
             return Ok(response);
         }
@@ -142,8 +194,9 @@ pub fn get(url: &str, accept: &str, limit: usize, timeout: Duration) -> Result<R
     Err(format!("{url}: too many redirects"))
 }
 
-fn get_once(url: &str, accept: &str, limit: usize, timeout: Duration) -> Result<Response, String> {
-    request_once(url, "GET", accept, None, limit, Budget::Each(timeout))
+/// The host a URL names, as `fetch`'s callers check it.
+pub fn host_of(url: &str) -> Result<(bool, String), String> {
+    parse_url(url).map(|url| (url.secure, url.host))
 }
 
 /// POST a bounded preparation request. No redirect can forward its identity
@@ -164,9 +217,11 @@ pub fn post_json(
         url,
         "POST",
         "application/json",
+        "",
         Some(body),
         limit,
         Budget::Until(Instant::now() + budget),
+        None,
     )
     .map_err(|_| "P2Pool preparation connection or response failed".to_owned())
 }
@@ -300,13 +355,17 @@ pub fn validate_preparation_url(url: &str) -> Result<(), String> {
     crate::config::validate_p2pool_preparation_url(url)
 }
 
+/// One request; `extra` holds whole header lines (each ending in CRLF).
+#[allow(clippy::too_many_arguments)]
 fn request_once(
     url: &str,
     method: &str,
     accept: &str,
+    extra: &str,
     body: Option<&[u8]>,
     limit: usize,
     budget: Budget,
+    progress: Option<&dyn Fn(usize)>,
 ) -> Result<Response, String> {
     let target = parse_url(url)?;
     let stream = addresses(&target.host, target.port, budget)?
@@ -335,7 +394,7 @@ fn request_once(
     });
     let request = format!(
         "{method} {} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: pickaxe-miner/{}\r\nAccept: {accept}\r\n\
-         Accept-Encoding: identity\r\n{content}Connection: close\r\n\r\n",
+         Accept-Encoding: identity\r\n{extra}{content}Connection: close\r\n\r\n",
         target.path,
         env!("CARGO_PKG_VERSION"),
     );
@@ -347,13 +406,13 @@ fn request_once(
         let mut tls = crate::tls::connect(&target.host, stream)?;
         tls.write_all(&request)
             .map_err(|error| format!("{url}: {error}"))?;
-        read_capped(&mut tls, limit + HEADER_ROOM)
+        read_capped(&mut tls, limit + HEADER_ROOM, progress)
     } else {
         let mut stream = stream;
         stream
             .write_all(&request)
             .map_err(|error| format!("{url}: {error}"))?;
-        read_capped(&mut stream, limit + HEADER_ROOM)
+        read_capped(&mut stream, limit + HEADER_ROOM, progress)
     }
     .map_err(|error| format!("{url}: {error}"))?;
     parse_response(&raw, limit).map_err(|error| format!("{url}: {error}"))
@@ -361,7 +420,11 @@ fn request_once(
 
 /// Reads until the server closes, refusing more than `cap` bytes. A TLS
 /// server that closes without a close_notify still ends the response.
-fn read_capped(reader: &mut impl Read, cap: usize) -> Result<Vec<u8>, String> {
+fn read_capped(
+    reader: &mut impl Read,
+    cap: usize,
+    progress: Option<&dyn Fn(usize)>,
+) -> Result<Vec<u8>, String> {
     let mut raw = Vec::new();
     let mut buffer = vec![0u8; 64 << 10];
     loop {
@@ -371,6 +434,9 @@ fn read_capped(reader: &mut impl Read, cap: usize) -> Result<Vec<u8>, String> {
                 raw.extend_from_slice(&buffer[..read]);
                 if raw.len() > cap {
                     return Err(format!("the response is larger than {cap} bytes"));
+                }
+                if let Some(progress) = progress {
+                    progress(raw.len());
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}

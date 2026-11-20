@@ -18,7 +18,12 @@ fn gpu_lock_path() -> Result<PathBuf, String> {
 /// #### PR #65: owner-pot recovery has one location per OS account and pot
 /// identity, even when the same key is selected from another config folder.
 pub(crate) fn pot_journal_path(name: &std::ffi::OsStr) -> Result<PathBuf, String> {
-    Ok(gpu_lock_path()?.with_file_name("electric").join(name))
+    Ok(electric_journal_dir()?.join(name))
+}
+
+/// The folder of those owner-pot journals.
+pub(crate) fn electric_journal_dir() -> Result<PathBuf, String> {
+    Ok(gpu_lock_path()?.with_file_name("electric"))
 }
 
 fn try_lock(path: &Path) -> Result<File, String> {
@@ -88,13 +93,39 @@ pub fn register_process() -> Option<ProcessMark> {
 /// Whether process `pid` holds its mark (a current Pickaxe).
 #[cfg_attr(not(windows), allow(dead_code))]
 fn is_marked(pid: u32) -> bool {
-    let Ok(path) = process_mark_path(pid) else {
-        return false;
-    };
+    process_mark_path(pid).is_ok_and(|path| is_held(&path))
+}
+
+/// Whether a mark file is held by its process.
+fn is_held(path: &Path) -> bool {
     match OpenOptions::new().read(true).write(true).open(path) {
         Ok(file) => matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
         Err(_) => false,
     }
+}
+
+/// Whether a current Pickaxe other than this process and `except` (older
+/// copies of this one waiting for it, see `update::relaunch`) runs: one
+/// that holds its mark. An update never replaces the program under it.
+pub fn other_pickaxe_running(except: &[u32]) -> bool {
+    process_mark_path(0)
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .is_some_and(|dir| marks_held(&dir, std::process::id(), except))
+}
+
+fn marks_held(dir: &Path, me: u32, except: &[u32]) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let pid = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".lock"))
+            .and_then(|pid| pid.parse::<u32>().ok());
+        pid.is_some_and(|pid| pid != me && !except.contains(&pid) && is_held(&entry.path()))
+    })
 }
 
 #[cfg(windows)]
@@ -199,6 +230,32 @@ mod tests {
         drop(mark);
         assert!(!is_marked(std::process::id()));
         assert!(!path.exists());
+    }
+
+    // An update never replaces the program while another current Pickaxe
+    // holds its mark; this process and its waiting older copies don't count.
+    #[test]
+    fn other_marks_count_unless_they_are_this_process_or_stale() {
+        let dir = std::env::temp_dir().join(format!(
+            "pickaxe-marks-test-{}-{:x}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let me = 70_000;
+        assert!(!marks_held(&dir, me, &[]));
+        // A stale mark (its process ended) and this process's own.
+        fs::write(dir.join("70001.lock"), b"").unwrap();
+        let own = try_lock(&dir.join(format!("{me}.lock"))).unwrap();
+        assert!(!marks_held(&dir, me, &[]));
+        // Another process's held mark, unless it is a waiting ancestor.
+        let other = try_lock(&dir.join("70002.lock")).unwrap();
+        assert!(marks_held(&dir, me, &[]));
+        assert!(!marks_held(&dir, me, &[70_002]));
+        drop(other);
+        assert!(!marks_held(&dir, me, &[]));
+        drop(own);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(windows)]

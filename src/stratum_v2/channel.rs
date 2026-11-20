@@ -2123,6 +2123,7 @@ mod tests {
             },
             pool_target,
             p2pool: None,
+            payouts: None,
             full_template: true,
         };
         let mut raw = rpc_template();
@@ -2345,6 +2346,7 @@ mod tests {
             },
             pool_target: [0xff; 32],
             p2pool: None,
+            payouts: None,
             full_template: true,
         };
         template.declare(Arc::new(plan.clone()));
@@ -2433,6 +2435,7 @@ mod tests {
             },
             pool_target: [0xff; 32],
             p2pool: None,
+            payouts: None,
             full_template: true,
         };
         template.declare(Arc::new(plan.clone()));

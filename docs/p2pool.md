@@ -162,15 +162,17 @@ list; Pickaxe never moves devices from one to another by itself.
 | Your templates | What runs | You give |
 |---|---|---|
 | off: join a P2Pool node, which builds the jobs | Pickaxe's server mines at that node over SV2 | its HOST:PORT and authority key |
-| your node's: Pickaxe runs your own P2Pool node with it | Pickaxe installs, updates and runs P2Pool as above, and mines at it | your BCH node (and its ZMQ block notices) |
+| your node's: Pickaxe runs your own P2Pool v2 node with it | Pickaxe installs, updates and runs P2Pool as above, linked with other P2Pool servers, and mines at it | your BCH node (and its ZMQ block notices or P2P address) |
 
 - **Payout:** P2Pool pays shares to a key, so the payout must be a P2PKH
   (`q…`) address. The server's identity at P2Pool is
   `<payout>,p2p=<share address>`, the share address made from the payout's
   key (`pickaxe stratum-v2 share-address` prints it). Pickaxe's donation
   channel names the donation key's own share address the same way.
-- **Your own P2Pool node:** the setup asks for your BCH node and refuses ZMQ
-  notices set to off (the command line takes off, see "Pool modes"). Its
+- **Your own P2Pool node:** the setup asks for your BCH node; with ZMQ
+  notices off it shows the node's P2P address (see "Pool modes"); Advanced
+  has P2Pool's own donation and fallback pools, and the main rows your
+  peers. Its
   server command is `pickaxe stratum-v2 serve
   --own-p2pool --sv1-listen 0.0.0.0:3333 ...` with the profile's node,
   notices and payout: it installs or updates P2Pool as `pickaxe p2pool set`
@@ -187,9 +189,9 @@ list; Pickaxe never moves devices from one to another by itself.
 - **When P2Pool is not green:** devices wait on it, or with
   `--fallback-pool` go to a fallback pool (see "Pool modes"); there is no
   switch to solo. Choose solo mining in the setup to mine solo.
-- **Profiles:** saved as joining a pool, which every build reads; that it is
-  P2Pool, and your own, is kept in `profile-choices.json` beside the
-  profiles.
+- **Profiles:** saved as joining a pool, with your own P2Pool's settings
+  (`p2pool`) beside it; that it is P2Pool, and your own, is also kept in
+  `profile-choices.json` beside the profiles.
 - Joining a public P2Pool node, your own node's templates can be mined
   there too (Job Declaration, PR #65): see
   [job-declaration.md](job-declaration.md#public-bch-p2pool-with-your-own-bch-node).
@@ -242,7 +244,15 @@ pickaxe stratum-v2 serve --config pool.json --network chipnet \
   device that channel's jobs for the donation's share of its accepted work
   (the SV1 adapter's rule), with the pool's extranonce prefix in each job's
   coinbase part; its job ids and shares map back to the channel they came
-  from, and verdicts come back under the device's own channel.
+  from, and verdicts come back under the device's own channel. A device on
+  a standard channel (some Bitaxe firmware) is switched the same way: both
+  its channels are standard ones, and when P2Pool puts them in a group and
+  sends the group extended jobs, the door gives the device each channel's
+  own standard job (the merkle root over that channel's extranonce prefix).
+  When a device closes its channel, P2Pool closes it, or the connection
+  ends, the door closes the donation channel at P2Pool with it (one P2Pool
+  opens after its device channel closed is closed as soon as it is open),
+  and nothing more goes either way on a closed channel.
 - **Your settings, in `p2pool/<network>.toml`:**
 
 | Flag | P2Pool's key | Limit |
@@ -268,8 +278,8 @@ pickaxe stratum-v2 serve --config pool.json --network chipnet \
   `getblocktemplate`, which P2Pool's RPC client notes Knuth lacks. Knuth
   needs those in P2Pool (P2Pool's change) before P2Pool runs on it.
 - **Profiles:** a profile keeps `p2pool` (donation, standalone, node_p2p)
-  beside its ASIC pool or join server, with fallback pools; the setup
-  screens come in their own change.
+  beside its ASIC pool or join server, with fallback pools; the setup sets
+  them (Run a pool, ASIC, Mode; see [pool.md](pool.md#a-non-custodial-pool-or-p2pool-v2)).
 
 ## Commands
 
@@ -284,8 +294,6 @@ pickaxe stratum-v2 serve --config pool.json --network chipnet \
 
 ## Not in this change
 
-- Running a P2Pool node for other miners from the setup: the command line
-  has it (see "Pool modes"); the setup screens come next.
 - `v0.0.1-alpha` predates P2Pool's `/miner` API and its template-refresh
   fix; a new release brings them to everyone running it.
 - A newer release that will not start is not rolled back by itself; the
@@ -356,7 +364,11 @@ and a real ASIC at it.
   identity, through the SV1 adapter and the SV2 door; an owner-only node
   keeps one identity; failover to a fallback pool and back; an SV2 device
   mines the donation's jobs for its share, its shares reach the right
-  channel, and a joining Pickaxe's visible donation is credited),
+  channel, and a joining Pickaxe's visible donation is credited; the same
+  for a standard channel, with standard jobs of its own or in a group sent
+  extended jobs, through the door to a stand-in P2Pool too; a donation
+  channel closes at P2Pool with its device channel, when the device leaves
+  and when it was opened too late or too small, with nothing more on it),
   `stratum_v2::command` (fee mode work/both and a long signature refused),
   `config` (the profile's P2Pool settings) and `cli`.
 - `p2pool::launch`: the configuration (node, ports, chain, store, logs,

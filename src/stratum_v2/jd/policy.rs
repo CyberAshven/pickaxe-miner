@@ -103,6 +103,29 @@ impl PayoutRule {
         (outputs, rates)
     }
 
+    // What: the outputs Requested Payout Outputs (0x5052) returns for a
+    // template worth `value`: the allocated outputs' scripts in their order
+    // (the miner, then the fee, then the donation), the donation and the fee
+    // their whole shares (`minimums`), the miner the rest. They sum to
+    // `value` and pass `check`.
+    // Why: the client builds its coinbase from exactly these outputs, so
+    // the pool's own rule must accept what it hands out.
+    // Look here if: a coinbase built from a RequestPayoutOutputs.Success is
+    // refused with invalid-coinbase-tx-outputs.
+    /// The exact outputs of a coinbase worth `value` under this rule.
+    pub fn exact_outputs(&self, value: u64) -> Vec<(u64, Vec<u8>)> {
+        let (donation, fee) = self.minimums(value);
+        let (mut outputs, rates) = self.allocated_outputs();
+        outputs[0].0 = value.saturating_sub(donation).saturating_sub(fee);
+        if let Some(index) = rates.fee_output {
+            outputs[usize::from(index)].0 = fee;
+        }
+        if let Some(index) = rates.donation_output {
+            outputs[usize::from(index)].0 = donation;
+        }
+        outputs
+    }
+
     /// The whole donation D and the whole fee F a coinbase worth `value`
     /// must pay: D from the value, F from what D leaves, both rounded down.
     pub fn minimums(&self, value: u64) -> (u64, u64) {

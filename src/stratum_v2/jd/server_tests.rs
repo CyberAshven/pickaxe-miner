@@ -989,3 +989,473 @@ fn push_solution_finds_the_declared_job_by_proof_of_work() {
         .unwrap();
     assert_eq!((reply.blocks.len(), reply.unmatched), (0, 1));
 }
+
+/// RequestExtensions for `requested`, as Knuth's client sends it.
+fn negotiate(requested: Vec<u16>) -> SerializedFrame {
+    RequestExtensions {
+        request_id: 1,
+        requested,
+    }
+    .frame()
+    .unwrap()
+}
+
+/// RequestPayoutOutputs for `token` on `pool`'s template, with the
+/// declaration's script head as the coinbase prefix.
+fn payout_request(request_id: u32, token: &[u8], pool: &BchTemplate) -> SerializedFrame {
+    let mut head = height_script(pool.height);
+    head.extend(b"jd");
+    RequestPayoutOutputs {
+        request_id,
+        token: token.to_vec(),
+        available_payout_value: pool.coinbase_value,
+        height: pool.height,
+        prev_hash: pool.previous_hash,
+        nbits: pool.bits,
+        coinbase_prefix: head,
+    }
+    .frame()
+    .unwrap()
+}
+
+/// The success or the error code an answer to RequestPayoutOutputs is.
+fn payout_answer(
+    responses: &mut JdResponses,
+) -> Result<crate::stratum_v2::extensions::RequestPayoutOutputsSuccess, String> {
+    use crate::stratum_v2::extensions::{
+        REQUEST_PAYOUT_OUTPUTS_ERROR, REQUEST_PAYOUT_OUTPUTS_SUCCESS,
+    };
+    assert_eq!(responses.frames.len(), 1);
+    let frame = &mut responses.frames[0];
+    assert_eq!(frame.header().ext_type(), PAYOUT_OUTPUTS);
+    match frame.header().msg_type() {
+        REQUEST_PAYOUT_OUTPUTS_SUCCESS => {
+            Ok(RequestPayoutOutputsSuccess::decode(frame.payload()).unwrap())
+        }
+        REQUEST_PAYOUT_OUTPUTS_ERROR => Err(RequestPayoutOutputsError::decode(frame.payload())
+            .unwrap()
+            .code),
+        other => panic!("message {other}"),
+    }
+}
+
+/// The coinbase prefix and suffix a client builds from a
+/// RequestPayoutOutputs.Success around a 32-byte extranonce.
+fn exact_parts(
+    success: &crate::stratum_v2::extensions::RequestPayoutOutputsSuccess,
+    height: u32,
+) -> (Vec<u8>, Vec<u8>) {
+    let mut head = height_script(height);
+    head.extend(b"jd");
+    let mut prefix = success.version.to_le_bytes().to_vec();
+    prefix.push(1);
+    prefix.extend([0; 32]);
+    prefix.extend([0xff; 4]);
+    prefix.push((head.len() + 32) as u8);
+    prefix.extend(&head);
+    let mut suffix = success.sequence.to_le_bytes().to_vec();
+    suffix.extend(&success.outputs);
+    suffix.extend(success.locktime.to_le_bytes());
+    (prefix, suffix)
+}
+
+// What: Knuth's negotiation on a JD session. A Full-Template session is
+// granted Requested Payout Outputs (0x5052) and BCH large templates
+// (0x4C54), in the order asked; a Coinbase-only one only 0x5052; a request
+// for neither gets RequestExtensions.Error naming it. Before the grant a
+// RequestPayoutOutputs is discarded; before setup the negotiation ends the
+// session; an unknown extension's frame, or one with the channel bit, is
+// discarded; once granted, a message only the pool sends breaks the
+// protocol.
+// Look here if: `DeclaratorSession::extension` changes.
+#[test]
+fn a_jd_session_grants_payout_outputs_and_large_templates() {
+    use crate::stratum_v2::extensions::{
+        RequestExtensionsError, RequestExtensionsSuccess, REQUEST_EXTENSIONS_ERROR, WORKER_HASHRATE,
+    };
+    let declarator = declarator_accepting(AcceptJd::Both);
+    let now = Instant::now();
+    let mut early = DeclaratorSession::new(&declarator);
+    assert!(early
+        .receive(
+            &mut negotiate(vec![PAYOUT_OUTPUTS]),
+            &declarator,
+            &NO_CONTEXT,
+            now
+        )
+        .is_err());
+    let (mut full, token, _) = full_session(&declarator, now);
+    let pool = Arc::new(context(1));
+    let current = Context {
+        current: Some(&pool),
+        recent: &[],
+    };
+    let mut discarded = full
+        .receive(
+            &mut payout_request(3, &token, &pool),
+            &declarator,
+            &current,
+            now,
+        )
+        .unwrap();
+    assert!(discarded.frames.is_empty());
+    let mut granted = full
+        .receive(
+            &mut negotiate(vec![WORKER_HASHRATE, LARGE_TEMPLATES, PAYOUT_OUTPUTS]),
+            &declarator,
+            &current,
+            now,
+        )
+        .unwrap();
+    assert_eq!(granted.frames[0].header().ext_type(), NEGOTIATION);
+    assert_eq!(
+        RequestExtensionsSuccess::decode(granted.frames[0].payload()),
+        Some(RequestExtensionsSuccess {
+            request_id: 1,
+            supported: vec![LARGE_TEMPLATES, PAYOUT_OUTPUTS],
+        })
+    );
+    discarded = full
+        .receive(
+            &mut crate::stratum_v2::wire::extension_frame(0x0003, 0, false, &[1]).unwrap(),
+            &declarator,
+            &current,
+            now,
+        )
+        .unwrap();
+    assert!(discarded.frames.is_empty());
+    discarded = full
+        .receive(
+            &mut crate::stratum_v2::wire::extension_frame(PAYOUT_OUTPUTS, 0, true, &[1]).unwrap(),
+            &declarator,
+            &current,
+            now,
+        )
+        .unwrap();
+    assert!(discarded.frames.is_empty());
+    assert!(full
+        .receive(
+            &mut PayoutOutputsStale.frame().unwrap(),
+            &declarator,
+            &current,
+            now
+        )
+        .is_err());
+    let mut coinbase_only = DeclaratorSession::new(&declarator);
+    coinbase_only
+        .receive(&mut setup(0), &declarator, &NO_CONTEXT, now)
+        .unwrap();
+    let mut answer = coinbase_only
+        .receive(
+            &mut negotiate(vec![LARGE_TEMPLATES, PAYOUT_OUTPUTS]),
+            &declarator,
+            &NO_CONTEXT,
+            now,
+        )
+        .unwrap();
+    assert_eq!(
+        RequestExtensionsSuccess::decode(answer.frames[0].payload()),
+        Some(RequestExtensionsSuccess {
+            request_id: 1,
+            supported: vec![PAYOUT_OUTPUTS],
+        })
+    );
+    let mut refused = coinbase_only
+        .receive(
+            &mut negotiate(vec![LARGE_TEMPLATES]),
+            &declarator,
+            &NO_CONTEXT,
+            now,
+        )
+        .unwrap();
+    assert_eq!(
+        refused.frames[0].header().msg_type(),
+        REQUEST_EXTENSIONS_ERROR
+    );
+    assert_eq!(
+        RequestExtensionsError::decode(refused.frames[0].payload()),
+        Some(RequestExtensionsError {
+            request_id: 1,
+            unsupported: vec![LARGE_TEMPLATES],
+            required: Vec::new(),
+        })
+    );
+}
+
+// What: a 0x5052 exchange. RequestPayoutOutputs for an allocated token on
+// the pool's template is answered with EXACT_OUTPUTS, version 2, sequence
+// 0xffffffff and lock time 0, and the token's rule's outputs (miner
+// 304,734,375, fee 3,078,125, donation 4,687,500 at 1.5% and 1%) in the
+// allocation's order and size. A Full-Template declaration built from them
+// is accepted, and a Coinbase-only token's rule accepts them. Another
+// height, parent or bits is stale-payout-outputs; an unknown or another
+// session's token is invalid-mining-job-token. When the pool's donation
+// changes, the session gets PayoutOutputsStale (once), tokens from before
+// are stale, and a new token's outputs pay the new rate.
+// Look here if: `DeclaratorSession::payout` or `poll` changes.
+#[test]
+fn requested_payout_outputs_pass_the_pools_own_check() {
+    let declarator = declarator_accepting(AcceptJd::Both);
+    let now = Instant::now();
+    let (mut session, token, scripts) = full_session(&declarator, now);
+    let pool = Arc::new(context(1));
+    let current = Context {
+        current: Some(&pool),
+        recent: &[],
+    };
+    session
+        .receive(
+            &mut negotiate(vec![PAYOUT_OUTPUTS]),
+            &declarator,
+            &current,
+            now,
+        )
+        .unwrap();
+    let reservation = {
+        let mut reply = session
+            .receive(&mut allocate(&payout(), 2), &declarator, &NO_CONTEXT, now)
+            .unwrap();
+        let success: AllocateMiningJobTokenSuccess =
+            binary_sv2::from_bytes(reply.frames[0].payload()).unwrap();
+        success.coinbase_outputs.as_ref().len()
+    };
+    let success = payout_answer(
+        &mut session
+            .receive(
+                &mut payout_request(4, &token, &pool),
+                &declarator,
+                &current,
+                now,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        (success.request_id, success.flags, success.version),
+        (4, EXACT_OUTPUTS, 2)
+    );
+    assert_eq!((success.sequence, success.locktime), (u32::MAX, 0));
+    assert_eq!(success.outputs.len(), reservation);
+    assert_eq!(
+        parse_outputs(&success.outputs).unwrap(),
+        [304_734_375, 3_078_125, 4_687_500]
+            .into_iter()
+            .zip(scripts.iter().cloned())
+            .collect::<Vec<_>>()
+    );
+    // The token is not spent: the declaration built from the outputs is
+    // accepted.
+    let txids = ids(1..=1);
+    let parts = exact_parts(&success, pool.height);
+    let mut declared = session
+        .receive(
+            &mut declare_frame(5, &token, pool.version, &parts, &txids),
+            &declarator,
+            &current,
+            now,
+        )
+        .unwrap();
+    declared_token(&mut declared);
+    // Coinbase-only: the token's own rule takes the same outputs.
+    let mut coinbase_only = DeclaratorSession::new(&declarator);
+    coinbase_only
+        .receive(&mut setup(0), &declarator, &NO_CONTEXT, now)
+        .unwrap();
+    coinbase_only
+        .receive(
+            &mut negotiate(vec![PAYOUT_OUTPUTS]),
+            &declarator,
+            &NO_CONTEXT,
+            now,
+        )
+        .unwrap();
+    let (allocated, _) = new_token(&mut coinbase_only, &declarator, now);
+    let success = payout_answer(
+        &mut coinbase_only
+            .receive(
+                &mut payout_request(6, &allocated, &pool),
+                &declarator,
+                &current,
+                now,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    match declarator.redeem(&allocated, &payout(), now) {
+        Ok(Custom::CoinbaseOnly(rule)) => assert_eq!(
+            rule.check(&parse_outputs(&success.outputs).unwrap()),
+            Ok(pool.coinbase_value)
+        ),
+        _ => panic!("a Coinbase-only token"),
+    }
+    // Stale: another height, parent or bits; refused: unknown tokens.
+    let (token, _) = new_token(&mut session, &declarator, now);
+    let mut ask = |frame: &mut SerializedFrame| {
+        payout_answer(&mut session.receive(frame, &declarator, &current, now).unwrap())
+    };
+    for change in 0..3 {
+        let mut other = (*pool).clone();
+        match change {
+            0 => other.height += 1,
+            1 => other.previous_hash = [9; 32],
+            _ => other.bits ^= 1,
+        }
+        assert_eq!(
+            ask(&mut payout_request(7, &token, &other)).unwrap_err(),
+            STALE_PAYOUT_OUTPUTS
+        );
+    }
+    let mut forged = token.clone();
+    *forged.last_mut().unwrap() ^= 1;
+    assert_eq!(
+        ask(&mut payout_request(8, &forged, &pool)).unwrap_err(),
+        "invalid-mining-job-token"
+    );
+    assert_eq!(
+        ask(&mut payout_request(9, &allocated, &pool)).unwrap_err(),
+        "invalid-mining-job-token",
+        "another session's (and spent) token"
+    );
+    assert!(ask(&mut payout_request(10, &token, &pool)).is_ok());
+    // The donation setting changes: one notice, then old tokens are stale
+    // and new ones pay the new rate (no donation output at 0%).
+    assert!(session.poll(&declarator).unwrap().frames.is_empty());
+    *declarator.donation.write().unwrap() = BchDonation::try_from(0).unwrap();
+    let notice = session.poll(&declarator).unwrap();
+    assert_eq!(notice.frames.len(), 1);
+    assert_eq!(
+        notice.frames[0].as_bytes(),
+        [0x52, 0x50, 0x03, 0x00, 0x00, 0x00]
+    );
+    assert!(session.poll(&declarator).unwrap().frames.is_empty());
+    let mut ask = |frame: &mut SerializedFrame| {
+        payout_answer(&mut session.receive(frame, &declarator, &current, now).unwrap())
+    };
+    assert_eq!(
+        ask(&mut payout_request(11, &token, &pool)).unwrap_err(),
+        STALE_PAYOUT_OUTPUTS
+    );
+    let (fresh, fresh_scripts) = new_token(&mut session, &declarator, now);
+    assert_eq!(fresh_scripts.len(), 2);
+    let success = payout_answer(
+        &mut session
+            .receive(
+                &mut payout_request(12, &fresh, &pool),
+                &declarator,
+                &current,
+                now,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        parse_outputs(&success.outputs).unwrap(),
+        vec![
+            (309_375_000, fresh_scripts[0].clone()),
+            (3_125_000, fresh_scripts[1].clone())
+        ]
+    );
+}
+
+// What: BCH large templates (0x4C54) on a Full-Template session. A template
+// of 65,537 transactions is declared as one DeclareMiningJob.Transactions
+// page of 65,535 ids and a DeclareMiningJob carrying the last 2; the pool,
+// missing two of them (one past position 65,535), asks with
+// ProvideMissingTransactions.Positions (U32 positions in the whole list);
+// a reply carrying only the first is taken and the rest asked for again;
+// then the declaration is accepted with every id in order. Before the grant
+// a page is discarded. The paged limit follows the pool's block size.
+// Look here if: `DeclaratorSession::page`, `advance` or `provide` change.
+#[test]
+fn large_templates_are_paged_and_asked_for_by_u32_position() {
+    use crate::stratum_v2::extensions::{
+        ProvideMissingTransactionsPositions, PROVIDE_MISSING_TRANSACTIONS_POSITIONS,
+    };
+    const COUNT: u32 = 65_537;
+    let declarator = declarator_accepting(AcceptJd::FullTemplate);
+    let now = Instant::now();
+    let (mut session, token, scripts) = full_session(&declarator, now);
+    let txids = ids(1..=COUNT);
+    let nonces: HashMap<Hash, u32> = (1..=COUNT).map(|nonce| (tx(nonce).0, nonce)).collect();
+    let missing = [nonces[&txids[7]], nonces[&txids[65_536]]];
+    let mut raw = rpc_template();
+    let mut txs: Vec<serde_json::Value> = (1..=COUNT)
+        .filter(|nonce| !missing.contains(nonce))
+        .map(transaction)
+        .collect();
+    txs.sort_by_key(|tx| tx["txid"].as_str().unwrap().to_owned());
+    raw["transactions"] = serde_json::json!(txs);
+    let pool = Arc::new(BchTemplate::from_rpc(&raw).unwrap());
+    let current = Context {
+        current: Some(&pool),
+        recent: &[],
+    };
+    let page = DeclareMiningJobTransactions {
+        request_id: 9,
+        txids: txids[..SEQ_MAX].to_vec(),
+    };
+    let ignored = session
+        .receive(&mut page.frame().unwrap(), &declarator, &current, now)
+        .unwrap();
+    assert!(ignored.frames.is_empty() && session.paging.is_none());
+    session
+        .receive(
+            &mut negotiate(vec![LARGE_TEMPLATES]),
+            &declarator,
+            &current,
+            now,
+        )
+        .unwrap();
+    session
+        .receive(&mut page.frame().unwrap(), &declarator, &current, now)
+        .unwrap();
+    let parts = coinbase_parts(pool.height, &scripts);
+    let mut reply = session
+        .receive(
+            &mut declare_frame(9, &token, pool.version, &parts, &txids[SEQ_MAX..]),
+            &declarator,
+            &current,
+            now,
+        )
+        .unwrap();
+    let positions = |reply: &mut JdResponses| {
+        let frame = &mut reply.frames[0];
+        assert_eq!(frame.header().ext_type(), LARGE_TEMPLATES);
+        assert_eq!(
+            frame.header().msg_type(),
+            PROVIDE_MISSING_TRANSACTIONS_POSITIONS
+        );
+        let ask = ProvideMissingTransactionsPositions::decode(frame.payload()).unwrap();
+        assert_eq!(ask.request_id, 9);
+        ask.positions
+    };
+    assert_eq!(positions(&mut reply), [7, 65_536]);
+    let mut reply = session
+        .receive(
+            &mut provide_frame(9, &[tx(missing[0]).1]),
+            &declarator,
+            &current,
+            now,
+        )
+        .unwrap();
+    assert_eq!(positions(&mut reply), [65_536]);
+    let mut reply = session
+        .receive(
+            &mut provide_frame(9, &[tx(missing[1]).1]),
+            &declarator,
+            &current,
+            now,
+        )
+        .unwrap();
+    let declared = declared_token(&mut reply);
+    match declarator.redeem(&declared, &payout(), now) {
+        Ok(Custom::Declared(job)) => {
+            assert_eq!(job.template.transaction_ids(), txids.as_slice());
+        }
+        _ => panic!("the declared job"),
+    }
+    assert_eq!(paged_limit(Some(65 * 100_000)), 100_000);
+    assert_eq!(paged_limit(Some(1_000)), SEQ_MAX);
+    assert_eq!(paged_limit(None), MAX_PAGED_TXS);
+    assert_eq!(paged_limit(Some(u64::MAX)), MAX_PAGED_TXS);
+}
