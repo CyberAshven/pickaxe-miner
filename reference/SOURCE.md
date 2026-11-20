@@ -6,11 +6,10 @@ Version string: M67.38-MainContinuousWins-v1
 
 ## Included
 
-- index.html
 - miner.js
 - photon-miner.wgsl
-- test-vectors.js
-- generator-table.bin (64 KiB fixed-base table)
+
+`index.html`, `test-vectors.js` and `generator-table.bin` (64 KiB fixed-base table) were mirrored too and removed on 2026-11-20 as unused; the browser package builds its own table.
 
 ## Not included
 
