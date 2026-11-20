@@ -11,6 +11,7 @@
 - [Token hash split](hash-split.md): PHOTON and ELECTRIC in one GPU session, with per-token shares, donations and dashboard details
 - [Fee policy](fee-policy.md)
 - [Rust dependency security](rust-security.md)
+- [Pickaxe updates](updates.md): the signed-release rule, the notice and Updates panel, applying at the next start, rollback, and how the owner signs a release
 - [Incremental-k search](incremental-k.md) (optional CUDA build feature)
 - [Running a pool](pool.md): an ASIC or GPU pool for other miners, as a service
 - [BCH P2Pool, managed](p2pool.md): P2Pool installed from its releases, kept updated and run by Pickaxe, with lights for P2Pool and the node

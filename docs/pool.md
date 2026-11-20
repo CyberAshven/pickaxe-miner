@@ -84,7 +84,7 @@ yours. Four cuts, each separate:
 
 | Cut | Goes to | Set by | Paid as |
 |---|---|---|---|
-| Pickaxe donation | the Pickaxe project, paid by whoever runs Pickaxe (you) | your donation setting, or a miner's higher `,donation=` (never lower); a joining Pickaxe's own donation channel is credited, as under "Fees" | mining work, on a second channel at P2Pool, for SV1 and SV2 devices |
+| Pickaxe donation | the Pickaxe project, paid by whoever runs Pickaxe (you) | your donation setting, or a miner's higher `,donation=` (never lower); a joining Pickaxe's own donation channel is credited, as under "Fees" | mining work, on a second channel at P2Pool (closed with the device's), for SV1 devices and SV2 devices on extended or standard channels |
 | P2Pool donation | the P2Pool project | you, as P2Pool's runner: `--p2pool-donation`, 0% to 10% (1% default) | each block's coinbase |
 | Operator fee | you, the host | `--pool-fee` (at most 10%, from what P2Pool's donation leaves) and `--pool-fee-address` | each block's coinbase only |
 | The rest | the miners | | each block's coinbase, by their work |

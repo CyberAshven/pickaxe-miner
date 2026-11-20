@@ -180,6 +180,7 @@ fn bar_row(ui: &mut egui::Ui, board: &Board, link: &Link) {
             ui.label(style::number(clock(started.elapsed()), 13.0).weak());
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            super::updates::bar_button(ui);
             if !board.live {
                 // Starting (shaders, the fee pot): nothing reads the
                 // session's controls yet, so stop it as Ctrl+C would.

@@ -9,7 +9,11 @@
 //! maps its job ids and shares back to the lane they came from, and
 //! switches lanes by the SV1 adapter's rule (`WorkAllocation::
 //! pool_donation_work`, repaid by accepted work). Verdicts come back under
-//! the device's own channel and sequence numbers.
+//! the device's own channel and sequence numbers. A standard channel gets
+//! standard jobs on both lanes, its own of each extended job a pool sends
+//! the group it put the lane in. When a device channel closes, or the
+//! connection ends, its donation lane closes at the pool with it, and
+//! nothing more goes either way on a closed lane.
 
 use super::super::{
     channel::MAX_ACTIVE_JOBS,
@@ -18,11 +22,15 @@ use super::super::{
     server::WorkSplit,
     sv1::{miner_login, DonationRoute, MinerLogins, DONATION_REFUSALS, P2PKH_ONLY},
     telemetry::{expected_hashes, ShareEvent},
+    template::{double_sha256, fold, Hash},
     wire::mining,
     work_allocation::WorkAllocation,
 };
 use crate::donation::bch::BchDonation;
-use std::{collections::BTreeMap, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Instant,
+};
 use stratum_core::{
     binary_sv2::{self, Sv2Option},
     codec_sv2::SerializedFrame,
@@ -35,6 +43,8 @@ use stratum_core::{
 pub(super) const MAX_OPENING: usize = 256;
 /// Shares a lane waits on the pool's verdict for; the oldest goes first.
 const MAX_PENDING: usize = 64;
+/// Closed channels at the pool whose late frames the door still drops.
+const MAX_CLOSED: usize = 256;
 
 /// A frame for the pool or for the device.
 pub(super) enum Out {
@@ -80,6 +90,9 @@ enum Request {
 struct Lane {
     channel: u32,
     group: u32,
+    /// The pool's extranonce prefix: of an extended channel, the part
+    /// before the miner's bytes; of a standard channel, its whole
+    /// extranonce.
     prefix: Vec<u8>,
     size: usize,
     target: [u8; 32],
@@ -147,6 +160,9 @@ pub(super) struct Relay {
     choice: Option<Option<BchDonation>>,
     own: OwnDonation,
     named: bool,
+    /// The pool's channels of this connection that closed, whose late
+    /// frames go nowhere.
+    closed: BTreeSet<u32>,
     pub(super) noted: Noted,
 }
 
@@ -173,6 +189,43 @@ impl Lane {
 
     fn addressed(&self, channel: u32) -> bool {
         self.channel == channel || (self.group != 0 && self.group == channel)
+    }
+
+    // #### Pool modes: a standard channel in a P2Pool group
+    // What: a pool may put standard channels in a group channel and send
+    // the group extended jobs (SV2 does, for a connection that does not
+    // require standard jobs). Each standard lane takes its own standard job
+    // of each: the pool's job id, version and start time, and the merkle
+    // root of the coinbase around the lane's own extranonce prefix, the one
+    // the pool checks that channel's shares against.
+    // Why: the device sees one standard channel outside any group, and its
+    // two lanes (its own and the donation's) have different prefixes.
+    // Look here if: a standard-channel device at the door gets no work, or
+    // its shares are refused at P2Pool.
+    /// This standard lane's job of the extended job `payload` sent to its
+    /// group, as the pool would send it to the lane alone.
+    fn standard_job(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
+        let mut bytes = payload.to_vec();
+        let job: NewExtendedMiningJob =
+            binary_sv2::from_bytes(&mut bytes).map_err(invalid("invalid mining job"))?;
+        let mut coinbase = job.coinbase_tx_prefix.as_ref().to_vec();
+        coinbase.extend(&self.prefix);
+        coinbase.extend(job.coinbase_tx_suffix.as_ref());
+        let path = job
+            .merkle_path
+            .iter()
+            .map(|hash| Hash::try_from(hash.as_ref()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "invalid merkle path")?;
+        let root = fold(double_sha256(&coinbase), &path);
+        let mut standard = mining(Mining::NewMiningJob(NewMiningJob {
+            channel_id: self.channel,
+            job_id: job.job_id,
+            ntime_start: job.ntime_start,
+            version: job.version,
+            merkle_root: (&root).into(),
+        }))?;
+        Ok(standard.payload().to_vec())
     }
 }
 
@@ -308,6 +361,7 @@ impl Relay {
             choice: None,
             own: OwnDonation::default(),
             named: false,
+            closed: BTreeSet::new(),
             noted: Noted::default(),
         }
     }
@@ -315,6 +369,47 @@ impl Relay {
     fn request_id(&mut self) -> u32 {
         self.next_request = self.next_request.wrapping_add(1).max(1);
         self.next_request
+    }
+
+    /// The pool's channel `channel` closed: its late frames go nowhere.
+    fn mark_closed(&mut self, channel: u32) {
+        if self.closed.len() >= MAX_CLOSED {
+            self.closed.pop_first();
+        }
+        self.closed.insert(channel);
+    }
+
+    /// Closes the pool's channel `channel` for `reason`.
+    fn close_lane(&mut self, channel: u32, reason: &str) -> Result<Out, String> {
+        self.mark_closed(channel);
+        Ok(Out::Up(mining(Mining::CloseChannel(CloseChannel {
+            channel_id: channel,
+            reason_code: reason.try_into().map_err(invalid("invalid close"))?,
+        }))?))
+    }
+
+    // #### Pool modes: a donation lane closes with its device channel
+    // What: when the device closes its channel, the pool closes the
+    // device's lane, or the connection ends, the donation lane closes at the
+    // pool too (CloseChannel); a donation lane the pool opens after its
+    // device channel closed, or that cannot carry the device's work, is
+    // closed as soon as the pool answers. Frames the pool still sends on a
+    // closed lane go nowhere, and the device's shares on a closed channel
+    // are refused here, so nothing more goes either way on it.
+    // Why: a donation channel left open at P2Pool is a miner P2Pool keeps
+    // waiting on, and its late jobs are not the device's.
+    // Look here if: P2Pool lists donation channels of devices that left.
+    /// The connection ends: each device channel closes at the pool with its
+    /// donation lane.
+    pub(super) fn close(&mut self) -> Result<Vec<Out>, String> {
+        let mut out = Vec::new();
+        for relayed in std::mem::take(&mut self.channels).into_values() {
+            out.push(self.close_lane(relayed.personal.channel, "connection-closed")?);
+            if let Slot::Open(lane) = relayed.donation {
+                out.push(self.close_lane(lane.channel, "connection-closed")?);
+            }
+        }
+        Ok(out)
     }
 
     // #### one donation, the higher rate, at the door
@@ -546,17 +641,17 @@ impl Relay {
                 Ok(out)
             }
             MESSAGE_TYPE_CLOSE_CHANNEL => {
-                let mut close: CloseChannel = binary_sv2::from_bytes(frame.payload())
+                let close: CloseChannel = binary_sv2::from_bytes(frame.payload())
                     .map_err(invalid("invalid channel close"))?;
-                let mut out = Vec::new();
-                let donation_lane = self
-                    .channels
-                    .remove(&close.channel_id)
-                    .and_then(|relayed| relayed.lane(true).map(|lane| lane.channel));
-                out.push(Out::Up(mining(Mining::CloseChannel(close.clone()))?));
-                if let Some(channel) = donation_lane {
-                    close.channel_id = channel;
-                    out.push(Out::Up(mining(Mining::CloseChannel(close))?));
+                let channel = close.channel_id;
+                let mut out = vec![Out::Up(mining(Mining::CloseChannel(close))?)];
+                // A donation lane the pool has not opened yet is closed
+                // once it answers (`pool_frame`).
+                if let Some(relayed) = self.channels.remove(&channel) {
+                    self.mark_closed(channel);
+                    if let Slot::Open(lane) = relayed.donation {
+                        out.push(self.close_lane(lane.channel, "channel-closed")?);
+                    }
                 }
                 Ok(out)
             }
@@ -678,25 +773,28 @@ impl Relay {
     }
 
     /// Stops donating on the device channel `down`: the lane closes at the
-    /// pool and the device goes back to its own jobs.
+    /// pool (`close`; otherwise the pool closed it) and the device goes back
+    /// to its own jobs.
     fn drop_donation(&mut self, down: u32, close: bool) -> Result<Vec<Out>, String> {
         let Some(relayed) = self.channels.get_mut(&down) else {
             return Ok(Vec::new());
         };
-        let mut out = Vec::new();
-        if let (true, Slot::Open(lane)) = (close, &relayed.donation) {
-            out.push(Out::Up(mining(Mining::CloseChannel(CloseChannel {
-                channel_id: lane.channel,
-                reason_code: "donation-stopped"
-                    .try_into()
-                    .map_err(invalid("invalid close"))?,
-            }))?));
-        }
-        relayed.donation = Slot::Unavailable;
-        if relayed.on_donation {
+        let slot = std::mem::replace(&mut relayed.donation, Slot::Unavailable);
+        let switched = if relayed.on_donation {
             relayed.on_donation = false;
-            out.extend(relayed.switch(down)?);
+            relayed.switch(down)?
+        } else {
+            Vec::new()
+        };
+        let mut out = Vec::new();
+        if let Slot::Open(lane) = slot {
+            if close {
+                out.push(self.close_lane(lane.channel, "donation-stopped")?);
+            } else {
+                self.mark_closed(lane.channel);
+            }
         }
+        out.extend(switched);
         Ok(out)
     }
 
@@ -772,6 +870,14 @@ impl Relay {
         let kind = header.msg_type();
         let channel_message = header.channel_msg();
         let payload = frame.payload().to_vec();
+        // Late frames on a channel that closed go nowhere.
+        if channel_message
+            && payload
+                .first_chunk::<4>()
+                .is_some_and(|id| self.closed.contains(&u32::from_le_bytes(*id)))
+        {
+            return Ok(Vec::new());
+        }
         let mut bytes = payload.clone();
         let mut out = Vec::new();
         match kind {
@@ -792,15 +898,18 @@ impl Relay {
                 } else {
                     let open: OpenStandardMiningChannelSuccess = binary_sv2::from_bytes(&mut bytes)
                         .map_err(invalid("invalid channel reply"))?;
+                    let prefix = open.extranonce_prefix.as_ref();
                     let lane = Lane::new(
                         open.channel_id,
                         open.group_channel_id,
-                        &[],
-                        0,
+                        prefix,
+                        prefix.len(),
                         open.target.as_ref(),
                     );
                     (open.request_id, lane, None)
                 };
+                // A channel id the pool gives again is a new channel.
+                self.closed.remove(&lane.channel);
                 match self.requests.remove(&request_id) {
                     Some(Request::Device {
                         id,
@@ -854,15 +963,27 @@ impl Relay {
                         out.push(Out::Down(frame));
                     }
                     Some(Request::Donation { channel, .. }) => {
-                        if let Some(relayed) = self.channels.get_mut(&channel) {
-                            let fits = relayed.extranonce.is_none_or(|size| lane.size >= size)
-                                && extended == relayed.extranonce.is_some()
-                                && lane.channel != relayed.personal.channel;
-                            relayed.donation = if fits {
-                                Slot::Open(Box::new(lane))
-                            } else {
-                                Slot::Unavailable
-                            };
+                        let ours = self.lane_of(lane.channel).is_some();
+                        match self.channels.get_mut(&channel) {
+                            Some(relayed)
+                                if matches!(relayed.donation, Slot::Requested)
+                                    && !ours
+                                    && relayed.extranonce.is_none_or(|size| lane.size >= size)
+                                    && extended == relayed.extranonce.is_some() =>
+                            {
+                                relayed.donation = Slot::Open(Box::new(lane));
+                            }
+                            // The device channel closed meanwhile, or the
+                            // lane cannot carry its work: closed at the pool
+                            // (never a lane of the door's own).
+                            relayed => {
+                                if let Some(relayed) = relayed {
+                                    relayed.donation = Slot::Unavailable;
+                                }
+                                if !ours {
+                                    out.push(self.close_lane(lane.channel, "donation-unused")?);
+                                }
+                            }
                         }
                     }
                     None => out.push(Out::Down(frame)),
@@ -913,22 +1034,28 @@ impl Relay {
                     let Some(relayed) = self.channels.get_mut(&down) else {
                         continue;
                     };
-                    if relayed.extranonce.is_some() != extended {
-                        continue;
-                    }
+                    let standard = relayed.extranonce.is_none();
                     let Some(lane) = relayed.lane_mut(donation) else {
                         continue;
                     };
+                    // An extended channel takes extended jobs; a standard
+                    // one standard jobs, and its own of each extended job
+                    // its group is sent.
+                    let job = match (standard, extended) {
+                        (true, true) => lane.standard_job(&payload)?,
+                        (false, true) | (true, false) => payload.clone(),
+                        (false, false) => continue,
+                    };
                     if future {
-                        lane.future.insert(pool_job, payload.clone());
+                        lane.future.insert(pool_job, job.clone());
                         while lane.future.len() > MAX_ACTIVE_JOBS {
                             lane.future.pop_first();
                         }
                     } else {
-                        lane.latest = Some((pool_job, payload.clone()));
+                        lane.latest = Some((pool_job, job.clone()));
                     }
                     if donation == relayed.on_donation {
-                        out.push(Out::Down(relayed.job_out(down, donation, &payload, false)?));
+                        out.push(Out::Down(relayed.job_out(down, donation, &job, false)?));
                     }
                 }
             }
@@ -1104,18 +1231,14 @@ impl Relay {
                     if donation {
                         out.extend(self.drop_donation(down, false)?);
                     } else if let Some(relayed) = self.channels.remove(&down) {
+                        self.mark_closed(relayed.personal.channel);
                         let mut copy = payload.clone();
                         let mut closed: CloseChannel = binary_sv2::from_bytes(&mut copy)
                             .map_err(invalid("invalid channel close"))?;
                         closed.channel_id = down;
                         out.push(Out::Down(mining(Mining::CloseChannel(closed))?));
                         if let Slot::Open(lane) = relayed.donation {
-                            out.push(Out::Up(mining(Mining::CloseChannel(CloseChannel {
-                                channel_id: lane.channel,
-                                reason_code: "channel-closed"
-                                    .try_into()
-                                    .map_err(invalid("invalid close"))?,
-                            }))?));
+                            out.push(self.close_lane(lane.channel, "channel-closed")?);
                         }
                     }
                 }
@@ -1494,6 +1617,498 @@ mod tests {
 
     fn relay_at(donation: &str) -> Relay {
         relay(donation)
+    }
+
+    fn open_standard(request_id: u32, identity: &str) -> SerializedFrame {
+        frame(Mining::OpenStandardMiningChannel(
+            OpenStandardMiningChannel {
+                request_id,
+                user_identity: identity.try_into().unwrap(),
+                nominal_hash_rate: 1e12,
+                max_target: (&[0xffu8; 32]).into(),
+            },
+        ))
+    }
+
+    /// The pool's request id and identity of a standard channel request.
+    fn opened_standard(mut request: SerializedFrame) -> (u32, String) {
+        assert_eq!(
+            request.header().msg_type(),
+            MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL
+        );
+        let open: OpenStandardMiningChannel = binary_sv2::from_bytes(request.payload()).unwrap();
+        (open.request_id, open.user_identity.as_utf8_or_hex())
+    }
+
+    fn standard_success(
+        request_id: u32,
+        channel_id: u32,
+        group_channel_id: u32,
+        prefix: &[u8],
+    ) -> SerializedFrame {
+        frame(Mining::OpenStandardMiningChannelSuccess(
+            OpenStandardMiningChannelSuccess {
+                request_id,
+                channel_id,
+                target: (&[0xffu8; 32]).into(),
+                extranonce_prefix: prefix.try_into().unwrap(),
+                group_channel_id,
+            },
+        ))
+    }
+
+    /// The sibling in the pool's jobs' merkle paths.
+    const SIBLING: Hash = [3; 32];
+
+    /// A future extended job, as a pool sends a group (one sibling).
+    fn group_job(channel_id: u32, job_id: u32, coinbase: &[u8]) -> SerializedFrame {
+        frame(Mining::NewExtendedMiningJob(NewExtendedMiningJob {
+            channel_id,
+            job_id,
+            ntime_start: Sv2Option::new(None),
+            version: 0x2000_0000,
+            version_rolling_allowed: true,
+            merkle_path: vec![(&SIBLING).into()].try_into().unwrap(),
+            coinbase_tx_prefix: coinbase.try_into().unwrap(),
+            coinbase_tx_suffix: [7u8; 8].as_slice().try_into().unwrap(),
+        }))
+    }
+
+    /// The merkle root a pool gives a standard channel whose extranonce
+    /// prefix is `prefix` for `group_job(_, _, coinbase)`.
+    fn root(coinbase: &[u8], prefix: &[u8]) -> Hash {
+        fold(
+            double_sha256(&[coinbase, prefix, &[7u8; 8]].concat()),
+            &[SIBLING],
+        )
+    }
+
+    /// A future standard job with `merkle_root`.
+    fn standard_job(channel_id: u32, job_id: u32, merkle_root: Hash) -> SerializedFrame {
+        frame(Mining::NewMiningJob(NewMiningJob {
+            channel_id,
+            job_id,
+            ntime_start: Sv2Option::new(None),
+            version: 0x2000_0000,
+            merkle_root: (&merkle_root).into(),
+        }))
+    }
+
+    fn standard_share(channel_id: u32, sequence_number: u32, job_id: u32) -> SerializedFrame {
+        frame(Mining::SubmitSharesStandard(SubmitSharesStandard {
+            channel_id,
+            sequence_number,
+            job_id,
+            nonce: 1,
+            ntime: 1_700_000_001,
+            version: 0x2000_0000,
+        }))
+    }
+
+    /// A standard job the device got: its channel, job id, merkle root and
+    /// whether it waits for its parent.
+    fn device_standard_job(mut frame: SerializedFrame) -> (u32, u32, Hash, bool) {
+        assert_eq!(frame.header().msg_type(), MESSAGE_TYPE_NEW_MINING_JOB);
+        let job: NewMiningJob = binary_sv2::from_bytes(frame.payload()).unwrap();
+        (
+            job.channel_id,
+            job.job_id,
+            job.merkle_root.as_ref().try_into().unwrap(),
+            job.is_future(),
+        )
+    }
+
+    /// A parent the device got: its channel and job id.
+    fn device_prev(mut frame: SerializedFrame) -> (u32, u32) {
+        assert_eq!(
+            frame.header().msg_type(),
+            MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH
+        );
+        let prev: SetNewPrevHash = binary_sv2::from_bytes(frame.payload()).unwrap();
+        (prev.channel_id, prev.job_id)
+    }
+
+    /// A standard share the pool got: its channel, sequence and job.
+    fn pool_standard_share(mut frame: SerializedFrame) -> (u32, u32, u32) {
+        assert_eq!(
+            frame.header().msg_type(),
+            MESSAGE_TYPE_SUBMIT_SHARES_STANDARD
+        );
+        let share: SubmitSharesStandard = binary_sv2::from_bytes(frame.payload()).unwrap();
+        (share.channel_id, share.sequence_number, share.job_id)
+    }
+
+    /// The device's success, or refusal, of a share: its channel, sequence
+    /// number and the refusal's code.
+    fn verdict(mut frame: SerializedFrame) -> (u32, u32, Option<String>) {
+        if frame.header().msg_type() == MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS {
+            let ack: SubmitSharesSuccess = binary_sv2::from_bytes(frame.payload()).unwrap();
+            return (ack.channel_id, ack.last_sequence_number, None);
+        }
+        let error: SubmitSharesError = binary_sv2::from_bytes(frame.payload()).unwrap();
+        (
+            error.channel_id,
+            error.sequence_number,
+            Some(error.error_code.as_utf8_or_hex()),
+        )
+    }
+
+    fn share_refused(channel_id: u32, sequence_number: u32, code: &str) -> SerializedFrame {
+        frame(Mining::SubmitSharesError(SubmitSharesError {
+            channel_id,
+            sequence_number,
+            error_code: code.try_into().unwrap(),
+        }))
+    }
+
+    /// The pool's job `job_id` (coinbase part `coinbase`) and its parent for
+    /// a connection's standard lanes: one extended job and parent for the
+    /// group 9 (`grouped`), or a standard job and parent for each lane in
+    /// `lanes` (its channel and extranonce prefix). The device's frames.
+    fn standard_work(
+        relay: &mut Relay,
+        grouped: bool,
+        lanes: &[(u32, &[u8])],
+        job_id: u32,
+        coinbase: &[u8],
+    ) -> Vec<SerializedFrame> {
+        let mut frames = Vec::new();
+        if grouped {
+            frames.push(group_job(9, job_id, coinbase));
+            frames.push(prev(9, job_id));
+        } else {
+            for (channel, prefix) in lanes {
+                frames.push(standard_job(*channel, job_id, root(coinbase, prefix)));
+            }
+            for (channel, _) in lanes {
+                frames.push(prev(*channel, job_id));
+            }
+        }
+        frames
+            .into_iter()
+            .flat_map(|frame| split(relay.pool_frame(frame, T).unwrap()).1)
+            .collect()
+    }
+
+    // #### Pool modes: the Pickaxe donation for a standard channel
+    // What: an SV2 device on a standard channel (some Bitaxe firmware)
+    // mines the donation for its share as an extended one does, whether
+    // P2Pool sends each standard channel its own jobs or puts both lanes in
+    // a group and sends the group extended jobs: the device's channel is
+    // outside any group, each lane's job reaches it as a standard job whose
+    // merkle root is over that lane's own extranonce prefix, under job ids
+    // of the door's; at 100% it moves to the donation lane's job, its
+    // shares reach the lane whose job they solved, and P2Pool's verdicts
+    // (accepted or refused) come back under its channel and sequence
+    // numbers, counted as donation or personal work.
+    // Look here if: standard channels at the door get no work, mine one
+    // lane only, or their shares reach the wrong channel.
+    #[test]
+    fn a_standard_channel_device_mines_the_donation_for_its_share_in_a_group_or_alone() {
+        for grouped in [true, false] {
+            let group = if grouped { 9 } else { 0 };
+            let mut relay = relay("100");
+            let payout = miner(2);
+            let (up, _) = split(relay.device_frame(open_standard(7, &payout)).unwrap());
+            let (request, identity) = opened_standard(up.into_iter().next().unwrap());
+            assert_eq!(identity, share_identity(&payout));
+            let (_, mut down) = split(
+                relay
+                    .pool_frame(standard_success(request, 5, group, &[5; 8]), T)
+                    .unwrap(),
+            );
+            let reply: OpenStandardMiningChannelSuccess =
+                binary_sv2::from_bytes(down[0].payload()).unwrap();
+            assert_eq!(
+                (reply.request_id, reply.channel_id, reply.group_channel_id),
+                (7, 5, 0),
+                "the device's channel is outside any group"
+            );
+            let own: &[(u32, &[u8])] = &[(5, &[5; 8])];
+            let down = standard_work(&mut relay, grouped, own, 1, &[1; 8]);
+            assert_eq!(down.len(), 2, "{grouped}: job and parent");
+            let (channel, own_job, merkle_root, future) = device_standard_job(down[0].clone());
+            assert_eq!(
+                (channel, merkle_root, future),
+                (5, root(&[1; 8], &[5; 8]), true)
+            );
+            assert_eq!(device_prev(down[1].clone()), (5, own_job));
+            // A share on its own job goes to its own channel.
+            let (up, _) = split(relay.device_frame(standard_share(5, 40, own_job)).unwrap());
+            assert_eq!(pool_standard_share(up[0].clone()), (5, 0, 1));
+            // The donation lane opens beside it, a standard channel too.
+            let (up, down) = split(relay.tick(Instant::now()).unwrap());
+            assert!(down.is_empty());
+            let (request, identity) = opened_standard(up.into_iter().next().unwrap());
+            assert_eq!(
+                identity,
+                share_identity(crate::donation::bch::address(NETWORK))
+            );
+            let (up, down) = split(
+                relay
+                    .pool_frame(standard_success(request, 6, group, &[6; 8]), T)
+                    .unwrap(),
+            );
+            assert!(up.is_empty() && down.is_empty(), "the lane is the door's");
+            // The next job reaches both lanes; the device mines its own.
+            let both: &[(u32, &[u8])] = &[(5, &[5; 8]), (6, &[6; 8])];
+            let down = standard_work(&mut relay, grouped, both, 2, &[2; 8]);
+            assert_eq!(down.len(), 2, "{grouped}: its own job and parent");
+            let (_, next_own, merkle_root, _) = device_standard_job(down[0].clone());
+            assert_eq!(merkle_root, root(&[2; 8], &[5; 8]));
+            // At 100% it moves to the donation lane's job.
+            let (_, down) = split(relay.tick(Instant::now()).unwrap());
+            assert_eq!(down.len(), 3, "target, job, parent");
+            assert_eq!(down[0].clone().header().msg_type(), MESSAGE_TYPE_SET_TARGET);
+            let (channel, donation_job, merkle_root, future) = device_standard_job(down[1].clone());
+            assert_eq!(
+                (channel, merkle_root, future),
+                (5, root(&[2; 8], &[6; 8]), true),
+                "{grouped}: the donation lane's extranonce in the merkle root"
+            );
+            assert_ne!(donation_job, next_own);
+            assert_eq!(device_prev(down[2].clone()), (5, donation_job));
+            // Its shares go to the donation lane, under the pool's job id.
+            let (up, _) = split(
+                relay
+                    .device_frame(standard_share(5, 41, donation_job))
+                    .unwrap(),
+            );
+            assert_eq!(pool_standard_share(up[0].clone()), (6, 0, 2));
+            let (up, _) = split(
+                relay
+                    .device_frame(standard_share(5, 42, donation_job))
+                    .unwrap(),
+            );
+            assert_eq!(pool_standard_share(up[0].clone()), (6, 1, 2));
+            // The verdicts come back under the device's channel and sequence.
+            let (_, down) = split(relay.pool_frame(ack(6, 0), T).unwrap());
+            assert_eq!(verdict(down[0].clone()), (5, 41, None));
+            let (_, down) = split(
+                relay
+                    .pool_frame(share_refused(6, 1, "difficulty-too-low"), T)
+                    .unwrap(),
+            );
+            assert_eq!(
+                verdict(down[0].clone()),
+                (5, 42, Some("difficulty-too-low".into()))
+            );
+            let (_, down) = split(relay.pool_frame(ack(5, 0), T).unwrap());
+            assert_eq!(verdict(down[0].clone()), (5, 40, None));
+            assert!(relay.noted.work.donation > 0.0 && relay.noted.work.personal > 0.0);
+            assert!(matches!(
+                relay.noted.verdicts.as_slice(),
+                [
+                    ShareEvent::Accepted(_),
+                    ShareEvent::Rejected("difficulty-too-low"),
+                    ShareEvent::Accepted(_)
+                ]
+            ));
+            // Its own lane's job is gone with the switch.
+            let (up, down) = split(relay.device_frame(standard_share(5, 43, next_own)).unwrap());
+            assert!(up.is_empty());
+            assert_eq!(
+                verdict(down[0].clone()),
+                (5, 43, Some("invalid-job-id".into()))
+            );
+        }
+    }
+
+    /// The device's standard channel `channel` opened at the pool as the
+    /// same channel (no group, prefix `[channel; 8]`) with job 1 and its
+    /// parent; the device's job id.
+    fn open_standard_device(relay: &mut Relay, request: u32, identity: &str, channel: u32) -> u32 {
+        let (up, _) = split(
+            relay
+                .device_frame(open_standard(request, identity))
+                .unwrap(),
+        );
+        let (pool_request, _) = opened_standard(up.into_iter().next().unwrap());
+        let prefix = [channel as u8; 8];
+        relay
+            .pool_frame(standard_success(pool_request, channel, 0, &prefix), T)
+            .unwrap();
+        let down = standard_work(relay, false, &[(channel, &prefix)], 1, &[1; 8]);
+        assert_eq!(down.len(), 2);
+        device_standard_job(down[0].clone()).1
+    }
+
+    // #### Pool modes: one donation, the higher rate, for standard channels
+    // What: as for extended channels, a standard-channel miner's typed
+    // `,pickaxe-donation=0` leaves the server's 2%; a joining Pickaxe's
+    // donation channel opened as a standard channel gets no lane and its
+    // accepted work is credited (1.5%), so the door's lane, a standard
+    // channel under the donation key's share address, takes the rest
+    // (0.51% of the miner's own work).
+    // Look here if: standard channels pay another rate than extended ones.
+    #[test]
+    fn a_standard_channel_pays_the_higher_rate_once_with_its_own_donation_credited() {
+        let mut relay = relay("2");
+        let payout = miner(2);
+        let own_job = open_standard_device(
+            &mut relay,
+            1,
+            &format!("{payout}.rig,pickaxe-donation=0"),
+            5,
+        );
+        assert_eq!(relay.rates(), (rate("2"), rate("0"), rate("2")));
+        let donation = crate::donation::bch::address(NETWORK);
+        let donation_job = open_standard_device(&mut relay, 2, donation, 6);
+        assert!(relay.channels[&6].pays_donation);
+        // 3 shares of 200 on the donation channel, acknowledged one by one.
+        let mut sequence = [0u32, 0u32];
+        for index in 0..200u32 {
+            let (channel, job_id, slot) = if index % 66 == 0 && index < 198 {
+                (6, donation_job, 1)
+            } else {
+                (5, own_job, 0)
+            };
+            let (up, _) = split(
+                relay
+                    .device_frame(standard_share(channel, index, job_id))
+                    .unwrap(),
+            );
+            assert_eq!(
+                pool_standard_share(up[0].clone()),
+                (channel, sequence[slot], 1)
+            );
+            relay.pool_frame(ack(channel, sequence[slot]), T).unwrap();
+            sequence[slot] += 1;
+        }
+        relay.device_frame(standard_share(5, 200, own_job)).unwrap();
+        relay.pool_frame(ack(5, sequence[0]), T + 300).unwrap();
+        assert_eq!(relay.rates(), (rate("2"), rate("1.5"), rate("0.51")));
+        let (up, _) = split(relay.tick(Instant::now()).unwrap());
+        assert_eq!(relay.noted.terms, Some((rate("2"), rate("1.5"))));
+        // The miner's channel gets a standard donation lane; the donation
+        // channel none.
+        assert_eq!(up.len(), 1);
+        let (_, identity) = opened_standard(up[0].clone());
+        assert_eq!(identity, share_identity(donation));
+        assert!(matches!(relay.channels[&5].donation, Slot::Requested));
+        assert!(matches!(relay.channels[&6].donation, Slot::Off));
+    }
+
+    fn close(channel_id: u32) -> SerializedFrame {
+        frame(Mining::CloseChannel(CloseChannel {
+            channel_id,
+            reason_code: "bye".try_into().unwrap(),
+        }))
+    }
+
+    /// The channels of the frames for the pool, each a CloseChannel.
+    fn closes(up: Vec<SerializedFrame>) -> Vec<u32> {
+        up.into_iter()
+            .map(|mut frame| {
+                assert_eq!(frame.header().msg_type(), MESSAGE_TYPE_CLOSE_CHANNEL);
+                let close: CloseChannel = binary_sv2::from_bytes(frame.payload()).unwrap();
+                close.channel_id
+            })
+            .collect()
+    }
+
+    /// The donation lane of the device channel `down` opened as
+    /// `pool_channel` (size 8) with job 3 and its parent, and the device
+    /// moved to it (at 100%); the device's job id.
+    fn open_donation(relay: &mut Relay, down: u32, pool_channel: u32) -> u32 {
+        let (up, _) = split(relay.tick(Instant::now()).unwrap());
+        let (request, _, _) = opened(up.into_iter().next().unwrap());
+        let prefix = [pool_channel as u8; 4];
+        relay
+            .pool_frame(success(request, pool_channel, 8, &prefix), T)
+            .unwrap();
+        relay.pool_frame(job(pool_channel, 3, &[2; 8]), T).unwrap();
+        relay.pool_frame(prev(pool_channel, 3), T).unwrap();
+        let (_, frames) = split(relay.tick(Instant::now()).unwrap());
+        let (channel, job_id, _) = device_job(frames[1].clone());
+        assert_eq!(channel, down);
+        job_id
+    }
+
+    // #### Pool modes: a donation lane closes with its device channel
+    // What: the device closes its channel while mining the donation: both
+    // its channel and its donation lane close at P2Pool, and nothing more
+    // goes on either (P2Pool's late jobs, parents, targets and verdicts
+    // reach no one; the device's share on the old job is refused here; no
+    // lane is asked for again). A donation lane P2Pool opens after its
+    // device channel closed, or too small for the device's extranonce, is
+    // closed as soon as P2Pool answers. When P2Pool closes the device's
+    // channel, its donation lane closes too; when the connection ends,
+    // every channel closes with its donation lane.
+    // Look here if: donation channels stay open at P2Pool after their
+    // device left.
+    #[test]
+    fn a_donation_lane_closes_at_p2pool_with_its_device_channel_and_nothing_more_goes_on_it() {
+        let mut relay = relay("100");
+        open_device(&mut relay, 1, &miner(2), 5);
+        let donation_job = open_donation(&mut relay, 5, 6);
+        let (up, _) = split(relay.device_frame(share(5, 1, donation_job)).unwrap());
+        assert_eq!(pool_share(up[0].clone()).0, 6, "a share waits on the lane");
+        let (up, down) = split(relay.device_frame(close(5)).unwrap());
+        assert!(down.is_empty());
+        assert_eq!(closes(up), vec![5, 6]);
+        for late in [
+            job(6, 4, &[3; 8]),
+            prev(6, 4),
+            ack(6, 0),
+            share_refused(6, 0, "stale-share"),
+            job(5, 4, &[3; 8]),
+            prev(5, 4),
+            ack(5, 0),
+            frame(Mining::SetTarget(SetTarget {
+                channel_id: 6,
+                target: (&[0x7fu8; 32]).into(),
+            })),
+        ] {
+            assert!(relay.pool_frame(late, T).unwrap().is_empty());
+        }
+        let (up, mut down) = split(relay.device_frame(share(5, 2, donation_job)).unwrap());
+        assert!(up.is_empty());
+        let error: SubmitSharesError = binary_sv2::from_bytes(down[0].payload()).unwrap();
+        assert_eq!(error.error_code.as_ref(), b"invalid-channel-id");
+        assert!(relay.tick(Instant::now()).unwrap().is_empty());
+        assert!(relay.noted.verdicts.is_empty(), "no late verdict counted");
+        // A lane still being opened is closed once P2Pool answers.
+        open_device(&mut relay, 2, &miner(3), 7);
+        let (up, _) = split(relay.tick(Instant::now()).unwrap());
+        let (request, _, _) = opened(up.into_iter().next().unwrap());
+        let (up, _) = split(relay.device_frame(close(7)).unwrap());
+        assert_eq!(closes(up), vec![7]);
+        let (up, down) = split(
+            relay
+                .pool_frame(success(request, 8, 8, &[8; 4]), T)
+                .unwrap(),
+        );
+        assert!(down.is_empty());
+        assert_eq!(closes(up), vec![8]);
+        assert!(relay.pool_frame(job(8, 1, &[1; 8]), T).unwrap().is_empty());
+        // A lane too small for the device's 8 bytes is closed, not used.
+        open_device(&mut relay, 3, &miner(4), 9);
+        let (up, _) = split(relay.tick(Instant::now()).unwrap());
+        let (request, _, _) = opened(up.into_iter().next().unwrap());
+        let (up, down) = split(
+            relay
+                .pool_frame(success(request, 10, 4, &[10; 4]), T)
+                .unwrap(),
+        );
+        assert!(down.is_empty());
+        assert_eq!(closes(up), vec![10]);
+        assert!(matches!(relay.channels[&9].donation, Slot::Unavailable));
+        assert!(relay.tick(Instant::now()).unwrap().is_empty());
+        // P2Pool closes a device's channel: its donation lane closes too.
+        open_device(&mut relay, 4, &miner(5), 11);
+        open_donation(&mut relay, 11, 12);
+        let (up, mut down) = split(relay.pool_frame(close(11), T).unwrap());
+        assert_eq!(closes(up), vec![12]);
+        let closed: CloseChannel = binary_sv2::from_bytes(down[0].payload()).unwrap();
+        assert_eq!(closed.channel_id, 11);
+        // The connection ends: each channel closes with its donation lane.
+        open_device(&mut relay, 5, &miner(6), 13);
+        open_donation(&mut relay, 13, 14);
+        let (up, down) = split(relay.close().unwrap());
+        assert!(down.is_empty());
+        assert_eq!(closes(up), vec![9, 13, 14]);
+        assert!(relay.pool_frame(job(14, 5, &[1; 8]), T).unwrap().is_empty());
     }
 
     // #### Pool modes: one donation, the higher rate, at the door

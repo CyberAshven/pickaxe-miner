@@ -937,6 +937,9 @@ enum SettingsRow {
     Fulcrum,
     Node,
     ProfileName,
+    /// Pickaxe's own updates (on, notify or off), at the end of every
+    /// mode's Advanced section; saved for the app, not the profile.
+    AutoUpdate,
     Start,
 }
 
@@ -2705,6 +2708,7 @@ impl SetupFlow {
         rows.push(SettingsRow::Advanced);
         if self.advanced_open {
             rows.extend(advanced);
+            rows.push(SettingsRow::AutoUpdate);
         }
         rows.extend([SettingsRow::ProfileName, SettingsRow::Start]);
         rows
@@ -3740,6 +3744,18 @@ impl SetupFlow {
             }
             return SetupAction::Continue;
         }
+        // Pickaxe's own update: U installs it, or restarts into an installed
+        // one (no session runs here); X hides the notice.
+        if let Some(press) = update_key(key.code, true) {
+            match press {
+                crate::update::Press::Restart => {
+                    crate::update::request_restart();
+                    return SetupAction::Cancel;
+                }
+                crate::update::Press::Said(text) => self.status_line = text,
+            }
+            return SetupAction::Continue;
+        }
         match key.code {
             KeyCode::Esc => return SetupAction::Cancel,
             KeyCode::Up => self.profile_selected = (self.profile_selected + count) % (count + 1),
@@ -4078,6 +4094,7 @@ impl SetupFlow {
                                 .into();
                     }
                     SettingsRow::RigsOnly => self.rigs_only = !self.rigs_only,
+                    SettingsRow::AutoUpdate => self.status_line = step_updates(forward),
                     _ => {}
                 }
             }
@@ -4122,6 +4139,7 @@ impl SetupFlow {
                     self.begin_edit(TextField::RigPort, value);
                 }
                 SettingsRow::RigsOnly => self.rigs_only = !self.rigs_only,
+                SettingsRow::AutoUpdate => self.status_line = step_updates(true),
                 SettingsRow::RigName => {
                     let value = self.rig_name.clone();
                     self.begin_edit(TextField::RigName, value);
@@ -5964,6 +5982,14 @@ fn handle_key(
         return Ok(false);
     }
 
+    // Pickaxe's own update: U downloads it, never restarts this session.
+    if !(state.advanced_mode || state.logs_mode || state.settings_mode) {
+        if let Some(crate::update::Press::Said(text)) = update_key(key.code, false) {
+            state.status_line = text;
+            return Ok(false);
+        }
+    }
+
     // #### PR #32
     // Advanced settings: Left/Right move the token donation in 0.5% steps,
     // never below the token's minimum. It applies to every GPU and rig at
@@ -6407,6 +6433,62 @@ fn parse_palette_command(input: &str) -> Result<PaletteCommand, String> {
     }
 }
 
+// Pickaxe's own updates in the terminal
+// What: the update notice ("Pickaxe v0.0.5 available · U to update",
+// "Updating… 42%", "Updated to v0.0.5 · restart to apply") sits on the
+// right of the top border of the setup and the mining dashboards, so it
+// takes no line of its own. U acts on it, X hides it. A restart happens
+// only from the profiles, where no session runs.
+// Look here if: the notice covers the heading, or U does something while a
+// text field is open.
+/// `block` with the update notice on its top border's right, if there is
+/// one.
+pub(crate) fn with_update_notice(block: Block<'static>) -> Block<'static> {
+    notice_on_border(
+        block,
+        crate::update::updater().and_then(crate::update::Updater::notice),
+    )
+}
+
+/// `block` with `notice` on its top border's right.
+fn notice_on_border(block: Block<'static>, notice: Option<String>) -> Block<'static> {
+    match notice {
+        Some(notice) => block.title_top(
+            Line::from(Span::styled(
+                format!(" {notice} "),
+                Style::default().fg(Color::Yellow),
+            ))
+            .right_aligned(),
+        ),
+        None => block,
+    }
+}
+
+/// U and X for the update notice: U updates (or, `between_sessions`,
+/// restarts into an installed update), X hides the notice. None when the
+/// key is not theirs.
+pub(crate) fn update_key(code: KeyCode, between_sessions: bool) -> Option<crate::update::Press> {
+    let updater = crate::update::updater()?;
+    match code {
+        KeyCode::Char('u' | 'U') => Some(updater.press(between_sessions)),
+        KeyCode::Char('x' | 'X') if updater.notice().is_some() => {
+            updater.dismiss();
+            Some(crate::update::Press::Said(String::new()))
+        }
+        _ => None,
+    }
+}
+
+/// The settings row's Left/Right: on, notify, off. The status line's
+/// answer (empty when saved).
+fn step_updates(forward: bool) -> String {
+    let mut settings = crate::update::settings();
+    settings.set_mode(settings.mode().next(forward));
+    crate::update::save_settings(&settings)
+        .err()
+        .unwrap_or_default()
+}
+
 /// Renders the current setup screen.
 fn render_setup(frame: &mut Frame<'_>, state: &SetupFlow) {
     let area = frame.area();
@@ -6426,7 +6508,7 @@ fn render_setup(frame: &mut Frame<'_>, state: &SetupFlow) {
         .split(area);
     frame.render_widget(
         Paragraph::new(format!("PICKAXE MINER   {}", setup_heading(state)))
-            .block(Block::default().borders(Borders::ALL)),
+            .block(with_update_notice(Block::default().borders(Borders::ALL))),
         rows[0],
     );
     match state.step {
@@ -7040,6 +7122,7 @@ fn settings_kind(state: &SetupFlow, row: SettingsRow) -> ItemKind {
         | SettingsRow::AsicToken
         | SettingsRow::TokenDonation
         | SettingsRow::Intensity
+        | SettingsRow::AutoUpdate
         | SettingsRow::Share(_) => ItemKind::Cycle { enter: None },
         SettingsRow::PoolAddress
         | SettingsRow::PoolKey
@@ -7158,6 +7241,11 @@ fn settings_line(state: &SetupFlow, row: SettingsRow) -> (&'static str, Piece, &
                 "mines with its GPUs too"
             }),
             "< > [Enter]",
+        ),
+        SettingsRow::AutoUpdate => (
+            "Pickaxe updates",
+            Piece::plain(crate::update::settings().describe()),
+            "< >",
         ),
         SettingsRow::RigName => (
             "Rig name",
@@ -8520,7 +8608,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) 
         Span::raw(format!("PHOTON   {state_text}   {gpus}")),
     ]);
     frame.render_widget(
-        Paragraph::new(line).block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(line).block(with_update_notice(Block::default().borders(Borders::ALL))),
         area,
     );
 }
@@ -11476,7 +11564,97 @@ mod tests {
             .iter()
             .position(|row| *row == SettingsRow::ProfileName)
             .unwrap();
-        rows[start..end].to_vec()
+        // Every mode's section ends with the app's own updates row
+        // (`every_advanced_section_ends_with_pickaxe_updates`).
+        assert_eq!(rows[end - 1], SettingsRow::AutoUpdate);
+        rows[start..end - 1].to_vec()
+    }
+
+    // Pickaxe's own updates
+    // What: the notice takes no line of its own: it sits on the right of the
+    // header's top border, and the heading stays as it was.
+    // Look here if: with_update_notice changes.
+    #[test]
+    fn the_update_notice_sits_on_the_headers_top_border() {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 3)).unwrap();
+        let notice = crate::update::State::Ready {
+            version: crate::update::release::Version(0, 0, 5),
+            signed: true,
+            waiting: None,
+        }
+        .notice();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new("PICKAXE MINER   Profiles")
+                        .block(notice_on_border(Block::bordered(), notice)),
+                    frame.area(),
+                )
+            })
+            .unwrap();
+        fn row(terminal: &Terminal<ratatui::backend::TestBackend>, y: u16) -> String {
+            (0..80)
+                .map(|x| terminal.backend().buffer()[(x, y)].symbol().to_owned())
+                .collect()
+        }
+        assert!(
+            row(&terminal, 0).ends_with(" Updated to v0.0.5 · restart to apply ┐"),
+            "{}",
+            row(&terminal, 0)
+        );
+        assert!(
+            row(&terminal, 1).starts_with("│PICKAXE MINER   Profiles"),
+            "{}",
+            row(&terminal, 1)
+        );
+        // Without news the border is plain.
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new("x").block(notice_on_border(Block::bordered(), None)),
+                    frame.area(),
+                )
+            })
+            .unwrap();
+        assert!(row(&terminal, 0)
+            .chars()
+            .skip(1)
+            .take(78)
+            .all(|ch| ch == '─'));
+    }
+
+    // Pickaxe's own updates
+    // What: the last row of every mode's Advanced section steps through on,
+    // notify and off; it is saved for the app (updates/settings.json), not
+    // the profile, and says what the mode does in this build.
+    // Look here if: with_advanced or the AutoUpdate row changes.
+    #[test]
+    fn every_advanced_section_ends_with_pickaxe_updates() {
+        for mode in [MiningMode::Gpu, MiningMode::Asic, MiningMode::Pool] {
+            let mut setup = setup_for(mode);
+            assert!(!setup.settings_rows().contains(&SettingsRow::AutoUpdate));
+            advanced_rows(&mut setup);
+        }
+        let mut setup = setup_for(MiningMode::Gpu);
+        setup.advanced_open = true;
+        setup.open_settings(SettingsRow::AutoUpdate);
+        let (label, value, hint) = settings_line(&setup, SettingsRow::AutoUpdate);
+        assert_eq!((label, hint), ("Pickaxe updates", "< >"));
+        // No signing key in this build: notify by default, and it says so.
+        assert_eq!(value.text, crate::update::Settings::default().describe());
+        assert!(value.text.starts_with("notify"), "{}", value.text);
+        assert_eq!(
+            settings_kind(&setup, SettingsRow::AutoUpdate),
+            ItemKind::Cycle { enter: None }
+        );
+        // Outside a run (no updates folder) a change is refused, not lost
+        // silently.
+        setup.handle_key(key(KeyCode::Right));
+        assert!(
+            setup.status_line.contains("not set up"),
+            "{}",
+            setup.status_line
+        );
     }
 
     // #### PR #42
