@@ -6,6 +6,7 @@
 use std::{
     io::{self, Read, Write},
     net::{Shutdown, TcpStream},
+    thread,
     time::{Duration, Instant},
 };
 use stratum_core::{
@@ -373,11 +374,29 @@ fn read_until(
             Ok(0) => return Err("SV2 peer disconnected during frame".into()),
             Ok(n) => output = &mut output[n..],
             Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
+            Err(e) if out_of_buffers(&e) => thread::sleep(NO_BUFFERS_PAUSE),
             Err(_) => return Err("SV2 frame read failed or timed out".into()),
         }
     }
     Ok(())
 }
+
+/// What: the OS had no buffer space for this read or write just now
+/// (WSAENOBUFS 10055 on Windows, ENOBUFS 105 on Linux, 55 on macOS).
+/// Why: it passes once memory frees up, so the frame waits within its own
+/// deadline instead of closing the session mid-frame; a closed sender left
+/// the peer with a failed read.
+/// Look here if: a large frame's send or read fails under memory pressure.
+fn out_of_buffers(error: &io::Error) -> bool {
+    let code = error.raw_os_error();
+    (cfg!(windows) && code == Some(10055))
+        || (cfg!(target_os = "linux") && code == Some(105))
+        || (cfg!(target_os = "macos") && code == Some(55))
+}
+
+/// The pause before trying again a read or write the OS refused for lack of
+/// buffer space.
+const NO_BUFFERS_PAUSE: Duration = Duration::from_millis(20);
 
 /// #### PR #42: the most one write call sends
 /// What: a frame is written in slices of at most 256 KiB.
@@ -397,6 +416,7 @@ fn write_until(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> R
             Ok(0) => return Err("SV2 peer disconnected during write".into()),
             Ok(n) => bytes = &bytes[n..],
             Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
+            Err(e) if out_of_buffers(&e) => thread::sleep(NO_BUFFERS_PAUSE),
             Err(_) => return Err("SV2 frame write failed or timed out".into()),
         }
     }
@@ -406,7 +426,7 @@ fn write_until(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{net::TcpListener, thread};
+    use std::net::TcpListener;
     use stratum_core::{
         binary_sv2,
         bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey},
