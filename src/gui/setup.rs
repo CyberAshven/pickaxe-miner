@@ -227,13 +227,20 @@ impl Setup {
             let State::Ready(driver) = &mut self.state else {
                 break;
             };
-            if driver.reads_pot(&input) {
+            // #### Local sources first: Start also waits a moment for a look
+            // at this computer's node still under way.
+            let wait = if driver.reads_pot(&input) {
+                Some("Reading the fee pot's balance…")
+            } else if driver.looks_here(&input) {
+                Some("Looking at this computer's node and Fulcrum server…")
+            } else {
+                None
+            };
+            if let Some(what) = wait {
                 if let State::Ready(driver) =
                     std::mem::replace(&mut self.state, State::Failed(String::new()))
                 {
-                    self.state = busy(driver, "Reading the fee pot's balance…", move |driver| {
-                        driver.act(input)
-                    });
+                    self.state = busy(driver, what, move |driver| driver.act(input));
                 }
                 break;
             }
