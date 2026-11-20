@@ -834,8 +834,8 @@ fn uplink(
                     }
                 }
                 Mining::SetTarget(set) if addressed_to(set.channel_id, channel, group) => {
-                    pool_target = <Hash>::try_from(set.maximum_target.as_ref())
-                        .map_err(|_| "malformed target")?;
+                    pool_target =
+                        <Hash>::try_from(set.target.as_ref()).map_err(|_| "malformed target")?;
                 }
                 Mining::SetGroupChannel(set) => {
                     if set.channel_ids.iter().any(|id| *id == channel) {
@@ -1254,7 +1254,7 @@ fn declare(
         token: token.try_into().map_err(|_| "token too long")?,
         version: template.version,
         prev_hash: (&template.previous_hash).into(),
-        min_ntime: template.current_time,
+        ntime_start: template.current_time,
         nbits: template.bits,
         coinbase_tx_version: 2,
         coinbase_prefix: head.as_slice().try_into().map_err(|_| "prefix too long")?,
