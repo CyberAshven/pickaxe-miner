@@ -7,7 +7,7 @@ use super::super::{
     server::{update_relay_stats, Relay, Shared},
     template::{BchTemplate, Hash},
     transport::{Limits, Receiver, Sender, Session},
-    wire::encoded,
+    wire::{encoded, extension_frame},
 };
 use super::{convert, COINBASE_FIXED, MAX_RETAINED, STALE_GRACE};
 use std::{
@@ -17,10 +17,15 @@ use std::{
     time::{Duration, Instant},
 };
 use stratum_core::{
-    binary_sv2,
+    binary_sv2::{self, Seq064K},
     codec_sv2::SerializedFrame,
     common_messages_sv2::{
         self as common, Protocol, SetupConnection, SetupConnectionError, SetupConnectionSuccess,
+    },
+    extensions_sv2::{
+        RequestExtensions, RequestExtensionsError, CHANNEL_BIT_REQUEST_EXTENSIONS_ERROR,
+        EXTENSION_TYPE_EXTENSIONS_NEGOTIATION, MESSAGE_TYPE_REQUEST_EXTENSIONS,
+        MESSAGE_TYPE_REQUEST_EXTENSIONS_ERROR,
     },
     template_distribution_sv2::{
         CoinbaseOutputConstraints, RequestTransactionData, SubmitSolution,
@@ -91,14 +96,23 @@ fn session_loop(
     shared: &Shared,
     relay: &Relay,
 ) -> Result<(), String> {
-    let Some(mut frame) = next_frame(receiver, shared)? else {
+    let Some(mut frame) = next_frame(receiver, shared, Instant::now() + SETUP_DEADLINE)? else {
         return Ok(());
     };
     setup(&mut frame, sender)?;
-    let Some(mut frame) = next_frame(receiver, shared)? else {
-        return Ok(());
+    // #### Template Distribution extensions: a negotiating client sends
+    // RequestExtensions before its constraints. Extension frames are
+    // answered or skipped, and the constraints keep one deadline.
+    let deadline = Instant::now() + SETUP_DEADLINE;
+    let reserve = loop {
+        let Some(mut frame) = next_frame(receiver, shared, deadline)? else {
+            return Ok(());
+        };
+        if !extension(&mut frame, sender)? {
+            break constraints(&mut frame)?
+                .ok_or("template client sent no coinbase constraints")?;
+        }
     };
-    let reserve = constraints(&mut frame)?.ok_or("template client sent no coinbase constraints")?;
     let mut active = Active {
         reserve,
         generation: None,
@@ -139,10 +153,12 @@ fn session_loop(
     Ok(())
 }
 
-/// The client's next frame within the setup deadline; none once the server
-/// stops.
-fn next_frame(receiver: &mut Receiver, shared: &Shared) -> Result<Option<SerializedFrame>, String> {
-    let deadline = Instant::now() + SETUP_DEADLINE;
+/// The client's next frame before `deadline`; none once the server stops.
+fn next_frame(
+    receiver: &mut Receiver,
+    shared: &Shared,
+    deadline: Instant,
+) -> Result<Option<SerializedFrame>, String> {
     while !shared.stop.load(Ordering::Relaxed) {
         if Instant::now() >= deadline {
             return Err("template client too slow to set up".into());
@@ -206,6 +222,52 @@ fn constraints(frame: &mut SerializedFrame) -> Result<Option<u32>, String> {
     let message: CoinbaseOutputConstraints = binary_sv2::from_bytes(frame.payload())
         .map_err(|_| "malformed coinbase output constraints")?;
     Ok(Some(message.coinbase_output_max_additional_size))
+}
+
+// #### Template Distribution extensions
+// What: a frame of a non-zero extension type (the channel bit aside) is an
+// extension's, not Template Distribution's. RequestExtensions (extension
+// 0x0001, message 0x00) is answered with RequestExtensions.Error, every
+// requested extension unsupported and none required, since this provider
+// supports none; any other extension's frame is discarded. Template
+// Distribution has no channel messages, so a frame of extension 0 with the
+// channel bit is an error, and a malformed RequestExtensions is one too.
+// Why: SV2 requires frames of an unknown extension meant for this end to be
+// discarded and ignored. A negotiating client sends RequestExtensions right
+// after SetupConnection.Success and waits for the answer; closing the
+// session there dropped it in a loop.
+// Look here if: a client that asks for extensions gets no templates, or an
+// extension's frame closes a template session.
+/// Answers or discards an extension's frame: true when the frame was one.
+fn extension(frame: &mut SerializedFrame, sender: &mut Sender) -> Result<bool, String> {
+    let header = frame.header();
+    if header.ext_type_without_channel_msg() == 0 {
+        if header.channel_msg() {
+            return Err("unexpected template distribution frame".into());
+        }
+        return Ok(false);
+    }
+    if header.ext_type_without_channel_msg() != EXTENSION_TYPE_EXTENSIONS_NEGOTIATION
+        || header.msg_type() != MESSAGE_TYPE_REQUEST_EXTENSIONS
+        || header.channel_msg()
+    {
+        return Ok(true);
+    }
+    let request: RequestExtensions =
+        binary_sv2::from_bytes(frame.payload()).map_err(|_| "malformed extensions request")?;
+    let refusal = RequestExtensionsError {
+        request_id: request.request_id,
+        unsupported_extensions: request.requested_extensions,
+        required_extensions: Seq064K::new(Vec::new()).map_err(|_| "extensions list too long")?,
+    };
+    let payload = binary_sv2::to_bytes(refusal).map_err(|_| "extensions answer encoding failed")?;
+    sender.send(extension_frame(
+        EXTENSION_TYPE_EXTENSIONS_NEGOTIATION,
+        MESSAGE_TYPE_REQUEST_EXTENSIONS_ERROR,
+        CHANNEL_BIT_REQUEST_EXTENSIONS_ERROR,
+        &payload,
+    )?)?;
+    Ok(true)
 }
 
 impl Active {
@@ -275,8 +337,8 @@ impl Active {
         relay: &Relay,
     ) -> Result<(), String> {
         let header = frame.header();
-        if header.channel_msg() || header.ext_type_without_channel_msg() != 0 {
-            return Err("unexpected template distribution frame".into());
+        if extension(frame, sender)? {
+            return Ok(());
         }
         match header.msg_type() {
             MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS => {
