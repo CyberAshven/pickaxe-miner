@@ -79,7 +79,17 @@ async function run() {
         session = await Electrum.connect(endpoint);
         feeChecked = 0;
         const source = session;
-        refresh = new SnapshotRefresh(() => fetchSnapshot(source), () => performance.now());
+        // Read the live state when the server reports a change, as the
+        // native miner does; a server without subscriptions is read every 2 s.
+        let watched = false;
+        try {
+          await source.rpcRaw('blockchain.scripthash.subscribe', [config.scriptHash]);
+          watched = true;
+        } catch { watched = false; }
+        const reader = new SnapshotRefresh(() => fetchSnapshot(source), () => performance.now(),
+          watched ? 30000 : 2000, 1000);
+        source.onNotice = () => reader.notice();
+        refresh = reader;
         log(`Connected: ${new URL(endpoint).hostname}`);
         return;
       } catch (error) { lastError = error; await wait(1000); }
@@ -109,8 +119,17 @@ async function run() {
     if (!refresh) throw new Error('Snapshot reader is not ready');
     return applySnapshot(await refresh.fresh());
   }
+  // A claim refused until its baton confirms waits on this connection for the
+  // next block notice (at most 30 s between checks), waking each second for Stop.
+  async function waitForBlock() {
+    const source = connected();
+    const until = performance.now() + 30000;
+    while (!stopping && source.open && performance.now() < until) {
+      if (await source.nextBlock(Math.min(1000, until - performance.now()))) return;
+    }
+  }
   async function settle(pending: PendingReward) {
-    const result = await resolveSubmission({ session: connected(), snapshot, pending, stopped: () => stopping, wait, progress: status });
+    const result = await resolveSubmission({ session: connected(), snapshot, pending, stopped: () => stopping, wait, waitForBlock, progress: status });
     if (result !== 'pending') {
       localStorage.removeItem(journal);
       if (result === 'accepted') { wins++; log(`Reward accepted: ${pending.txid}`); }

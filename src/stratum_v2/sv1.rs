@@ -869,10 +869,10 @@ impl Lane {
             .clone()
             .ok_or("job before initial parent")?;
         if job
-            .min_ntime
+            .ntime_start
             .clone()
             .into_inner()
-            .is_none_or(|time| time < prev.min_ntime)
+            .is_none_or(|time| time < prev.ntime_start)
         {
             return Err("job time precedes active parent".into());
         }
@@ -1741,7 +1741,7 @@ impl Bridge {
                 let target: SetTarget =
                     binary_sv2::from_bytes(frame.payload()).map_err(|_| "invalid target")?;
                 let maximum: [u8; 32] = target
-                    .maximum_target
+                    .target
                     .as_ref()
                     .try_into()
                     .map_err(|_| "invalid target")?;
@@ -2128,7 +2128,7 @@ mod tests {
             NewExtendedMiningJob {
                 channel_id,
                 job_id,
-                min_ntime: binary_sv2::Sv2Option::new(None),
+                ntime_start: binary_sv2::Sv2Option::new(None),
                 version: 0x20000000,
                 version_rolling_allowed: true,
                 merkle_path: Vec::<binary_sv2::U256>::new().try_into().unwrap(),
@@ -2147,7 +2147,7 @@ mod tests {
                 channel_id,
                 job_id,
                 prev_hash: (&[0u8; 32]).into(),
-                min_ntime: 1700000000,
+                ntime_start: 1700000000,
                 nbits: 0x1d00ffff,
             },
             MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
@@ -2203,7 +2203,7 @@ mod tests {
             NewExtendedMiningJob {
                 channel_id: 9,
                 job_id: 6,
-                min_ntime: binary_sv2::Sv2Option::new(Some(1700000000)),
+                ntime_start: binary_sv2::Sv2Option::new(Some(1700000000)),
                 version: 0x20000000,
                 version_rolling_allowed: true,
                 merkle_path: Vec::<binary_sv2::U256>::new().try_into().unwrap(),
@@ -2479,7 +2479,7 @@ mod tests {
                 NewExtendedMiningJob {
                     channel_id,
                     job_id,
-                    min_ntime: binary_sv2::Sv2Option::new(None),
+                    ntime_start: binary_sv2::Sv2Option::new(None),
                     version: 0x20000000,
                     version_rolling_allowed: true,
                     merkle_path: Vec::<binary_sv2::U256>::new().try_into().unwrap(),
@@ -2497,7 +2497,7 @@ mod tests {
                     channel_id,
                     job_id,
                     prev_hash: (&[0u8; 32]).into(),
-                    min_ntime: 1700000000,
+                    ntime_start: 1700000000,
                     nbits: 0x1d00ffff,
                 },
                 MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
@@ -2932,12 +2932,12 @@ mod tests {
 
     #[test]
     fn a_new_target_reaches_firmware_with_the_next_job_without_flushing_work() {
-        let job = |job_id: u32, min_ntime: Option<u32>| {
+        let job = |job_id: u32, ntime_start: Option<u32>| {
             encoded(
                 NewExtendedMiningJob {
                     channel_id: 3,
                     job_id,
-                    min_ntime: binary_sv2::Sv2Option::new(min_ntime),
+                    ntime_start: binary_sv2::Sv2Option::new(ntime_start),
                     version: 0x20000000,
                     version_rolling_allowed: true,
                     merkle_path: Vec::<binary_sv2::U256>::new().try_into().unwrap(),
@@ -2956,7 +2956,7 @@ mod tests {
                 channel_id: 3,
                 job_id: 5,
                 prev_hash: (&[0u8; 32]).into(),
-                min_ntime: 1700000000,
+                ntime_start: 1700000000,
                 nbits: 0x1d00ffff,
             },
             MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
@@ -2971,7 +2971,7 @@ mod tests {
         let set = encoded(
             SetTarget {
                 channel_id: 3,
-                maximum_target: (&target).into(),
+                target: (&target).into(),
             },
             MESSAGE_TYPE_SET_TARGET,
             true,
@@ -3237,7 +3237,7 @@ mod tests {
         let job = NewExtendedMiningJob {
             channel_id: 3,
             job_id: 1,
-            min_ntime: binary_sv2::Sv2Option::new(None),
+            ntime_start: binary_sv2::Sv2Option::new(None),
             version: 0x2000_0000,
             version_rolling_allowed: false,
             merkle_path: Vec::<binary_sv2::U256>::new().try_into().unwrap(),

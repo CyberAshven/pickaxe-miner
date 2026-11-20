@@ -211,6 +211,10 @@ pub enum P2poolCommand {
         /// Start the installed version without installing a newer one.
         #[arg(long)]
         no_update: bool,
+        /// Run alone on its own share chain: dial no peers and take none
+        /// (the P2P port on this computer only).
+        #[arg(long)]
+        standalone: bool,
     },
     /// Install the newest P2Pool release after checking it against the
     /// SHA-256 published beside it.
@@ -221,8 +225,16 @@ pub enum P2poolCommand {
     },
     /// Go back to the P2Pool version installed before this one.
     Rollback,
-    /// The installed and newest versions, and the settings.
+    /// The installed and newest versions, the settings and the peer counts.
     Status,
+    /// The P2Pool servers a start may dial: the seeds, yours and the ones
+    /// P2Pool was connected to before, each with its last check.
+    Peers {
+        /// Check them now (one TCP connect each, 2 s at most) and show
+        /// what the next start dials.
+        #[arg(long)]
+        check: bool,
+    },
     /// Change the settings: automatic updates, the share chain, peers.
     Set {
         /// on (the default) or off: off, a newer release waits for
@@ -232,11 +244,13 @@ pub enum P2poolCommand {
         /// main or mini (the default; shares 256 times easier).
         #[arg(long, value_name = "main|mini")]
         share_chain: Option<String>,
-        /// Another P2Pool node to join, such as /ip4/203.0.113.7/tcp/6884;
-        /// repeat for more.
+        /// Another P2Pool node to join, such as /ip4/203.0.113.7/tcp/6884
+        /// or /dns4/pool.example.com/tcp/6884; repeat for more. Always
+        /// dialed, before the seeds and the peers P2Pool learned.
         #[arg(long = "peer", value_name = "ADDRESS")]
         peers: Vec<String>,
-        /// Forget the saved peers (this node then starts its own share chain).
+        /// Forget your saved peers (the seeds and learned peers are still
+        /// dialed; `run --standalone` dials none).
         #[arg(long)]
         no_peers: bool,
     },
@@ -678,6 +692,61 @@ mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn p2pool_peer_commands_parse() {
+        let peers = Cli::try_parse_from(["pickaxe", "p2pool", "peers", "--check"]).unwrap();
+        assert!(matches!(
+            peers.command,
+            Some(Commands::P2pool {
+                command: P2poolCommand::Peers { check: true }
+            })
+        ));
+        let listed = Cli::try_parse_from(["pickaxe", "p2pool", "peers"]).unwrap();
+        assert!(matches!(
+            listed.command,
+            Some(Commands::P2pool {
+                command: P2poolCommand::Peers { check: false }
+            })
+        ));
+        let alone = Cli::try_parse_from(["pickaxe", "p2pool", "run", "--standalone"]).unwrap();
+        assert!(matches!(
+            alone.command,
+            Some(Commands::P2pool {
+                command: P2poolCommand::Run {
+                    no_update: false,
+                    standalone: true
+                }
+            })
+        ));
+        let set = Cli::try_parse_from([
+            "pickaxe",
+            "p2pool",
+            "set",
+            "--no-peers",
+            "--peer",
+            "/dns4/pool.example.com/tcp/6884",
+            "--peer",
+            "/ip4/203.0.113.7/tcp/6884",
+        ])
+        .unwrap();
+        let Some(Commands::P2pool {
+            command: P2poolCommand::Set {
+                peers, no_peers, ..
+            },
+        }) = set.command
+        else {
+            panic!("{:?}", set.command);
+        };
+        assert!(no_peers);
+        assert_eq!(
+            peers,
+            [
+                "/dns4/pool.example.com/tcp/6884",
+                "/ip4/203.0.113.7/tcp/6884"
+            ]
+        );
+    }
 
     #[test]
     fn required_command_shape_parses() {

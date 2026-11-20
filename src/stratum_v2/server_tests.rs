@@ -893,7 +893,7 @@ impl Device {
         let mut bytes = version.to_le_bytes().to_vec();
         bytes.extend(previous.prev_hash.as_ref());
         bytes.extend(root);
-        bytes.extend(previous.min_ntime.to_le_bytes());
+        bytes.extend(previous.ntime_start.to_le_bytes());
         bytes.extend(previous.nbits.to_le_bytes());
         bytes.extend(0u32.to_le_bytes());
         let mut header: Header = consensus::deserialize(&bytes).unwrap();
@@ -909,7 +909,7 @@ impl Device {
                 sequence_number: sequence,
                 job_id,
                 nonce,
-                ntime: previous.min_ntime,
+                ntime: previous.ntime_start,
                 version,
                 extranonce: extra.as_slice().try_into().unwrap(),
             })
@@ -919,7 +919,7 @@ impl Device {
                 sequence_number: sequence,
                 job_id,
                 nonce,
-                ntime: previous.min_ntime,
+                ntime: previous.ntime_start,
                 version,
             })
         };
@@ -2316,7 +2316,7 @@ fn a_proxy_mines_through_a_grouped_connection() {
                 let prev: SetNewPrevHash = binary_sv2::from_bytes(frame.payload()).unwrap();
                 *parent = Some((
                     prev.prev_hash.as_ref().try_into().unwrap(),
-                    prev.min_ntime,
+                    prev.ntime_start,
                     prev.nbits,
                 ));
                 (kind, prev.channel_id)
@@ -3236,7 +3236,7 @@ fn a_scripted_jd_client_sets_a_custom_job_and_mines_it() {
                 token: token.as_slice().try_into().unwrap(),
                 version: 0x2000_0000,
                 prev_hash: (&[0xab; 32]).into(),
-                min_ntime: time,
+                ntime_start: time,
                 nbits: 0x207f_ffff,
                 coinbase_tx_version: 2,
                 coinbase_prefix: prefix.as_slice().try_into().unwrap(),

@@ -36,3 +36,44 @@ test('raw RPC responses retain integers beyond JavaScript precision across frame
   assert.equal(await unframed, second);
   rpc.close();
 });
+
+test('a pushed block notice wakes a waiting claim once, and a closed connection ends the wait', async () => {
+  const sent = [];
+  const socket = { readyState: 1, send: s => sent.push(s), close() { this.readyState = 3; } };
+  const rpc = new Electrum(socket);
+  const waiting = rpc.nextBlock(60000);
+  socket.onmessage({ data: '{"jsonrpc":"2.0","method":"blockchain.headers.subscribe","params":[{"height":7,"hex":"00"}]}\n' });
+  assert.equal(await waiting, true);
+  // A notice pushed while nothing waits is kept for the next wait, once.
+  socket.onmessage({ data: '{"method":"blockchain.headers.subscribe","params":[{"height":8,"hex":"00"}]}\n' });
+  assert.equal(await rpc.nextBlock(60000), true);
+  assert.equal(await rpc.nextBlock(1), false);
+  // Other notifications, and the answer to a headers call, are not block notices.
+  const other = rpc.nextBlock(20);
+  socket.onmessage({ data: '{"method":"blockchain.scripthash.subscribe","params":["aa","bb"]}\n' });
+  const call = rpc.rpc('blockchain.headers.subscribe');
+  socket.onmessage({ data: '{"id":1,"result":{"height":8,"hex":"00"}}\n' });
+  await call;
+  assert.equal(await other, false);
+  assert.equal(sent.length, 1, 'waiting sends nothing');
+  const closing = rpc.nextBlock(60000);
+  rpc.close();
+  assert.equal(await closing, false);
+  assert.equal(await rpc.nextBlock(60000), false);
+});
+
+test('block and subscribed-script notices are reported; other messages are not', async () => {
+  const socket = { readyState: 1, send() {}, close() {} };
+  const rpc = new Electrum(socket);
+  let notices = 0;
+  rpc.onNotice = () => { notices++; };
+  const line = value => ({ data: JSON.stringify(value) + '\n' });
+  socket.onmessage(line({ jsonrpc: '2.0', method: 'blockchain.headers.subscribe', params: [{ height: 1 }] }));
+  socket.onmessage(line({ jsonrpc: '2.0', method: 'blockchain.scripthash.subscribe', params: ['ab', 'cd'] }));
+  socket.onmessage(line({ method: 'notification', params: [] }));
+  const reply = rpc.rpc('blockchain.headers.subscribe');
+  socket.onmessage(line({ id: 1, result: { height: 2 } }));
+  assert.deepEqual(await reply, { height: 2 });
+  assert.equal(notices, 2);
+  rpc.close();
+});

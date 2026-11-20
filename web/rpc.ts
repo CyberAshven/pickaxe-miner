@@ -8,11 +8,16 @@ export class Electrum {
   private next: number;
   readonly pending: Map<number, Request>;
   private buffer: string;
+  // A block notice the server pushed since the last `nextBlock`, and who waits for one.
+  private blockNoticed: boolean;
+  private readonly blockWaiters: Set<(noticed: boolean) => void>;
   constructor(socket: WebSocket) {
     this.socket = socket;
     this.next = 1;
     this.pending = new Map();
     this.buffer = '';
+    this.blockNoticed = false;
+    this.blockWaiters = new Set();
     socket.onmessage = event => {
       try {
         if (typeof event.data !== 'string') throw new Error('Expected a text response');
@@ -33,7 +38,19 @@ export class Electrum {
     socket.onclose = () => this.close(new Error('Connection closed'));
     socket.onerror = () => this.close(new Error('WebSocket connection failed'));
   }
+  /** Called when the server pushes a new block or a subscribed script's change. */
+  onNotice: (() => void) | undefined;
   receive(value: unknown, raw: string) {
+    if (typeof value === 'object' && value !== null && !('id' in value && value.id != null) && 'method' in value
+        && (value.method === 'blockchain.headers.subscribe' || value.method === 'blockchain.scripthash.subscribe')) {
+      if (value.method === 'blockchain.headers.subscribe') {
+        // The header subscription pushes every block; a claim waiting for one wakes here.
+        this.blockNoticed = true;
+        for (const waiter of [...this.blockWaiters]) waiter(true);
+      }
+      this.onNotice?.();
+      return;
+    }
     if (typeof value !== 'object' || value === null || !('id' in value) || typeof value.id !== 'number') return;
     const request = this.pending.get(value.id);
     if (!request) return;
@@ -63,9 +80,27 @@ export class Electrum {
       this.socket.send(JSON.stringify({ id, method, params }) + '\n');
     });
   }
+  get open(): boolean { return this.socket.readyState === 1; }
+  // Resolves true on the next pushed block notice (or one already pushed since the
+  // last call), false after `ms` or when the connection closes. Sends nothing.
+  nextBlock(ms: number): Promise<boolean> {
+    if (this.blockNoticed) { this.blockNoticed = false; return Promise.resolve(true); }
+    if (!this.open) return Promise.resolve(false);
+    return new Promise(resolve => {
+      const done = (noticed: boolean) => {
+        clearTimeout(timer);
+        this.blockWaiters.delete(done);
+        if (noticed) this.blockNoticed = false;
+        resolve(noticed);
+      };
+      const timer = setTimeout(() => done(false), ms);
+      this.blockWaiters.add(done);
+    });
+  }
   close(error: unknown = new Error('Connection closed')) {
     for (const request of this.pending.values()) { clearTimeout(request.timer); request.reject(error); }
     this.pending.clear();
+    for (const waiter of [...this.blockWaiters]) waiter(false);
     this.socket.onclose = null;
     this.socket.close();
   }

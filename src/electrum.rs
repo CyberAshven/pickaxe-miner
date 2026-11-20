@@ -264,6 +264,39 @@ impl ElectrumSession {
         matches!(self.link, Link::Node { .. })
     }
 
+    /// The node's tip height from one `getblockcount`; `None` on a Fulcrum
+    /// session, whose pushed block notices tell instead.
+    pub fn node_tip_height(&mut self) -> Result<Option<u32>, String> {
+        let Link::Node { endpoint, .. } = &self.link else {
+            return Ok(None);
+        };
+        crate::node::rpc_call(endpoint, "getblockcount", json!([]))?
+            .as_u64()
+            .and_then(|height| u32::try_from(height).ok())
+            .map(Some)
+            .ok_or_else(|| "getblockcount returned a non-number".into())
+    }
+
+    /// A node session on `photon` without contacting the node.
+    #[cfg(test)]
+    pub(crate) fn node_for_test(
+        photon: crate::node::NativePhotonSession,
+        deployment: &'static PhotonDeployment,
+    ) -> Self {
+        Self {
+            url: crate::node::redact_url(photon.endpoint()),
+            server_version: Value::Null,
+            link: Link::Node {
+                endpoint: photon.endpoint().to_owned(),
+                photon: Box::new(photon),
+            },
+            deployment,
+            fee_policy: None,
+            watched: Vec::new(),
+            notice: false,
+        }
+    }
+
     /// #### PR #42: connects to a Fulcrum server over plain TCP
     /// (`tcp://HOST:PORT`), with the same 15 s timeouts as WebSocket.
     fn connect_tcp(url_str: &str, deployment: &'static PhotonDeployment) -> Result<Self, String> {
