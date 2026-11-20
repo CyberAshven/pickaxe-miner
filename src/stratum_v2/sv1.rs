@@ -586,6 +586,11 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
     // through the adapter's donation channel and through the pool's own
     // rule. The key is Pickaxe's own: BCH P2Pool reads `donation=` for its
     // own, independent donation, which the adapter must never zero.
+    // #### one donation, the higher rate: the 0 now only says "I donate
+    // myself", for pools from before this rule. A Pickaxe pool of this rule
+    // lowers nothing for it: it credits the donation channel's accepted
+    // work, which it sees on this connection, and takes only the rest of
+    // its rate (`own_donation`).
     // Look here if: a device donates twice at a Pickaxe pool, a P2Pool
     // node's donation drops to 0 for Pickaxe miners, or a pool refuses every
     // login with an option.
@@ -650,13 +655,10 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
     };
     let opened: OpenExtendedMiningChannelSuccess =
         binary_sv2::from_bytes(reply.payload()).map_err(|_| "invalid channel reply")?;
-    let donation = upstream.donation.as_ref().map(|route| {
-        if identity.contains(",p2p=") && !upstream.identity.contains(",p2p=") {
-            route.naming_share()
-        } else {
-            route.clone()
-        }
-    });
+    let donation = upstream
+        .donation
+        .as_ref()
+        .map(|route| donation_route(route, upstream, &identity, zero));
     Ok(Opened {
         bridge: Bridge::new(opened, upstream.remote, donation)?
             .with_fixed_version(upstream.fixed_version)
@@ -665,6 +667,42 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
         receive,
         local,
     })
+}
+
+// #### one donation, the higher rate: the donation channel at an older pool
+// What: where the device's channel opened naming `,pickaxe-donation=0`,
+// the donation channel, refused under its own identity, asks once more
+// naming the same option, unless it already has a fallback (P2Pool's share
+// address). A Pickaxe pool of this rule never refuses it (a channel paying
+// the donation's address needs no option there, and its work is credited
+// to the device); one from before refused it with donation-mismatch, since
+// its device channel named a donation and the donation channel none.
+// Why: at such a pool the device's typed 0 took nothing and the refused
+// donation channel left the adapter's own donation at nothing too; asked
+// again, it mines to the donation's address there (less that pool's fee).
+// Look here if: an adapter's donation stops at a Pickaxe pool, or a pool
+// gets two requests for the donation channel.
+/// The adapter's donation route at `upstream` once the device's channel
+/// opened as `identity`, `zero` when that named `,pickaxe-donation=0`.
+fn donation_route(
+    route: &DonationRoute,
+    upstream: &Upstream,
+    identity: &str,
+    zero: bool,
+) -> DonationRoute {
+    let route = if identity.contains(",p2p=") && !upstream.identity.contains(",p2p=") {
+        route.naming_share()
+    } else {
+        route.clone()
+    };
+    if zero && route.fallback.is_none() {
+        DonationRoute {
+            fallback: Some(format!("{},pickaxe-donation=0", route.identity)),
+            ..route
+        }
+    } else {
+        route
+    }
 }
 
 /// #### merge-mining v2: whether a login already names a donation option
@@ -2877,6 +2915,50 @@ mod tests {
         assert!(names_donation("bchtest:qq.rig,pickaxe-donation=0"));
         assert!(names_donation("bchtest:qq,p2p=bchtest:qz, donation=2"));
         assert!(!names_donation("bchtest:qq,p2p=bchtest:qz"));
+    }
+
+    // #### one donation, the higher rate: the donation channel at an older
+    // pool
+    // What: once the device's channel opened naming `,pickaxe-donation=0`,
+    // a refused donation channel is asked again naming it too; without the
+    // 0, or with P2Pool's share-address fallback, the route is unchanged.
+    #[test]
+    fn the_donation_channel_names_the_devices_zero_once_refused() {
+        let donation = crate::donation::bch::address(crate::config::MiningNetwork::Chipnet);
+        let route = DonationRoute {
+            identity: donation.to_owned(),
+            rate: Arc::new(RwLock::new(BchDonation::default())),
+            fallback: None,
+        };
+        let upstream = Upstream {
+            identity: "bchtest:qq.rig".into(),
+            remote: true,
+            donation: Some(route.clone()),
+            ..Upstream::local("127.0.0.1:3336".parse().unwrap(), [1; 32])
+        };
+        let zeroed = donation_route(&route, &upstream, "bchtest:qq.rig,pickaxe-donation=0", true);
+        assert_eq!(zeroed.identity, donation);
+        assert_eq!(
+            zeroed.fallback,
+            Some(format!("{donation},pickaxe-donation=0"))
+        );
+        // Never P2Pool's own `donation=` key.
+        assert!(!zeroed.fallback.as_deref().unwrap().contains(",donation="));
+        let plain = donation_route(&route, &upstream, "bchtest:qq.rig", false);
+        assert_eq!(plain.fallback, None);
+        let shared = DonationRoute {
+            fallback: Some("bare".into()),
+            ..route.clone()
+        };
+        let kept = donation_route(
+            &shared,
+            &upstream,
+            "bchtest:qq.rig,pickaxe-donation=0",
+            true,
+        );
+        assert_eq!(kept.fallback, Some("bare".into()));
+        // The retry itself follows the fallback (see
+        // `a_refused_donation_identity_retries_once_under_the_fallback`).
     }
 
     // #### PR #40

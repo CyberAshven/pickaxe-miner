@@ -22,7 +22,7 @@ pub fn address(network: MiningNetwork) -> &'static str {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "u16", into = "u16")]
 pub struct BchDonation(u16);
 

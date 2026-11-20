@@ -1039,10 +1039,10 @@ fn a_device_mines_the_test_token_and_each_state_is_proven_once() {
 // root of their own: a miner finds a block whose output 0 is a non-empty
 // root; their share wins the token, which the claim worker proves and
 // journals with the split preimage of the default donation's 1% and the
-// operator's 2% coinbase-mode fee. (A login's donation=0, which leaves the
-// fee slot alone, is in the channel tests.)
+// operator's 2% coinbase-mode fee. (A job at 0% donation, whose leaves
+// carry the fee slot alone, is in the channel tests.)
 // Look here if: a public pool's miners stop winning tokens, or their split
-// names the donation they declined.
+// names another donation than their jobs'.
 #[test]
 fn a_public_pools_miners_mine_their_own_roots() {
     use super::merge::{
@@ -2716,13 +2716,15 @@ fn public_pool_miners_can_see_their_leaves() {
 
 // #### merge-mining v2: one donation at a pool
 // What: the adapter, which donates on its own channel at a remote pool,
-// asks a Pickaxe public pool for no donation on the device's channel
-// (`,pickaxe-donation=0`, a key BCH P2Pool does not read): the device's
-// block pays the miner and the operator's fee, nothing to the donation.
-// Look here if: a device at a Pickaxe pool donates twice, or the adapter's
-// login options change.
+// names `,pickaxe-donation=0` on the device's channel (a key BCH P2Pool
+// does not read). #### one donation, the higher rate: a Pickaxe pool no
+// longer lowers its rate for that text: with the adapter's own donation at
+// 0% (no donation channel, nothing to credit), the device's block pays the
+// miner, the donation at the pool's 1.5% and the operator's fee.
+// Look here if: a typed 0 lowers a Pickaxe pool's donation, or the
+// adapter's login options change.
 #[test]
-fn the_adapter_asks_a_pickaxe_pool_for_no_second_donation() {
+fn a_typed_zero_donation_does_not_lower_a_pickaxe_pools_rate() {
     use crate::donation::bch::{FeeMode, PoolFee};
     use crate::tx::cashaddr_to_p2pkh_locking;
     let operator = address(6);
@@ -2789,10 +2791,97 @@ fn the_adapter_asks_a_pickaxe_pool_for_no_second_donation() {
         outputs,
         vec![
             cashaddr_to_p2pkh_locking(&miner).unwrap(),
+            cashaddr_to_p2pkh_locking(crate::donation::bch::address(MiningNetwork::Chipnet))
+                .unwrap(),
             cashaddr_to_p2pkh_locking(&operator).unwrap(),
         ]
     );
     drop(node);
+    device.write.shutdown(std::net::Shutdown::Both).unwrap();
+}
+
+// #### one donation, the higher rate: the donation's channel
+// What: the adapter's own donation channel at a Pickaxe pool opens on the
+// device's connection beside its `,pickaxe-donation=0` login (no
+// donation-mismatch), and mines donation work there: at the adapter's 100%
+// the device moves to it, and the block it finds pays the donation whole,
+// with no fee to the operator; the pool counts that work as donation.
+// Look here if: an adapter's donation channel is refused at a Pickaxe
+// pool, or the pool takes a fee from it.
+#[test]
+fn the_adapters_donation_channel_mines_donation_work_at_a_pickaxe_pool() {
+    use crate::donation::bch::{FeeMode, PoolFee};
+    use crate::tx::cashaddr_to_p2pkh_locking;
+    let pool = Running::public(super::payout::PublicPool {
+        fee: Some(PoolFee {
+            rate: "1".parse().unwrap(),
+            mode: FeeMode::Coinbase,
+        }),
+        address: address(6),
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let local = listener.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(Mutex::new(ServerStats::default()));
+    let donation = crate::donation::bch::address(MiningNetwork::Chipnet);
+    let upstreams = vec![super::sv1::Upstream {
+        address: pool.address.to_string(),
+        authority: pool.authority,
+        identity: address(7),
+        remote: true,
+        donation: Some(super::sv1::DonationRoute {
+            identity: donation.to_owned(),
+            rate: Arc::new(std::sync::RwLock::new("100".parse().unwrap())),
+            fallback: None,
+        }),
+        public: false,
+        prefer: None,
+        fixed_version: false,
+    }];
+    let thread = {
+        let stop = stop.clone();
+        let stats = stats.clone();
+        thread::spawn(move || super::sv1::run(listener, upstreams, stop, stats))
+    };
+    let adapter = FirmwareAdapter {
+        stop,
+        thread: Some(thread),
+        address: local,
+    };
+    let mut device = FirmwareDevice::connect(&adapter, true, false);
+    // The device's own job first, then the donation channel's.
+    let notify = (0..16)
+        .map(|_| device.receive())
+        .find(|message| {
+            message["method"] == "mining.notify"
+                && message["params"][0]
+                    .as_str()
+                    .and_then(|job| job.parse::<u32>().ok())
+                    .is_some_and(|job| job & 0x8000_0000 != 0)
+        })
+        .expect("a donation channel job");
+    let (_, submit) = device.solve_notify(0, true, &notify);
+    device.send(submit);
+    let ack = loop {
+        let message = device.receive();
+        if !message["id"].is_null() {
+            break message;
+        }
+    };
+    assert_eq!(ack["result"], true, "{ack}");
+    pool.wait(|stats| stats.blocks_accepted == 1);
+    let node = pool.node.lock().unwrap();
+    let block: Block =
+        consensus::deserialize(&hex::decode(node.submitted.last().unwrap()).unwrap()).unwrap();
+    let outputs: Vec<Vec<u8>> = block.txdata[0]
+        .output
+        .iter()
+        .map(|output| output.script_pubkey.to_bytes())
+        .collect();
+    assert_eq!(outputs, vec![cashaddr_to_p2pkh_locking(donation).unwrap()]);
+    drop(node);
+    let work = pool.stats.lock().unwrap().work;
+    assert!(work.donation > 0.0 && work.fee == 0.0, "{work:?}");
     device.write.shutdown(std::net::Shutdown::Both).unwrap();
 }
 
@@ -3383,8 +3472,10 @@ fn coinbase_only_pickaxe_jdc_mines_at_a_pickaxe_jds_on_loopback() {
 
 // #### merge-mining v2: the miner's donation at a Pickaxe pool
 // What: a Job Declaration client whose own donation setting is 0% names it
-// (`,pickaxe-donation=0.00`) to a Pickaxe pool whose own setting is 1.5%:
-// the block pays the miner and the pool's 1% fee, nothing to the donation.
+// (`,pickaxe-donation=0.00`) to a Pickaxe pool whose own setting is 1.5%.
+// #### one donation, the higher rate: the higher rate, the pool's 1.5%,
+// applies: the block pays the miner, the pool's 1% fee (of what the
+// donation leaves) and the donation 1.5%, all in the coinbase.
 // Look here if: `JdTarget::login` or the pool's login options change.
 #[test]
 fn a_jd_client_names_its_own_donation_to_a_pickaxe_pool() {
@@ -3424,10 +3515,17 @@ fn a_jd_client_names_its_own_donation_to_a_pickaxe_pool() {
     assert_eq!(
         outputs,
         vec![
-            (309_375_000, miner),
+            (304_734_375, miner),
             (
-                3_125_000,
+                3_078_125,
                 crate::tx::cashaddr_to_coinbase_locking(&address(0x34)).unwrap()
+            ),
+            (
+                4_687_500,
+                crate::tx::cashaddr_to_p2pkh_locking(crate::donation::bch::address(
+                    MiningNetwork::Chipnet
+                ))
+                .unwrap()
             ),
         ]
     );

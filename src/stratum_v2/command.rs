@@ -1999,6 +1999,10 @@ fn render_workers(
             },
             ago(device.last_share_seconds),
             format_difficulty(device.difficulty),
+            // #### one donation, the higher rate: the miner's effective
+            // donation and their own Pickaxe's credit, never an address.
+            super::telemetry::donation_text(device.donation_bps, device.own_donation_bps)
+                .unwrap_or_else(|| "—".into()),
             device.protocol.clone(),
             device
                 .adapter_error
@@ -2039,6 +2043,7 @@ fn render_workers(
                 Constraint::Length(8),
                 Constraint::Length(10),
                 Constraint::Length(10),
+                Constraint::Length(17),
                 Constraint::Length(4),
                 Constraint::Min(10),
             ],
@@ -2057,6 +2062,7 @@ fn render_workers(
                 "Reject",
                 "Last share",
                 "Difficulty",
+                "Donation",
                 "Via",
                 "Last issue",
             ])
@@ -2096,6 +2102,10 @@ struct WorkerLine {
     model: Option<String>,
     firmware: Option<String>,
     power_w: Option<f64>,
+    /// #### one donation, the higher rate: a public pool miner's effective
+    /// donation and their own Pickaxe's credit.
+    donation_bps: Option<u16>,
+    own_donation_bps: Option<u16>,
 }
 
 impl From<&DeviceSnapshot> for WorkerLine {
@@ -2119,6 +2129,8 @@ impl From<&DeviceSnapshot> for WorkerLine {
             model: device.model.clone(),
             firmware: device.firmware.clone(),
             power_w: device.power_w,
+            donation_bps: device.donation_bps,
+            own_donation_bps: device.own_donation_bps,
         }
     }
 }
@@ -2299,7 +2311,9 @@ fn connect_text(page: &ConnectPage) -> String {
             "\nUsername: the miner's own BCH address (q or p; the prefix may be left out), \
              optionally followed by .name; the blocks they find pay it. SV2 devices give it \
              as their user identity. Adding ,donation=<percent> (0 to 100 in 0.5% steps) \
-             sets that miner's own Pickaxe donation.\nMerge-mined tokens: each miner mines \
+             raises that miner's Pickaxe donation above your setting, never below it; \
+             what their own Pickaxe visibly donates is credited.\nMerge-mined tokens: each \
+             miner mines \
              a root of their own; its token wins pay them, minus their donation and your fee \
              as each token allows.\n"
         }
@@ -2725,6 +2739,7 @@ fn watch_panel(devices_file: &Path, row: &WorkerLine) -> DevicePanel {
     if let Some(file) = &file {
         view.set_server_urls(file.server_urls());
     }
+    view.set_donation(row.donation_bps, row.own_donation_bps);
     view
 }
 // #### end PR #42 ####

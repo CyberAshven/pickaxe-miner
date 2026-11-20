@@ -129,11 +129,11 @@ JSON start line (`--no-tui`) lists the same addresses under `connect`.
   Another Pickaxe joins with that same line (Join a pool).
 - A username that is not a payout address on the pool's network is refused
   when the device authorizes, with that reason.
-- A miner may set their own Pickaxe donation by adding `,donation=<percent>`
-  to the username (0 to 100 in 0.5% steps, such as
-  `bitcoincash:q….rig1,donation=0.5`); without it your pool's setting
-  applies. It never changes your fee. Details are in
-  [merge-mining.md](merge-mining.md#the-login-option).
+- A miner may raise their own Pickaxe donation by adding
+  `,donation=<percent>` to the username (0 to 100 in 0.5% steps, such as
+  `bitcoincash:q….rig1,donation=3`): the higher of that and your setting
+  applies, once. It never lowers your setting and never changes your fee.
+  Details are in [merge-mining.md](merge-mining.md#the-login-option).
 - The workers page names each device by its worker name (`rig1` in
   `bitcoincash:q….rig1`), never by its address; a device that gives only an
   address keeps a generated label.
@@ -156,10 +156,22 @@ JSON start line (`--no-tui`) lists the same addresses under `connect`.
 
 ## Fees
 
-- **Order**: the Pickaxe donation comes off first, in full (1.5% by default;
-  Advanced settings or `--donation` set the pool's default from 0% to 100%,
-  and each miner may choose their own with `,donation=`). Your pool fee
-  comes off what is left, and the miner keeps the rest.
+- **Order**: the Pickaxe donation comes off first, in full: your rate (1.5%
+  by default; Advanced settings or `--donation`, 0% to 100%) or the miner's
+  own `,donation=` when it is higher, never both added. Your pool fee comes
+  off what is left, and the miner keeps the rest.
+- **Paid once**: a miner whose own Pickaxe joins your Public Solo Endpoint
+  with Join a pool (its SV1 adapter) already donates on a donation channel
+  of its own, on the same connection, whose work pays the donation whole,
+  with no fee. The server credits the share of that miner's accepted work
+  it sees on that channel over the last hour, up to the miner's rate, and
+  takes only the rest. Text alone, such as
+  `,pickaxe-donation=0`, credits nothing. The workers page and the Device
+  panel show each miner's rate and that credit (`own`).
+
+  For example, at your 2% a miner whose Pickaxe visibly mines 1.5% for the
+  donation gives 0.5% more of their work through your server; at your 1.5% a
+  miner who types `,donation=3` gives 3%, not 4.5%.
 - **Merge-mined tokens**: each miner mines a root of their own, so their
   token wins pay them, with the donation and your fee taken from each win as
   from a block (your coinbase fee in full, two thirds in `both` mode; fee
@@ -192,8 +204,8 @@ a fee; with SV1 they can decode the coinbase parts of each job.
 `--accept-job-declaration` lets miners mine their own node's templates at
 your pool (SV2 Job Declaration), on the pool's SV2 port, in both of the
 spec's modes (or one, with `full` or `coinbase`). Their coinbase must pay your
-fee and the Pickaxe donation (the miner's `,donation=` choice, or your
-setting) in full, whatever your fee mode, because their jobs cannot rotate
+fee and the Pickaxe donation (the higher of your setting and the miner's
+`,donation=`) in full, whatever your fee mode, because their jobs cannot rotate
 work; the pool checks every custom job's outputs before
 accepting it. With Full-Template, a miner declares the transactions too: your
 node checks the template (`validateblocktemplate`) and gets the miner's blocks
