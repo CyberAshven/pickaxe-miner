@@ -97,7 +97,7 @@ winit = { version = "0.30.13", optional = true, default-features = false, featur
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }
 
-wasm-bindgen = "=0.2.128"
+wasm-bindgen = "=0.2.130"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 

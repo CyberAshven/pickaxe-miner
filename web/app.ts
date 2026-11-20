@@ -79,7 +79,17 @@ async function run() {
         session = await Electrum.connect(endpoint);
         feeChecked = 0;
         const source = session;
-        refresh = new SnapshotRefresh(() => fetchSnapshot(source), () => performance.now());
+        // Read the live state when the server reports a change, as the
+        // native miner does; a server without subscriptions is read every 2 s.
+        let watched = false;
+        try {
+          await source.rpcRaw('blockchain.scripthash.subscribe', [config.scriptHash]);
+          watched = true;
+        } catch { watched = false; }
+        const reader = new SnapshotRefresh(() => fetchSnapshot(source), () => performance.now(),
+          watched ? 30000 : 2000, 1000);
+        source.onNotice = () => reader.notice();
+        refresh = reader;
         log(`Connected: ${new URL(endpoint).hostname}`);
         return;
       } catch (error) { lastError = error; await wait(1000); }
