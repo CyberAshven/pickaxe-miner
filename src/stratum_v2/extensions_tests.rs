@@ -1,7 +1,7 @@
 //! Byte-level checks against Knuth's own vectors. Each `knuth` comment names
 //! the test file and line at the extension's head in CyberAshven/kth:
 //! worker-hashrate 3311cc2555, jd-payout-outputs 854d7100b8,
-//! jd-large-templates 6370ee1e1c.
+//! jd-large-templates 6370ee1e1c, tdp-large-templates 9ddf0d0b66.
 
 use super::*;
 
@@ -395,4 +395,122 @@ fn paging_splits_as_knuth_does() {
         let joined: Vec<Hash> = pages.concat().into_iter().chain(tail.to_vec()).collect();
         assert_eq!(joined, all);
     }
+}
+
+// What: 0x4C54's Template Distribution messages encode as Knuth's vectors:
+// RequestTransactionData.Transactions is a U64 template id then
+// SEQ0_64K[B0_16M] (U24 lengths), Kept a U64 template id, a U64 base
+// template id then the B0_16M bitmap as given; both frame with extension
+// 0x4C54, types 3 and 4 and the channel bit clear. Each fills at most one
+// frame: one of exactly 16,777,215 payload bytes passes and one byte more
+// is refused either way, and 65,536 transactions are refused.
+// Look here if: the 0x4C54 Template Distribution codec changes.
+#[test]
+fn large_template_distribution_messages_match_knuths_bytes() {
+    // knuth: src/node/test/sv2_jd_messages.cpp:428-432 (tdp-large-templates
+    // head).
+    let page = RequestTransactionDataTransactions {
+        template_id: 0x0807_0605_0403_0201,
+        transactions: vec![vec![0xaa], vec![0xbb, 0xcc]],
+    };
+    assert_eq!(
+        round_trip(&page),
+        [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x02, 0x00, 0x01, 0x00, 0x00, 0xaa,
+            0x02, 0x00, 0x00, 0xbb, 0xcc
+        ]
+    );
+    assert_eq!(framed(&page)[..6], [0x54, 0x4c, 0x03, 19, 0, 0]);
+    // knuth: :433-436.
+    round_trip(&RequestTransactionDataTransactions::default());
+    assert!(RequestTransactionDataTransactions {
+        template_id: 1,
+        transactions: vec![Vec::new(); SEQ_MAX + 1],
+    }
+    .encode()
+    .is_err());
+    // knuth: :437-447: the id, the count and one B0_16M length are 13 bytes.
+    let mut full = RequestTransactionDataTransactions {
+        template_id: 1,
+        transactions: vec![vec![0xab; FRAME_MAX - 13]],
+    };
+    assert_eq!(full.size(), FRAME_MAX);
+    let bytes = full.encode().unwrap();
+    assert_eq!(bytes.len(), FRAME_MAX);
+    assert_eq!(
+        RequestTransactionDataTransactions::decode(&bytes).as_ref(),
+        Some(&full)
+    );
+    full.transactions[0].push(0);
+    assert!(full.encode().is_err());
+    assert!(RequestTransactionDataTransactions::decode(&vec![0; FRAME_MAX + 1]).is_none());
+    // knuth: :449-453.
+    let kept = RequestTransactionDataKept {
+        template_id: 7,
+        base_template_id: 6,
+        kept: vec![0x05, 0x01],
+    };
+    assert_eq!(
+        round_trip(&kept),
+        [7, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0x02, 0x00, 0x00, 0x05, 0x01]
+    );
+    assert_eq!(framed(&kept)[..6], [0x54, 0x4c, 0x04, 21, 0, 0]);
+    // knuth: :454-455: a base without transactions has an empty bitmap.
+    round_trip(&RequestTransactionDataKept {
+        template_id: 7,
+        base_template_id: 6,
+        kept: Vec::new(),
+    });
+    // knuth: :456-464.
+    let mut full = RequestTransactionDataKept {
+        template_id: 1,
+        base_template_id: 2,
+        kept: vec![0xff; FRAME_MAX - 19],
+    };
+    assert_eq!(full.kept.len(), MAX_KEPT);
+    let bytes = full.encode().unwrap();
+    assert_eq!(bytes.len(), FRAME_MAX);
+    assert_eq!(
+        RequestTransactionDataKept::decode(&bytes).as_ref(),
+        Some(&full)
+    );
+    full.kept.push(0);
+    assert!(full.encode().is_err());
+    assert!(RequestTransactionDataKept::decode(&vec![0; FRAME_MAX + 1]).is_none());
+}
+
+// What: a Kept bitmap over a base of n transactions is exactly ceil(n / 8)
+// bytes with its unused high bits clear, bit i least significant first.
+// Why: Knuth's docs/sv2.md:152-155 and its test client's rebuild
+// (src/node/test/sv2_template_provider.cpp:642-643, tdp-large-templates
+// head).
+// Look here if: `kept_bitmap_fits` or `kept_bit` changes.
+#[test]
+fn a_kept_bitmap_is_exactly_its_bases_length() {
+    assert!(kept_bitmap_fits(&[], 0));
+    assert!(!kept_bitmap_fits(&[0], 0));
+    for count in [1, 7, 8, 9, 17] {
+        let mut bitmap = vec![0xff; count / 8];
+        if count % 8 != 0 {
+            bitmap.push((1 << (count % 8)) - 1);
+        }
+        assert!(kept_bitmap_fits(&bitmap, count), "{count}");
+        assert!((0..count).all(|index| kept_bit(&bitmap, index)));
+        assert!(!kept_bit(&bitmap, count + 8));
+        let mut long = bitmap.clone();
+        long.push(0);
+        assert!(!kept_bitmap_fits(&long, count), "{count}");
+        assert!(
+            !kept_bitmap_fits(&bitmap[..bitmap.len() - 1], count),
+            "{count}"
+        );
+        if count % 8 != 0 {
+            let mut high = bitmap.clone();
+            *high.last_mut().unwrap() |= 0x80;
+            assert!(!kept_bitmap_fits(&high, count), "{count}");
+        }
+    }
+    // Bit 0 of byte 0 is the base's first transaction; 0x05 keeps 0 and 2.
+    let kept: Vec<bool> = (0..8).map(|index| kept_bit(&[0x05], index)).collect();
+    assert_eq!(kept, [true, false, true, false, false, false, false, false]);
 }
