@@ -1235,7 +1235,8 @@ fn check_pool_flags(action: &StratumV2Command) -> Result<(), String> {
     };
     if *public && !own_p2pool && !fallback_pool.is_empty() {
         return Err(
-            "--fallback-pool with --public needs --own-p2pool: a Public Solo Endpoint mines              your own node"
+            "--fallback-pool with --public needs --own-p2pool: a Public Solo Endpoint mines \
+             your own node"
                 .into(),
         );
     }
@@ -1246,7 +1247,9 @@ fn check_pool_flags(action: &StratumV2Command) -> Result<(), String> {
         )
     {
         return Err(
-            "with --own-p2pool, P2Pool pays the fee in the coinbase of each block: use              --pool-fee-mode coinbase (work and both mine the fee as work, which P2Pool              cannot)"
+            "with --own-p2pool, P2Pool pays the fee in the coinbase of each block: use \
+             --pool-fee-mode coinbase (work and both mine the fee as work, which P2Pool \
+             cannot)"
                 .into(),
         );
     }
