@@ -47,6 +47,9 @@ pub mod gui;
 pub mod hash_split;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod hip_photon;
+// HTTP GET over rustls for release downloads and P2Pool's API.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod http;
 // #### PR #42: where GPU mining takes its jobs, and the way back to the node.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod job_source;
