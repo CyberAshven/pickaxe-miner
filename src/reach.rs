@@ -5,7 +5,7 @@
 
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Where an address works from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,7 +134,7 @@ pub fn copy(text: &str) -> bool {
 }
 
 fn pipe(program: &str, text: &str) -> bool {
-    let Ok(mut child) = Command::new(program)
+    let Ok(mut child) = crate::child_process::command(program)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

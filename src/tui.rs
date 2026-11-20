@@ -14,8 +14,12 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+#[cfg(feature = "gui")]
+pub(crate) use miners::label_event;
 use miners::Tokens;
-pub use miners::{run_electric, run_miners, Miners};
+pub use miners::{
+    run_electric, run_miners, sessions_shown_elsewhere, show_sessions_in, Miners, SessionView,
+};
 mod session_preferences;
 use ratatui::{
     backend::CrosstermBackend,
@@ -30,6 +34,8 @@ use ratatui::{
     Frame, Terminal, TerminalOptions, Viewport,
 };
 pub use session_preferences::remember_token_session;
+// The setup as plain data, steered by the desktop window.
+mod window;
 use std::{
     collections::VecDeque,
     io::{self, Stdout},
@@ -40,6 +46,11 @@ use std::{
     },
     thread,
     time::{Duration, Instant},
+};
+use window::Target;
+pub use window::{
+    EditView, ItemKind, Piece, PotView, SetupCommand, SetupDriver, SetupInput, SetupItem, SetupKey,
+    SetupOutcome, SetupView, Tone,
 };
 
 const DRAW_INTERVAL: Duration = Duration::from_millis(200);
@@ -564,7 +575,24 @@ impl ProfileChoices {
     }
 }
 
-#[derive(Default)]
+/// The profile Start last started, by name, kept beside the profiles
+/// (`last-profile.txt`), so `pickaxe gui --start` starts it again.
+fn last_profile_path(profiles: &Path) -> PathBuf {
+    profiles.with_file_name("last-profile.txt")
+}
+
+/// The profile Start last started; none when it was never saved.
+fn last_profile(profiles: &Path) -> Option<String> {
+    let name = std::fs::read_to_string(last_profile_path(profiles)).ok()?;
+    Some(name.trim().to_owned()).filter(|name| !name.is_empty())
+}
+
+fn save_last_profile(profiles: &Path, name: &str) -> Result<(), String> {
+    crate::config::write_private_atomic(&last_profile_path(profiles), name.as_bytes())
+        .map_err(|error| format!("save the last profile started: {error}"))
+}
+
+#[derive(Default, Clone)]
 pub struct SetupOverrides {
     pub network: Option<MiningNetwork>,
     pub token: Option<String>,
@@ -3681,6 +3709,11 @@ impl SetupFlow {
                     let new = updated.profiles[self.profile_selected].name.clone();
                     ProfileChoices::rename(path, &old, Some(&new))?;
                     self.saved_choices = ProfileChoices::load(path);
+                    // The profile last started keeps its place under its new
+                    // name.
+                    if last_profile(path).is_some_and(|last| last.eq_ignore_ascii_case(&old)) {
+                        save_last_profile(path, &new)?;
+                    }
                 }
                 self.profiles = updated;
                 Ok("Profile renamed".into())
@@ -4420,22 +4453,131 @@ pub fn run_setup(
     cookies_path: &Path,
     overrides: SetupOverrides,
 ) -> Result<Option<SetupResult>, String> {
-    let mut state = SetupFlow::new(config, devices, prefer, default_gpus)?;
-    if !profiles.profiles.is_empty() {
-        state.step = SetupStep::Profiles;
-    }
-    state.profiles = profiles;
-    state.profile_path = Some(profile_path.to_path_buf());
-    state.saved_choices = ProfileChoices::load(profile_path);
-    state.sources = sources;
-    state.sources_path = Some(sources_path.to_path_buf());
-    // #### PR #42: the cookie files saved for nodes, read again each time
-    // (the setup may have changed them).
-    state.cookies = crate::config::NodeCookies::load_optional(cookies_path);
-    state.cookies_path = Some(cookies_path.to_path_buf());
-    state.overrides = overrides;
-    state.apply_connections()?;
+    let state = SetupFlow::for_setup(
+        config,
+        devices,
+        prefer,
+        default_gpus,
+        profile_path,
+        profiles,
+        sources_path,
+        sources,
+        cookies_path,
+        overrides,
+    )?;
     run_setup_terminal(state)
+}
+
+impl SetupFlow {
+    /// The setup the terminal and the desktop window (`SetupDriver`) run:
+    /// the saved profiles, connections and cookie files, and the command
+    /// line's overrides.
+    #[allow(clippy::too_many_arguments)]
+    fn for_setup(
+        config: RuntimeConfig,
+        devices: Vec<GpuDevice>,
+        prefer: BackendKind,
+        default_gpus: &[GpuDevice],
+        profile_path: &Path,
+        profiles: MiningProfiles,
+        sources_path: &Path,
+        sources: SharedSources,
+        cookies_path: &Path,
+        overrides: SetupOverrides,
+    ) -> Result<Self, String> {
+        let mut state = SetupFlow::new(config, devices, prefer, default_gpus)?;
+        if !profiles.profiles.is_empty() {
+            state.step = SetupStep::Profiles;
+        }
+        state.profiles = profiles;
+        state.profile_path = Some(profile_path.to_path_buf());
+        state.saved_choices = ProfileChoices::load(profile_path);
+        state.sources = sources;
+        state.sources_path = Some(sources_path.to_path_buf());
+        // #### PR #42: the cookie files saved for nodes, read again each time
+        // (the setup may have changed them).
+        state.cookies = crate::config::NodeCookies::load_optional(cookies_path);
+        state.cookies_path = Some(cookies_path.to_path_buf());
+        state.overrides = overrides;
+        state.apply_connections()?;
+        Ok(state)
+    }
+
+    /// What the setup takes in before each draw: the checks' results and
+    /// ELECTRIC's fee pot and its balance.
+    fn poll(&mut self) {
+        self.poll_local_node();
+        self.refresh_electric_pot();
+        self.poll_pot_balance();
+    }
+
+    /// How long the setup waits for a key before it draws again.
+    fn wait(&self) -> Duration {
+        // #### PR #40
+        // While the check for a node on this computer runs, wake up to show
+        // its result as soon as it is in.
+        // #### PR #61: and while the fee pot shows, to show its balance.
+        if self.checking_local_node() || self.watching_pot() {
+            EVENT_POLL_INTERVAL
+        } else {
+            DRAW_INTERVAL
+        }
+    }
+
+    /// What Start completes, for the terminal and the window alike: the
+    /// profile saved with its choices, and the session to start.
+    /// #### PR #61: ELECTRIC and the hash split (#53) are saved as
+    /// profiles too, with their choices beside them.
+    fn finish(&mut self) -> Result<SetupResult, String> {
+        let gpus = self.chosen_gpus();
+        // #### PR #42: the profile keeps its mode and pool values.
+        let settings = self.profile_settings();
+        let path = self
+            .profile_path
+            .clone()
+            .ok_or("the setup has no profile file to save to")?;
+        let mut profiles = self.profiles.clone();
+        let before = self
+            .active_profile
+            .and_then(|index| profiles.profiles.get(index))
+            .map(|profile| profile.name.clone());
+        let profile_name = profiles
+            .upsert(self.active_profile, &self.profile_name_input, settings)
+            .and_then(|name| {
+                profiles.save(&path)?;
+                // #### PR #61: the choices kept beside the profile, under
+                // its new name if the name row renamed it.
+                if let Some(old) = before.filter(|old| *old != name) {
+                    ProfileChoices::rename(&path, &old, None)?;
+                }
+                ProfileChoices::save(&path, &name, &self.profile_choices())?;
+                save_last_profile(&path, &name)?;
+                Ok(name)
+            })?;
+        // The saved profile is the open one now, so a setup that stays (the
+        // window's) saves it again instead of adding another.
+        self.active_profile = profiles
+            .profiles
+            .iter()
+            .position(|profile| profile.name == profile_name);
+        self.profiles = profiles;
+        self.profile_name_input = profile_name.clone();
+        self.saved_choices = ProfileChoices::load(&path);
+        let own_gpus = self.electric || self.split;
+        Ok(SetupResult {
+            config: self.config.clone(),
+            gpus,
+            profile_name,
+            server: if own_gpus { None } else { self.server_setup() },
+            options: if own_gpus {
+                ServerOptions::default()
+            } else {
+                self.server_options()
+            },
+            electric: self.electric,
+            split: self.split.then(|| self.shares()),
+        })
+    }
 }
 
 /// Draws and processes setup screens in the terminal.
@@ -4447,26 +4589,17 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
         if stop.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        state.poll_local_node();
-        state.refresh_electric_pot();
-        state.poll_pot_balance();
+        state.poll();
         terminal
             .terminal
             .draw(|frame| render_setup(frame, &state))
             .map_err(|error| format!("draw mining setup: {error}"))?;
 
-        // #### PR #40
-        // While the check for a node on this computer runs, wake up to show
-        // its result as soon as it is in.
-        // #### PR #61: and while the fee pot shows, to show its balance.
         // Always bound the input wait: a console signal may not produce a
         // crossterm key event, especially on Windows after a profile return.
-        let wait = if state.checking_local_node() || state.watching_pot() {
-            EVENT_POLL_INTERVAL
-        } else {
-            DRAW_INTERVAL
-        };
-        if !event::poll(wait).map_err(|error| format!("read mining setup input: {error}"))? {
+        if !event::poll(state.wait())
+            .map_err(|error| format!("read mining setup input: {error}"))?
+        {
             continue;
         }
         let input = event::read().map_err(|error| format!("read mining setup input: {error}"))?;
@@ -4480,56 +4613,16 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
         match state.handle_key(key) {
             SetupAction::Continue => {}
             SetupAction::Cancel => return Ok(None),
-            // #### PR #61: ELECTRIC and the hash split (#53) are saved as
-            // profiles too, with their choices beside them.
-            SetupAction::Complete => {
-                let gpus = state.chosen_gpus();
-                // #### PR #42: the profile keeps its mode and pool values.
-                let settings = state.profile_settings();
-                let mut profiles = state.profiles.clone();
-                let before = state
-                    .active_profile
-                    .and_then(|index| profiles.profiles.get(index))
-                    .map(|profile| profile.name.clone());
-                let saved = profiles
-                    .upsert(state.active_profile, &state.profile_name_input, settings)
-                    .and_then(|name| {
-                        let path = state.profile_path.as_deref().expect("setup profile path");
-                        profiles.save(path)?;
-                        // #### PR #61: the choices kept beside the profile,
-                        // under its new name if the name row renamed it.
-                        if let Some(old) = before.filter(|old| *old != name) {
-                            ProfileChoices::rename(path, &old, None)?;
-                        }
-                        ProfileChoices::save(path, &name, &state.profile_choices())?;
-                        Ok(name)
-                    });
-                match saved {
-                    Ok(profile_name) => {
-                        let own_gpus = state.electric || state.split;
-                        return Ok(Some(SetupResult {
-                            config: state.config.clone(),
-                            gpus,
-                            profile_name,
-                            server: if own_gpus { None } else { state.server_setup() },
-                            options: if own_gpus {
-                                ServerOptions::default()
-                            } else {
-                                state.server_options()
-                            },
-                            electric: state.electric,
-                            split: state.split.then(|| state.shares()),
-                        }));
-                    }
-                    Err(error) => state.status_line = error,
-                }
-            }
+            SetupAction::Complete => match state.finish() {
+                Ok(result) => return Ok(Some(result)),
+                Err(error) => state.status_line = error,
+            },
         }
     }
 }
 
 /// Appends one Unix-timestamped line to the optional `PICKAXE_TUI_LOG` file.
-fn append_tui_log(line: &str) {
+pub(crate) fn append_tui_log(line: &str) {
     let Ok(path) = std::env::var("PICKAXE_TUI_LOG") else {
         return;
     };
@@ -4590,7 +4683,7 @@ fn win_probability_for_rule(target_le_hex: &str, rule: ProofRule) -> Option<f64>
 }
 
 /// Formats the periodic status line for the TUI observation log.
-fn tui_status_line(snapshot: &RuntimeSnapshot) -> String {
+pub(crate) fn tui_status_line(snapshot: &RuntimeSnapshot) -> String {
     let expected = expected_winner_seconds(
         &snapshot.photon_target_le,
         snapshot.search.rate,
@@ -4658,6 +4751,23 @@ pub fn run(
     let stop = Arc::new(AtomicBool::new(false));
     crate::session_control::install_stop(&stop)?;
     let initial = supervisor.snapshot();
+    // A window showing sessions (`pickaxe gui`) shows this one too.
+    if sessions_shown_elsewhere() {
+        let token = crate::hash_split::SplitToken::Gpu(crate::config::MiningToken::Photon);
+        let shown = run_miners(
+            &Miners {
+                network: initial.network,
+                runtimes: vec![(token, &supervisor)],
+                electric: None,
+                split: None,
+                stop: Some(&stop),
+            },
+            &devices,
+            &|| stop.load(Ordering::Relaxed),
+        );
+        let last = supervisor.stop();
+        return shown.map(|()| last);
+    }
     let mut state = TuiState::new(&initial);
     state.set_devices(devices);
     let mut terminal = TerminalSession::enter()?;
@@ -5325,8 +5435,48 @@ fn render_setup(frame: &mut Frame<'_>, state: &SetupFlow) {
             Constraint::Length(4),
         ])
         .split(area);
+    frame.render_widget(
+        Paragraph::new(format!("PICKAXE MINER   {}", setup_heading(state)))
+            .block(Block::default().borders(Borders::ALL)),
+        rows[0],
+    );
+    match state.step {
+        SetupStep::Profiles => render_setup_profiles(frame, rows[1], state),
+        SetupStep::Hardware => render_setup_hardware(frame, rows[1], state),
+        SetupStep::Network => render_setup_network(frame, rows[1], state),
+        SetupStep::Token => render_setup_token(frame, rows[1], state),
+        SetupStep::Settings => render_setup_settings(frame, rows[1], state),
+        SetupStep::Connections => render_setup_connections(frame, rows[1], state),
+        SetupStep::Gpus => render_setup_gpus(frame, rows[1], state),
+        SetupStep::TailscalePeers => render_setup_tailscale(frame, rows[1], state),
+    }
+    let keys = setup_keys(state);
+    let message = if state.status_line.is_empty() {
+        keys.to_string()
+    } else {
+        format!("{keys}\n{}", state.status_line)
+    };
+    frame.render_widget(
+        Paragraph::new(message)
+            .block(Block::default().borders(Borders::ALL))
+            .wrap(Wrap { trim: false }),
+        rows[2],
+    );
+}
+
+// The setup's screens as plain text
+// What: each setup screen's rows, values, hints and notes come from one
+// function per screen (`profile_items`, `settings_line`, `pot_text`, ...)
+// that returns plain pieces of text; the terminal draws them with ratatui
+// and the desktop window (`window::SetupDriver`) with egui.
+// Why: the window drives this setup instead of a copy of it, and both must
+// always say the same words.
+// Look here if: the terminal and the window show a row differently.
+/// The setup's heading after "PICKAXE MINER": the step, or the settings'
+/// mode and profile.
+fn setup_heading(state: &SetupFlow) -> String {
     let network = network_label(state.config.network);
-    let step = match state.step {
+    match state.step {
         SetupStep::Profiles => "Profiles".to_string(),
         SetupStep::Hardware => "Setup   1/4 Hardware".to_string(),
         SetupStep::Network => "Setup   2/4 Network".to_string(),
@@ -5353,71 +5503,46 @@ fn render_setup(frame: &mut Frame<'_>, state: &SetupFlow) {
             };
             format!("Settings · {what}   {who}")
         }
-    };
-    frame.render_widget(
-        Paragraph::new(format!("PICKAXE MINER   {step}"))
-            .block(Block::default().borders(Borders::ALL)),
-        rows[0],
-    );
-    match state.step {
-        SetupStep::Profiles => render_setup_profiles(frame, rows[1], state),
-        SetupStep::Hardware => render_setup_hardware(frame, rows[1], state),
-        SetupStep::Network => render_setup_network(frame, rows[1], state),
-        SetupStep::Token => render_setup_token(frame, rows[1], state),
-        SetupStep::Settings => render_setup_settings(frame, rows[1], state),
-        SetupStep::Connections => render_setup_connections(frame, rows[1], state),
-        SetupStep::Gpus => render_setup_gpus(frame, rows[1], state),
-        SetupStep::TailscalePeers => render_setup_tailscale(frame, rows[1], state),
     }
-    let keys = if state.editing.is_some() {
-        "[Type] edit   [Enter] save   [Esc] cancel"
-    } else {
-        match state.step {
-            SetupStep::Profiles if state.profile_delete_pending => "[Y] delete   [N] keep",
-            SetupStep::Profiles => {
-                "[Up/Down] choose   [Enter] open   [R] rename   [D] delete   [Esc] quit"
-            }
-            SetupStep::Hardware | SetupStep::Network => {
-                "[Up/Down] choose   [Enter] next   [Esc] back"
-            }
-            SetupStep::Token if state.mode != MiningMode::Gpu => {
-                "[Up/Down] choose   [Enter] next   [Esc] back"
-            }
-            SetupStep::Token => {
-                "[Up/Down] choose   [Type] search name, category or covenant   [Enter] select   [Esc] back"
-            }
-            // #### PR #69: one 78-column line, so an 80-column window keeps
-            // the second footer row for the status line (Start's warnings).
-            SetupStep::Settings if state.electric_in_use() => {
-                "[Up/Down] row  [Left/Right] change  [Enter] edit/start  [F] pot QR  [Esc] back"
-            }
-            SetupStep::Settings => {
-                "[Up/Down] row   [Left/Right] change   [Enter] edit / start   [Esc] back"
-            }
-            // #### PR #42: another computer, Tailscale, cookie files.
-            SetupStep::Connections if state.connection_kind == ConnectionKind::Node => {
-                "[Up/Down] choose  [Enter] add/edit  [Del] remove  [F] other PC  [T] Tailscale  [C] cookie file  [Esc] done"
-            }
-            SetupStep::Connections => {
-                "[Up/Down] choose  [Enter] add/edit  [Del] remove  [F] other PC  [T] Tailscale  [Esc] done"
-            }
-            SetupStep::TailscalePeers => "[Up/Down] choose   [Enter] look there   [Esc] back",
-            SetupStep::Gpus => {
-                "[Up/Down] choose   [Space] mine on it or not   [A] all   [Enter/Esc] done"
-            }
+}
+
+/// The keys of the screen shown, as the footer names them.
+fn setup_keys(state: &SetupFlow) -> &'static str {
+    if state.editing.is_some() {
+        return "[Type] edit   [Enter] save   [Esc] cancel";
+    }
+    match state.step {
+        SetupStep::Profiles if state.profile_delete_pending => "[Y] delete   [N] keep",
+        SetupStep::Profiles => {
+            "[Up/Down] choose   [Enter] open   [R] rename   [D] delete   [Esc] quit"
         }
-    };
-    let message = if state.status_line.is_empty() {
-        keys.to_string()
-    } else {
-        format!("{keys}\n{}", state.status_line)
-    };
-    frame.render_widget(
-        Paragraph::new(message)
-            .block(Block::default().borders(Borders::ALL))
-            .wrap(Wrap { trim: false }),
-        rows[2],
-    );
+        SetupStep::Hardware | SetupStep::Network => "[Up/Down] choose   [Enter] next   [Esc] back",
+        SetupStep::Token if state.mode != MiningMode::Gpu => {
+            "[Up/Down] choose   [Enter] next   [Esc] back"
+        }
+        SetupStep::Token => {
+            "[Up/Down] choose   [Type] search name, category or covenant   [Enter] select   [Esc] back"
+        }
+        // #### PR #69: one 78-column line, so an 80-column window keeps
+        // the second footer row for the status line (Start's warnings).
+        SetupStep::Settings if state.electric_in_use() => {
+            "[Up/Down] row  [Left/Right] change  [Enter] edit/start  [F] pot QR  [Esc] back"
+        }
+        SetupStep::Settings => {
+            "[Up/Down] row   [Left/Right] change   [Enter] edit / start   [Esc] back"
+        }
+        // #### PR #42: another computer, Tailscale, cookie files.
+        SetupStep::Connections if state.connection_kind == ConnectionKind::Node => {
+            "[Up/Down] choose  [Enter] add/edit  [Del] remove  [F] other PC  [T] Tailscale  [C] cookie file  [Esc] done"
+        }
+        SetupStep::Connections => {
+            "[Up/Down] choose  [Enter] add/edit  [Del] remove  [F] other PC  [T] Tailscale  [Esc] done"
+        }
+        SetupStep::TailscalePeers => "[Up/Down] choose   [Enter] look there   [Esc] back",
+        SetupStep::Gpus => {
+            "[Up/Down] choose   [Space] mine on it or not   [A] all   [Enter/Esc] done"
+        }
+    }
 }
 
 fn selection_marker(selected: bool) -> &'static str {
@@ -5432,14 +5557,36 @@ fn dim(text: impl Into<String>) -> Span<'static> {
     Span::styled(text.into(), Style::default().fg(Color::DarkGray))
 }
 
+/// A piece of setup text as the terminal draws it.
+fn span(piece: Piece) -> Span<'static> {
+    match piece.tone {
+        Tone::Plain => Span::raw(piece.text),
+        Tone::Dim => dim(piece.text),
+        Tone::Warn => Span::styled(piece.text, Style::default().fg(Color::Yellow)),
+        Tone::Good => Span::styled(piece.text, Style::default().fg(Color::Green)),
+    }
+}
+
+/// A line of setup text as the terminal draws it.
+fn line(pieces: Vec<Piece>) -> Line<'static> {
+    Line::from(pieces.into_iter().map(span).collect::<Vec<_>>())
+}
+
+/// `head`, then an item's value, as one line.
+fn item_line(head: String, item: SetupItem) -> Line<'static> {
+    let mut spans = vec![Span::raw(head)];
+    spans.extend(item.value.into_iter().map(span));
+    Line::from(spans)
+}
+
 /// Shows the text being typed, or the stored value, or a hint when empty.
-fn edit_value(state: &SetupFlow, field: TextField, value: &str, hint: &str) -> Span<'static> {
+fn edit_value(state: &SetupFlow, field: TextField, value: &str, hint: &str) -> Piece {
     if state.editing == Some(field) {
-        Span::raw(format!("{}_", state.text_input))
+        Piece::plain(format!("{}_", state.text_input))
     } else if value.trim().is_empty() {
-        dim(hint.to_string())
+        Piece::dim(hint)
     } else {
-        Span::raw(value.to_string())
+        Piece::plain(value)
     }
 }
 
@@ -5482,8 +5629,12 @@ fn profile_summary(
     }
 }
 
-fn render_setup_profiles(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
-    let mut lines = state
+const PROFILES_TITLE: &str = "Mining profiles";
+
+/// The saved profiles, then "+ New profile" and a note.
+fn profile_items(state: &SetupFlow) -> Vec<SetupItem> {
+    let count = state.profiles.profiles.len();
+    let mut items: Vec<SetupItem> = state
         .profiles
         .profiles
         .iter()
@@ -5496,36 +5647,62 @@ fn render_setup_profiles(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                 .and_then(|value| MiningNetwork::parse(value).ok())
                 .unwrap_or(MiningNetwork::Mainnet);
             let device = state.profile_gpus(settings);
-            let selected = state.profile_selected == index;
-            let name = if selected && state.editing == Some(TextField::ProfileRename) {
-                format!("{}_", state.text_input)
-            } else {
-                profile.name.clone()
-            };
-            Line::from(vec![
-                Span::raw(format!("{} {name:<18} ", selection_marker(selected))),
-                dim(profile_summary(
-                    settings,
-                    network,
-                    &device,
-                    state.saved_choices.get(&profile.name),
-                )),
-            ])
+            SetupItem::new(
+                Target::Profile(index),
+                ItemKind::Choice,
+                profile.name.clone(),
+                state.profile_selected == index,
+            )
+            .with_value(vec![Piece::dim(profile_summary(
+                settings,
+                network,
+                &device,
+                state.saved_choices.get(&profile.name),
+            ))])
+        })
+        .collect();
+    items.push(SetupItem::new(
+        Target::Profile(count),
+        ItemKind::Choice,
+        "+ New profile",
+        state.profile_selected == count,
+    ));
+    items.push(SetupItem::info(Vec::new()));
+    items.push(SetupItem::info(vec![Piece::dim(
+        "A saved profile opens Settings with Start selected; one more Enter mines.",
+    )]));
+    items
+}
+
+fn render_setup_profiles(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+    let count = state.profiles.profiles.len();
+    let lines = profile_items(state)
+        .into_iter()
+        .map(|item| match item.target {
+            Target::Profile(index) if index < count => {
+                let name = if item.selected && state.editing == Some(TextField::ProfileRename) {
+                    format!("{}_", state.text_input)
+                } else {
+                    item.label.clone()
+                };
+                item_line(
+                    format!("{} {name:<18} ", selection_marker(item.selected)),
+                    item,
+                )
+            }
+            Target::Profile(_) => Line::from(format!(
+                "{} {}",
+                selection_marker(item.selected),
+                item.label
+            )),
+            _ => line(item.value),
         })
         .collect::<Vec<_>>();
-    lines.push(Line::from(format!(
-        "{} + New profile",
-        selection_marker(state.profile_selected == state.profiles.profiles.len())
-    )));
-    lines.push(Line::from(""));
-    lines.push(Line::from(dim(
-        "A saved profile opens Settings with Start selected; one more Enter mines.",
-    )));
     frame.render_widget(
         Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title(" Mining profiles ")
+                    .title(format!(" {PROFILES_TITLE} "))
                     .borders(Borders::ALL),
             )
             .wrap(Wrap { trim: false }),
@@ -5533,163 +5710,221 @@ fn render_setup_profiles(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
     );
 }
 
-fn render_setup_hardware(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+const HARDWARE_TITLE: &str = "What do you want to do?";
+
+/// GPU mining, ASIC mining or running a pool.
+fn hardware_items(state: &SetupFlow) -> Vec<SetupItem> {
     // #### PR #40: running a pool for other miners is a choice of its own.
     let choice = |mode: MiningMode, name: &str, what: &str| {
-        Line::from(vec![
-            Span::raw(format!(
-                "{} {name:<14}",
-                selection_marker(state.mode == mode)
-            )),
-            dim(what.to_owned()),
-        ])
+        SetupItem::new(
+            Target::Mode(mode),
+            ItemKind::Choice,
+            name,
+            state.mode == mode,
+        )
+        .with_value(vec![Piece::dim(what)])
     };
+    vec![
+        choice(
+            MiningMode::Gpu,
+            "GPU mining",
+            "your GPUs; one PC or a farm of rigs (HiveOS, mmpOS, RaveOS, SimpleMining OS, ...)",
+        ),
+        choice(
+            MiningMode::Asic,
+            "ASIC mining",
+            "your devices: solo on your node, or join a pool",
+        ),
+        choice(
+            MiningMode::Pool,
+            "Run a pool",
+            "let other miners mine on your server",
+        ),
+        SetupItem::info(Vec::new()),
+        SetupItem::info(vec![Piece::dim(
+            "This choice changes the screens after it.",
+        )]),
+    ]
+}
+
+fn render_setup_hardware(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+    let lines = hardware_items(state)
+        .into_iter()
+        .map(|item| match item.kind {
+            ItemKind::Info => line(item.value),
+            _ => item_line(
+                format!("{} {:<14}", selection_marker(item.selected), item.label),
+                item,
+            ),
+        })
+        .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(vec![
-            choice(
-                MiningMode::Gpu,
-                "GPU mining",
-                "your GPUs; one PC or a farm of rigs (HiveOS, mmpOS, RaveOS, SimpleMining OS, ...)",
-            ),
-            choice(
-                MiningMode::Asic,
-                "ASIC mining",
-                "your devices: solo on your node, or join a pool",
-            ),
-            choice(
-                MiningMode::Pool,
-                "Run a pool",
-                "let other miners mine on your server",
-            ),
-            Line::from(""),
-            Line::from(dim("This choice changes the screens after it.")),
-        ])
-        .block(
+        Paragraph::new(lines).block(
             Block::default()
-                .title(" What do you want to do? ")
+                .title(format!(" {HARDWARE_TITLE} "))
                 .borders(Borders::ALL),
         ),
         area,
     );
+}
+
+const NETWORK_TITLE: &str = "Bitcoin Cash network";
+
+/// Mainnet or Chipnet.
+fn network_items(state: &SetupFlow) -> Vec<SetupItem> {
+    let choice = |network: MiningNetwork, name: &str| {
+        SetupItem::new(
+            Target::Network(network),
+            ItemKind::Choice,
+            name,
+            state.config.network == network,
+        )
+    };
+    vec![
+        choice(MiningNetwork::Mainnet, "Mainnet"),
+        choice(MiningNetwork::Chipnet, "Chipnet").with_value(vec![Piece::dim("(test network)")]),
+        SetupItem::info(Vec::new()),
+        SetupItem::info(vec![Piece::dim(
+            "Sets the tokens, the server list, the address prefix and the donation addresses.",
+        )]),
+    ]
 }
 
 fn render_setup_network(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+    let lines = network_items(state)
+        .into_iter()
+        .map(|item| match item.kind {
+            ItemKind::Info => line(item.value),
+            _ if item.value.is_empty() => Line::from(format!(
+                "{} {}",
+                selection_marker(item.selected),
+                item.label
+            )),
+            _ => item_line(
+                format!("{} {} ", selection_marker(item.selected), item.label),
+                item,
+            ),
+        })
+        .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(format!(
-                "{} Mainnet",
-                selection_marker(state.config.network == MiningNetwork::Mainnet)
-            )),
-            Line::from(vec![
-                Span::raw(format!(
-                    "{} Chipnet ",
-                    selection_marker(state.config.network == MiningNetwork::Chipnet)
-                )),
-                dim("(test network)"),
-            ]),
-            Line::from(""),
-            Line::from(dim(
-                "Sets the tokens, the server list, the address prefix and the donation addresses.",
-            )),
-        ])
-        .block(
+        Paragraph::new(lines).block(
             Block::default()
-                .title(" Bitcoin Cash network ")
+                .title(format!(" {NETWORK_TITLE} "))
                 .borders(Borders::ALL),
         ),
         area,
     );
 }
 
-fn render_setup_token(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
-    let soon = Style::default().fg(Color::Yellow);
-    let lines = if state.mode == MiningMode::Pool {
+/// The token list's title for the chosen hardware.
+fn token_title(state: &SetupFlow) -> &'static str {
+    match state.mode {
+        MiningMode::Gpu => "GPU tokens",
+        MiningMode::Asic => "ASIC targets",
+        MiningMode::Pool => "What will miners mine?",
+    }
+}
+
+/// What the GPU token list's search box says.
+const TOKEN_SEARCH_HINT: &str =
+    "Use arrows to choose, or type a token name, category ID or covenant.";
+
+/// What to mine: a pool's miners, an ASIC's target, or the GPU tokens the
+/// search matches with ELECTRIC and the hash split.
+fn token_items(state: &SetupFlow) -> Vec<SetupItem> {
+    if state.mode == MiningMode::Pool {
         // #### PR #40
-        vec![
-            Line::from(format!(
-                "{} {}",
-                selection_marker(state.pool_target == 0),
-                POOL_TARGETS[0]
+        let choice = |index: usize, what: &str| {
+            SetupItem::new(
+                Target::Pool(index),
+                ItemKind::Choice,
+                POOL_TARGETS[index],
+                state.pool_target == index,
+            )
+            .with_value(vec![Piece::dim(what)])
+        };
+        return vec![
+            choice(
+                0,
+                "BCH + merge-mined CashTokens, for SHA-256 ASICs over SV1 and SV2.",
+            ),
+            choice(
+                1,
+                "PHOTON and other GPU tokens, for GPU rigs, each with its own address.",
+            ),
+        ];
+    }
+    if state.mode == MiningMode::Asic {
+        // #### PR #40: BCH mining works today; only P2Pool v2 is "coming
+        // soon", and ASIC-exclusive tokens are not supported yet.
+        let choice = |index: usize, what: &str| {
+            SetupItem::new(
+                Target::Asic(index),
+                ItemKind::Choice,
+                ASIC_TARGETS[index],
+                state.asic_target == index,
+            )
+            .with_value(vec![Piece::dim(what)])
+        };
+        // #### PR #42: the network's ASIC-exclusive tokens, or none.
+        let available = match (state.asic_tokens)(state.config.network).as_slice() {
+            [] => Piece::warn(format!(
+                "    None is deployed on {} yet.",
+                network_label(state.config.network)
             )),
-            Line::from(dim(
-                "    BCH + merge-mined CashTokens, for SHA-256 ASICs over SV1 and SV2.",
+            tokens => Piece::dim(format!(
+                "    {} available: {}",
+                tokens.len(),
+                tokens
+                    .iter()
+                    .map(|token| token.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )),
-            Line::from(format!(
-                "{} {}",
-                selection_marker(state.pool_target == 1),
-                POOL_TARGETS[1]
-            )),
-            Line::from(dim(
-                "    PHOTON and other GPU tokens, for GPU rigs, each with its own address.",
-            )),
-        ]
-    } else if state.mode == MiningMode::Asic {
-        vec![
-            // #### PR #40: BCH mining works today; only P2Pool v2 is "coming
-            // soon", and ASIC-exclusive tokens are not supported yet.
-            Line::from(Span::raw(format!(
-                "{} {}",
-                selection_marker(state.asic_target == 0),
-                ASIC_TARGETS[0]
-            ))),
-            Line::from(dim(
-                "    Mines BCH and adds every merge-mined CashToken automatically as each is supported.",
-            )),
-            // #### PR #42: the network's ASIC-exclusive tokens, or none.
-            Line::from(Span::raw(format!(
-                "{} {}",
-                selection_marker(state.asic_target == 1),
-                ASIC_TARGETS[1]
-            ))),
-            Line::from(dim(
-                "    Your ASICs mine one token instead of BCH. No BCH node needed.",
-            )),
-            match (state.asic_tokens)(state.config.network).as_slice() {
-                [] => Line::from(Span::styled(
-                    format!(
-                        "    None is deployed on {} yet.",
-                        network_label(state.config.network)
-                    ),
-                    soon,
-                )),
-                tokens => Line::from(dim(format!(
-                    "    {} available: {}",
-                    tokens.len(),
-                    tokens
-                        .iter()
-                        .map(|token| token.name)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ))),
-            },
-        ]
-    } else {
-        let matches = state.matching_tokens();
-        let mut lines = matches
-            .iter()
-            .enumerate()
-            .map(|(index, token)| {
-                Line::from(format!(
-                    "{} {}  GPU  available",
-                    selection_marker(index == state.token_selected),
-                    token.as_str()
-                ))
-            })
-            .collect::<Vec<_>>();
-        if state.electric_listed() {
-            lines.push(Line::from(format!(
-                "{} ELECTRIC  GPU  available",
-                selection_marker(state.token_selected == matches.len())
-            )));
-        }
-        // #### PR #53
-        if state.split_listed() {
-            lines.push(Line::from(vec![
-                Span::raw(format!(
-                    "{} Hash split  GPU  ",
-                    selection_marker(state.token_selected == state.split_index())
-                )),
-                dim(format!(
+        };
+        return vec![
+            choice(
+                0,
+                "Mines BCH and adds every merge-mined CashToken automatically as each is supported.",
+            ),
+            choice(
+                1,
+                "Your ASICs mine one token instead of BCH. No BCH node needed.",
+            ),
+            SetupItem::info(vec![available]),
+        ];
+    }
+    let token = |index: usize, name: &str| {
+        SetupItem::new(
+            Target::Token(index),
+            ItemKind::Choice,
+            name,
+            state.token_selected == index,
+        )
+        .with_value(vec![Piece::plain("GPU  available")])
+    };
+    let matches = state.matching_tokens();
+    let mut items = matches
+        .iter()
+        .enumerate()
+        .map(|(index, matched)| token(index, matched.as_str()))
+        .collect::<Vec<_>>();
+    if state.electric_listed() {
+        items.push(token(matches.len(), "ELECTRIC"));
+    }
+    // #### PR #53
+    if state.split_listed() {
+        let index = state.split_index();
+        items.push(
+            SetupItem::new(
+                Target::Token(index),
+                ItemKind::Choice,
+                "Hash split",
+                state.token_selected == index,
+            )
+            .with_value(vec![
+                Piece::plain("GPU  "),
+                Piece::dim(format!(
                     "share the GPUs between {}",
                     crate::hash_split::SplitToken::available(state.config.network)
                         .iter()
@@ -5697,34 +5932,119 @@ fn render_setup_token(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                         .collect::<Vec<_>>()
                         .join(" and ")
                 )),
-            ]));
+            ]),
+        );
+    }
+    if items.is_empty() {
+        items.push(SetupItem::info(vec![Piece::plain("No matching token")]));
+    }
+    items
+}
+
+fn render_setup_token(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+    let mut lines = Vec::new();
+    for item in token_items(state) {
+        let marker = selection_marker(item.selected);
+        match item.kind {
+            ItemKind::Info => lines.push(line(item.value)),
+            // A pool's or an ASIC's choice, its description under it.
+            _ if state.mode != MiningMode::Gpu => {
+                lines.push(Line::from(format!("{marker} {}", item.label)));
+                let mut what = item.value;
+                if let Some(first) = what.first_mut() {
+                    first.text.insert_str(0, "    ");
+                }
+                lines.push(line(what));
+            }
+            _ => lines.push(item_line(format!("{marker} {}  ", item.label), item)),
         }
-        if lines.is_empty() {
-            lines.push(Line::from("No matching token"));
-        }
+    }
+    if state.mode == MiningMode::Gpu {
         lines.extend([
             Line::from(""),
             Line::from(format!("Search: {}", state.token_input)),
-            Line::from(dim(
-                "Use arrows to choose, or type a token name, category ID or covenant.",
-            )),
+            Line::from(dim(TOKEN_SEARCH_HINT)),
         ]);
-        lines
-    };
-    let title = match state.mode {
-        MiningMode::Gpu => " GPU tokens ",
-        MiningMode::Asic => " ASIC targets ",
-        MiningMode::Pool => " What will miners mine? ",
-    };
+    }
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().title(title).borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title(format!(" {} ", token_title(state)))
+                    .borders(Borders::ALL),
+            )
             .wrap(Wrap { trim: false }),
         area,
     );
 }
 
-fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+/// What Start says for the chosen hardware.
+fn start_label(state: &SetupFlow) -> Piece {
+    match state.mode {
+        MiningMode::Gpu => Piece::good("Start mining"),
+        MiningMode::Asic if state.asic_target == 0 => Piece::good("Start the BCH ASIC server"),
+        // #### PR #42: a token instead of BCH.
+        MiningMode::Asic if state.chosen_asic_token().is_some() => {
+            Piece::good("Start the ASIC token server")
+        }
+        MiningMode::Asic => Piece::dim("Start (no ASIC-exclusive token is deployed yet)"),
+        MiningMode::Pool => Piece::good("Start the pool"),
+    }
+}
+
+/// How a settings row changes: the keys the terminal takes on it.
+fn settings_kind(state: &SetupFlow, row: SettingsRow) -> ItemKind {
+    match row {
+        SettingsRow::Start => ItemKind::Start,
+        SettingsRow::Token | SettingsRow::Fulcrum | SettingsRow::Node => ItemKind::Action,
+        SettingsRow::Gpu => ItemKind::Cycle {
+            enter: Some("List"),
+        },
+        SettingsRow::StartDifficulty | SettingsRow::NodeZmq | SettingsRow::RigPort => {
+            ItemKind::Cycle {
+                enter: Some("Edit"),
+            }
+        }
+        SettingsRow::Advanced => ItemKind::Toggle {
+            on: state.advanced_open,
+        },
+        SettingsRow::Templates => ItemKind::Toggle {
+            on: state.template_port.is_some(),
+        },
+        SettingsRow::RigsOnly => ItemKind::Toggle {
+            on: state.rigs_only,
+        },
+        SettingsRow::Network
+        | SettingsRow::AsicTarget
+        | SettingsRow::Mining
+        | SettingsRow::PoolKind
+        | SettingsRow::PoolFee
+        | SettingsRow::FeeFrom
+        | SettingsRow::Donation
+        | SettingsRow::JobDeclaration
+        | SettingsRow::AcceptJd
+        | SettingsRow::AsicToken
+        | SettingsRow::TokenDonation
+        | SettingsRow::Intensity
+        | SettingsRow::Share(_) => ItemKind::Cycle { enter: None },
+        SettingsRow::PoolAddress
+        | SettingsRow::PoolKey
+        | SettingsRow::P2PoolApi
+        | SettingsRow::FeeAddress
+        | SettingsRow::PoolName
+        | SettingsRow::Sv1Port
+        | SettingsRow::Sv2Port
+        | SettingsRow::Backups
+        | SettingsRow::PoolUser
+        | SettingsRow::FallbackPools
+        | SettingsRow::RigName
+        | SettingsRow::Address
+        | SettingsRow::ProfileName => ItemKind::Text,
+    }
+}
+
+/// A settings row's name, value and key hint.
+fn settings_line(state: &SetupFlow, row: SettingsRow) -> (&'static str, Piece, &'static str) {
     let network = state.config.network;
     let label = network_label(network);
     let builtin = match network {
@@ -5733,507 +6053,507 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
     };
     let fulcrum = state.sources.list(network, ConnectionKind::Fulcrum).len();
     let nodes = state.sources.list(network, ConnectionKind::Node).len();
-    let mut lines = Vec::new();
-    for (index, row) in state.settings_rows().into_iter().enumerate() {
-        let selected = state.settings_row == index;
-        let marker = selection_marker(selected);
-        if row == SettingsRow::Start {
-            lines.push(Line::from(""));
-            lines.push(match state.mode {
-                MiningMode::Gpu => Line::from(vec![
-                    Span::raw(format!("{marker} ")),
-                    Span::styled("Start mining", Style::default().fg(Color::Green)),
-                ]),
-                MiningMode::Asic if state.asic_target == 0 => Line::from(vec![
-                    Span::raw(format!("{marker} ")),
-                    Span::styled(
-                        "Start the BCH ASIC server",
-                        Style::default().fg(Color::Green),
-                    ),
-                ]),
-                // #### PR #42: a token instead of BCH.
-                MiningMode::Asic if state.chosen_asic_token().is_some() => Line::from(vec![
-                    Span::raw(format!("{marker} ")),
-                    Span::styled(
-                        "Start the ASIC token server",
-                        Style::default().fg(Color::Green),
-                    ),
-                ]),
-                MiningMode::Asic => Line::from(vec![
-                    Span::raw(format!("{marker} ")),
-                    dim("Start (no ASIC-exclusive token is deployed yet)"),
-                ]),
-                MiningMode::Pool => Line::from(vec![
-                    Span::raw(format!("{marker} ")),
-                    Span::styled("Start the pool", Style::default().fg(Color::Green)),
-                ]),
-            });
-            continue;
+    match row {
+        SettingsRow::Network => (
+            "Network",
+            Piece::plain(network_label(state.config.network)),
+            "[Enter] or < > change",
+        ),
+        SettingsRow::Token => (
+            "Token",
+            Piece::plain(if state.split {
+                "Hash split".to_owned()
+            } else if state.electric {
+                "ELECTRIC".to_owned()
+            } else {
+                state.config.token.as_str().to_owned()
+            }),
+            "[Enter] change",
+        ),
+        SettingsRow::Gpu => {
+            let gpus = state.chosen_gpus();
+            let value = match gpus.as_slice() {
+                [gpu] => format!(
+                    "{}:{}  {} {}",
+                    gpu.backend.as_str().to_ascii_uppercase(),
+                    gpu.index,
+                    gpu.vendor,
+                    gpu.name
+                ),
+                gpus => format!(
+                    "{} GPUs: {}",
+                    gpus.len(),
+                    gpus.iter()
+                        .map(|gpu| gpu.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            };
+            ("GPU", Piece::plain(value), "< >  [Enter] list")
         }
-        let (name, value, hint) = match row {
-            SettingsRow::Network => (
-                "Network",
-                Span::raw(network_label(state.config.network)),
-                "[Enter] or < > change",
-            ),
-            SettingsRow::Token => (
-                "Token",
-                Span::raw(if state.split {
-                    "Hash split".to_owned()
-                } else if state.electric {
-                    "ELECTRIC".to_owned()
-                } else {
-                    state.config.token.as_str().to_owned()
-                }),
-                "[Enter] change",
-            ),
-            SettingsRow::Gpu => {
-                let gpus = state.chosen_gpus();
-                let value = match gpus.as_slice() {
-                    [gpu] => format!(
-                        "{}:{}  {} {}",
-                        gpu.backend.as_str().to_ascii_uppercase(),
-                        gpu.index,
-                        gpu.vendor,
-                        gpu.name
-                    ),
-                    gpus => format!(
-                        "{} GPUs: {}",
-                        gpus.len(),
-                        gpus.iter()
-                            .map(|gpu| gpu.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                };
-                ("GPU", Span::raw(value), "< >  [Enter] list")
-            }
-            SettingsRow::AsicTarget => (
-                "ASIC target",
-                Span::raw(ASIC_TARGETS[state.asic_target].to_owned()),
-                "< >",
-            ),
-            // #### PR #42: the token and its donation.
-            SettingsRow::AsicToken => (
-                "Token",
-                match state.chosen_asic_token() {
-                    None => dim(format!("none deployed on {label} yet")),
-                    Some(token) if token.fixed_version => Span::raw(format!(
-                        "{}: keeps the block version fixed, so Bitaxe and most newer ASICs \
+        SettingsRow::AsicTarget => (
+            "ASIC target",
+            Piece::plain(ASIC_TARGETS[state.asic_target].to_owned()),
+            "< >",
+        ),
+        // #### PR #42: the token and its donation.
+        SettingsRow::AsicToken => (
+            "Token",
+            match state.chosen_asic_token() {
+                None => Piece::dim(format!("none deployed on {label} yet")),
+                Some(token) if token.fixed_version => Piece::plain(format!(
+                    "{}: keeps the block version fixed, so Bitaxe and most newer ASICs \
                          cannot mine it at full speed",
-                        token.name
-                    )),
-                    Some(token) => Span::raw(token.name.to_owned()),
-                },
-                "< >",
+                    token.name
+                )),
+                Some(token) => Piece::plain(token.name.to_owned()),
+            },
+            "< >",
+        ),
+        SettingsRow::TokenDonation => (
+            "Donation",
+            match state.token_donation_terms() {
+                None => Piece::dim("the token's own, by default"),
+                Some((name, donation, default)) => Piece::plain(format!(
+                    "{donation} of {name} mining work (default {default})"
+                )),
+            },
+            "< >  0.5% steps",
+        ),
+        // #### PR #42: the GPU farm's and pool's rigs, and a rig.
+        SettingsRow::RigPort => (
+            "Rig port",
+            match (state.mode, state.rig_port) {
+                _ if state.editing == Some(TextField::RigPort) => {
+                    Piece::plain(format!("{}_", state.text_input))
+                }
+                (MiningMode::Gpu, None) => Piece::dim("off; only this PC mines"),
+                (MiningMode::Gpu, Some(port)) => Piece::plain(format!(
+                    "on, port {port}: your rigs join this PC (Connection info shows how)"
+                )),
+                (_, port) => Piece::plain(format!(
+                    "{}: other people's rigs join the pool here",
+                    port.unwrap_or(DEFAULT_RIG_PORT)
+                )),
+            },
+            "< > [Enter]",
+        ),
+        SettingsRow::RigsOnly => (
+            "This PC",
+            Piece::plain(if state.rigs_only {
+                "only the rigs mine (no GPU used here)"
+            } else {
+                "mines with its GPUs too"
+            }),
+            "< > [Enter]",
+        ),
+        SettingsRow::RigName => (
+            "Rig name",
+            edit_value(
+                state,
+                TextField::RigName,
+                &state.rig_name,
+                "this computer's name (default)",
             ),
-            SettingsRow::TokenDonation => (
+            "[Enter]",
+        ),
+        // #### PR #40
+        SettingsRow::Mining => (
+            "Mining",
+            Piece::plain(match (state.mode, state.gpu_join, state.asic_mining) {
+                (MiningMode::Gpu, false, _) => "Solo (claims to your address)",
+                (MiningMode::Gpu, true, _) => {
+                    "Join a GPU pool or farm (rigs on HiveOS, mmpOS, RaveOS, ...)"
+                }
+                (_, _, AsicMining::Solo) => "Solo (your BCH node)",
+                (_, _, AsicMining::JoinPool) => "Join a pool",
+            }),
+            "< >",
+        ),
+        // #### PR #61: P2Pool is ready to join or run for ASICs; running
+        // a P2Pool for other miners is still to come.
+        SettingsRow::PoolKind => (
+            "Pool type",
+            Piece::plain(match (state.pool_kind, state.mode) {
+                (PoolKind::Normal, _) => "Normal pool",
+                (PoolKind::P2PoolV2, MiningMode::Pool) => "P2Pool v2  (coming soon)",
+                (PoolKind::P2PoolV2, _) => "P2Pool",
+            }),
+            "< >",
+        ),
+        SettingsRow::PoolAddress => (
+            "Pool",
+            edit_value(
+                state,
+                TextField::PoolAddress,
+                &state.join_address,
+                "HOST:PORT, or paste stratum2+tcp://HOST:PORT/KEY",
+            ),
+            "[Enter]",
+        ),
+        SettingsRow::P2PoolApi => (
+            "P2Pool preparation",
+            edit_value(
+                state,
+                TextField::P2PoolApi,
+                &state.p2pool_prepare_api,
+                "HTTPS URL of the node's /jd_prepare",
+            ),
+            "[Enter]",
+        ),
+        SettingsRow::PoolKey => (
+            "Pool key",
+            edit_value(
+                state,
+                TextField::PoolKey,
+                &state.join_key,
+                "the authority key the pool publishes",
+            ),
+            "[Enter]",
+        ),
+        SettingsRow::PoolFee => (
+            "Pool fee",
+            Piece::plain(if state.pool_target == 1 {
+                format!(
+                    "{} of each rig's mining time, after the donation",
+                    state.pool_fee
+                )
+            } else {
+                format!("{} after the donation", state.pool_fee)
+            }),
+            "< >",
+        ),
+        SettingsRow::FeeFrom => (
+            "Fee from",
+            Piece::plain(match state.pool_fee_mode {
+                crate::donation::bch::FeeMode::Coinbase => "Coinbase",
+                crate::donation::bch::FeeMode::Work => "Mining work",
+                crate::donation::bch::FeeMode::Both => "Both (1/3 work, 2/3 coinbase)",
+            }),
+            "< >",
+        ),
+        SettingsRow::PoolName => (
+            "Pool name",
+            edit_value(
+                state,
+                TextField::PoolName,
+                &state.pool_tag,
+                "written into your blocks, such as /MyPool/",
+            ),
+            "[Enter]",
+        ),
+        SettingsRow::FeeAddress => (
+            "Fee address",
+            edit_value(
+                state,
+                TextField::FeeAddress,
+                &state.pool_fee_address,
+                if state.pool_target == 1 {
+                    "your payout address; a q address"
+                } else {
+                    "your payout address; q or p (multisig)"
+                },
+            ),
+            "[Enter]",
+        ),
+        SettingsRow::Address => (
+            "Address",
+            edit_value(
+                state,
+                TextField::Address,
+                &state.config.payout_address,
+                &format!("type your {label} payout address"),
+            ),
+            "[Enter]",
+        ),
+        SettingsRow::Intensity => {
+            let filled = usize::from(state.config.intensity / 10);
+            (
+                "Intensity",
+                Piece::plain(format!(
+                    "{}{} {:>3}%",
+                    "█".repeat(filled),
+                    "░".repeat(10 - filled),
+                    state.config.intensity
+                )),
+                "< >",
+            )
+        }
+        // #### PR #53: one block a 5% step.
+        SettingsRow::Share(index) => {
+            let (token, share) = state
+                .shares()
+                .at(usize::from(index))
+                .unwrap_or((crate::hash_split::SplitToken::Electric, 0));
+            let filled = usize::from(share / crate::hash_split::STEP);
+            (
+                token.name(),
+                Piece::plain(format!(
+                    "{}{} {:>3}%",
+                    "█".repeat(filled),
+                    "░".repeat(20 - filled),
+                    share
+                )),
+                if state.share_editing && state.current_row() == row {
+                    "< >  5% steps · [Enter] done"
+                } else {
+                    "[Enter] change"
+                },
+            )
+        }
+        SettingsRow::Fulcrum => (
+            "Fulcrum",
+            Piece::plain(format!("{builtin} built-in + {fulcrum} yours ({label})")),
+            "[Enter]",
+        ),
+        // #### PR #65: GPU mining takes its token jobs from a saved
+        // node first, and from the Fulcrum servers without one.
+        SettingsRow::Node => (
+            "BCH node",
+            Piece::plain(match (nodes, state.mode) {
+                (0, MiningMode::Gpu) => {
+                    format!("none saved for {label}; jobs come from the Fulcrum servers")
+                }
+                (0, _) => format!("none saved for {label}"),
+                (_, MiningMode::Gpu) => {
+                    format!("{nodes} saved for {label}; jobs come from your node first")
+                }
+                _ => format!("{nodes} saved for {label}"),
+            }),
+            "[Enter]",
+        ),
+        // #### PR #42: the Advanced section.
+        SettingsRow::Advanced => (
+            "Advanced",
+            Piece::plain(if state.advanced_open {
+                "▾ open: server options below".to_owned()
+            } else {
+                "▸ closed: ports, start difficulty, donation and more".to_owned()
+            }),
+            "[Enter] < >",
+        ),
+        SettingsRow::Donation => {
+            let (work, reward) = state.config.bch_donation.shares();
+            (
                 "Donation",
-                match state.token_donation_terms() {
-                    None => dim("the token's own, by default"),
-                    Some((name, donation, default)) => Span::raw(format!(
-                        "{donation} of {name} mining work (default {default})"
-                    )),
-                },
-                "< >  0.5% steps",
-            ),
-            // #### PR #42: the GPU farm's and pool's rigs, and a rig.
-            SettingsRow::RigPort => (
-                "Rig port",
-                match (state.mode, state.rig_port) {
-                    _ if state.editing == Some(TextField::RigPort) => {
-                        Span::raw(format!("{}_", state.text_input))
-                    }
-                    (MiningMode::Gpu, None) => dim("off; only this PC mines"),
-                    (MiningMode::Gpu, Some(port)) => Span::raw(format!(
-                        "on, port {port}: your rigs join this PC (Connection info shows how)"
-                    )),
-                    (_, port) => Span::raw(format!(
-                        "{}: other people's rigs join the pool here",
-                        port.unwrap_or(DEFAULT_RIG_PORT)
-                    )),
-                },
-                "< > [Enter]",
-            ),
-            SettingsRow::RigsOnly => (
-                "This PC",
-                Span::raw(if state.rigs_only {
-                    "only the rigs mine (no GPU used here)"
-                } else {
-                    "mines with its GPUs too"
-                }),
-                "< > [Enter]",
-            ),
-            SettingsRow::RigName => (
-                "Rig name",
-                edit_value(
-                    state,
-                    TextField::RigName,
-                    &state.rig_name,
-                    "this computer's name (default)",
-                ),
-                "[Enter]",
-            ),
-            // #### PR #40
-            SettingsRow::Mining => (
-                "Mining",
-                Span::raw(match (state.mode, state.gpu_join, state.asic_mining) {
-                    (MiningMode::Gpu, false, _) => "Solo (claims to your address)",
-                    (MiningMode::Gpu, true, _) => {
-                        "Join a GPU pool or farm (rigs on HiveOS, mmpOS, RaveOS, ...)"
-                    }
-                    (_, _, AsicMining::Solo) => "Solo (your BCH node)",
-                    (_, _, AsicMining::JoinPool) => "Join a pool",
-                }),
-                "< >",
-            ),
-            // #### PR #61: P2Pool is ready to join or run for ASICs; running
-            // a P2Pool for other miners is still to come.
-            SettingsRow::PoolKind => (
-                "Pool type",
-                Span::raw(match (state.pool_kind, state.mode) {
-                    (PoolKind::Normal, _) => "Normal pool",
-                    (PoolKind::P2PoolV2, MiningMode::Pool) => "P2Pool v2  (coming soon)",
-                    (PoolKind::P2PoolV2, _) => "P2Pool",
-                }),
-                "< >",
-            ),
-            SettingsRow::PoolAddress => (
-                "Pool",
-                edit_value(
-                    state,
-                    TextField::PoolAddress,
-                    &state.join_address,
-                    "HOST:PORT, or paste stratum2+tcp://HOST:PORT/KEY",
-                ),
-                "[Enter]",
-            ),
-            SettingsRow::P2PoolApi => (
-                "P2Pool preparation",
-                edit_value(state, TextField::P2PoolApi, &state.p2pool_prepare_api, "HTTPS URL of the node's /jd_prepare"),
-                "[Enter]",
-            ),
-            SettingsRow::PoolKey => (
-                "Pool key",
-                edit_value(
-                    state,
-                    TextField::PoolKey,
-                    &state.join_key,
-                    "the authority key the pool publishes",
-                ),
-                "[Enter]",
-            ),
-            SettingsRow::PoolFee => (
-                "Pool fee",
-                Span::raw(if state.pool_target == 1 {
-                    format!(
-                        "{} of each rig's mining time, after the donation",
-                        state.pool_fee
-                    )
-                } else {
-                    format!("{} after the donation", state.pool_fee)
-                }),
-                "< >",
-            ),
-            SettingsRow::FeeFrom => (
-                "Fee from",
-                Span::raw(match state.pool_fee_mode {
-                    crate::donation::bch::FeeMode::Coinbase => "Coinbase",
-                    crate::donation::bch::FeeMode::Work => "Mining work",
-                    crate::donation::bch::FeeMode::Both => "Both (1/3 work, 2/3 coinbase)",
-                }),
-                "< >",
-            ),
-            SettingsRow::PoolName => (
-                "Pool name",
-                edit_value(
-                    state,
-                    TextField::PoolName,
-                    &state.pool_tag,
-                    "written into your blocks, such as /MyPool/",
-                ),
-                "[Enter]",
-            ),
-            SettingsRow::FeeAddress => (
-                "Fee address",
-                edit_value(
-                    state,
-                    TextField::FeeAddress,
-                    &state.pool_fee_address,
-                    if state.pool_target == 1 {
-                        "your payout address; a q address"
-                    } else {
-                        "your payout address; q or p (multisig)"
-                    },
-                ),
-                "[Enter]",
-            ),
-            SettingsRow::Address => (
-                "Address",
-                edit_value(
-                    state,
-                    TextField::Address,
-                    &state.config.payout_address,
-                    &format!("type your {label} payout address"),
-                ),
-                "[Enter]",
-            ),
-            SettingsRow::Intensity => {
-                let filled = usize::from(state.config.intensity / 10);
-                (
-                    "Intensity",
-                    Span::raw(format!(
-                        "{}{} {:>3}%",
-                        "█".repeat(filled),
-                        "░".repeat(10 - filled),
-                        state.config.intensity
-                    )),
-                    "< >",
-                )
-            }
-            // #### PR #53: one block a 5% step.
-            SettingsRow::Share(index) => {
-                let (token, share) = state
-                    .shares()
-                    .at(usize::from(index))
-                    .unwrap_or((crate::hash_split::SplitToken::Electric, 0));
-                let filled = usize::from(share / crate::hash_split::STEP);
-                (
-                    token.name(),
-                    Span::raw(format!(
-                        "{}{} {:>3}%",
-                        "█".repeat(filled),
-                        "░".repeat(20 - filled),
-                        share
-                    )),
-                    if state.share_editing && state.current_row() == row {
-                        "< >  5% steps · [Enter] done"
-                    } else {
-                        "[Enter] change"
-                    },
-                )
-            }
-            SettingsRow::Fulcrum => (
-                "Fulcrum",
-                Span::raw(format!("{builtin} built-in + {fulcrum} yours ({label})")),
-                "[Enter]",
-            ),
-            // #### PR #65: GPU mining takes its token jobs from a saved
-            // node first, and from the Fulcrum servers without one.
-            SettingsRow::Node => (
-                "BCH node",
-                Span::raw(match (nodes, state.mode) {
-                    (0, MiningMode::Gpu) => {
-                        format!("none saved for {label}; jobs come from the Fulcrum servers")
-                    }
-                    (0, _) => format!("none saved for {label}"),
-                    (_, MiningMode::Gpu) => {
-                        format!("{nodes} saved for {label}; jobs come from your node first")
-                    }
-                    _ => format!("{nodes} saved for {label}"),
-                }),
-                "[Enter]",
-            ),
-            // #### PR #42: the Advanced section.
-            SettingsRow::Advanced => (
-                "Advanced",
-                Span::raw(if state.advanced_open {
-                    "▾ open: server options below".to_owned()
-                } else {
-                    "▸ closed: ports, start difficulty, donation and more".to_owned()
-                }),
-                "[Enter] < >",
-            ),
-            SettingsRow::Donation => {
-                let (work, reward) = state.config.bch_donation.shares();
-                (
-                    "Donation",
-                    Span::raw(format!(
-                        "{} of BCH and merge-mined CashTokens ({reward} of rewards and wins · \
+                Piece::plain(format!(
+                    "{} of BCH and merge-mined CashTokens ({reward} of rewards and wins · \
                          {work} of work)",
-                        state.config.bch_donation
-                    )),
-                    "< >  0% to 100%",
-                )
-            }
-            SettingsRow::StartDifficulty => (
-                "Start diff.",
-                match state.start_difficulty {
-                    _ if state.editing == Some(TextField::StartDifficulty) => {
-                        Span::raw(format!("{}_", state.text_input))
-                    }
-                    None => Span::raw(format!(
-                        "{} (default; vardiff adjusts each device)",
-                        group_digits(DEFAULT_START_DIFFICULTY)
-                    )),
-                    Some(difficulty) => Span::raw(group_digits(difficulty)),
-                },
-                "< > halves or doubles  [Enter]",
-            ),
-            SettingsRow::Sv1Port => (
-                "SV1 port",
-                edit_value(state, TextField::Sv1Port, &state.sv1_port.to_string(), ""),
-                "[Enter]  most ASIC firmware",
-            ),
-            SettingsRow::Sv2Port => (
-                "SV2 port",
-                edit_value(state, TextField::Sv2Port, &state.sv2_port.to_string(), ""),
-                "[Enter]",
-            ),
-            // #### PR #42: Template Distribution, off by default.
-            SettingsRow::Templates => (
-                "Serve templates",
-                match state.template_port {
-                    None => dim("off; SV2 pools and P2Pool can take this node's templates"),
-                    Some(port) => Span::raw(format!(
-                        "on, port {port}: SV2 pools and P2Pool take this node's templates"
-                    )),
-                },
-                "< > [Enter]",
-            ),
-            // #### PR #42: the node's ZMQ block notices.
-            SettingsRow::NodeZmq => (
-                "Block notices",
-                match state.node_zmq.as_str() {
-                    _ if state.editing == Some(TextField::NodeZmq) => {
-                        Span::raw(format!("{}_", state.text_input))
-                    }
-                    "" => dim("from bitcoin.conf (zmqpubhashblock) for a node on this PC"),
-                    "off" => dim("off; the server asks the node for new blocks"),
-                    url => Span::raw(format!("{url}: new blocks reach devices at once")),
-                },
-                "< > [Enter]",
-            ),
-            SettingsRow::Backups => (
-                if state.mode == MiningMode::Gpu {
-                    "Backups"
-                } else {
-                    "Backup pools"
-                },
-                match state.backups.len() {
-                    _ if state.editing == Some(TextField::Backups) => {
-                        Span::raw(format!("{}_", state.text_input))
-                    }
-                    // #### PR #42: a GPU rig's backups are coordinators.
-                    0 if state.mode == MiningMode::Gpu => dim(
-                        "no backup coordinators; paste stratum2+tcp://HOST:3340/KEY lines"
-                            .to_owned(),
-                    ),
-                    0 => dim("none; paste stratum2+tcp://HOST:PORT/KEY lines".to_owned()),
-                    count if state.mode == MiningMode::Gpu => Span::raw(format!(
-                        "{count} backup coordinators, used in order when the coordinator fails"
-                    )),
-                    count => Span::raw(format!("{count}, used in order when the pool fails")),
-                },
-                "[Enter]",
-            ),
-            SettingsRow::PoolUser => (
-                "Pool username",
-                edit_value(
-                    state,
-                    TextField::PoolUser,
-                    &state.pool_user,
-                    "your payout address (default)",
+                    state.config.bch_donation
+                )),
+                "< >  0% to 100%",
+            )
+        }
+        SettingsRow::StartDifficulty => (
+            "Start diff.",
+            match state.start_difficulty {
+                _ if state.editing == Some(TextField::StartDifficulty) => {
+                    Piece::plain(format!("{}_", state.text_input))
+                }
+                None => Piece::plain(format!(
+                    "{} (default; vardiff adjusts each device)",
+                    group_digits(DEFAULT_START_DIFFICULTY)
+                )),
+                Some(difficulty) => Piece::plain(group_digits(difficulty)),
+            },
+            "< > halves or doubles  [Enter]",
+        ),
+        SettingsRow::Sv1Port => (
+            "SV1 port",
+            edit_value(state, TextField::Sv1Port, &state.sv1_port.to_string(), ""),
+            "[Enter]  most ASIC firmware",
+        ),
+        SettingsRow::Sv2Port => (
+            "SV2 port",
+            edit_value(state, TextField::Sv2Port, &state.sv2_port.to_string(), ""),
+            "[Enter]",
+        ),
+        // #### PR #42: Template Distribution, off by default.
+        SettingsRow::Templates => (
+            "Serve templates",
+            match state.template_port {
+                None => Piece::dim("off; SV2 pools and P2Pool can take this node's templates"),
+                Some(port) => Piece::plain(format!(
+                    "on, port {port}: SV2 pools and P2Pool take this node's templates"
+                )),
+            },
+            "< > [Enter]",
+        ),
+        // #### PR #42: the node's ZMQ block notices.
+        SettingsRow::NodeZmq => (
+            "Block notices",
+            match state.node_zmq.as_str() {
+                _ if state.editing == Some(TextField::NodeZmq) => {
+                    Piece::plain(format!("{}_", state.text_input))
+                }
+                "" => Piece::dim("from bitcoin.conf (zmqpubhashblock) for a node on this PC"),
+                "off" => Piece::dim("off; the server asks the node for new blocks"),
+                url => Piece::plain(format!("{url}: new blocks reach devices at once")),
+            },
+            "< > [Enter]",
+        ),
+        SettingsRow::Backups => (
+            if state.mode == MiningMode::Gpu {
+                "Backups"
+            } else {
+                "Backup pools"
+            },
+            match state.backups.len() {
+                _ if state.editing == Some(TextField::Backups) => {
+                    Piece::plain(format!("{}_", state.text_input))
+                }
+                // #### PR #42: a GPU rig's backups are coordinators.
+                0 if state.mode == MiningMode::Gpu => Piece::dim(
+                    "no backup coordinators; paste stratum2+tcp://HOST:3340/KEY lines".to_owned(),
                 ),
-                "[Enter]",
+                0 => Piece::dim("none; paste stratum2+tcp://HOST:PORT/KEY lines".to_owned()),
+                count if state.mode == MiningMode::Gpu => Piece::plain(format!(
+                    "{count} backup coordinators, used in order when the coordinator fails"
+                )),
+                count => Piece::plain(format!("{count}, used in order when the pool fails")),
+            },
+            "[Enter]",
+        ),
+        SettingsRow::PoolUser => (
+            "Pool username",
+            edit_value(
+                state,
+                TextField::PoolUser,
+                &state.pool_user,
+                "your payout address (default)",
             ),
-            // #### PR #61: with P2Pool, your node's templates mean your own
-            // P2Pool node run with it.
-            SettingsRow::JobDeclaration if state.pool_kind == PoolKind::P2PoolV2 => (
-                "Your templates",
-                if state.own_p2pool {
-                    Span::raw("your node's: Pickaxe runs your own P2Pool node with it")
-                } else if state.job_declaration.is_some() {
-                    Span::raw("public P2Pool; your node's templates required (SV2)")
-                } else {
-                    dim("off; join a P2Pool node, which builds the jobs")
-                },
-                "< >",
-            ),
-            // #### PR #42: Job Declaration, accepting it, and fallback pools;
-            // all off by default.
-            SettingsRow::JobDeclaration => (
-                "Your templates",
-                match state.job_declaration {
-                    None => dim("off; devices mine the pool's own jobs"),
-                    Some(crate::config::SavedDeclaration::Full) => Span::raw(
-                        "full template: your node's templates, declared with their transactions",
-                    ),
-                    Some(crate::config::SavedDeclaration::Coinbase) => Span::raw(
-                        "coinbase only: your node's templates; the pool sees the coinbase",
-                    ),
-                    Some(crate::config::SavedDeclaration::FullRequired) => Span::raw(
-                        "full template required: wait or try another pool; never use pool templates",
-                    ),
-                    Some(crate::config::SavedDeclaration::CoinbaseRequired) => Span::raw(
-                        "coinbase only required: wait or try another pool; never use pool templates",
-                    ),
-                },
-                "< > [Enter]  a Pickaxe pool",
-            ),
-            SettingsRow::AcceptJd => (
-                "Miner templates",
-                match state.accept_jd {
-                    None => dim("off; miners mine your node's templates"),
-                    Some(crate::config::SavedAccept::Both) => Span::raw(
-                        "full template and coinbase only: miners may mine their own node's templates",
-                    ),
-                    Some(crate::config::SavedAccept::Full) => Span::raw(
-                        "full template only: your node checks each miner's template",
-                    ),
-                    Some(crate::config::SavedAccept::Coinbase) => Span::raw(
-                        "coinbase only: miners' own nodes submit their blocks",
-                    ),
-                },
-                "< > [Enter]",
-            ),
-            SettingsRow::FallbackPools => (
-                "Fallback pools",
-                match state.fallback_pools.len() {
-                    _ if state.editing == Some(TextField::FallbackPools) => {
-                        Span::raw(format!("{}_", state.text_input))
-                    }
-                    0 => dim("none; paste stratum2+tcp://HOST:PORT/KEY lines".to_owned()),
-                    count => Span::raw(format!(
-                        "{count}, used in order while your node gives no work"
-                    )),
-                },
-                "[Enter]",
-            ),
-            SettingsRow::ProfileName => (
-                "Profile name",
-                edit_value(
-                    state,
-                    TextField::ProfileName,
-                    &state.profile_name_input,
-                    "random name if blank",
+            "[Enter]",
+        ),
+        // #### PR #61: with P2Pool, your node's templates mean your own
+        // P2Pool node run with it.
+        SettingsRow::JobDeclaration if state.pool_kind == PoolKind::P2PoolV2 => (
+            "Your templates",
+            if state.own_p2pool {
+                Piece::plain("your node's: Pickaxe runs your own P2Pool node with it")
+            } else if state.job_declaration.is_some() {
+                Piece::plain("public P2Pool; your node's templates required (SV2)")
+            } else {
+                Piece::dim("off; join a P2Pool node, which builds the jobs")
+            },
+            "< >",
+        ),
+        // #### PR #42: Job Declaration, accepting it, and fallback pools;
+        // all off by default.
+        SettingsRow::JobDeclaration => (
+            "Your templates",
+            match state.job_declaration {
+                None => Piece::dim("off; devices mine the pool's own jobs"),
+                Some(crate::config::SavedDeclaration::Full) => Piece::plain(
+                    "full template: your node's templates, declared with their transactions",
                 ),
-                "[Enter]",
+                Some(crate::config::SavedDeclaration::Coinbase) => {
+                    Piece::plain("coinbase only: your node's templates; the pool sees the coinbase")
+                }
+                Some(crate::config::SavedDeclaration::FullRequired) => Piece::plain(
+                    "full template required: wait or try another pool; never use pool templates",
+                ),
+                Some(crate::config::SavedDeclaration::CoinbaseRequired) => Piece::plain(
+                    "coinbase only required: wait or try another pool; never use pool templates",
+                ),
+            },
+            "< > [Enter]  a Pickaxe pool",
+        ),
+        SettingsRow::AcceptJd => (
+            "Miner templates",
+            match state.accept_jd {
+                None => Piece::dim("off; miners mine your node's templates"),
+                Some(crate::config::SavedAccept::Both) => Piece::plain(
+                    "full template and coinbase only: miners may mine their own node's templates",
+                ),
+                Some(crate::config::SavedAccept::Full) => {
+                    Piece::plain("full template only: your node checks each miner's template")
+                }
+                Some(crate::config::SavedAccept::Coinbase) => {
+                    Piece::plain("coinbase only: miners' own nodes submit their blocks")
+                }
+            },
+            "< > [Enter]",
+        ),
+        SettingsRow::FallbackPools => (
+            "Fallback pools",
+            match state.fallback_pools.len() {
+                _ if state.editing == Some(TextField::FallbackPools) => {
+                    Piece::plain(format!("{}_", state.text_input))
+                }
+                0 => Piece::dim("none; paste stratum2+tcp://HOST:PORT/KEY lines".to_owned()),
+                count => Piece::plain(format!(
+                    "{count}, used in order while your node gives no work"
+                )),
+            },
+            "[Enter]",
+        ),
+        SettingsRow::ProfileName => (
+            "Profile name",
+            edit_value(
+                state,
+                TextField::ProfileName,
+                &state.profile_name_input,
+                "random name if blank",
             ),
-            SettingsRow::Start => unreachable!("handled above"),
-        };
-        lines.push(Line::from(vec![
-            Span::raw(format!("{marker} {name:<14}")),
-            value,
-            Span::raw("   "),
-            dim(hint),
-        ]));
+            "[Enter]",
+        ),
+        SettingsRow::Start => ("", start_label(state), ""),
+    }
+}
+
+/// The settings page: its rows, the split's total under its last share,
+/// then a note.
+fn settings_items(state: &SetupFlow) -> Vec<SetupItem> {
+    let mut items = Vec::new();
+    for (index, row) in state.settings_rows().into_iter().enumerate() {
+        let (name, value, hint) = settings_line(state, row);
+        items.push(
+            SetupItem::new(
+                Target::Row(index),
+                settings_kind(state, row),
+                name,
+                state.settings_row == index,
+            )
+            .with_value(vec![value])
+            .with_hint(hint),
+        );
         // #### PR #53: the split's total under its last share.
         if let SettingsRow::Share(index) = row {
             let shares = state.shares();
             if usize::from(index) + 1 == shares.len() {
                 let total = shares.total();
-                lines.push(Line::from(dim(format!(
+                items.push(SetupItem::info(vec![Piece::dim(format!(
                     "                {total}% of the GPUs' time in all · {}% idle",
                     100 - total
-                ))));
+                ))]));
             }
         }
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(dim(
+    items.push(SetupItem::info(Vec::new()));
+    items.push(SetupItem::info(vec![Piece::dim(
         "Servers and nodes you add are saved once per network and shared by every profile.",
-    )));
+    )]));
+    items
+}
+
+fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+    let mut lines = Vec::new();
+    for item in settings_items(state) {
+        let marker = selection_marker(item.selected);
+        match item.kind {
+            ItemKind::Info => lines.push(line(item.value)),
+            ItemKind::Start => {
+                lines.push(Line::from(""));
+                lines.push(item_line(format!("{marker} "), item));
+            }
+            _ => {
+                let hint = dim(item.hint.clone());
+                let mut row = item_line(format!("{marker} {:<14}", item.label), item);
+                row.spans.extend([Span::raw("   "), hint]);
+                lines.push(row);
+            }
+        }
+    }
     let settings = Paragraph::new(lines)
         .block(Block::default().title(" Settings ").borders(Borders::ALL))
         .wrap(Wrap { trim: false });
@@ -6265,21 +6585,15 @@ fn electric_pot_width(state: &SetupFlow) -> u16 {
 }
 
 /// #### PR #69: the pot's balance as one line.
-fn pot_balance_line(state: &SetupFlow) -> Line<'static> {
+fn pot_balance(state: &SetupFlow) -> Piece {
     match &state.pot_balance {
-        None => Line::from(dim("Reading its balance…")),
-        Some(Ok((sats, 0))) => Line::from(Span::styled(
-            format!("Balance: {sats} sats · pays no claim yet"),
-            Style::default().fg(Color::Yellow),
+        None => Piece::dim("Reading its balance…"),
+        Some(Ok((sats, 0))) => Piece::warn(format!("Balance: {sats} sats · pays no claim yet")),
+        Some(Ok((sats, claims))) => Piece::good(format!(
+            "Balance: {sats} sats · pays {claims} claim{}",
+            if *claims == 1 { "" } else { "s" }
         )),
-        Some(Ok((sats, claims))) => Line::from(Span::styled(
-            format!(
-                "Balance: {sats} sats · pays {claims} claim{}",
-                if *claims == 1 { "" } else { "s" }
-            ),
-            Style::default().fg(Color::Green),
-        )),
-        Some(Err(error)) => Line::from(dim(format!("Balance unread: {error}"))),
+        Some(Err(error)) => Piece::dim(format!("Balance unread: {error}")),
     }
 }
 
@@ -6293,54 +6607,61 @@ fn qr_line(row: &str, pad: usize) -> Line<'static> {
     ])
 }
 
+const POT_TITLE: &str = "ELECTRIC fee pot";
+const POT_FULL_TITLE: &str = "ELECTRIC fee pot · scan to fund · [F] or [Esc] back";
+
+/// #### PR #69: the fee pot full-screen's text, the two lines kept above a
+/// QR code under them, and the pot; or why there is no pot to show yet.
+#[allow(clippy::type_complexity)]
+fn pot_full_text(
+    state: &SetupFlow,
+) -> Result<(&ElectricPot, Vec<Vec<Piece>>, Vec<Vec<Piece>>), String> {
+    let pot = match &state.electric_pot {
+        Some((_, Ok(pot))) if !pot.checking => pot,
+        Some((_, Ok(_))) => return Err("Checking which fee pot mines…".into()),
+        Some((_, Err(error))) => return Err(error.clone()),
+        None => return Err("No fee pot yet: enter your payout address in the settings.".into()),
+    };
+    let text = vec![
+        vec![pot_balance(state)],
+        Vec::new(),
+        vec![Piece::warn(pot.address.clone())],
+        Vec::new(),
+        vec![Piece::plain("Send plain BCH here from your wallet.")],
+        vec![Piece::dim("It pays each claim's 1,000 sats and fee;")],
+        vec![Piece::dim("the 1,000 sats come back with the tokens.")],
+        Vec::new(),
+        vec![Piece::plain(format!("Refund key: {}", pot.key.display()))],
+        vec![Piece::dim("Back it up; only it can refund the pot.")],
+    ];
+    let head = vec![
+        vec![pot_balance(state)],
+        vec![Piece::warn(pot.address.clone())],
+    ];
+    Ok((pot, text, head))
+}
+
 /// #### PR #69: the fee pot full-screen (F), over the whole terminal: its
 /// balance, address and recovery key, and the largest whole QR code that
 /// fits, beside the text when there is width and under it otherwise.
 fn render_electric_pot_full(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
     let block = Block::default()
-        .title(" ELECTRIC fee pot · scan to fund · [F] or [Esc] back ")
+        .title(format!(" {POT_FULL_TITLE} "))
         .borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let message = |frame: &mut Frame<'_>, text: &str| {
-        frame.render_widget(
-            Paragraph::new(vec![Line::from(text.to_owned())]).wrap(Wrap { trim: false }),
-            inner,
-        );
-    };
-    let pot = match &state.electric_pot {
-        Some((_, Ok(pot))) if !pot.checking => pot,
-        Some((_, Ok(_))) => return message(frame, "Checking which fee pot mines…"),
-        Some((_, Err(error))) => return message(frame, error),
-        None => {
-            return message(
-                frame,
-                "No fee pot yet: enter your payout address in the settings.",
-            )
+    let (pot, text, head) = match pot_full_text(state) {
+        Ok(full) => full,
+        Err(message) => {
+            frame.render_widget(
+                Paragraph::new(vec![Line::from(message)]).wrap(Wrap { trim: false }),
+                inner,
+            );
+            return;
         }
     };
-    let text = vec![
-        pot_balance_line(state),
-        Line::from(""),
-        Line::from(Span::styled(
-            pot.address.clone(),
-            Style::default().fg(Color::Yellow),
-        )),
-        Line::from(""),
-        Line::from("Send plain BCH here from your wallet."),
-        Line::from(dim("It pays each claim's 1,000 sats and fee;")),
-        Line::from(dim("the 1,000 sats come back with the tokens.")),
-        Line::from(""),
-        Line::from(format!("Refund key: {}", pot.key.display())),
-        Line::from(dim("Back it up; only it can refund the pot.")),
-    ];
-    let head = vec![
-        pot_balance_line(state),
-        Line::from(Span::styled(
-            pot.address.clone(),
-            Style::default().fg(Color::Yellow),
-        )),
-    ];
+    let text: Vec<Line<'static>> = text.into_iter().map(line).collect();
+    let head: Vec<Line<'static>> = head.into_iter().map(line).collect();
     let head_rows: u16 = head
         .iter()
         .map(|line| {
@@ -6395,76 +6716,92 @@ fn render_electric_pot_full(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
+/// #### PR #58: ELECTRIC's fee pot panel: the lines above its QR code, the
+/// pot to fund when there is one (its QR code goes there), and the lines
+/// under it.
+#[allow(clippy::type_complexity)]
+fn pot_text(state: &SetupFlow) -> (Vec<Vec<Piece>>, Option<&ElectricPot>, Vec<Vec<Piece>>) {
+    match &state.electric_pot {
+        None => (
+            vec![
+                vec![Piece::plain("Enter your payout address.")],
+                vec![Piece::dim("Pickaxe then makes your fee pot")],
+                vec![Piece::dim("and shows it here to fund.")],
+            ],
+            None,
+            Vec::new(),
+        ),
+        Some((_, Err(error))) => (vec![vec![Piece::plain(error.clone())]], None, Vec::new()),
+        // #### PR #65: no address to fund until it is known which pot mines.
+        Some((_, Ok(pot))) if pot.checking => (
+            vec![
+                vec![Piece::plain("Checking which fee pot mines…")],
+                vec![Piece::dim("A previous funded pot with this key")],
+                vec![Piece::dim("is mined until it is migrated.")],
+                vec![Piece::plain(format!("Refund key: {}", pot.key.display()))],
+            ],
+            None,
+            Vec::new(),
+        ),
+        Some((_, Ok(pot))) => {
+            let mut head = Vec::new();
+            if pot.previous {
+                head.extend([
+                    vec![Piece::warn("Mining the previous funded pot")],
+                    vec![Piece::warn("until it is migrated.")],
+                    vec![Piece::dim("Refund it to fund the signed-claim pot.")],
+                ]);
+            }
+            // #### PR #53: what was read from the pot, first so it always shows.
+            head.push(vec![pot_balance(state)]);
+            head.extend([
+                vec![Piece::warn(pot.address.clone())],
+                vec![Piece::plain("Send plain BCH here from your wallet.")],
+                vec![Piece::dim("It pays each claim's 1,000 sats and fee;")],
+                vec![Piece::dim("the 1,000 sats come back with the tokens.")],
+            ]);
+            let tail = vec![
+                vec![Piece::plain(format!("Refund key: {}", pot.key.display()))],
+                vec![Piece::dim("Back it up; only it can refund the pot.")],
+            ];
+            (head, Some(pot), tail)
+        }
+    }
+}
+
 /// #### PR #58: ELECTRIC's fee pot, to fund before mining starts: its
 /// address, a QR code of it and where its recovery key is saved.
 /// #### PR #69: its balance and address come first, and its QR code shows
 /// only when it fits whole in `area`; otherwise F shows it full-screen.
 fn render_electric_pot(state: &SetupFlow, area: Rect) -> Paragraph<'static> {
     let block = Block::default()
-        .title(" ELECTRIC fee pot ")
+        .title(format!(" {POT_TITLE} "))
         .borders(Borders::ALL);
     let inner_width = usize::from(area.width.saturating_sub(2));
     let inner_height = usize::from(area.height.saturating_sub(2));
-    let lines = match &state.electric_pot {
-        None => vec![
-            Line::from("Enter your payout address."),
-            Line::from(dim("Pickaxe then makes your fee pot")),
-            Line::from(dim("and shows it here to fund.")),
-        ],
-        Some((_, Err(error))) => vec![Line::from(error.clone())],
-        // #### PR #65: no address to fund until it is known which pot mines.
-        Some((_, Ok(pot))) if pot.checking => vec![
-            Line::from("Checking which fee pot mines…"),
-            Line::from(dim("A previous funded pot with this key")),
-            Line::from(dim("is mined until it is migrated.")),
-            Line::from(format!("Refund key: {}", pot.key.display())),
-        ],
-        Some((_, Ok(pot))) => {
-            let mut lines = Vec::new();
-            if pot.previous {
-                let note = Style::default().fg(Color::Yellow);
-                lines.extend([
-                    Line::from(Span::styled("Mining the previous funded pot", note)),
-                    Line::from(Span::styled("until it is migrated.", note)),
-                    Line::from(dim("Refund it to fund the signed-claim pot.")),
-                ]);
-            }
-            // #### PR #53: what was read from the pot, first so it always shows.
-            lines.push(pot_balance_line(state));
-            lines.extend([
-                Line::from(Span::styled(
-                    pot.address.clone(),
-                    Style::default().fg(Color::Yellow),
-                )),
-                Line::from("Send plain BCH here from your wallet."),
-                Line::from(dim("It pays each claim's 1,000 sats and fee;")),
-                Line::from(dim("the 1,000 sats come back with the tokens.")),
-            ]);
-            let rows_before: usize = lines
-                .iter()
-                .map(|line| line.width().max(1).div_ceil(inner_width.max(1)))
-                .sum();
-            let qr_width = pot.qr.first().map_or(0, |row| row.chars().count());
-            // The QR code only whole: a cut or wrapped one cannot be scanned.
-            if !pot.qr.is_empty()
-                && qr_width <= inner_width
-                && rows_before + pot.qr.len() < inner_height
-            {
-                let pad = (inner_width - qr_width) / 2;
-                lines.extend(pot.qr.iter().map(|row| qr_line(row, pad)));
-            } else {
-                lines.push(Line::from(Span::styled(
-                    "[F] shows the QR code full-screen",
-                    Style::default().fg(Color::Yellow),
-                )));
-            }
-            lines.extend([
-                Line::from(format!("Refund key: {}", pot.key.display())),
-                Line::from(dim("Back it up; only it can refund the pot.")),
-            ]);
-            lines
+    let (head, pot, tail) = pot_text(state);
+    let mut lines: Vec<Line<'static>> = head.into_iter().map(line).collect();
+    if let Some(pot) = pot {
+        let rows_before: usize = lines
+            .iter()
+            .map(|line| line.width().max(1).div_ceil(inner_width.max(1)))
+            .sum();
+        let qr_width = pot.qr.first().map_or(0, |row| row.chars().count());
+        // The QR code only whole: a cut or wrapped one cannot be scanned.
+        if !pot.qr.is_empty()
+            && qr_width <= inner_width
+            && rows_before + pot.qr.len() < inner_height
+        {
+            let pad = (inner_width - qr_width) / 2;
+            lines.extend(pot.qr.iter().map(|row| qr_line(row, pad)));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "[F] shows the QR code full-screen",
+                Style::default().fg(Color::Yellow),
+            )));
         }
-    };
+    }
+    lines.extend(tail.into_iter().map(line));
     Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false })
@@ -6499,138 +6836,181 @@ impl ElectricPot {
     }
 }
 
-/// The GPU list: one checkbox per GPU that can mine.
-fn render_setup_gpus(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
-    let mut lines = state
+const GPUS_TITLE: &str = "GPUs";
+
+/// The GPU list: one checkbox per GPU that can mine, then two notes.
+fn gpu_items(state: &SetupFlow) -> Vec<SetupItem> {
+    let mut items = state
         .devices
         .iter()
         .zip(&state.chosen)
         .enumerate()
         .map(|(index, (device, chosen))| {
-            Line::from(vec![
-                Span::raw(format!(
-                    "{} {} {:<40} ",
-                    selection_marker(index == state.selected),
-                    if *chosen { "[x]" } else { "[ ]" },
-                    device.name
-                )),
-                dim(format!(
-                    "{}:{} · {}",
-                    device.backend.as_str().to_ascii_uppercase(),
-                    device.index,
-                    if device.integrated {
-                        "integrated"
-                    } else {
-                        "discrete"
-                    }
-                )),
-            ])
+            SetupItem::new(
+                Target::Gpu(index),
+                ItemKind::Toggle { on: *chosen },
+                device.name.clone(),
+                index == state.selected,
+            )
+            .with_value(vec![Piece::dim(format!(
+                "{}:{} · {}",
+                device.backend.as_str().to_ascii_uppercase(),
+                device.index,
+                if device.integrated {
+                    "integrated"
+                } else {
+                    "discrete"
+                }
+            ))])
         })
         .collect::<Vec<_>>();
-    lines.extend([
-        Line::from(""),
-        Line::from(dim(
+    items.extend([
+        SetupItem::info(Vec::new()),
+        SetupItem::info(vec![Piece::dim(
             "Every ticked GPU mines the same job for your address, so they never compete.",
-        )),
-        Line::from(dim(
+        )]),
+        SetupItem::info(vec![Piece::dim(
             "An integrated GPU shares the CPU's power and memory; it adds little on most PCs.",
-        )),
+        )]),
     ]);
+    items
+}
+
+/// The GPU list: one checkbox per GPU that can mine.
+fn render_setup_gpus(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+    let lines = gpu_items(state)
+        .into_iter()
+        .map(|item| match item.kind {
+            ItemKind::Toggle { on } => item_line(
+                format!(
+                    "{} {} {:<40} ",
+                    selection_marker(item.selected),
+                    if on { "[x]" } else { "[ ]" },
+                    item.label
+                ),
+                item,
+            ),
+            _ => line(item.value),
+        })
+        .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().title(" GPUs ").borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title(format!(" {GPUS_TITLE} "))
+                    .borders(Borders::ALL),
+            )
             .wrap(Wrap { trim: false }),
         area,
     );
 }
 
-fn render_setup_connections(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+/// The connection list's title: Fulcrum servers or BCH nodes, and the
+/// network.
+fn connections_title(state: &SetupFlow) -> String {
+    format!(
+        "{} · {} · shared by all profiles",
+        match state.connection_kind {
+            ConnectionKind::Fulcrum => "Fulcrum servers",
+            ConnectionKind::Node => "BCH nodes",
+        },
+        network_label(state.config.network)
+    )
+}
+
+/// The connection list's rows in the cursor's order, under a heading: the
+/// saved servers or nodes, "+ add", the node on this PC, then what the
+/// searches found that Enter adds.
+fn connection_items(state: &SetupFlow) -> Vec<SetupItem> {
     let network = state.config.network;
     let saved = state.sources.list(network, state.connection_kind);
-    let mut lines = vec![Line::from(vec![
-        Span::raw("Yours "),
-        dim("(tried first, unless also built in):"),
+    let mut items = vec![SetupItem::info(vec![
+        Piece::plain("Yours "),
+        Piece::dim("(tried first, unless also built in):"),
     ])];
     for (index, entry) in saved.iter().enumerate() {
-        let selected = state.connection_selected == index;
-        let editing = selected && state.editing == Some(TextField::Connection);
-        let shown = if editing {
-            format!("{}_", state.text_input)
-        } else {
-            crate::node::redact_url(entry)
-        };
-        let mut line = vec![Span::raw(format!("{} {shown}", selection_marker(selected)))];
+        let mut item = SetupItem::new(
+            Target::Connection(index),
+            ItemKind::Text,
+            crate::node::redact_url(entry),
+            state.connection_selected == index,
+        );
         // #### PR #42: what the check of a saved node found.
-        if state.connection_kind == ConnectionKind::Node && !editing {
-            line.push(Span::raw("  "));
-            line.push(match state.node_checks.get(entry) {
-                Some(check @ crate::node::NodeCheck::Ready { .. }) => Span::raw(check.summary()),
-                Some(check) => dim(check.summary()),
-                None if state.node_checks_rx.is_some() => dim("checking…"),
-                None => dim(""),
-            });
+        if state.connection_kind == ConnectionKind::Node {
+            item.value = vec![match state.node_checks.get(entry) {
+                Some(check @ crate::node::NodeCheck::Ready { .. }) => Piece::plain(check.summary()),
+                Some(check) => Piece::dim(check.summary()),
+                None if state.node_checks_rx.is_some() => Piece::dim("checking…"),
+                None => Piece::dim(""),
+            }];
         }
-        lines.push(Line::from(line));
+        items.push(item);
     }
-    let adding = state.connection_selected == saved.len();
-    let add_label = match state.connection_kind {
-        ConnectionKind::Fulcrum => "+ add server",
-        ConnectionKind::Node => "+ add node",
-    };
-    lines.push(Line::from(format!(
-        "{} {}",
-        selection_marker(adding),
-        if adding && state.editing == Some(TextField::Connection) {
-            format!("{}_", state.text_input)
-        } else {
-            add_label.to_string()
-        }
-    )));
+    items.push(SetupItem::new(
+        Target::Connection(saved.len()),
+        ItemKind::Text,
+        match state.connection_kind {
+            ConnectionKind::Fulcrum => "+ add server",
+            ConnectionKind::Node => "+ add node",
+        },
+        state.connection_selected == saved.len(),
+    ));
     if let Some(info) = state.local_node_offer() {
-        lines.push(Line::from(format!(
-            "{} Use the node on this PC: {}",
-            selection_marker(state.connection_selected == saved.len() + 1),
-            info.summary()
-        )));
+        items.push(
+            SetupItem::new(
+                Target::Connection(saved.len() + 1),
+                ItemKind::Action,
+                "Use the node on this PC",
+                state.connection_selected == saved.len() + 1,
+            )
+            .with_value(vec![Piece::plain(info.summary())]),
+        );
     }
-    // #### PR #42: what the searches found that Enter adds, then the field
-    // F or C opened.
+    // #### PR #42: what the searches found that Enter adds.
     let first_offer = saved.len() + 1 + usize::from(state.local_node_offer().is_some());
     for (position, (place, found)) in state.found_offers().iter().enumerate() {
-        lines.push(Line::from(format!(
-            "{} Add from {place}: {}",
-            selection_marker(state.connection_selected == first_offer + position),
-            found.summary()
-        )));
+        items.push(
+            SetupItem::new(
+                Target::Connection(first_offer + position),
+                ItemKind::Action,
+                format!("Add from {place}"),
+                state.connection_selected == first_offer + position,
+            )
+            .with_value(vec![Piece::plain(found.summary())]),
+        );
     }
+    items
+}
+
+/// What the field F or C opened on the connection list asks for.
+fn edit_prompt(state: &SetupFlow) -> Option<String> {
     match state.editing {
-        Some(TextField::Computer) => lines.push(Line::from(format!(
-            "Computer (name, .local name or address): {}_",
-            state.text_input
-        ))),
-        Some(TextField::CookieFile) => {
-            if let Some((host, port)) = state.selected_node_endpoint() {
-                lines.push(Line::from(format!(
-                    "Cookie file for {host}:{port} (empty: none): {}_",
-                    state.text_input
-                )));
-            }
-        }
-        _ => {}
+        Some(TextField::Computer) => Some("Computer (name, .local name or address)".into()),
+        Some(TextField::CookieFile) => state
+            .selected_node_endpoint()
+            .map(|(host, port)| format!("Cookie file for {host}:{port} (empty: none)")),
+        _ => None,
     }
-    lines.push(Line::from(""));
+}
+
+/// The connection list's notes under its rows: the built-in servers, or
+/// what the check of this computer found and how to make a node answer;
+/// and the searches.
+fn connection_notes(state: &SetupFlow) -> Vec<Vec<Piece>> {
+    let network = state.config.network;
+    let mut lines = Vec::new();
     match state.connection_kind {
         ConnectionKind::Fulcrum => {
-            lines.push(Line::from(vec![
-                Span::raw("Built-in "),
-                dim("(health-ranked once mining starts):"),
-            ]));
+            lines.push(vec![
+                Piece::plain("Built-in "),
+                Piece::dim("(health-ranked once mining starts):"),
+            ]);
             let builtin = match network {
                 MiningNetwork::Mainnet => crate::protocol::FULCRUM_WSS_BOOTSTRAP,
                 MiningNetwork::Chipnet => crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP,
             };
             for endpoint in builtin {
-                lines.push(Line::from(dim(format!("  {endpoint}"))));
+                lines.push(vec![Piece::dim(format!("  {endpoint}"))]);
             }
             // #### PR #42: the searches.
             found_lines(state, &mut lines);
@@ -6643,67 +7023,101 @@ fn render_setup_connections(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow
             let local = crate::node::local_node_url(network).trim_start_matches("http://");
             match &state.local_node {
                 LocalNodeCheck::Running(checked, _) if *checked == network => {
-                    lines.push(Line::from(dim(format!(
+                    lines.push(vec![Piece::dim(format!(
                         "Looking for a BCH node on this PC ({local})..."
-                    ))))
+                    ))])
                 }
                 LocalNodeCheck::Done(checked, result) if *checked == network => match result {
                     crate::node::LocalNode::Found(info) if info.network() == Some(network) => {
                         if state.local_node_offer().is_none() {
-                            lines.push(Line::from(dim(format!(
+                            lines.push(vec![Piece::dim(format!(
                                 "On this PC: {} (saved)",
                                 info.summary()
-                            ))));
+                            ))]);
                         }
                     }
-                    crate::node::LocalNode::Found(_) => lines.push(Line::from(dim(format!(
+                    crate::node::LocalNode::Found(_) => lines.push(vec![Piece::dim(format!(
                         "The node on this PC ({local}) is not on {}.",
                         network_label(network)
-                    )))),
+                    ))]),
                     crate::node::LocalNode::NeedsLogin => {
-                        lines.push(Line::from(dim(format!(
+                        lines.push(vec![Piece::dim(format!(
                             "A BCH node answers on this PC ({local}) but wants its RPC login:"
-                        ))));
-                        lines.push(Line::from(dim(format!(
+                        ))]);
+                        lines.push(vec![Piece::dim(format!(
                             "add it as http://USER:PASSWORD@{local}"
-                        ))));
+                        ))]);
                     }
-                    crate::node::LocalNode::Missing => lines.push(Line::from(dim(format!(
+                    crate::node::LocalNode::Missing => lines.push(vec![Piece::dim(format!(
                         "No BCH node answers on this PC ({local})."
-                    )))),
+                    ))]),
                 },
                 _ => {}
             }
             // #### PR #42: the rest of this computer: nodes on other ports,
             // Fulcrum servers and ZMQ block notices.
             found_lines(state, &mut lines);
-            lines.push(Line::from(dim(
+            lines.push(vec![Piece::dim(
                 "There are no public nodes: node RPC is private.",
-            )));
-            lines.push(Line::from(dim(match network {
+            )]);
+            lines.push(vec![Piece::dim(match network {
                 MiningNetwork::Mainnet => {
                     "Bitcoin Cash Node on this PC answers with server=1 in bitcoin.conf; Pickaxe reads its cookie, so no password is needed."
                 }
                 MiningNetwork::Chipnet => {
                     "Bitcoin Cash Node on this PC answers with server=1 and chipnet=1 in bitcoin.conf; Pickaxe reads its cookie, so no password is needed."
                 }
-            })));
-            lines.push(Line::from(dim(
+            })]);
+            lines.push(vec![Piece::dim(
                 "A node on another computer needs its RPC login: http://USER:PASSWORD@HOST:PORT.",
-            )));
+            )]);
         }
     }
-    let title = format!(
-        " {} · {} · shared by all profiles ",
-        match state.connection_kind {
-            ConnectionKind::Fulcrum => "Fulcrum servers",
-            ConnectionKind::Node => "BCH nodes",
-        },
-        network_label(network)
-    );
+    lines
+}
+
+fn render_setup_connections(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+    let saved = state
+        .sources
+        .list(state.config.network, state.connection_kind)
+        .len();
+    let mut lines = Vec::new();
+    for item in connection_items(state) {
+        let Target::Connection(index) = item.target else {
+            lines.push(line(item.value));
+            continue;
+        };
+        let marker = selection_marker(item.selected);
+        let editing = item.selected && state.editing == Some(TextField::Connection);
+        let typed = format!("{}_", state.text_input);
+        if index < saved {
+            let shown = if editing { typed } else { item.label.clone() };
+            let mut spans = vec![Span::raw(format!("{marker} {shown}"))];
+            if !item.value.is_empty() && !editing {
+                spans.push(Span::raw("  "));
+                spans.extend(item.value.into_iter().map(span));
+            }
+            lines.push(Line::from(spans));
+        } else if index == saved {
+            let shown = if editing { typed } else { item.label };
+            lines.push(Line::from(format!("{marker} {shown}")));
+        } else {
+            lines.push(item_line(format!("{marker} {}: ", item.label), item));
+        }
+    }
+    // #### PR #42: the field F or C opened.
+    if let Some(prompt) = edit_prompt(state) {
+        lines.push(Line::from(format!("{prompt}: {}_", state.text_input)));
+    }
+    lines.push(Line::from(""));
+    lines.extend(connection_notes(state).into_iter().map(line));
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().title(title).borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title(format!(" {} ", connections_title(state)))
+                    .borders(Borders::ALL),
+            )
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -6713,19 +7127,19 @@ fn render_setup_connections(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow
 /// cannot add: on the BCH node list everything else (a Fulcrum server, ZMQ,
 /// a node on another chain or not answering), on the Fulcrum list a server
 /// that is not a Fulcrum Pickaxe can use; nothing saved already.
-fn found_lines(state: &SetupFlow, lines: &mut Vec<Line<'static>>) {
+fn found_lines(state: &SetupFlow, lines: &mut Vec<Vec<Piece>>) {
     use crate::node_find::Found;
     let node_list = state.connection_kind == ConnectionKind::Node;
     if state.finder.is_some() {
-        lines.push(Line::from(dim(
+        lines.push(vec![Piece::dim(
             "Looking for other nodes and Fulcrum servers on this PC...",
-        )));
+        )]);
     }
     if let Some(search) = &state.finder_there {
-        lines.push(Line::from(dim(format!(
+        lines.push(vec![Piece::dim(format!(
             "Looking for nodes and Fulcrum servers on {}...",
             search.label
-        ))));
+        ))]);
     }
     let saved = state
         .sources
@@ -6743,7 +7157,7 @@ fn found_lines(state: &SetupFlow, lines: &mut Vec<Line<'static>>) {
             (Found::Fulcrum { report: Err(_), .. }, _) | (_, true) => found.summary(),
             (_, false) => continue,
         };
-        lines.push(Line::from(dim(format!("On {place}: {shown}"))));
+        lines.push(vec![Piece::dim(format!("On {place}: {shown}"))]);
     }
     if let Some((at, label, there)) = &state.found_there {
         let nothing = if node_list {
@@ -6754,51 +7168,75 @@ fn found_lines(state: &SetupFlow, lines: &mut Vec<Line<'static>>) {
                 .any(|found| matches!(found, Found::Fulcrum { .. }))
         };
         if *at == state.config.network && nothing {
-            lines.push(Line::from(dim(format!(
+            lines.push(vec![Piece::dim(format!(
                 "Nothing answers on {label} at the usual ports."
-            ))));
+            ))]);
+        }
+    }
+}
+
+/// The Tailscale list's title.
+fn tailscale_title(state: &SetupFlow) -> String {
+    format!(
+        "Tailscale computers · {}",
+        network_label(state.config.network)
+    )
+}
+
+/// #### PR #42: the Tailscale network's computers that are online, or why
+/// none shows.
+fn tailscale_items(state: &SetupFlow) -> Vec<SetupItem> {
+    match &state.tailscale {
+        _ if state.tailscale_rx.is_some() => vec![SetupItem::info(vec![Piece::dim(
+            "Asking Tailscale for its computers...",
+        )])],
+        None => Vec::new(),
+        Some(Err(error)) => vec![
+            SetupItem::info(vec![Piece::plain(format!("{error}."))]),
+            SetupItem::info(vec![Piece::dim(
+                "Sign in to Tailscale, or press [F] on the list to type a computer's name or address.",
+            )]),
+        ],
+        Some(Ok(peers)) if peers.is_empty() => vec![SetupItem::info(vec![Piece::dim(
+            "No other computer of your Tailscale network is online.",
+        )])],
+        Some(Ok(peers)) => {
+            let mut items = vec![SetupItem::info(vec![Piece::dim(
+                "Online computers of your Tailscale network:",
+            )])];
+            items.extend(peers.iter().enumerate().map(|(index, peer)| {
+                SetupItem::new(
+                    Target::Peer(index),
+                    ItemKind::Choice,
+                    peer.name.clone(),
+                    index == state.tailscale_selected,
+                )
+                .with_value(vec![Piece::plain(peer.address.clone())])
+            }));
+            items
         }
     }
 }
 
 /// #### PR #42: the Tailscale network's computers that are online.
 fn render_setup_tailscale(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
-    let mut lines = Vec::new();
-    match &state.tailscale {
-        _ if state.tailscale_rx.is_some() => {
-            lines.push(Line::from(dim("Asking Tailscale for its computers...")))
-        }
-        None => {}
-        Some(Err(error)) => {
-            lines.push(Line::from(format!("{error}.")));
-            lines.push(Line::from(dim(
-                "Sign in to Tailscale, or press [F] on the list to type a computer's name or address.",
-            )));
-        }
-        Some(Ok(peers)) if peers.is_empty() => lines.push(Line::from(dim(
-            "No other computer of your Tailscale network is online.",
-        ))),
-        Some(Ok(peers)) => {
-            lines.push(Line::from(dim(
-                "Online computers of your Tailscale network:",
-            )));
-            for (index, peer) in peers.iter().enumerate() {
-                lines.push(Line::from(format!(
-                    "{} {}  {}",
-                    selection_marker(index == state.tailscale_selected),
-                    peer.name,
-                    peer.address
-                )));
-            }
-        }
-    }
-    let title = format!(
-        " Tailscale computers · {} ",
-        network_label(state.config.network)
-    );
+    let lines = tailscale_items(state)
+        .into_iter()
+        .map(|item| match item.kind {
+            ItemKind::Info => line(item.value),
+            _ => item_line(
+                format!("{} {}  ", selection_marker(item.selected), item.label),
+                item,
+            ),
+        })
+        .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().title(title).borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title(format!(" {} ", tailscale_title(state)))
+                    .borders(Borders::ALL),
+            )
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -8136,7 +8574,7 @@ pub(crate) fn event_log_text(event: &RuntimeEvent) -> String {
 }
 
 /// Removes embedded credentials from a displayed endpoint.
-fn redact_endpoint(input: &str) -> String {
+pub(crate) fn redact_endpoint(input: &str) -> String {
     let Some((scheme, rest)) = input.split_once("://") else {
         return input.into();
     };

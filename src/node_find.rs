@@ -212,7 +212,7 @@ pub fn tailscale_peers_from(status: &serde_json::Value) -> Vec<TailscalePeer> {
 
 /// Asks the `tailscale` command on this computer for its online computers.
 pub fn tailscale_peers() -> Result<Vec<TailscalePeer>, String> {
-    let mut child = std::process::Command::new("tailscale")
+    let mut child = crate::child_process::command("tailscale")
         .args(["status", "--json"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

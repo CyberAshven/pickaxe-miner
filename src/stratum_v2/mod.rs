@@ -66,6 +66,9 @@ mod template_tests;
 pub mod transport;
 #[cfg(feature = "stratum-v2")]
 pub mod wire;
+// The server shown somewhere other than the terminal (`pickaxe gui`).
+#[cfg(feature = "stratum-v2")]
+pub mod view;
 #[cfg(feature = "stratum-v2")]
 mod work_allocation;
 #[cfg(feature = "stratum-v2")]
