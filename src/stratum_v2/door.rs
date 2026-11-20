@@ -4,20 +4,23 @@
 //! each connection is relayed to your own P2Pool node (on this computer
 //! only) over its own pinned SV2 link, and each channel opens there under
 //! its miner's own payout identity (`sv1::miner_login`), never the
-//! owner's. Jobs, targets and verdicts pass through unchanged; P2Pool
-//! builds the blocks and checks every share. While P2Pool serves no work,
-//! new connections go to the first fallback pool that takes them, and come
-//! back as SV1 devices do (`sv1::Preferred`).
+//! owner's, with a second channel under the donation's identity for the
+//! Pickaxe donation's share of the device's work (`relay`). P2Pool builds
+//! the blocks and checks every share. While P2Pool serves no work, new
+//! connections go to the first fallback pool that takes them, and come back
+//! as SV1 devices do (`sv1::Preferred`).
+
+mod relay;
 
 use super::{
     server::{self, ServerStats},
-    sv1::{miner_login, MinerLogins, Upstream, P2PKH_ONLY},
+    sv1::Upstream,
     telemetry::ShareEvent,
     transport::{Receiver, Sender, Session},
     wire::encoded,
 };
+use relay::{Out, Relay};
 use std::{
-    collections::BTreeMap,
     io,
     net::{TcpListener, TcpStream, ToSocketAddrs},
     sync::{
@@ -25,7 +28,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use stratum_core::{
     binary_sv2,
@@ -34,12 +37,9 @@ use stratum_core::{
         Protocol, SetupConnection, SetupConnectionError, MESSAGE_TYPE_SETUP_CONNECTION,
         MESSAGE_TYPE_SETUP_CONNECTION_ERROR, MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
     },
-    mining_sv2::*,
 };
 
 const MAX_CONNECTIONS: usize = 64;
-/// Channel requests of one connection the pool has not answered yet.
-const MAX_OPENING: usize = 256;
 const DEADLINE: Duration = Duration::from_secs(10);
 /// SetupConnection's flag for a client that sets its own jobs (Job
 /// Declaration): not taken through the door.
@@ -47,6 +47,8 @@ const REQUIRES_WORK_SELECTION: u32 = 0b010;
 /// Why a session at your own P2Pool node ends while it serves no work: the
 /// solo server's own reason, as the SV1 adapter gives it.
 const NOT_SERVING: &str = "template source unavailable; reconnect when healthy";
+/// How often the relay moves devices between lanes.
+const TICK: Duration = Duration::from_millis(250);
 
 /// Serves SV2 devices on `listener` with this server's key
 /// (`authority_secret`), relaying each to the first of `upstreams` that
@@ -123,16 +125,6 @@ pub fn run(
     result
 }
 
-/// What the door knows of one relayed connection's channels, for the
-/// workers page: each channel's share target, and the usernames of the
-/// channels being opened.
-#[derive(Default)]
-struct Channels {
-    opening: BTreeMap<u32, String>,
-    targets: BTreeMap<u32, [u8; 32]>,
-    named: bool,
-}
-
 fn serve(
     stream: TcpStream,
     upstreams: &[Upstream],
@@ -190,7 +182,8 @@ fn serve(
         return Err(failure);
     };
     down_send.send(reply)?;
-    let mut channels = Channels::default();
+    let mut relay = Relay::new(upstream.miners, upstream.donation.clone());
+    let mut ticked = Instant::now();
     let result = (|| {
         while !stop.load(Ordering::Relaxed) {
             let now = Instant::now();
@@ -205,25 +198,73 @@ fn serve(
             if upstream.down(now) {
                 return Err(NOT_SERVING.to_owned());
             }
+            let mut out = Vec::new();
             if let Some(frame) = down_receive.receive(Duration::from_millis(1))? {
-                from_device(
-                    frame,
-                    upstream.miners,
-                    &mut channels,
-                    &mut up_send,
-                    &mut down_send,
-                )?;
+                out.extend(relay.device_frame(frame)?);
             }
             if let Some(frame) = up_receive.receive(Duration::from_millis(1))? {
-                observe(&frame, &mut channels, stats, device);
-                down_send.send(frame)?;
+                out.extend(relay.pool_frame(frame, unix_now())?);
             }
+            if now.saturating_duration_since(ticked) >= TICK {
+                ticked = now;
+                out.extend(relay.tick(now)?);
+            }
+            for frame in out {
+                match frame {
+                    Out::Up(frame) => up_send.send(frame)?,
+                    Out::Down(frame) => down_send.send(frame)?,
+                }
+            }
+            note(&mut relay, stats, device);
         }
         Ok(())
     })();
     up_send.close();
     down_send.close();
     result
+}
+
+/// Unix time in seconds, for the own donation's buckets.
+fn unix_now() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |time| u32::try_from(time.as_secs()).unwrap_or(u32::MAX))
+}
+
+/// What the relay learned, onto the workers page.
+/// The donation terms come with each tick (`Relay::tick`), the rest as it
+/// happens.
+fn note(relay: &mut Relay, stats: &Mutex<ServerStats>, device: u64) {
+    let noted = std::mem::take(&mut relay.noted);
+    if noted.name.is_none() && noted.verdicts.is_empty() && noted.terms.is_none() {
+        return;
+    }
+    let Ok(mut stats) = stats.lock() else {
+        return;
+    };
+    if let Some(name) = &noted.name {
+        stats.device_stats.set_worker(device, name);
+    }
+    if noted.terms.is_some() {
+        stats.device_stats.set_donation(device, noted.terms);
+    }
+    if noted.verdicts.is_empty() {
+        return;
+    }
+    stats.pool_work.merge(noted.work);
+    for verdict in noted.verdicts {
+        match verdict {
+            ShareEvent::Accepted(_) => {
+                stats.shares_accepted = stats.shares_accepted.saturating_add(1)
+            }
+            ShareEvent::Rejected(_) => {
+                stats.shares_rejected = stats.shares_rejected.saturating_add(1)
+            }
+        }
+        stats
+            .device_stats
+            .share(device, verdict, false, Instant::now());
+    }
 }
 
 fn setup_error(flags: u32, code: &str) -> Result<SerializedFrame, String> {
@@ -261,223 +302,17 @@ fn open(
     Ok((send, receive, reply))
 }
 
-/// The code a refused username is answered with: P2Pool's and SV2's own
-/// codes where they exist.
-fn refusal_code(reason: &str) -> &'static str {
-    if reason == super::payout::DONATION_OPTION_ERROR {
-        "invalid-donation"
-    } else if reason == P2PKH_ONLY {
-        "p2pkh-payout-required"
-    } else if reason.starts_with("p2p=") {
-        "invalid-share-address"
-    } else {
-        "unknown-user"
-    }
-}
-
-/// One frame from the device: a channel opens under its miner's identity
-/// upstream (or is refused here, with the reason's code); custom jobs are
-/// refused; everything else goes upstream as it is.
-fn from_device(
-    mut frame: SerializedFrame,
-    miners: Option<MinerLogins>,
-    channels: &mut Channels,
-    up: &mut Sender,
-    down: &mut Sender,
-) -> Result<(), String> {
-    let kind = frame.header().msg_type();
-    let extension = frame.header().ext_type_without_channel_msg();
-    if extension != 0 {
-        return up.send(frame);
-    }
-    // A public port: requests the pool has not answered stay few.
-    if channels.opening.len() >= MAX_OPENING
-        && matches!(
-            kind,
-            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL | MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL
-        )
-    {
-        return Err("too many channel requests".into());
-    }
-    let identity = |name: &str| match miners {
-        Some(logins) => miner_login(logins, name)
-            .map(|login| login.identity)
-            .map_err(|reason| refusal_code(&reason)),
-        None => Ok(name.to_owned()),
-    };
-    let refuse = |down: &mut Sender, request_id: u32, code: &str| {
-        down.send(encoded(
-            OpenMiningChannelError {
-                request_id,
-                error_code: code.try_into().map_err(|_| "invalid channel error")?,
-            },
-            MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR,
-            false,
-        )?)
-    };
-    match kind {
-        MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL => {
-            let mut request: OpenExtendedMiningChannel =
-                binary_sv2::from_bytes(frame.payload()).map_err(|_| "malformed channel request")?;
-            let name = request.user_identity.as_utf8_or_hex();
-            match identity(&name) {
-                Ok(upstream) => {
-                    channels.opening.insert(request.request_id, name);
-                    request.user_identity = upstream
-                        .as_str()
-                        .try_into()
-                        .map_err(|_| "identity too long")?;
-                    up.send(encoded(
-                        request,
-                        MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
-                        false,
-                    )?)
-                }
-                Err(code) => refuse(down, request.request_id, code),
-            }
-        }
-        MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL => {
-            let mut request: OpenStandardMiningChannel =
-                binary_sv2::from_bytes(frame.payload()).map_err(|_| "malformed channel request")?;
-            let name = request.user_identity.as_utf8_or_hex();
-            let request_id = request.request_id;
-            match identity(&name) {
-                Ok(upstream) => {
-                    channels.opening.insert(request_id, name);
-                    request.user_identity = upstream
-                        .as_str()
-                        .try_into()
-                        .map_err(|_| "identity too long")?;
-                    up.send(encoded(
-                        request,
-                        MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL,
-                        false,
-                    )?)
-                }
-                Err(code) => refuse(down, request_id, code),
-            }
-        }
-        MESSAGE_TYPE_SET_CUSTOM_MINING_JOB | MESSAGE_TYPE_SETUP_CONNECTION => {
-            Err("unexpected device message".into())
-        }
-        _ => up.send(frame),
-    }
-}
-
-/// Notes what an upstream frame means for the workers page: a channel's
-/// target, the device's name, the pool's verdicts on its shares.
-fn observe(
-    frame: &SerializedFrame,
-    channels: &mut Channels,
-    stats: &Mutex<ServerStats>,
-    device: u64,
-) {
-    let kind = frame.header().msg_type();
-    if frame.header().ext_type_without_channel_msg() != 0
-        || !matches!(
-            kind,
-            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS
-                | MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS
-                | MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR
-                | MESSAGE_TYPE_SET_TARGET
-                | MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS
-                | MESSAGE_TYPE_SUBMIT_SHARES_ERROR
-        )
-    {
-        return;
-    }
-    // Read from a copy: the frame goes on to the device as it came.
-    let mut copy = frame.clone();
-    let payload = copy.payload();
-    let target = |bytes: &[u8]| -> Option<[u8; 32]> { bytes.try_into().ok() };
-    let mut verdicts = Vec::new();
-    let mut named = None;
-    match kind {
-        MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS => {
-            if let Ok(open) = binary_sv2::from_bytes::<OpenExtendedMiningChannelSuccess>(payload) {
-                if let Some(value) = target(open.target.as_ref()) {
-                    channels.targets.insert(open.channel_id, value);
-                }
-                named = channels.opening.remove(&open.request_id);
-            }
-        }
-        MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS => {
-            if let Ok(open) = binary_sv2::from_bytes::<OpenStandardMiningChannelSuccess>(payload) {
-                if let Some(value) = target(open.target.as_ref()) {
-                    channels.targets.insert(open.channel_id, value);
-                }
-                named = channels.opening.remove(&open.request_id);
-            }
-        }
-        MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR => {
-            if let Ok(error) = binary_sv2::from_bytes::<OpenMiningChannelError>(payload) {
-                channels.opening.remove(&error.request_id);
-            }
-        }
-        MESSAGE_TYPE_SET_TARGET => {
-            if let Ok(set) = binary_sv2::from_bytes::<SetTarget>(payload) {
-                if let Some(value) = target(set.maximum_target.as_ref()) {
-                    channels.targets.insert(set.channel_id, value);
-                }
-            }
-        }
-        MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS => {
-            if let Ok(ack) = binary_sv2::from_bytes::<SubmitSharesSuccess>(payload) {
-                let value = channels
-                    .targets
-                    .get(&ack.channel_id)
-                    .copied()
-                    .unwrap_or([0xff; 32]);
-                let count = ack.new_submits_accepted_count.min(1024);
-                verdicts.extend((0..count).map(|_| ShareEvent::Accepted(value)));
-            }
-        }
-        MESSAGE_TYPE_SUBMIT_SHARES_ERROR => {
-            if let Ok(error) = binary_sv2::from_bytes::<SubmitSharesError>(payload) {
-                verdicts.push(ShareEvent::Rejected(match error.error_code.as_ref() {
-                    b"stale-share" => "stale-share",
-                    b"duplicate-share" => "duplicate-share",
-                    b"difficulty-too-low" => "difficulty-too-low",
-                    b"invalid-job-id" => "invalid-job-id",
-                    _ => "rejected-by-pool",
-                }));
-            }
-        }
-        _ => (),
-    }
-    if named.is_none() && verdicts.is_empty() {
-        return;
-    }
-    let Ok(mut stats) = stats.lock() else {
-        return;
-    };
-    if let Some(name) = named.filter(|_| !channels.named) {
-        stats.device_stats.set_worker(device, &name);
-        channels.named = true;
-    }
-    for verdict in verdicts {
-        match verdict {
-            ShareEvent::Accepted(_) => {
-                stats.shares_accepted = stats.shares_accepted.saturating_add(1)
-            }
-            ShareEvent::Rejected(_) => {
-                stats.shares_rejected = stats.shares_rejected.saturating_add(1)
-            }
-        }
-        stats
-            .device_stats
-            .share(device, verdict, false, Instant::now());
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::relay::refusal_code;
     use super::*;
     use crate::config::MiningNetwork;
+    use crate::stratum_v2::sv1::{miner_login, MinerLogins, P2PKH_ONLY};
     use serde_json::{json, Value};
     use std::io::{BufRead, Write};
     use std::net::SocketAddr;
     use stratum_core::common_messages_sv2::SetupConnectionSuccess;
+    use stratum_core::mining_sv2::*;
 
     /// A Chipnet address of the given CashAddr version: 0 is P2PKH (q), 8
     /// is P2SH (p).

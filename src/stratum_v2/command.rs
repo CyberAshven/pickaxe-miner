@@ -2338,8 +2338,8 @@ fn connect_text(page: &ConnectPage) -> String {
              pays shares to a key (the prefix may be left out), optionally followed by \
              .name. P2Pool runs here: every block found pays everyone mining here by their \
              work, minus the Pickaxe donation, P2Pool's donation and your fee. Adding \
-             ,donation=<percent> (0 to 100 in 0.5% steps) sets that miner's own Pickaxe \
-             donation, mined as work.\n"
+             ,donation=<percent> (0 to 100 in 0.5% steps) raises that miner's Pickaxe \
+             donation above yours, never lowers it; it is mined as work.\n"
         }
     });
     // #### PR #42: where miners' own templates go.

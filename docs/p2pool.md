@@ -227,11 +227,22 @@ pickaxe stratum-v2 serve --config pool.json --network chipnet \
   opens its SV2 channel (`p2pkh-payout-required`), with the reason. A `p2p=`
   in the login must be the payout's own share address.
 - **Four cuts, never mixed:** the Pickaxe donation (yours to pay, as the one
-  running Pickaxe: your donation setting, or a miner's own `,donation=`,
-  mined as work on a second channel under the donation key's share
-  address); P2Pool's donation (`--p2pool-donation`, your choice as its
+  running Pickaxe: your donation setting, or a miner's `,donation=` when
+  higher, never both and never lower, a typed `,pickaxe-donation=0`
+  included), mined as work on a second channel under the donation key's
+  share address, for SV1 devices (the adapter) and SV2 devices (the door)
+  alike; P2Pool's donation (`--p2pool-donation`, your choice as its
   runner); your fee; the miner keeps the rest. A miner's `,donation=` never
-  reaches P2Pool.
+  reaches P2Pool. Another Pickaxe joining through the door donates on its
+  own donation channel; the door credits that channel's accepted work over
+  the last hour, as a Public Solo Endpoint does (see pool.md, "Fees"), and
+  takes only the rest.
+- **The door's donation:** for each SV2 device channel the door opens a
+  second channel at P2Pool under the donation's identity and gives the
+  device that channel's jobs for the donation's share of its accepted work
+  (the SV1 adapter's rule), with the pool's extranonce prefix in each job's
+  coinbase part; its job ids and shares map back to the channel they came
+  from, and verdicts come back under the device's own channel.
 - **Your settings, in `p2pool/<network>.toml`:**
 
 | Flag | P2Pool's key | Limit |
@@ -259,8 +270,6 @@ pickaxe stratum-v2 serve --config pool.json --network chipnet \
 - **Profiles:** a profile keeps `p2pool` (donation, standalone, node_p2p)
   beside its ASIC pool or join server, with fallback pools; the setup
   screens come in their own change.
-- **Not yet:** SV2 devices through the door mine without the Pickaxe
-  donation's work channel (another Pickaxe joining runs its own).
 
 ## Commands
 
@@ -345,7 +354,9 @@ and a real ASIC at it.
   signature in the TOML and P2Pool's limits; `node_p2p_address` without
   ZMQ), `stratum_v2::door` (two miners reach P2Pool each under their own
   identity, through the SV1 adapter and the SV2 door; an owner-only node
-  keeps one identity; failover to a fallback pool and back),
+  keeps one identity; failover to a fallback pool and back; an SV2 device
+  mines the donation's jobs for its share, its shares reach the right
+  channel, and a joining Pickaxe's visible donation is credited),
   `stratum_v2::command` (fee mode work/both and a long signature refused),
   `config` (the profile's P2Pool settings) and `cli`.
 - `p2pool::launch`: the configuration (node, ports, chain, store, logs,

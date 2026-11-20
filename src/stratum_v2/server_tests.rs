@@ -2837,6 +2837,8 @@ fn the_adapters_donation_channel_mines_donation_work_at_a_pickaxe_pool() {
         public: false,
         prefer: None,
         fixed_version: false,
+        miners: None,
+        serving: None,
     }];
     let thread = {
         let stop = stop.clone();
