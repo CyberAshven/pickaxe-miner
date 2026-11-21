@@ -7,6 +7,8 @@ pub mod backend_kind;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod benchmark;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod child_process;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod cli;
 pub mod config;
 pub mod crypto;
@@ -37,11 +39,17 @@ pub mod electric;
 #[allow(dead_code)]
 pub mod electrum;
 pub mod gpu_types;
+/// The desktop window (`pickaxe gui`), drawn with egui.
+#[cfg(all(feature = "gui", not(target_arch = "wasm32")))]
+pub mod gui;
 // #### PR #53: several GPU tokens on the same GPUs, each for its share of the time.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod hash_split;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod hip_photon;
+// HTTP GET over rustls for release downloads and P2Pool's API.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod http;
 // #### PR #42: where GPU mining takes its jobs, and the way back to the node.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod job_source;
@@ -95,6 +103,10 @@ pub mod tls;
 #[allow(dead_code)]
 pub mod tui;
 pub mod tx;
+// Pickaxe's own updates from its signed GitHub releases (docs/updates.md).
+// Never in the browser build.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod update;
 #[cfg(feature = "portable-wgpu")]
 pub mod wgpu_photon;
 

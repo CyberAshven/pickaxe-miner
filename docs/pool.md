@@ -1,21 +1,30 @@
-# Running a public pool
+# Running a server for other miners
 
-Pickaxe's ASIC server can run as a public pool. Miners connect with their own
-payout address as the username, and a block they find pays them directly in
-its coinbase: there is no pool wallet, no custody and no payouts to send. You
-earn a fee that you choose, after the Pickaxe donation. A GPU pool works the
-same way for GPU rigs; see [A public GPU pool](#a-public-gpu-pool).
+In the setup, **Run a pool**, then **ASIC**, offers three modes (the
+**Mode** row; a line under it says what differs):
 
-## Start the pool
+| Mode | A block pays |
+|---|---|
+| **Public Solo Endpoint** | the miner who found it: others mine Solo through your server |
+| **Non-custodial Pool** | everyone on your server, by their work: P2Pool on your server alone |
+| **P2Pool v2** | the same, linked with other P2Pool servers |
 
-The pool builds blocks from your own BCH node, as solo mining does (see
+Either way miners connect with their own payout address as the username,
+and each block's coinbase pays directly: there is no pool wallet, no custody
+and no payouts to send. You earn a fee that you choose, after the Pickaxe
+donation. **Run a pool**, then **GPU rigs**, is a Public Solo Endpoint for
+GPU rigs; see [below](#a-public-solo-endpoint-for-gpu-rigs).
+
+## Start a Public Solo Endpoint
+
+The server builds blocks from your own BCH node, as solo mining does (see
 [stratum-v2.md](stratum-v2.md)). In the setup choose **Run a pool**, then
-**ASIC pool**, and set the pool fee on the settings page. The rest is under
-**Advanced** on the same page (Enter opens it): where the fee comes from and
-its address, the pool's name, the start difficulty, the SV1 and SV2 ports,
-serving templates, whether miners may use their own templates, and the
-donation. A saved profile keeps them all and reopens as a pool. From a
-terminal:
+**ASIC**, keep the mode **Public Solo Endpoint**, and set the fee on the
+settings page. The rest is under **Advanced** on the same page (Enter opens
+it): where the fee comes from and its address, the pool's name, the start
+difficulty, the SV1 and SV2 ports, serving templates, whether miners may use
+their own templates, and the donation. A saved profile keeps them all and
+reopens in its mode. From a terminal:
 
 ```text
 pickaxe_miner stratum-v2 serve --config pool.json \
@@ -48,6 +57,19 @@ block by their work: P2Pool runs inside, on its own share chain, alone.
 **P2Pool v2** is the same, linked with other P2Pool servers. There is no
 pool wallet either way: each block's coinbase pays everyone directly.
 
+In the setup, choose either as the **Mode**. The fee is paid in the coinbase,
+at most 10% (no fee source row); the pool name is P2Pool's pool signature, at
+most 16 characters. **Advanced** adds the **Pickaxe donation** (your server's
+rate, mined as work), the **P2Pool donation** (P2Pool's own, 0% to 10%, 1% by
+default) and fallback pools; P2Pool v2 adds **Peers** on the main rows (yours,
+kept in P2Pool's settings as `pickaxe p2pool set --peer` keeps them; "no
+seeds yet" while Pickaxe carries none). With **Block notices** off (Knuth and
+other nodes without ZMQ), a **Node P2P** row shows the address P2Pool hears
+of new blocks on, by default your node's host with 8333 (48333 on Chipnet);
+Start asks for it when that cannot be told. P2Pool itself still needs Bitcoin
+Cash Node: when the node list found another node, the settings say so. A
+profile keeps the mode and every row, and Start runs:
+
 ```text
 pickaxe_miner stratum-v2 serve --config pool.json \
   --listen 0.0.0.0:3336 --sv1-listen 0.0.0.0:3333 \
@@ -62,7 +84,7 @@ yours. Four cuts, each separate:
 
 | Cut | Goes to | Set by | Paid as |
 |---|---|---|---|
-| Pickaxe donation | the Pickaxe project, paid by whoever runs Pickaxe (you) | your donation setting, or a miner's higher `,donation=` (never lower); a joining Pickaxe's own donation channel is credited, as under "Fees" | mining work, on a second channel at P2Pool, for SV1 and SV2 devices |
+| Pickaxe donation | the Pickaxe project, paid by whoever runs Pickaxe (you) | your donation setting, or a miner's higher `,donation=` (never lower); a joining Pickaxe's own donation channel is credited, as under "Fees" | mining work, on a second channel at P2Pool (closed with the device's), for SV1 devices and SV2 devices on extended or standard channels |
 | P2Pool donation | the P2Pool project | you, as P2Pool's runner: `--p2pool-donation`, 0% to 10% (1% default) | each block's coinbase |
 | Operator fee | you, the host | `--pool-fee` (at most 10%, from what P2Pool's donation leaves) and `--pool-fee-address` | each block's coinbase only |
 | The rest | the miners | | each block's coinbase, by their work |
@@ -150,7 +172,7 @@ JSON start line (`--no-tui`) lists the same addresses under `connect`.
   computer with **Join a pool**, pasting this pool's SV2 line, and point the
   ASICs at that computer: their SV1 stays on that site's network and only
   encrypted SV2 crosses the internet.
-- A public pool for anyone forwards its ports and publishes
+- A server for anyone forwards its ports and publishes
   `stratum+tcp://<your domain or public IP>:3333`. Pickaxe never opens router
   ports by itself.
 
@@ -193,7 +215,9 @@ paying 3.125 BCH pays the donation 0.03125 BCH (its coinbase part; its work
 part is separate mining work), your fee address 0.061875 BCH, and the miner
 3.031875 BCH.
 
-The dashboard header shows `Public pool, fee 2.00% from coinbase`. With SV2,
+The dashboard header, in the terminal and the window, names the mode and its
+fee: `Public Solo Endpoint, fee 2.00% from coinbase` (or `Non-custodial
+Pool, fee …`, `P2Pool v2, fee …`). With SV2,
 miners see every coinbase output in the jobs they receive, so nobody can hide
 a fee; with SV1 they can decode the coinbase parts of each job.
 
@@ -226,11 +250,12 @@ coinbase; Pickaxe saves each one before sending it to your node and retries
 until the node answers. Details and SRI's configuration lines are in
 [stratum-v2.md](stratum-v2.md#serving-templates-to-a-pool-template-distribution).
 
-## A public GPU pool
+## A Public Solo Endpoint for GPU rigs
 
-In the setup choose **Run a pool**, then **GPU pool**: this computer
+In the setup choose **Run a pool**, then **GPU rigs**: this computer
 coordinates other people's rigs on port 3340, with no GPU of its own. Each rig
-mines for its own address and its wins are claimed to it. A token claim pays
+mines for its own address and its wins are claimed to it, as on a Public Solo
+Endpoint. A token claim pays
 one address, so your fee is a share of each rig's mining time, after the
 donation, paid to a `q` address. Connection info (`I`) shows the command a rig
 runs to join, with its own address in place of `YOUR_BCH_ADDRESS`. From a
@@ -238,7 +263,5 @@ terminal, and the details, see [farm.md](farm.md#a-public-gpu-pool).
 
 ## Not yet
 
-- Shared rewards are the Non-custodial Pool and P2Pool v2 above; their
-  setup screens come next.
 - Tested end to end with simulated SV1 and SV2 devices on a test node, not
   yet with real public miners.

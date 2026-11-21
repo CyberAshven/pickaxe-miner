@@ -1115,7 +1115,9 @@ impl SavedServer {
         }
         let join = self.join.as_deref().map(str::trim).unwrap_or("");
         if self.mode.joins() {
-            if join.is_empty() {
+            // #### Pool modes: your own P2Pool, which ASICs join here, has
+            // no address to save.
+            if join.is_empty() && !(self.mode == SavedMode::AsicJoin && p2pool.is_some()) {
                 return Err("a profile that joins a pool needs the pool's address".into());
             }
         } else if self.join.is_some() || self.join_key.is_some() {
@@ -1830,7 +1832,32 @@ fn valid_profile_name(name: &str) -> Result<&str, String> {
     }
 }
 
+/// What a PHOTON mining session saves back to its profile when it stops:
+/// the intensity, payout and donation the dashboard may have changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSettings {
+    pub intensity: u8,
+    pub address: String,
+    /// `None` keeps the token's minimum, so a later minimum applies.
+    pub token_donation: Option<crate::donation::TokenDonation>,
+}
+
 impl MiningProfiles {
+    /// Saves `session` into the profile `name` at `path` (the terminal and
+    /// the desktop window both save a stopped session this way).
+    pub fn save_session(path: &Path, name: &str, session: &SessionSettings) -> Result<(), String> {
+        let mut profiles = Self::load_optional(path)?;
+        let profile = profiles
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.name.eq_ignore_ascii_case(name))
+            .ok_or("mining profile was renamed or removed during this session")?;
+        profile.settings.intensity = Some(session.intensity);
+        profile.settings.address = Some(session.address.clone());
+        profile.settings.token_donation_bps = session.token_donation;
+        profiles.save(path)
+    }
+
     pub fn load_optional(path: &Path) -> Result<Self, String> {
         if !path.exists() {
             return Ok(Self::default());
@@ -2013,7 +2040,7 @@ pub(crate) fn restrict_private_config(path: &Path) -> Result<(), String> {
 /// other local users cannot read `user:pass@host` out of the config.
 #[cfg(windows)]
 fn restrict_config_to_current_user(path: &Path) -> Result<(), String> {
-    let whoami = std::process::Command::new("whoami")
+    let whoami = crate::child_process::command("whoami")
         .output()
         .map_err(|error| format!("identify config owner for {}: {error}", path.display()))?;
     if !whoami.status.success() {
@@ -2029,7 +2056,7 @@ fn restrict_config_to_current_user(path: &Path) -> Result<(), String> {
             path.display()
         ));
     }
-    let output = std::process::Command::new("icacls")
+    let output = crate::child_process::command("icacls")
         .arg(path)
         .arg("/inheritance:r")
         .arg("/grant:r")
@@ -3037,6 +3064,19 @@ mod tests {
         )
         .validate()
         .unwrap();
+        // Your own P2Pool has no address to save; another pool needs one.
+        let own = SavedServer {
+            mode: SavedMode::AsicJoin,
+            join: None,
+            pool_fee: None,
+            fee_mode: None,
+            pool_tag: None,
+            ..pool.clone()
+        };
+        with(Some(own.clone()), Some(SavedP2Pool::default()))
+            .validate()
+            .unwrap();
+        assert!(with(Some(own), None).validate().is_err());
         for (server, p2pool, why) in [
             (
                 Some(SavedServer {
