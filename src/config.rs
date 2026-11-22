@@ -146,6 +146,7 @@ impl MiningToken {
     ) -> crate::donation::Policy {
         let mut policy = self.fee_policy(network);
         if let crate::donation::Scheme::Work(shares) = &mut policy.scheme {
+            let donation = donation.raised_to(self.donation_default());
             *shares = donation.work_shares(self.donation_default(), *shares);
         }
         policy
@@ -390,6 +391,7 @@ impl RuntimeConfig {
     pub fn token_donation(&self) -> crate::donation::TokenDonation {
         self.token_donation
             .unwrap_or_else(|| self.token.donation_default())
+            .raised_to(self.token.donation_default())
     }
 
     /// The selected token's policy at the donation in effect.
@@ -2121,19 +2123,19 @@ mod tests {
         assert_eq!(mainnet.scheme.description(), "Donation: 6%");
         let chipnet = MiningToken::Photon.fee_policy_at(MiningNetwork::Chipnet, six);
         assert_eq!(chipnet.scheme.work(), [600, 0]);
-        // #### 2026-10-24: below the default every share shrinks, to none.
+        // Below the default stays at 4%.
         let low =
             MiningToken::Photon.fee_policy_at(MiningNetwork::Mainnet, TokenDonation::from_bps(100));
-        assert_eq!(low.scheme.work(), [50, 50]);
+        assert_eq!(low.scheme.work(), [200, 200]);
         let none =
             MiningToken::Photon.fee_policy_at(MiningNetwork::Mainnet, TokenDonation::from_bps(0));
-        assert_eq!(none.scheme.work(), [0, 0]);
-        assert_eq!(none.scheme.description(), "Donation: 0%");
+        assert_eq!(none.scheme.work(), [200, 200]);
+        assert_eq!(none.scheme.description(), "Donation: 4%");
         let mut cfg = RuntimeConfig::default();
         assert_eq!(cfg.token_donation().bps(), 400);
         cfg.token_donation = Some(TokenDonation::from_bps(150));
-        assert_eq!(cfg.token_donation().bps(), 150);
-        assert_eq!(cfg.fee_policy().scheme.work(), [75, 75]);
+        assert_eq!(cfg.token_donation().bps(), 400);
+        assert_eq!(cfg.fee_policy().scheme.work(), [200, 200]);
         cfg.token_donation = None;
         // The saved setting only holds a value other than the default.
         cfg.set_payout(PAYOUT.into()).unwrap();

@@ -905,6 +905,7 @@ fn electric_donation(cfg: &RuntimeConfig) -> Option<crate::donation::TokenDonati
         .get("ELECTRIC")
         .copied()
         .or(cfg.token_donation)
+        .map(|donation| donation.raised_to(super::DONATION_DEFAULT))
 }
 
 fn print_deployment(cfg: &RuntimeConfig, deployment: &Deployment, addresses: &[String; 3]) {

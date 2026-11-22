@@ -589,7 +589,11 @@ fn donate(miners: &Miners<'_>, index: usize, up: bool) -> Result<Option<String>,
         return Ok(None);
     };
     if let Some((_, runtime)) = miners.runtimes.iter().find(|(t, _)| *t == token) {
-        let next = runtime.snapshot().token_donation.adjusted(up);
+        let snapshot = runtime.snapshot();
+        let next = snapshot
+            .token_donation
+            .adjusted(up)
+            .raised_to(snapshot.donation_default);
         return runtime
             .set_donation(next)
             .map(|()| Some(format!("Donation {next}")));
@@ -601,7 +605,8 @@ fn donate(miners: &Miners<'_>, index: usize, up: bool) -> Result<Option<String>,
         .summary()
         .donation
         .unwrap_or(crate::electric::DONATION_DEFAULT)
-        .adjusted(up);
+        .adjusted(up)
+        .raised_to(crate::electric::DONATION_DEFAULT);
     monitor
         .request_donation(miners.network, next)
         .map(|()| Some(format!("ELECTRIC donation {next}")))

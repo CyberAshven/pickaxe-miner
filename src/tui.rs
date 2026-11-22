@@ -2793,7 +2793,8 @@ impl SetupFlow {
                     })
                     .copied()
                     .or(self.config.token_donation)
-                    .unwrap_or(default),
+                    .unwrap_or(default)
+                    .raised_to(default),
                 default,
             ));
         }
@@ -4061,8 +4062,11 @@ impl SetupFlow {
                             % count;
                     }
                     SettingsRow::TokenDonation => {
-                        if let Some((_, donation, _)) = self.token_donation_terms() {
-                            let next = donation.adjusted(forward);
+                        if let Some((_, donation, default)) = self.token_donation_terms() {
+                            let mut next = donation.adjusted(forward);
+                            if self.mode != MiningMode::Asic {
+                                next = next.raised_to(default);
+                            }
                             self.config.token_donation = Some(next);
                             if self.split {
                                 for (token, _) in self.shares().iter() {
@@ -5999,12 +6003,15 @@ fn handle_key(
             KeyCode::Esc | KeyCode::Char('a') | KeyCode::Char('A') => state.advanced_mode = false,
             KeyCode::Left | KeyCode::Right | KeyCode::Char('-') | KeyCode::Char('+') => {
                 let raise = matches!(key.code, KeyCode::Right | KeyCode::Char('+'));
-                let next = snapshot.token_donation.adjusted(raise);
+                let next = snapshot
+                    .token_donation
+                    .adjusted(raise)
+                    .raised_to(snapshot.donation_default);
                 if next == snapshot.token_donation {
                     state.status_line = if raise {
                         "The donation is at its highest.".into()
                     } else {
-                        "The donation is at 0%.".into()
+                        "The donation is at its lowest.".into()
                     };
                 } else {
                     apply_result(
@@ -9549,7 +9556,7 @@ fn render_advanced_with_scope(
         ]),
         Line::from(""),
         dim(format!(
-            "A share of the mining work itself mines for the Pickaxe donation address. This token's default is {}; change it in 0.5% steps, down to 0%.",
+            "A share of the mining work itself mines for the Pickaxe donation address. This token's default is {}; change it in 0.5% steps, down to its default.",
             snapshot.donation_default
         )),
         dim(session_note.unwrap_or("It applies to every GPU and rig at once and is saved to your profile when you stop.").into()),
@@ -11902,9 +11909,9 @@ mod tests {
         for _ in 0..10 {
             setup.handle_key(key(KeyCode::Left));
         }
-        assert_eq!(setup.config.token_donation().bps(), 0);
+        assert_eq!(setup.config.token_donation().bps(), 400);
         assert!(
-            setup_text(&setup).contains("0.00% of PHOTON mining work (default 4.00%)"),
+            setup_text(&setup).contains("4.00% of PHOTON mining work (default 4.00%)"),
             "{}",
             setup_text(&setup)
         );
