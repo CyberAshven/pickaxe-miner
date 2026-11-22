@@ -3,17 +3,7 @@ name: supply-chain-guard
 description: Use before cloning, checking out, building, linting, testing, installing or opening any repository, branch, PR head, package or download not written in this session, and before every commit and push. Scans git objects for injected loaders (PolinRider's whitespace-hidden config loader, Shai-Hulud install hooks, GlassWorm invisible Unicode, fake-font and editor-task launchers) without running anything, and stops the work when one is found.
 ---
 
-# Supply-chain guard
 
-On 2026-11-16 an obfuscated JavaScript loader was found in `eslint.config.mjs`
-on CyberAshven/bchd (16 branches) and on the bitcoin-cash-explorer repos
-(BitcoinCash1 `main`, CyberAshven `feat/p2p-light-client`). It sat at the end
-of a line, after hundreds of spaces, so an editor showed a normal file. It
-was delivered by rewriting existing commits (same message, author and author
-date; new committer date in `+0000`) and force-pushing them under the
-owner's account. Any `eslint` run would have executed it. It is the
-PolinRider campaign, and the same families keep coming back. The rules below
-keep such code from ever running here.
 
 ## What runs code without being asked
 
