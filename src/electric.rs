@@ -198,7 +198,9 @@ impl Deployment {
     /// with anything above the default going to the project address and
     /// anything below it shrinking every share (`TokenDonation::work_shares`).
     pub fn donation_policy(&self, donation: Option<TokenDonation>) -> Policy {
-        let donation = donation.unwrap_or(DONATION_DEFAULT);
+        let donation = donation
+            .unwrap_or(DONATION_DEFAULT)
+            .raised_to(DONATION_DEFAULT);
         match self.network {
             MiningNetwork::Mainnet => Policy {
                 scheme: Scheme::Work(donation.work_shares(DONATION_DEFAULT, [200, 200])),
@@ -1213,13 +1215,13 @@ mod tests {
             mainnet
                 .donation_policy(Some(TokenDonation::from_bps(150)))
                 .scheme,
-            Scheme::Work([75, 75])
+            Scheme::Work([200, 200])
         );
         assert_eq!(
             mainnet
                 .donation_policy(Some(TokenDonation::from_bps(0)))
                 .scheme,
-            Scheme::Work([0, 0])
+            Scheme::Work([200, 200])
         );
         assert_eq!(
             mainnet

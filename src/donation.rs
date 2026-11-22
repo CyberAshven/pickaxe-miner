@@ -39,6 +39,15 @@ impl TokenDonation {
         self.0
     }
 
+    /// Not below `floor`. PHOTON and ELECTRIC pass their 4% default.
+    pub const fn raised_to(self, floor: Self) -> Self {
+        if self.0 < floor.0 {
+            floor
+        } else {
+            self
+        }
+    }
+
     /// The next 0.5% step up or down, down to 0%.
     pub fn adjusted(self, increase: bool) -> Self {
         let next = if increase {
