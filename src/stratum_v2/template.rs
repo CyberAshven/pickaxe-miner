@@ -265,8 +265,8 @@ impl BchTemplate {
     /// the prefix a minimal BIP34 height push (at most 8 bytes, its rest the
     /// node's flags), the value within the money supply, the provider's
     /// target no easier than `nBits`'s (the block target is `nBits`'s), the
-    /// transactions full, witness-free and in CTOR order (at most 65,535),
-    /// and their coinbase merkle path the one announced. Its size limit is
+    /// transactions full, witness-free and in CTOR order, and their
+    /// coinbase merkle path the one announced. Its size limit is
     /// the transactions, the header and the largest coinbase the reserve
     /// allows, which `coinbase_with_aux` then keeps to.
     /// Why: TDP carries no size limit and no chain; a provider must not make
@@ -301,9 +301,9 @@ impl BchTemplate {
         if !meets_target(&provided.target, &target) {
             return Err("template provider's target is easier than its bits".into());
         }
-        if provided.transactions.len() > 65_535 {
-            return Err("template too large for SV2".into());
-        }
+        // #### BCH large templates: the core RequestTransactionData.Success
+        // carries at most 65,535 transactions; with 0x4C54 only the block
+        // size limit bounds them.
         let mut hashes = Vec::with_capacity(provided.transactions.len());
         let mut previous_display: Option<Hash> = None;
         let mut size = 0u64;
@@ -340,7 +340,7 @@ impl BchTemplate {
             coinbase_value: provided.value,
             parent_time: None,
             coinbase_flags: prefix[push.len()..].to_vec(),
-            transactions: provided.transactions.into_iter().map(Arc::from).collect(),
+            transactions: provided.transactions.into(),
             txids: hashes.into(),
             index: Default::default(),
             merkle_path: merkle_path.into(),
@@ -362,7 +362,7 @@ impl BchTemplate {
     pub fn custom(
         context: &BchTemplate,
         version: u32,
-        min_ntime: u32,
+        ntime_start: u32,
         merkle_path: Vec<Hash>,
     ) -> Self {
         Self {
@@ -370,8 +370,8 @@ impl BchTemplate {
             version,
             bits: context.bits,
             target: context.target,
-            min_time: min_ntime,
-            current_time: min_ntime,
+            min_time: ntime_start,
+            current_time: ntime_start,
             height: context.height,
             size_limit: context.size_limit,
             coinbase_value: context.coinbase_value,
@@ -574,11 +574,11 @@ impl BchTemplate {
 
     /// #### PR #42: this template for a custom job set on it: the job's
     /// version and start time, the same transactions.
-    pub fn with_header(&self, version: u32, min_ntime: u32) -> Self {
+    pub fn with_header(&self, version: u32, ntime_start: u32) -> Self {
         Self {
             version,
-            min_time: min_ntime,
-            current_time: min_ntime,
+            min_time: ntime_start,
+            current_time: ntime_start,
             ..self.clone()
         }
     }
@@ -597,6 +597,8 @@ impl BchTemplate {
 
     /// #### PR #65: obtain P2Pool's exact PPLNS coinbase before publishing.
     /// It cannot change the independently sourced transaction list or revenue.
+    /// Requested Payout Outputs (0x5052): or the pool's outputs for this
+    /// template (`payouts`), asked through the uplink.
     pub fn prepare_p2pool(&mut self) -> Result<(), String> {
         self.p2pool = None;
         // A token set does not stop it: P2Pool's coinbase carries no token
@@ -610,8 +612,50 @@ impl BchTemplate {
                 &self.script_head(),
                 None,
             )?));
+        } else if let (Some(plan), Some(payouts)) = (self.jd.as_ref(), self.payouts()) {
+            self.p2pool = Some(Arc::new(payouts.prepare(
+                self.height,
+                self.bits,
+                self.previous_hash,
+                self.coinbase_value,
+                self.script_head(),
+                plan.upstream_prefix.len() + plan.rollable(),
+                self.min_time,
+            )?));
         }
         Ok(())
+    }
+
+    // What: a Job Declaration template whose pool granted Requested Payout
+    // Outputs (0x5052) takes its coinbase outputs from the pool, prepared
+    // before it is published. One exception: a Full-Template template that
+    // merge-mines tokens at a pool whose tokens carry its rates (a Pickaxe
+    // pool's) builds its outputs from those rates with the commitment as
+    // output 0, as without the extension; exact outputs leave no room for it,
+    // and the pool's check takes both.
+    // Why: the pool's answer is what it pays shares on; merge-mined tokens
+    // at a Pickaxe pool must not stop because the pool also speaks 0x5052.
+    // Look here if: a JD template waits for a payout answer it should not,
+    // or merge-mined tokens stop under Job Declaration.
+    /// The pool's payout door for this template, when its outputs come from
+    /// the pool.
+    pub fn payouts(&self) -> Option<&Arc<super::jd::payouts::Payouts>> {
+        let plan = self.jd.as_ref()?;
+        let payouts = plan.payouts.as_ref()?;
+        let merged = payouts.local_rates && plan.full_template && self.tokens.is_some();
+        (!merged).then_some(payouts)
+    }
+
+    /// Whether this template's coinbase is prepared before it is published:
+    /// P2Pool's, or the pool's Requested Payout Outputs.
+    pub fn needs_preparation(&self) -> bool {
+        self.is_p2pool() || self.payouts().is_some()
+    }
+
+    /// The prepared coinbase (P2Pool's or the pool's payout outputs), once
+    /// prepared.
+    pub fn prepared_coinbase(&self) -> Option<&crate::stratum_v2::jd::declared::CoinbaseShape> {
+        self.p2pool.as_ref().map(|prepared| &prepared.coinbase)
     }
 
     pub fn p2pool_token(&self) -> Option<&[u8]> {
@@ -635,6 +679,9 @@ impl BchTemplate {
     fn check_p2pool_prepared(&self) -> Result<(), String> {
         if self.is_p2pool() && self.p2pool.is_none() {
             return Err("P2Pool coinbase has not been prepared".into());
+        }
+        if self.payouts().is_some() && self.p2pool.is_none() {
+            return Err("the pool's payout outputs have not been prepared".into());
         }
         Ok(())
     }
@@ -668,6 +715,13 @@ impl BchTemplate {
     /// #### PR #42: the transactions' ids, in block order.
     pub fn transaction_ids(&self) -> &[Hash] {
         &self.txids
+    }
+
+    /// #### BCH large templates: the same ids, shared, so a Template
+    /// Distribution connection keeps them as the base of its next push
+    /// without the transactions.
+    pub fn shared_transaction_ids(&self) -> Arc<[Hash]> {
+        self.txids.clone()
     }
 
     /// #### PR #42: the transaction with id `txid`, from an index built on
@@ -730,8 +784,9 @@ impl BchTemplate {
             return Ok(None);
         };
         // #### merge-mining v2: only Full-Template declarations carry the
-        // leaves the pool checks (`merge::disclosure`).
-        if self.is_p2pool() || !plan.full_template {
+        // leaves the pool checks (`merge::disclosure`); the pool's exact
+        // outputs (0x5052) carry no commitment.
+        if self.is_p2pool() || self.payouts().is_some() || !plan.full_template {
             return Ok(None);
         }
         let miner = plan
@@ -826,10 +881,13 @@ impl BchTemplate {
         }
         // #### merge-mining v2: a Coinbase-only declaration cannot show the
         // pool its leaves, so the pool refuses a token commitment there.
-        self.jd
-            .as_ref()
-            .is_some_and(|plan| !plan.full_template)
-            .then_some("Coinbase-only Job Declaration cannot show the pool its token leaves; use Full-Template")
+        if self.jd.as_ref().is_some_and(|plan| !plan.full_template) {
+            return Some("Coinbase-only Job Declaration cannot show the pool its token leaves; use Full-Template");
+        }
+        // The pool's exact outputs (0x5052) leave no room for output 0.
+        self.payouts().map(|_| {
+            "the pool sets this coinbase's outputs exactly (Requested Payout Outputs), so it cannot carry the token commitment"
+        })
     }
 
     // #### merge-mining v2: pool and role rules
@@ -919,9 +977,16 @@ impl BchTemplate {
             if aux.is_some() {
                 return Err("P2Pool coinbase does not carry this token proof format".into());
             }
+            // An extended channel's job coinbase stops before the device's
+            // bytes (its shares rebuild from the parts), so they are zeros
+            // here; a longer extranonce is still refused.
+            let mut whole = extranonce.to_vec();
+            if whole.len() < prepared.coinbase.extranonce_len() {
+                whole.resize(prepared.coinbase.extranonce_len(), 0);
+            }
             let bytes = prepared
                 .coinbase
-                .coinbase(extranonce)
+                .coinbase(&whole)
                 .ok_or("P2Pool extranonce length changed")?;
             self.check_block_size(bytes.len())?;
             return Ok(Coinbase {
@@ -1217,7 +1282,9 @@ pub struct Provided<'a> {
     /// The coinbase prefix: the height push, then any flags.
     pub prefix: &'a [u8],
     pub value: u64,
-    pub transactions: Vec<Vec<u8>>,
+    /// #### BCH large templates: shared, so the transactions a provider
+    /// pushed stay the base of its next push without a copy.
+    pub transactions: Vec<Arc<[u8]>>,
     pub merkle_path: &'a [Hash],
     /// The coinbase output bytes this server declared it may add.
     pub reserve: u32,

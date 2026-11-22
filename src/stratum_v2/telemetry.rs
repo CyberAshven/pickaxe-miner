@@ -32,6 +32,23 @@ pub enum ShareEvent {
     Rejected(&'static str),
 }
 
+/// #### one donation, the higher rate: a public pool miner's effective
+/// Pickaxe donation and the part their own Pickaxe visibly mines, as the
+/// workers page and the Device panel show them: "2.00%", or "2.00% · own
+/// 1.50%". `None` off a public pool.
+pub fn donation_text(effective_bps: Option<u16>, own_bps: Option<u16>) -> Option<String> {
+    let percent = |bps: u16| {
+        crate::donation::bch::BchDonation::try_from(bps)
+            .map(|rate| rate.to_string())
+            .unwrap_or_default()
+    };
+    let effective = percent(effective_bps?);
+    Some(match own_bps.filter(|own| *own > 0) {
+        Some(own) => format!("{effective} · own {}", percent(own)),
+        None => effective,
+    })
+}
+
 /// #### PR #40
 /// The difficulty a share's hash reached (pool difficulty: 1 is one in 2^32
 /// hashes), for best-share records; the target's difficulty is the same
@@ -75,6 +92,11 @@ pub struct DeviceSnapshot {
     pub model: Option<String>,
     pub firmware: Option<String>,
     pub power_w: Option<f64>,
+    /// #### one donation, the higher rate: on a public pool, the miner's
+    /// effective Pickaxe donation and the part their own Pickaxe visibly
+    /// mines (credited), in hundredths of a percent.
+    pub donation_bps: Option<u16>,
+    pub own_donation_bps: Option<u16>,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +143,9 @@ struct Device {
     adapter_error: Option<&'static str>,
     report: Option<DeviceReport>,
     best_share: Option<f64>,
+    /// #### one donation, the higher rate: the effective rate and the own
+    /// Pickaxe's credit, on a public pool.
+    donation: Option<(u16, u16)>,
 }
 
 /// #### PR #42
@@ -172,7 +197,14 @@ pub struct Devices {
     // Look here if: a device behind a gateway can be controlled after its
     // neighbours' rows are gone, or an address stays refused with no row.
     shared_addresses: HashSet<IpAddr>,
+    /// The rows of the workers a connection's shares named (extension
+    /// 0x0002), by connection and name.
+    workers: HashMap<(u64, String), u64>,
 }
+
+/// Worker rows one connection may add; shares naming more count on the
+/// connection's own row.
+const WORKER_ROWS: usize = 256;
 
 impl std::fmt::Debug for Devices {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -190,6 +222,43 @@ impl Default for Devices {
             sockets: HashMap::new(),
             rows: BTreeMap::new(),
             shared_addresses: HashSet::new(),
+            workers: HashMap::new(),
+        }
+    }
+}
+
+impl Device {
+    /// A new row, connected since `now`.
+    fn new(
+        label: String,
+        number: u64,
+        worker: Option<String>,
+        protocol: &'static str,
+        now: Instant,
+    ) -> Self {
+        Self {
+            label,
+            number,
+            worker,
+            replaced: Vec::new(),
+            ip: None,
+            protocol,
+            started: now,
+            ended: None,
+            channels: 0,
+            accepted: 0,
+            rejected: 0,
+            adapter_rejected: 0,
+            last_rejection: None,
+            last_share: None,
+            work: VecDeque::new(),
+            hour: VecDeque::new(),
+            difficulty: None,
+            connection_error: None,
+            adapter_error: None,
+            report: None,
+            best_share: None,
+            donation: None,
         }
     }
 }
@@ -273,10 +342,26 @@ impl Devices {
                 adapter_error: None,
                 report: None,
                 best_share: None,
+                donation: None,
             },
         );
         self.prune();
         id
+    }
+
+    /// #### one donation, the higher rate: a public pool miner's effective
+    /// donation and their own Pickaxe's credit, or none.
+    pub fn set_donation(
+        &mut self,
+        id: u64,
+        terms: Option<(
+            crate::donation::bch::BchDonation,
+            crate::donation::bch::BchDonation,
+        )>,
+    ) {
+        if let Some(row) = self.rows.get_mut(&id) {
+            row.donation = terms.map(|(effective, own)| (u16::from(effective), u16::from(own)));
+        }
     }
 
     /// #### PR #42: removes a connection that turned out to be a Job
@@ -287,6 +372,64 @@ impl Devices {
             self.rows.extend(row.replaced);
         }
         self.sockets.retain(|_, existing| *existing != id);
+        let rows = &mut self.rows;
+        self.workers.retain(|(owner, _), row| {
+            if *owner == id {
+                rows.remove(row);
+            }
+            *owner != id
+        });
+    }
+
+    // What: a share that names its worker (extension 0x0002, a proxy's
+    // channel carrying many miners) counts on that worker's own row,
+    // labelled with the name as `set_worker` labels a device (never an
+    // address: a name that is one counts on the connection's row). The
+    // row is made on the worker's first share, has no address, and goes
+    // offline when its connection closes. The connection's own row still
+    // notes the share's time, for the reconnect rules.
+    // Why: the workers table shows each worker behind a proxy instead of
+    // one row for all of them.
+    // Look here if: a proxy's workers are missing from the table, or their
+    // shares are counted twice.
+    /// Counts a share of connection `id` that names `worker`.
+    pub fn worker_share(&mut self, id: u64, worker: &str, event: ShareEvent, now: Instant) {
+        let Some(name) = worker_name(worker) else {
+            return self.share(id, event, false, now);
+        };
+        let Some(parent) = self.rows.get_mut(&id).filter(|row| row.ended.is_none()) else {
+            return;
+        };
+        if matches!(event, ShareEvent::Accepted(_)) {
+            parent.last_share = Some(now);
+        }
+        let protocol = parent.protocol;
+        let key = (id, name);
+        let row = match self.workers.get(&key) {
+            Some(row) if self.rows.contains_key(row) => *row,
+            _ => {
+                let owned = self
+                    .workers
+                    .keys()
+                    .filter(|(owner, _)| *owner == id)
+                    .count();
+                if owned >= WORKER_ROWS {
+                    return self.share(id, event, false, now);
+                }
+                let Some(row) = self.next_id.checked_add(1) else {
+                    return self.share(id, event, false, now);
+                };
+                self.next_id = row;
+                let label = device_label(self.prefix, Some(&key.1), row);
+                self.rows.insert(
+                    row,
+                    Device::new(label, row, Some(key.1.clone()), protocol, now),
+                );
+                self.workers.insert(key, row);
+                row
+            }
+        };
+        self.share(row, event, false, now);
     }
 
     /// #### PR #40: a device's label, for records kept outside the table.
@@ -620,6 +763,16 @@ impl Devices {
             row.last_share,
         );
         self.sockets.retain(|_, existing| *existing != id);
+        // The workers its shares named go offline with it.
+        let rows = &mut self.rows;
+        self.workers.retain(|(owner, _), row| {
+            if *owner == id {
+                if let Some(row) = rows.get_mut(row) {
+                    row.ended.get_or_insert(now);
+                }
+            }
+            *owner != id
+        });
         if let (true, Some(ip)) = (first, ip) {
             // #### PR #42: the shared mark is taken before settling, which
             // can merge away the rows this connection took over.
@@ -770,6 +923,8 @@ impl Devices {
                     model: row.report.as_ref().and_then(|r| r.model.clone()),
                     firmware: row.report.as_ref().and_then(|r| r.firmware.clone()),
                     power_w: row.report.as_ref().and_then(|r| r.power_w),
+                    donation_bps: row.donation.map(|(effective, _)| effective),
+                    own_donation_bps: row.donation.map(|(_, own)| own),
                 }
             })
             .collect();
@@ -785,6 +940,14 @@ impl Devices {
 // Only static categories leave this module; unknown upstream text may contain
 // an address, credentials or untrusted control characters.
 pub fn connection_reason(error: &str) -> &'static str {
+    // Frame read and write failures name their OS error after this text.
+    let error = [
+        "SV2 frame read failed or timed out",
+        "SV2 frame write failed or timed out",
+    ]
+    .into_iter()
+    .find(|fixed| error.starts_with(fixed))
+    .unwrap_or(error);
     match error {
         "SV1 disconnected" => "device disconnected",
         "SV2 peer disconnected"
@@ -1211,6 +1374,46 @@ mod tests {
             devices.snapshots(Instant::now())[0].label,
             format!("rig1 #{id}")
         );
+    }
+
+    // What: shares naming their worker (extension 0x0002) count on one row
+    // per worker of the connection, labelled by the worker's name; a name
+    // that is an address counts on the connection's own row; the worker
+    // rows go offline when the connection closes, and a connection that
+    // turned out to be a Job Declaration client's takes them with it.
+    // Look here if: `Devices::worker_share` changes.
+    #[test]
+    fn named_workers_get_rows_of_their_own_and_never_an_address() {
+        let address = crate::tx::p2pkh_hash_to_cashaddr_for_network(
+            &[0x11; 20],
+            crate::config::MiningNetwork::Mainnet,
+        )
+        .unwrap();
+        let now = Instant::now();
+        let mut devices = Devices::default();
+        let proxy = devices.connect("127.0.0.1:4100".parse().unwrap(), false, now);
+        let accepted = ShareEvent::Accepted([0xff; 32]);
+        devices.worker_share(proxy, "account.rig-7", accepted, now);
+        devices.worker_share(proxy, "account.rig-7", accepted, now);
+        devices.worker_share(proxy, "rig-8", ShareEvent::Rejected("stale-share"), now);
+        devices.worker_share(proxy, &address, accepted, now);
+        let rows = devices.snapshots(now);
+        assert_eq!(rows.len(), 3);
+        let row = |name: &str| rows.iter().find(|row| row.label.starts_with(name)).unwrap();
+        assert_eq!((row("rig-7 #").accepted, row("rig-7 #").rejected), (2, 0));
+        assert_eq!((row("rig-8 #").accepted, row("rig-8 #").rejected), (0, 1));
+        // The address's share stayed on the proxy's own row.
+        assert_eq!(row("Device ").accepted, 1);
+        assert!(rows.iter().all(|row| !row.label.contains(&address[12..])));
+        devices.close(proxy, false, None, now);
+        assert!(devices.snapshots(now).iter().all(|row| !row.connected));
+        let jd = devices.connect("127.0.0.1:4101".parse().unwrap(), false, now);
+        devices.worker_share(jd, "rig-9", accepted, now);
+        devices.forget(jd);
+        assert!(devices
+            .snapshots(now)
+            .iter()
+            .all(|row| !row.label.starts_with("rig-9")));
     }
 
     #[test]

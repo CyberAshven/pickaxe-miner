@@ -367,7 +367,7 @@ fn node_ready(info: &NodeInfo, network: MiningNetwork, height: u32) -> Result<()
     if info.network() != Some(network) {
         return Err(format!("the node is not on {}", network.as_str()));
     }
-    if info.syncing || info.blocks < info.headers {
+    if !info.synced() {
         return Err(format!("the node is syncing ({})", info.summary()));
     }
     if info.blocks + 1 < u64::from(height) {

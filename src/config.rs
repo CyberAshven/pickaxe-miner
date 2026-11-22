@@ -146,6 +146,7 @@ impl MiningToken {
     ) -> crate::donation::Policy {
         let mut policy = self.fee_policy(network);
         if let crate::donation::Scheme::Work(shares) = &mut policy.scheme {
+            let donation = donation.raised_to(self.donation_default());
             *shares = donation.work_shares(self.donation_default(), *shares);
         }
         policy
@@ -292,6 +293,9 @@ pub struct RuntimeConfig {
     pub node_zmq: NodeZmq,
     /// Preferred network transport for submission/diagnostics.
     pub source: JobSource,
+    /// #### Pool modes: your own P2Pool's donation, standalone choice and
+    /// node P2P port, for `stratum-v2 serve --own-p2pool`.
+    pub p2pool: SavedP2Pool,
     /// When true, the GPU mining loop is running.
     pub mining: bool,
     /// Immutable mining-work generation. Zero means no live job is published yet.
@@ -314,6 +318,7 @@ impl Default for RuntimeConfig {
             fulcrum_url: None,
             node_url: None,
             node_zmq: NodeZmq::Auto,
+            p2pool: SavedP2Pool::default(),
             source: JobSource::Fulcrum,
             mining: false,
             generation_id: 0,
@@ -386,6 +391,7 @@ impl RuntimeConfig {
     pub fn token_donation(&self) -> crate::donation::TokenDonation {
         self.token_donation
             .unwrap_or_else(|| self.token.donation_default())
+            .raised_to(self.token.donation_default())
     }
 
     /// The selected token's policy at the donation in effect.
@@ -828,6 +834,13 @@ pub struct SavedConfig {
     /// GPU profiles leave it out, so their saved bytes do not change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server: Option<SavedServer>,
+    /// #### Pool modes: the server runs its own P2Pool with these settings:
+    /// with an ASIC pool server it is a Non-custodial Pool (or P2Pool v2),
+    /// with an ASIC join server it mines at it for its own devices. Left
+    /// out, none are saved. A build from before Pool modes refuses a file
+    /// that has them (its records reject unknown fields).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p2pool: Option<SavedP2Pool>,
 }
 
 // #### PR #42: profiles keep their mode
@@ -968,6 +981,54 @@ pub struct SavedServer {
     pub node_zmq: Option<String>,
 }
 
+/// #### Pool modes: your own P2Pool's settings, as a profile saves them
+/// (`SavedConfig::p2pool`, beside its server) and as the server runs with
+/// them (`RuntimeConfig::p2pool`, from the profile or --p2pool-donation,
+/// --p2pool-standalone and --node-p2p). The pool's fee, fee address and
+/// name (the server's `pool_fee`, `fee_address`, `pool_tag`) go to P2Pool
+/// too.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SavedP2Pool {
+    /// P2Pool's own donation (`--p2pool-donation`), apart from the Pickaxe
+    /// donation; left out, P2Pool's default 1%.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub donation: Option<crate::donation::bch::BchDonation>,
+    /// P2Pool alone on its own share chain (`--p2pool-standalone`): the
+    /// Non-custodial Pool; otherwise linked with other P2Pool nodes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub standalone: bool,
+    /// The node's P2P port (`--node-p2p`), for block notices without ZMQ;
+    /// left out, the node's host and the network's P2P port when it gives
+    /// no ZMQ notices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_p2p: Option<String>,
+}
+
+/// #### Pool modes: a node's P2P address, `HOST:PORT` with an IPv6 host in
+/// brackets, as `--node-p2p` takes it.
+pub fn validate_node_p2p(address: &str) -> Result<String, String> {
+    let invalid = || "--node-p2p takes HOST:PORT, such as 192.168.1.5:8333".to_owned();
+    let address = address.trim();
+    let (host, port) = address.rsplit_once(':').ok_or_else(invalid)?;
+    let host_ok = match host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+    {
+        Some(ip) => ip.parse::<std::net::Ipv6Addr>().is_ok(),
+        None => {
+            !host.is_empty()
+                && host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        }
+    };
+    if !host_ok || port.parse::<u16>().map_or(true, |port| port == 0) {
+        return Err(invalid());
+    }
+    Ok(address.to_owned())
+}
+
 /// Shared profile validation also runs in browser and portable-only builds.
 /// Credentials and control characters are refused without echoing the URL.
 pub fn validate_p2pool_preparation_url(url: &str) -> Result<(), String> {
@@ -1026,6 +1087,16 @@ pub fn validate_p2pool_preparation_url(url: &str) -> Result<(), String> {
 impl SavedServer {
     /// Rejects values the setup would refuse for this mode on `network`.
     pub fn validate(&self, network: MiningNetwork) -> Result<(), String> {
+        self.validate_with(network, None)
+    }
+
+    /// #### Pool modes: the same, for a server that runs its own P2Pool
+    /// with `p2pool`'s settings when there are any.
+    pub fn validate_with(
+        &self,
+        network: MiningNetwork,
+        p2pool: Option<&SavedP2Pool>,
+    ) -> Result<(), String> {
         if let Some(api) = &self.p2pool_prepare_api {
             if self.mode != SavedMode::AsicJoin || self.job_declaration.is_none() {
                 return Err(
@@ -1046,7 +1117,9 @@ impl SavedServer {
         }
         let join = self.join.as_deref().map(str::trim).unwrap_or("");
         if self.mode.joins() {
-            if join.is_empty() {
+            // #### Pool modes: your own P2Pool, which ASICs join here, has
+            // no address to save.
+            if join.is_empty() && !(self.mode == SavedMode::AsicJoin && p2pool.is_some()) {
                 return Err("a profile that joins a pool needs the pool's address".into());
             }
         } else if self.join.is_some() || self.join_key.is_some() {
@@ -1171,8 +1244,46 @@ impl SavedServer {
         if self.accept_job_declaration.is_some() && self.mode != SavedMode::AsicPool {
             return Err("only an ASIC pool accepts miners' own templates".into());
         }
-        if !self.fallback_pools.is_empty() && self.mode != SavedMode::AsicSolo {
-            return Err("only ASIC solo mining saves fallback pools".into());
+        // #### Pool modes: and a server running its own P2Pool.
+        if !self.fallback_pools.is_empty() && self.mode != SavedMode::AsicSolo && p2pool.is_none() {
+            return Err("only ASIC solo mining or your own P2Pool saves fallback pools".into());
+        }
+        // #### Pool modes: P2Pool's own limits.
+        if let Some(p2pool) = p2pool {
+            if !matches!(self.mode, SavedMode::AsicJoin | SavedMode::AsicPool) {
+                return Err("only an ASIC pool or ASIC join profile runs its own P2Pool".into());
+            }
+            if self.job_declaration.is_some() {
+                return Err("a profile running its own P2Pool declares no templates".into());
+            }
+            // P2Pool's cap on its donation and fee: 10% (1,000 basis points).
+            if p2pool.donation.is_some_and(|donation| {
+                u16::from(donation) > 1_000 || u16::from(donation) % 50 != 0
+            }) {
+                return Err("P2Pool's own donation is 0% to 10% in 0.5% steps".into());
+            }
+            if self.pool_fee.is_some_and(|fee| u16::from(fee) > 1_000) {
+                return Err("P2Pool takes a fee of at most 10%".into());
+            }
+            if self
+                .fee_mode
+                .is_some_and(|mode| mode != crate::donation::bch::FeeMode::Coinbase)
+            {
+                return Err("P2Pool pays the fee from the coinbase only".into());
+            }
+            if self
+                .pool_tag
+                .as_deref()
+                .is_some_and(|tag| tag.trim().len() > 16)
+            {
+                return Err("P2Pool's pool signature is at most 16 characters".into());
+            }
+            if self.accept_job_declaration.is_some() {
+                return Err("a pool running its own P2Pool takes no miners' templates".into());
+            }
+            if let Some(address) = &p2pool.node_p2p {
+                validate_node_p2p(address)?;
+            }
         }
         if self.fallback_pools.len() > 8
             || self.fallback_pools.iter().any(|pool| {
@@ -1247,6 +1358,10 @@ impl SavedConfig {
         if let Some(value) = &self.source {
             cfg.set_source(value)?;
         }
+        // #### Pool modes: your own P2Pool's settings.
+        if let Some(p2pool) = &self.p2pool {
+            cfg.p2pool = p2pool.clone();
+        }
         Ok(())
     }
 
@@ -1271,8 +1386,12 @@ impl SavedConfig {
         self.apply_to_runtime(&mut runtime)?;
         // #### PR #42: a saved mode's pool values are checked as the setup
         // checks them.
+        // #### Pool modes: your own P2Pool's settings go with its server.
+        if self.p2pool.is_some() && self.server.is_none() {
+            return Err("P2Pool settings need an ASIC pool or ASIC join profile".into());
+        }
         if let Some(server) = &self.server {
-            server.validate(runtime.network)?;
+            server.validate_with(runtime.network, self.p2pool.as_ref())?;
         }
         runtime.validate_payout_network()
     }
@@ -1348,6 +1467,7 @@ impl SavedConfig {
             node_rpc: runtime.node_url.clone(),
             source: Some(runtime.source.as_str().to_string()),
             server: None,
+            p2pool: None,
         }
     }
 }
@@ -1714,7 +1834,32 @@ fn valid_profile_name(name: &str) -> Result<&str, String> {
     }
 }
 
+/// What a PHOTON mining session saves back to its profile when it stops:
+/// the intensity, payout and donation the dashboard may have changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSettings {
+    pub intensity: u8,
+    pub address: String,
+    /// `None` keeps the token's minimum, so a later minimum applies.
+    pub token_donation: Option<crate::donation::TokenDonation>,
+}
+
 impl MiningProfiles {
+    /// Saves `session` into the profile `name` at `path` (the terminal and
+    /// the desktop window both save a stopped session this way).
+    pub fn save_session(path: &Path, name: &str, session: &SessionSettings) -> Result<(), String> {
+        let mut profiles = Self::load_optional(path)?;
+        let profile = profiles
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.name.eq_ignore_ascii_case(name))
+            .ok_or("mining profile was renamed or removed during this session")?;
+        profile.settings.intensity = Some(session.intensity);
+        profile.settings.address = Some(session.address.clone());
+        profile.settings.token_donation_bps = session.token_donation;
+        profiles.save(path)
+    }
+
     pub fn load_optional(path: &Path) -> Result<Self, String> {
         if !path.exists() {
             return Ok(Self::default());
@@ -1897,7 +2042,7 @@ pub(crate) fn restrict_private_config(path: &Path) -> Result<(), String> {
 /// other local users cannot read `user:pass@host` out of the config.
 #[cfg(windows)]
 fn restrict_config_to_current_user(path: &Path) -> Result<(), String> {
-    let whoami = std::process::Command::new("whoami")
+    let whoami = crate::child_process::command("whoami")
         .output()
         .map_err(|error| format!("identify config owner for {}: {error}", path.display()))?;
     if !whoami.status.success() {
@@ -1913,7 +2058,7 @@ fn restrict_config_to_current_user(path: &Path) -> Result<(), String> {
             path.display()
         ));
     }
-    let output = std::process::Command::new("icacls")
+    let output = crate::child_process::command("icacls")
         .arg(path)
         .arg("/inheritance:r")
         .arg("/grant:r")
@@ -1978,19 +2123,19 @@ mod tests {
         assert_eq!(mainnet.scheme.description(), "Donation: 6%");
         let chipnet = MiningToken::Photon.fee_policy_at(MiningNetwork::Chipnet, six);
         assert_eq!(chipnet.scheme.work(), [600, 0]);
-        // #### 2026-10-24: below the default every share shrinks, to none.
+        // Below the default stays at 4%.
         let low =
             MiningToken::Photon.fee_policy_at(MiningNetwork::Mainnet, TokenDonation::from_bps(100));
-        assert_eq!(low.scheme.work(), [50, 50]);
+        assert_eq!(low.scheme.work(), [200, 200]);
         let none =
             MiningToken::Photon.fee_policy_at(MiningNetwork::Mainnet, TokenDonation::from_bps(0));
-        assert_eq!(none.scheme.work(), [0, 0]);
-        assert_eq!(none.scheme.description(), "Donation: 0%");
+        assert_eq!(none.scheme.work(), [200, 200]);
+        assert_eq!(none.scheme.description(), "Donation: 4%");
         let mut cfg = RuntimeConfig::default();
         assert_eq!(cfg.token_donation().bps(), 400);
         cfg.token_donation = Some(TokenDonation::from_bps(150));
-        assert_eq!(cfg.token_donation().bps(), 150);
-        assert_eq!(cfg.fee_policy().scheme.work(), [75, 75]);
+        assert_eq!(cfg.token_donation().bps(), 400);
+        assert_eq!(cfg.fee_policy().scheme.work(), [200, 200]);
         cfg.token_donation = None;
         // The saved setting only holds a value other than the default.
         cfg.set_payout(PAYOUT.into()).unwrap();
@@ -2847,6 +2992,166 @@ mod tests {
             assert!(fs::read_to_string(&path).unwrap().contains("secret-pass"));
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // #### Pool modes
+    // What: a profile keeps your own P2Pool's settings beside its ASIC pool
+    // or ASIC join server (P2Pool's own donation, standalone, the node's
+    // P2P port), with fallback pools; they reach the runtime config, and
+    // what P2Pool cannot take is refused: a donation or fee over 10%, a fee
+    // from work, a signature over 16 bytes, miners' own templates, P2Pool
+    // settings without such a server.
+    // Look here if: SavedP2Pool or `SavedServer::validate_with` change.
+    #[test]
+    fn a_profile_keeps_its_own_p2pools_settings_beside_its_server() {
+        let pool = SavedServer {
+            mode: SavedMode::AsicPool,
+            join: None,
+            join_key: None,
+            pool_fee: Some("2".parse().unwrap()),
+            fee_mode: Some(crate::donation::bch::FeeMode::Coinbase),
+            fee_address: None,
+            pool_tag: Some("/MyPool/".into()),
+            sv1_port: None,
+            sv2_port: None,
+            start_difficulty: None,
+            backups: Vec::new(),
+            pool_user: None,
+            tp_port: None,
+            job_declaration: None,
+            p2pool_prepare_api: None,
+            accept_job_declaration: None,
+            fallback_pools: vec!["stratum2+tcp://fallback.example:3336/KEY".into()],
+            asic_token: None,
+            rig_name: None,
+            rig_port: None,
+            rigs_only: false,
+            node_zmq: Some("off".into()),
+        };
+        let p2pool = SavedP2Pool {
+            donation: Some("0.5".parse().unwrap()),
+            standalone: true,
+            node_p2p: Some("192.168.1.20:48333".into()),
+        };
+        let with = |server: Option<SavedServer>, p2pool: Option<SavedP2Pool>| SavedConfig {
+            network: Some("chipnet".into()),
+            server,
+            p2pool,
+            ..SavedConfig::default()
+        };
+        let saved = with(Some(pool.clone()), Some(p2pool.clone()));
+        saved.validate().unwrap();
+        let text = serde_json::to_string(&saved).unwrap();
+        assert!(
+            text.contains(
+                "\"p2pool\":{\"donation\":50,\"standalone\":true,\"node_p2p\":\"192.168.1.20:48333\"}"
+            ),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<SavedConfig>(&text).unwrap(), saved);
+        let mut runtime = RuntimeConfig::default();
+        saved.apply_to_runtime(&mut runtime).unwrap();
+        assert_eq!(runtime.p2pool, p2pool);
+        // An ASIC join profile mines at your own P2Pool for your devices.
+        with(
+            Some(SavedServer {
+                mode: SavedMode::AsicJoin,
+                join: Some("stratum2+tcp://127.0.0.1:3361/KEY".into()),
+                pool_fee: None,
+                fee_mode: None,
+                pool_tag: None,
+                ..pool.clone()
+            }),
+            Some(SavedP2Pool::default()),
+        )
+        .validate()
+        .unwrap();
+        // Your own P2Pool has no address to save; another pool needs one.
+        let own = SavedServer {
+            mode: SavedMode::AsicJoin,
+            join: None,
+            pool_fee: None,
+            fee_mode: None,
+            pool_tag: None,
+            ..pool.clone()
+        };
+        with(Some(own.clone()), Some(SavedP2Pool::default()))
+            .validate()
+            .unwrap();
+        assert!(with(Some(own), None).validate().is_err());
+        for (server, p2pool, why) in [
+            (
+                Some(SavedServer {
+                    fee_mode: Some(crate::donation::bch::FeeMode::Both),
+                    ..pool.clone()
+                }),
+                Some(p2pool.clone()),
+                "a fee from work",
+            ),
+            (
+                Some(SavedServer {
+                    pool_fee: Some("10.5".parse().unwrap()),
+                    ..pool.clone()
+                }),
+                Some(p2pool.clone()),
+                "a fee over 10%",
+            ),
+            (
+                Some(SavedServer {
+                    pool_tag: Some("/SeventeenBytes!/".into()),
+                    ..pool.clone()
+                }),
+                Some(p2pool.clone()),
+                "a 17-byte signature",
+            ),
+            (
+                Some(SavedServer {
+                    accept_job_declaration: Some(SavedAccept::Both),
+                    ..pool.clone()
+                }),
+                Some(p2pool.clone()),
+                "miners' own templates",
+            ),
+            (
+                Some(pool.clone()),
+                Some(SavedP2Pool {
+                    donation: Some("10.5".parse().unwrap()),
+                    ..p2pool.clone()
+                }),
+                "a P2Pool donation over 10%",
+            ),
+            (
+                Some(pool.clone()),
+                Some(SavedP2Pool {
+                    node_p2p: Some("node.lan".into()),
+                    ..p2pool.clone()
+                }),
+                "a P2P address without its port",
+            ),
+            (
+                Some(SavedServer {
+                    mode: SavedMode::AsicSolo,
+                    pool_fee: None,
+                    fee_mode: None,
+                    pool_tag: None,
+                    ..pool.clone()
+                }),
+                Some(p2pool.clone()),
+                "P2Pool settings on solo mining",
+            ),
+            (
+                None,
+                Some(p2pool.clone()),
+                "P2Pool settings without a server",
+            ),
+            (
+                Some(pool.clone()),
+                None,
+                "fallback pools on a Public Solo Endpoint",
+            ),
+        ] {
+            assert!(with(server, p2pool).validate().is_err(), "{why}");
+        }
     }
 
     // #### PR #42

@@ -21,22 +21,51 @@ pub struct PublicPool {
 
 // #### merge-mining v2: login options
 // What: a public pool's username is `ADDRESS[.worker][,key=value]...`. The
-// options come after the first comma: `donation=<percent>` sets this
-// miner's whole Pickaxe donation (0 to 100 in 0.5% steps), as does
+// options come after the first comma: `donation=<percent>` names this
+// miner's Pickaxe donation (0 to 100 in 0.5% steps), as does
 // `pickaxe-donation=`, the key only Pickaxe pools read (Pickaxe's own SV1
 // adapter names it, see `sv1::open`); `p2p=` is BCH P2Pool's share address
 // and is ignored here, and other keys are ignored too. A malformed
 // donation, or two of them, refuses the login.
-// Why: the Pickaxe donation is the miner's choice even on someone else's
-// pool; without the option the pool's own setting applies, as before.
+// #### one donation, the higher rate: the named rate can raise the
+// server's, never lower it (see `effective_donation`).
+// Why: a miner may pay the donation on someone else's server even when its
+// owner set 0; without the option the server's own setting applies.
 // Look here if: a username with options is refused, or a donation option
-// does not change a miner's donation.
-/// A public pool miner's login: the payout address and the donation they
-/// chose, if any.
+// does not raise a miner's donation.
+/// A public pool miner's login: the payout address and the donation it
+/// names, if any.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Login {
     pub payout: String,
     pub donation: Option<BchDonation>,
+}
+
+// #### one donation, the higher rate
+// What: a Public Solo Endpoint's (or a pool's) miner pays the higher of the
+// server's Pickaxe donation rate and the rate their login names, once: host
+// 1.5% and a login's 3% is 3%, host 1.5% and a login's 0 is 1.5%, host 0
+// and a login's 1.5% is 1.5%. Every per-miner use of the rate goes through
+// here: the server's work rotation, the coinbase donation output and the
+// token leaves' donation slot (through the jobs' `BchPayout::donation`), and
+// the Job Declaration minimum (the allocated token's rate). What the
+// miner's own Pickaxe visibly donates on the same connection is credited
+// after this (`own_donation`), never what a login says.
+// Why: the donation is owed by whoever runs Pickaxe; the server's owner
+// sets the server's rate, and a miner may pay more but never less.
+// Look here if: a login lowers a miner's donation, or two rates are added
+// instead of the higher one taken.
+/// The Pickaxe donation rate a server's miner pays: the higher of `server`,
+/// the server's rate, and `login`, the rate their login names, if any.
+pub fn effective_donation(server: BchDonation, login: Option<BchDonation>) -> BchDonation {
+    login.map_or(server, |login| login.max(server))
+}
+
+/// #### one donation, the higher rate: whether a login's payout is the
+/// Pickaxe donation's own address, as the SV1 adapter's donation channel
+/// opens at a remote pool: that channel's work is the donation.
+pub fn is_donation(network: MiningNetwork, payout: &str) -> bool {
+    payout == crate::donation::bch::address(network)
 }
 
 /// The message a malformed `donation=` refuses a login with.
@@ -282,6 +311,46 @@ mod tests {
             );
         }
         assert!(login(",donation=1").is_err());
+    }
+
+    // #### one donation, the higher rate
+    // What: the higher of the server's rate and the login's applies, once:
+    // host 0 and miner 1.5% is 1.5%, host 1.5% and a typed 0 is 1.5%, host
+    // 1.5% and miner 3% is 3% (not 4.5%); no option leaves the server's.
+    // The donation's own address is a donation channel's payout, with or
+    // without its prefix or a P2Pool share address.
+    #[test]
+    fn the_higher_of_the_two_donation_rates_applies_once() {
+        let rate = |text: &str| text.parse::<BchDonation>().unwrap();
+        for (server, login, effective) in [
+            ("0", Some("1.5"), "1.5"),
+            ("1.5", Some("0"), "1.5"),
+            ("1.5", Some("3"), "3"),
+            ("2", Some("2"), "2"),
+            ("1.5", None, "1.5"),
+            ("0", None, "0"),
+            ("100", Some("0"), "100"),
+        ] {
+            assert_eq!(
+                effective_donation(rate(server), login.map(rate)),
+                rate(effective),
+                "{server} {login:?}"
+            );
+        }
+        let network = MiningNetwork::Chipnet;
+        let donation = crate::donation::bch::address(network);
+        let bare = donation.split_once(':').unwrap().1;
+        for identity in [
+            donation.to_owned(),
+            bare.to_owned(),
+            format!("{donation},p2p=bchtest:qq"),
+        ] {
+            let login = identity_login(network, &identity).unwrap();
+            assert!(is_donation(network, &login.payout), "{identity}");
+        }
+        let payout = super::super::template_tests::payout();
+        assert!(!is_donation(network, &payout));
+        assert!(!is_donation(MiningNetwork::Mainnet, donation));
     }
 
     // #### PR #40

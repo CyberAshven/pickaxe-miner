@@ -372,9 +372,11 @@ fn session(
     options: Session,
 ) -> Result<(), String> {
     use std::io::IsTerminal;
+    // A window showing the session needs no terminal.
     let monitor = super::ui::Monitor::new(
         cfg.intensity,
-        options.plain || !std::io::stdout().is_terminal(),
+        options.plain
+            || (!std::io::stdout().is_terminal() && !crate::tui::sessions_shown_elsewhere()),
         device_names(devices),
     );
     let mut ready = prepare(cfg, args, devices, config_path, options.create_key)?;
@@ -903,6 +905,7 @@ fn electric_donation(cfg: &RuntimeConfig) -> Option<crate::donation::TokenDonati
         .get("ELECTRIC")
         .copied()
         .or(cfg.token_donation)
+        .map(|donation| donation.raised_to(super::DONATION_DEFAULT))
 }
 
 fn print_deployment(cfg: &RuntimeConfig, deployment: &Deployment, addresses: &[String; 3]) {

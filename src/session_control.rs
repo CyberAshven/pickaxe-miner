@@ -29,6 +29,15 @@ impl StopState {
             self.pending = true;
         }
     }
+
+    /// Whether a signal is waiting for the next owner or reached the bound one.
+    fn signalled(&self) -> bool {
+        self.pending
+            || self
+                .target
+                .upgrade()
+                .is_some_and(|stop| stop.load(Ordering::SeqCst))
+    }
 }
 
 type StopTarget = Arc<Mutex<StopState>>;
@@ -63,6 +72,20 @@ pub fn take_profiles_request() -> bool {
     PROFILES.swap(false, Ordering::AcqRel)
 }
 
+/// Stops the running session as Ctrl+C does: the desktop window's Stop for
+/// sessions without a stop control of their own (rig mode, the ASIC server).
+/// It reaches only a session that is running: unlike Ctrl+C, a request with
+/// no session bound is dropped rather than carried into the next one.
+pub fn stop_session() {
+    if let Some(Ok(target)) = STOP.get() {
+        PROFILES.store(false, Ordering::Release);
+        let state = target.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(stop) = state.target.upgrade() {
+            stop.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Install once; the signal follows the active session rather than retaining
 /// a closed worker's stop flag across visits to the profile picker.
 pub fn install_stop(stop: &Arc<AtomicBool>) -> Result<(), String> {
@@ -78,6 +101,18 @@ pub fn install_stop(stop: &Arc<AtomicBool>) -> Result<(), String> {
         .map_err(Clone::clone)?;
     target.lock().unwrap_or_else(|e| e.into_inner()).bind(stop);
     Ok(())
+}
+
+/// Whether Ctrl+C reached the handler for the session being started: a
+/// request carried across the handoff, or the stop flag bound now. A start
+/// that waits on the network (a claim waiting for a block) checks it before
+/// its session binds a flag of its own. It never consumes the request.
+/// Before the handler is installed, Ctrl+C ends the process instead.
+pub fn stop_signalled() -> bool {
+    let Some(Ok(target)) = STOP.get() else {
+        return false;
+    };
+    target.lock().unwrap_or_else(|e| e.into_inner()).signalled()
 }
 
 #[cfg(test)]
@@ -115,6 +150,24 @@ mod tests {
         assert!(!photon.load(Ordering::SeqCst));
         routing.signal();
         assert!(photon.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_start_sees_a_signal_without_consuming_it() {
+        let mut routing = StopState::default();
+        assert!(!routing.signalled());
+        let previous = Arc::new(AtomicBool::new(false));
+        routing.bind(&previous);
+        assert!(!routing.signalled());
+        drop(previous);
+        assert!(!routing.signalled(), "a closed session's flag is gone");
+        routing.signal();
+        assert!(routing.signalled());
+        assert!(routing.signalled(), "seeing it does not consume it");
+        let next = Arc::new(AtomicBool::new(false));
+        routing.bind(&next);
+        assert!(next.load(Ordering::SeqCst));
+        assert!(routing.signalled());
     }
 
     #[test]

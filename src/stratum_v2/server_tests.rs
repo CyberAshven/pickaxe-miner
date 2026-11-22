@@ -682,7 +682,7 @@ impl Running {
     }
 
     pub(super) fn wait(&self, condition: impl Fn(&ServerStats) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + PROGRESS_DEADLINE;
         loop {
             if condition(&self.stats.lock().unwrap()) {
                 return;
@@ -695,6 +695,14 @@ impl Running {
         }
     }
 }
+
+/// What: how long a test waits for progress it expects from a server (ready
+/// templates, an accepted block, a counted verdict, a leaf log line).
+/// Why: the waits return as soon as the condition holds; 5 s was too short
+/// for a loaded Windows runner starting a template server, which failed tests
+/// that had nothing wrong.
+/// Look here if: a test fails with "server progress deadline exceeded".
+const PROGRESS_DEADLINE: Duration = Duration::from_secs(30);
 
 impl Drop for Running {
     fn drop(&mut self) {
@@ -893,7 +901,7 @@ impl Device {
         let mut bytes = version.to_le_bytes().to_vec();
         bytes.extend(previous.prev_hash.as_ref());
         bytes.extend(root);
-        bytes.extend(previous.min_ntime.to_le_bytes());
+        bytes.extend(previous.ntime_start.to_le_bytes());
         bytes.extend(previous.nbits.to_le_bytes());
         bytes.extend(0u32.to_le_bytes());
         let mut header: Header = consensus::deserialize(&bytes).unwrap();
@@ -909,7 +917,7 @@ impl Device {
                 sequence_number: sequence,
                 job_id,
                 nonce,
-                ntime: previous.min_ntime,
+                ntime: previous.ntime_start,
                 version,
                 extranonce: extra.as_slice().try_into().unwrap(),
             })
@@ -919,7 +927,7 @@ impl Device {
                 sequence_number: sequence,
                 job_id,
                 nonce,
-                ntime: previous.min_ntime,
+                ntime: previous.ntime_start,
                 version,
             })
         };
@@ -1039,10 +1047,10 @@ fn a_device_mines_the_test_token_and_each_state_is_proven_once() {
 // root of their own: a miner finds a block whose output 0 is a non-empty
 // root; their share wins the token, which the claim worker proves and
 // journals with the split preimage of the default donation's 1% and the
-// operator's 2% coinbase-mode fee. (A login's donation=0, which leaves the
-// fee slot alone, is in the channel tests.)
+// operator's 2% coinbase-mode fee. (A job at 0% donation, whose leaves
+// carry the fee slot alone, is in the channel tests.)
 // Look here if: a public pool's miners stop winning tokens, or their split
-// names the donation they declined.
+// names another donation than their jobs'.
 #[test]
 fn a_public_pools_miners_mine_their_own_roots() {
     use super::merge::{
@@ -2080,6 +2088,8 @@ fn sv1_firmware_mines_at_a_remote_sv2_pool_and_the_adapter_counts_its_verdicts()
         public: false,
         prefer: None,
         fixed_version: false,
+        miners: None,
+        serving: None,
     };
     let upstreams = vec![pool_with([3; 32]), pool_with(pool.authority)];
     let thread = {
@@ -2103,7 +2113,7 @@ fn sv1_firmware_mines_at_a_remote_sv2_pool_and_the_adapter_counts_its_verdicts()
         assert_eq!(pool.node.lock().unwrap().tip, hash);
     }
     // The pool's verdicts reach the adapter's own workers page.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PROGRESS_DEADLINE;
     while stats.lock().unwrap().shares_accepted < 2 {
         assert!(Instant::now() < deadline, "pool verdicts not counted");
         thread::sleep(Duration::from_millis(10));
@@ -2316,7 +2326,7 @@ fn a_proxy_mines_through_a_grouped_connection() {
                 let prev: SetNewPrevHash = binary_sv2::from_bytes(frame.payload()).unwrap();
                 *parent = Some((
                     prev.prev_hash.as_ref().try_into().unwrap(),
-                    prev.min_ntime,
+                    prev.ntime_start,
                     prev.nbits,
                 ));
                 (kind, prev.channel_id)
@@ -2495,6 +2505,8 @@ fn solo_devices_move_to_the_fallback_pool_when_the_node_stops_and_return_when_it
             public: false,
             prefer: Some(preferred),
             fixed_version: false,
+            miners: None,
+            serving: None,
         },
     ];
     let thread = {
@@ -2548,6 +2560,8 @@ fn at_a_remote_pool_the_donation_mines_on_its_own_channel_and_the_pool_accepts_i
         public: false,
         prefer: None,
         fixed_version: false,
+        miners: None,
+        serving: None,
     }];
     let thread = {
         let stop = stop.clone();
@@ -2587,7 +2601,7 @@ fn at_a_remote_pool_the_donation_mines_on_its_own_channel_and_the_pool_accepts_i
     // device built with the adapter's extranonce is the pool's own.
     pool.wait(|stats| stats.blocks_accepted == 1);
     assert_eq!(pool.node.lock().unwrap().tip, hash);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PROGRESS_DEADLINE;
     while stats.lock().unwrap().shares_accepted < 1 {
         assert!(Instant::now() < deadline, "pool verdict not counted");
         thread::sleep(Duration::from_millis(10));
@@ -2668,7 +2682,7 @@ fn public_pool_miners_can_see_their_leaves() {
     send(json!({"id":2,"method":"mining.subscribe","params":["test"]}));
     assert!(next()["result"].is_array());
     send(json!({"id":3,"method":"mining.authorize","params":[miner.clone()]}));
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PROGRESS_DEADLINE;
     let leaves = loop {
         assert!(Instant::now() < deadline, "no leaves reached the firmware");
         let message = next();
@@ -2690,7 +2704,7 @@ fn public_pool_miners_can_see_their_leaves() {
     // A standard-channel device: the leaf log.
     let log = directory.0.join("leaves.jsonl");
     let device = Device::connect_as(&server, false, &address(4));
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PROGRESS_DEADLINE;
     while !std::fs::read_to_string(&log).is_ok_and(|text| text.lines().count() >= 1) {
         assert!(Instant::now() < deadline, "no leaf log line");
         thread::sleep(Duration::from_millis(10));
@@ -2710,13 +2724,15 @@ fn public_pool_miners_can_see_their_leaves() {
 
 // #### merge-mining v2: one donation at a pool
 // What: the adapter, which donates on its own channel at a remote pool,
-// asks a Pickaxe public pool for no donation on the device's channel
-// (`,pickaxe-donation=0`, a key BCH P2Pool does not read): the device's
-// block pays the miner and the operator's fee, nothing to the donation.
-// Look here if: a device at a Pickaxe pool donates twice, or the adapter's
-// login options change.
+// names `,pickaxe-donation=0` on the device's channel (a key BCH P2Pool
+// does not read). #### one donation, the higher rate: a Pickaxe pool no
+// longer lowers its rate for that text: with the adapter's own donation at
+// 0% (no donation channel, nothing to credit), the device's block pays the
+// miner, the donation at the pool's 1.5% and the operator's fee.
+// Look here if: a typed 0 lowers a Pickaxe pool's donation, or the
+// adapter's login options change.
 #[test]
-fn the_adapter_asks_a_pickaxe_pool_for_no_second_donation() {
+fn a_typed_zero_donation_does_not_lower_a_pickaxe_pools_rate() {
     use crate::donation::bch::{FeeMode, PoolFee};
     use crate::tx::cashaddr_to_p2pkh_locking;
     let operator = address(6);
@@ -2745,6 +2761,8 @@ fn the_adapter_asks_a_pickaxe_pool_for_no_second_donation() {
         public: false,
         prefer: None,
         fixed_version: false,
+        miners: None,
+        serving: None,
     }];
     let thread = {
         let stop = stop.clone();
@@ -2781,10 +2799,99 @@ fn the_adapter_asks_a_pickaxe_pool_for_no_second_donation() {
         outputs,
         vec![
             cashaddr_to_p2pkh_locking(&miner).unwrap(),
+            cashaddr_to_p2pkh_locking(crate::donation::bch::address(MiningNetwork::Chipnet))
+                .unwrap(),
             cashaddr_to_p2pkh_locking(&operator).unwrap(),
         ]
     );
     drop(node);
+    device.write.shutdown(std::net::Shutdown::Both).unwrap();
+}
+
+// #### one donation, the higher rate: the donation's channel
+// What: the adapter's own donation channel at a Pickaxe pool opens on the
+// device's connection beside its `,pickaxe-donation=0` login (no
+// donation-mismatch), and mines donation work there: at the adapter's 100%
+// the device moves to it, and the block it finds pays the donation whole,
+// with no fee to the operator; the pool counts that work as donation.
+// Look here if: an adapter's donation channel is refused at a Pickaxe
+// pool, or the pool takes a fee from it.
+#[test]
+fn the_adapters_donation_channel_mines_donation_work_at_a_pickaxe_pool() {
+    use crate::donation::bch::{FeeMode, PoolFee};
+    use crate::tx::cashaddr_to_p2pkh_locking;
+    let pool = Running::public(super::payout::PublicPool {
+        fee: Some(PoolFee {
+            rate: "1".parse().unwrap(),
+            mode: FeeMode::Coinbase,
+        }),
+        address: address(6),
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let local = listener.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(Mutex::new(ServerStats::default()));
+    let donation = crate::donation::bch::address(MiningNetwork::Chipnet);
+    let upstreams = vec![super::sv1::Upstream {
+        address: pool.address.to_string(),
+        authority: pool.authority,
+        identity: address(7),
+        remote: true,
+        donation: Some(super::sv1::DonationRoute {
+            identity: donation.to_owned(),
+            rate: Arc::new(std::sync::RwLock::new("100".parse().unwrap())),
+            fallback: None,
+        }),
+        public: false,
+        prefer: None,
+        fixed_version: false,
+        miners: None,
+        serving: None,
+    }];
+    let thread = {
+        let stop = stop.clone();
+        let stats = stats.clone();
+        thread::spawn(move || super::sv1::run(listener, upstreams, stop, stats))
+    };
+    let adapter = FirmwareAdapter {
+        stop,
+        thread: Some(thread),
+        address: local,
+    };
+    let mut device = FirmwareDevice::connect(&adapter, true, false);
+    // The device's own job first, then the donation channel's.
+    let notify = (0..16)
+        .map(|_| device.receive())
+        .find(|message| {
+            message["method"] == "mining.notify"
+                && message["params"][0]
+                    .as_str()
+                    .and_then(|job| job.parse::<u32>().ok())
+                    .is_some_and(|job| job & 0x8000_0000 != 0)
+        })
+        .expect("a donation channel job");
+    let (_, submit) = device.solve_notify(0, true, &notify);
+    device.send(submit);
+    let ack = loop {
+        let message = device.receive();
+        if !message["id"].is_null() {
+            break message;
+        }
+    };
+    assert_eq!(ack["result"], true, "{ack}");
+    pool.wait(|stats| stats.blocks_accepted == 1);
+    let node = pool.node.lock().unwrap();
+    let block: Block =
+        consensus::deserialize(&hex::decode(node.submitted.last().unwrap()).unwrap()).unwrap();
+    let outputs: Vec<Vec<u8>> = block.txdata[0]
+        .output
+        .iter()
+        .map(|output| output.script_pubkey.to_bytes())
+        .collect();
+    assert_eq!(outputs, vec![cashaddr_to_p2pkh_locking(donation).unwrap()]);
+    drop(node);
+    let work = pool.stats.lock().unwrap().work;
+    assert!(work.donation > 0.0 && work.fee == 0.0, "{work:?}");
     device.write.shutdown(std::net::Shutdown::Both).unwrap();
 }
 
@@ -2903,6 +3010,8 @@ fn real_sv2_pool_sends_work_to_sv1_firmware() {
         public: false,
         prefer: None,
         fixed_version: false,
+        miners: None,
+        serving: None,
     };
     let thread = {
         let stop = stop.clone();
@@ -2989,6 +3098,8 @@ fn a_device_whose_pools_all_fail_still_shows_the_reason() {
             public: false,
             prefer: None,
             fixed_version: false,
+            miners: None,
+            serving: None,
         },
         super::sv1::Upstream {
             address: pool.address.to_string(),
@@ -2999,6 +3110,8 @@ fn a_device_whose_pools_all_fail_still_shows_the_reason() {
             public: false,
             prefer: None,
             fixed_version: false,
+            miners: None,
+            serving: None,
         },
     ];
     let thread = {
@@ -3147,7 +3260,7 @@ fn a_scripted_jd_client_sets_a_custom_job_and_mines_it() {
                 token: token.as_slice().try_into().unwrap(),
                 version: 0x2000_0000,
                 prev_hash: (&[0xab; 32]).into(),
-                min_ntime: time,
+                ntime_start: time,
                 nbits: 0x207f_ffff,
                 coinbase_tx_version: 2,
                 coinbase_prefix: prefix.as_slice().try_into().unwrap(),
@@ -3348,10 +3461,10 @@ fn coinbase_only_pickaxe_jdc_mines_at_a_pickaxe_jds_on_loopback() {
             && stats.shares_accepted >= 1
     });
     client.wait(|stats| {
-        stats
-            .jd_client
-            .as_ref()
-            .is_some_and(|jd| jd.forwarded >= 1 && jd.accepted >= 1)
+        stats.jd_client.as_ref().is_some_and(|jd| {
+            // The coinbase came from the pool's payout outputs (0x5052).
+            jd.forwarded >= 1 && jd.accepted >= 1 && jd.payout_outputs >= 1
+        })
     });
     let found = pool
         .stats
@@ -3369,8 +3482,10 @@ fn coinbase_only_pickaxe_jdc_mines_at_a_pickaxe_jds_on_loopback() {
 
 // #### merge-mining v2: the miner's donation at a Pickaxe pool
 // What: a Job Declaration client whose own donation setting is 0% names it
-// (`,pickaxe-donation=0.00`) to a Pickaxe pool whose own setting is 1.5%:
-// the block pays the miner and the pool's 1% fee, nothing to the donation.
+// (`,pickaxe-donation=0.00`) to a Pickaxe pool whose own setting is 1.5%.
+// #### one donation, the higher rate: the higher rate, the pool's 1.5%,
+// applies: the block pays the miner, the pool's 1% fee (of what the
+// donation leaves) and the donation 1.5%, all in the coinbase.
 // Look here if: `JdTarget::login` or the pool's login options change.
 #[test]
 fn a_jd_client_names_its_own_donation_to_a_pickaxe_pool() {
@@ -3410,10 +3525,17 @@ fn a_jd_client_names_its_own_donation_to_a_pickaxe_pool() {
     assert_eq!(
         outputs,
         vec![
-            (309_375_000, miner),
+            (304_734_375, miner),
             (
-                3_125_000,
+                3_078_125,
                 crate::tx::cashaddr_to_coinbase_locking(&address(0x34)).unwrap()
+            ),
+            (
+                4_687_500,
+                crate::tx::cashaddr_to_p2pkh_locking(crate::donation::bch::address(
+                    MiningNetwork::Chipnet
+                ))
+                .unwrap()
             ),
         ]
     );
@@ -3532,7 +3654,11 @@ fn full_template_declares_provides_a_missing_transaction_and_both_nodes_get_the_
     assert_eq!(hash(&miner_node), hash(&pool_node));
     client.wait(|stats| {
         stats.jd_client.as_ref().is_some_and(|jd| {
-            jd.mode == "full-template" && jd.provided == 1 && jd.declared >= 1 && jd.pushed == 1
+            jd.mode == "full-template"
+                && jd.provided == 1
+                && jd.declared >= 1
+                && jd.pushed == 1
+                && jd.payout_outputs >= 1
         })
     });
     let found = pool
@@ -3680,7 +3806,7 @@ fn a_pool_without_job_declaration_leaves_the_local_server_without_work() {
         }],
         stop.clone(),
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PROGRESS_DEADLINE;
     loop {
         let summary = handle.status.summary.lock().unwrap().clone();
         if summary.fallbacks >= 1 {

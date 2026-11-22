@@ -4,7 +4,7 @@
 //! answers on its chain and is synced.
 use super::launch::{self, Light, State, Supervisor};
 use super::release::{self, Check, Installed, Release};
-use super::{home, Settings, ShareChain};
+use super::{home, peers, Settings, ShareChain};
 use crate::cli::P2poolCommand;
 use crate::config::{MiningNetwork, RuntimeConfig};
 use crate::node::NodeCheck;
@@ -35,13 +35,14 @@ pub fn command(
             match release::check(&home) {
                 Ok(Check::UpToDate(tag)) => println!("newest:    {tag} (up to date)"),
                 Ok(Check::Available { release, .. }) => println!(
-                    "newest:    {}{} (run `pickaxe p2pool update`)",
+                    "newest:    {}{}, {} (run `pickaxe p2pool update`)",
                     release.tag,
                     if release.prerelease {
                         ", pre-release"
                     } else {
                         ""
-                    }
+                    },
+                    release.signature_text()
                 ),
                 Err(error) => println!("newest:    unknown ({error})"),
             }
@@ -50,6 +51,10 @@ pub fn command(
                 on_off(settings.auto_update),
                 settings.share_chain.as_str(),
                 peers_text(&settings)
+            );
+            println!(
+                "peers:     {} (`pickaxe p2pool peers`)",
+                peers::summary(cfg.network, &settings.peers, &home)
             );
             println!(
                 "releases:  https://github.com/{}/releases",
@@ -110,8 +115,18 @@ pub fn command(
             if *no_peers {
                 settings.peers.clear();
             }
-            settings.peers.extend(peers.iter().cloned());
-            settings.peers.dedup();
+            for peer in peers {
+                let peer = peer.trim();
+                if !peers::is_dial_address(peer) {
+                    return Err(format!(
+                        "--peer {peer}: give a P2P address such as /ip4/203.0.113.7/tcp/6884 \
+                         or /dns4/pool.example.com/tcp/6884"
+                    ));
+                }
+                if !settings.peers.iter().any(|kept| kept == peer) {
+                    settings.peers.push(peer.to_owned());
+                }
+            }
             settings.save(&home)?;
             println!(
                 "P2Pool: auto-update {}, {} share chain, {}.",
@@ -121,8 +136,74 @@ pub fn command(
             );
             Ok(())
         }
-        P2poolCommand::Run { no_update } => run(cfg, config_path, plain, *no_update),
+        P2poolCommand::Peers { check } => {
+            let settings = Settings::load(&home)?;
+            let dial = check.then(|| peers::dial_list(cfg.network, &settings.peers, false, &home));
+            print!(
+                "{}",
+                peers_report(cfg.network, &settings, &home, dial.as_deref())
+            );
+            Ok(())
+        }
+        P2poolCommand::Run {
+            no_update,
+            standalone,
+        } => run(cfg, config_path, plain, *no_update, *standalone),
     }
+}
+
+/// `pickaxe p2pool peers`: the seeds, your peers and the known ones with
+/// their last check, and with `--check` what the next start dials.
+fn peers_report(
+    network: MiningNetwork,
+    settings: &Settings,
+    home: &Path,
+    dial: Option<&[String]>,
+) -> String {
+    use std::fmt::Write;
+    let listing = peers::listing(network, &settings.peers, home);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let mut out = String::new();
+    let _ = writeln!(out, "P2Pool peers on {}", network.as_str());
+    for (title, rows, none) in [
+        (
+            "Seeds",
+            &listing.seeds,
+            "none yet (they come with Pickaxe releases)",
+        ),
+        (
+            "Yours",
+            &listing.yours,
+            "none (`pickaxe p2pool set --peer ADDRESS`)",
+        ),
+        (
+            "Known (P2Pool was connected to them)",
+            &listing.known,
+            "none yet",
+        ),
+    ] {
+        if rows.is_empty() {
+            let _ = writeln!(out, "{title}: {none}");
+            continue;
+        }
+        let _ = writeln!(out, "{title}:");
+        for peer in rows {
+            let _ = writeln!(out, "  {}  {}", peer.address, peers::describe(peer, now));
+        }
+    }
+    let _ = match dial {
+        Some([]) => writeln!(
+            out,
+            "Next start dials: nobody; P2Pool starts its own share chain and takes \
+             peers that dial in."
+        ),
+        Some(dial) => writeln!(out, "Next start dials:")
+            .and_then(|()| dial.iter().try_for_each(|peer| writeln!(out, "  {peer}"))),
+        None => writeln!(out, "`pickaxe p2pool peers --check` checks them now."),
+    };
+    out
 }
 
 fn on_off(value: bool) -> &'static str {
@@ -135,10 +216,26 @@ fn on_off(value: bool) -> &'static str {
 
 fn peers_text(settings: &Settings) -> String {
     match settings.peers.len() {
-        0 => "no peers (its own share chain)".into(),
-        1 => "1 peer".into(),
-        count => format!("{count} peers"),
+        0 => "no peers of your own".into(),
+        1 => "1 peer of your own".into(),
+        count => format!("{count} peers of your own"),
     }
+}
+
+/// Whom this start links with: alone, or how many peers it dials.
+fn linked_text(plan: &launch::Plan) -> String {
+    if plan.standalone {
+        return "alone (standalone)".into();
+    }
+    let mut text = match plan.dial.get().map_or(0, Vec::len) {
+        0 => "linked · no peers to dial yet".to_owned(),
+        1 => "linked · dials 1 peer".to_owned(),
+        count => format!("linked · dials {count} peers"),
+    };
+    if peers::seeds(plan.network).is_empty() {
+        text.push_str(" · no seeds yet");
+    }
+    text
 }
 
 /// What the update line says.
@@ -256,6 +353,7 @@ fn run(
     config_path: &Path,
     plain: bool,
     no_update: bool,
+    standalone: bool,
 ) -> Result<(), String> {
     let home = home(config_path);
     let mut settings = Settings::load(&home)?;
@@ -269,7 +367,8 @@ fn run(
     crate::session_control::install_stop(&stop)?;
     let node_watch = NodeWatch::start(node, cfg.network);
     loop {
-        let plan = launch::plan(cfg, &home, &installed, &settings)?;
+        let mut plan = launch::plan(cfg, &home, &installed, &settings)?;
+        plan.standalone = standalone;
         let supervisor = Supervisor::start(plan.command()?, Some(launch::API_PORT));
         let view = View {
             network: cfg.network,
@@ -321,10 +420,11 @@ fn report(
     update: &Update,
 ) -> Result<Exit, String> {
     println!(
-        "P2Pool {} on {} ({} share chain); devices: {}. Ctrl+C stops.",
+        "P2Pool {} on {} ({} share chain, {}); devices: {}. Ctrl+C stops.",
         view.plan.tag,
         view.network.as_str(),
         view.plan.settings.share_chain.as_str(),
+        linked_text(view.plan),
         view.device_url
     );
     match update {
@@ -515,7 +615,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &Shown<'_>) {
         Line::from(format!(
             "Chain    {} share chain · {}",
             plan.settings.share_chain.as_str(),
-            peers_text(&plan.settings)
+            linked_text(plan)
         )),
         Line::from(format!("Devices  {}", state.view.device_url)),
         Line::from(format!(
@@ -579,6 +679,10 @@ mod tests {
             zmq: "tcp://node.example:28332".into(),
             bootstrap_address: String::new(),
             authority_secret: [7; 32],
+            node_p2p: None,
+            operator: None,
+            standalone: false,
+            dial: std::sync::OnceLock::new(),
         };
         let view = View {
             network: MiningNetwork::Chipnet,
@@ -594,6 +698,7 @@ mod tests {
             asset_url: String::new(),
             sha256_url: String::new(),
             digest: None,
+            signed_sums: None,
         };
         let update = Update::Available(release);
         let node = NodeCheck::Ready {
@@ -638,7 +743,7 @@ mod tests {
             "P2Pool   ● running · share chain tip 1234 · 0 peers · up 1m 15s",
             "Node     ● Bitcoin Cash Node 29.2.0 · synced at height 328500",
             "Version  v0.0.1-alpha · auto-update off · v0.0.2 is available · press u to install",
-            "Chain    mini share chain · no peers (its own share chain)",
+            "Chain    mini share chain · linked · no peers to dial yet · no seeds yet",
             &format!("Devices  {}", view.device_url),
             "1 restart",
             "Stratum V2 listening on",
@@ -667,5 +772,47 @@ mod tests {
         assert!(down.contains("auto-update on · up to date"));
         assert_eq!(node_light(None).0, Light::Grey);
         assert_eq!(duration_text(Duration::from_secs(3_725)), "1h 02m");
+        // Linked with peers to dial, and alone.
+        let mut linked = plan.clone();
+        linked.dial = vec!["/ip4/203.0.113.7/tcp/6884".to_owned(); 2].into();
+        assert_eq!(
+            linked_text(&linked),
+            "linked · dials 2 peers · no seeds yet"
+        );
+        let mut alone = linked;
+        alone.standalone = true;
+        assert_eq!(linked_text(&alone), "alone (standalone)");
+    }
+
+    #[test]
+    fn the_peers_command_lists_each_list_with_its_last_check() {
+        let home = super::super::test_dir("screen-peers");
+        let settings = Settings {
+            peers: vec!["/ip4/203.0.113.7/tcp/6884".into()],
+            ..Settings::default()
+        };
+        let report = peers_report(MiningNetwork::Chipnet, &settings, &home, None);
+        for expected in [
+            "P2Pool peers on chipnet\n",
+            "Seeds: none yet (they come with Pickaxe releases)\n",
+            "Yours:\n  /ip4/203.0.113.7/tcp/6884  not checked yet\n",
+            "Known (P2Pool was connected to them): none yet\n",
+            "`pickaxe p2pool peers --check` checks them now.",
+        ] {
+            assert!(report.contains(expected), "{expected}: {report}");
+        }
+        let dial = vec!["/ip4/203.0.113.7/tcp/6884".to_owned()];
+        assert!(
+            peers_report(MiningNetwork::Chipnet, &settings, &home, Some(&dial))
+                .contains("Next start dials:\n  /ip4/203.0.113.7/tcp/6884\n")
+        );
+        assert!(peers_report(
+            MiningNetwork::Chipnet,
+            &Settings::default(),
+            &home,
+            Some(&[])
+        )
+        .contains("Next start dials: nobody"));
+        std::fs::remove_dir_all(home).unwrap();
     }
 }

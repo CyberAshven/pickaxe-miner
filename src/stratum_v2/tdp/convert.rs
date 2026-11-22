@@ -63,7 +63,7 @@ pub fn set_new_prev_hash(id: u64, template: &BchTemplate) -> Result<SerializedFr
         SetNewPrevHash {
             template_id: id,
             prev_hash: (&template.previous_hash).into(),
-            header_timestamp: template.current_time,
+            ntime_start: template.current_time,
             n_bits: template.bits,
             target: (&template.target).into(),
         },
@@ -100,6 +100,29 @@ pub fn transaction_data(id: u64, template: &BchTemplate) -> Result<SerializedFra
         false,
     )
     .map_err(|_| "template-too-large")
+}
+
+/// #### BCH large templates: `RequestTransactionData.Success` with
+/// `transactions` and empty `excess_data`, the end of a push or of an
+/// answer in pages.
+pub fn transaction_data_success(
+    id: u64,
+    transactions: &[&[u8]],
+) -> Result<SerializedFrame, String> {
+    let list = transactions
+        .iter()
+        .map(|tx| B016M::try_from(*tx))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "transaction over 16 MiB")?;
+    encoded(
+        RequestTransactionDataSuccess {
+            template_id: id,
+            excess_data: (&[][..]).try_into().map_err(|_| "excess data too long")?,
+            transaction_list: list.try_into().map_err(|_| "over 65,535 transactions")?,
+        },
+        MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_SUCCESS,
+        false,
+    )
 }
 
 /// `RequestTransactionData.Error` with `code`.
@@ -159,9 +182,9 @@ pub fn assemble(template: &BchTemplate, solution: &SubmitSolution) -> Result<Ass
     header[..4].copy_from_slice(&solution.version.to_le_bytes());
     header[4..36].copy_from_slice(&template.previous_hash);
     header[36..68].copy_from_slice(&root);
-    header[68..72].copy_from_slice(&solution.header_timestamp.to_le_bytes());
+    header[68..72].copy_from_slice(&solution.ntime.to_le_bytes());
     header[72..76].copy_from_slice(&template.bits.to_le_bytes());
-    header[76..].copy_from_slice(&solution.header_nonce.to_le_bytes());
+    header[76..].copy_from_slice(&solution.nonce.to_le_bytes());
     let refused = if !tx.input[0]
         .script_sig
         .as_bytes()
@@ -172,7 +195,7 @@ pub fn assemble(template: &BchTemplate, solution: &SubmitSolution) -> Result<Ass
         Some("version")
     } else if !meets_target(&double_sha256(&header), &template.target) {
         Some("high-hash")
-    } else if template.wrong_bits(solution.header_timestamp) {
+    } else if template.wrong_bits(solution.ntime) {
         // #### PR #48: a Chipnet block whose time needs other bits (see
         // `BchTemplate::wrong_bits`).
         Some("bad-diffbits")
@@ -276,8 +299,8 @@ pub(super) mod tests {
         SubmitSolution {
             template_id: id,
             version,
-            header_timestamp: time,
-            header_nonce: nonce,
+            ntime: time,
+            nonce,
             coinbase_tx: coinbase.try_into().unwrap(),
         }
     }

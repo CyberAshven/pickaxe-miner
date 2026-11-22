@@ -1,6 +1,10 @@
 //! #### PR #53: P2Pool's releases: the newest one for this platform, its
 //! download checked against the SHA-256 published beside it, unpacked into
 //! its own version folder, with the previous version kept to roll back to.
+//! A release that also publishes a minisign-signed `SHA256SUMS` is held to
+//! Pickaxe's own rule (`crate::update::trust`) once a P2Pool key is compiled
+//! in: its signature must verify and its archive match the signed checksum.
+//! Until then P2Pool installs on its published SHA-256 alone, as unsigned.
 use super::http;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -58,6 +62,26 @@ pub struct Release {
     /// The SHA-256 GitHub itself records for the archive (its `digest`),
     /// a second source besides the published `.sha256` file.
     pub digest: Option<[u8; 32]>,
+    /// The release's `SHA256SUMS` and its minisign signature, when it
+    /// publishes both (boxed: rarely there, and `Release` rides in enums).
+    pub signed_sums: Option<Box<(String, String)>>,
+}
+
+impl Release {
+    /// Whether this release can count as signed: it publishes a signed
+    /// checksum file and Pickaxe has a key for P2Pool's releases.
+    pub fn may_be_signed(&self) -> bool {
+        self.signed_sums.is_some() && !crate::update::trust::P2POOL_TRUSTED_KEYS.is_empty()
+    }
+
+    /// How its download is checked, for status lines.
+    pub fn signature_text(&self) -> &'static str {
+        if self.may_be_signed() {
+            "signed SHA256SUMS, verified before it installs"
+        } else {
+            "unsigned: checked against its published SHA-256 only"
+        }
+    }
 }
 
 /// The newest release in GitHub's release list with `asset` and its
@@ -87,6 +111,12 @@ pub fn newest(releases: &serde_json::Value, asset: &str) -> Option<Release> {
         .iter()
         .filter(|release| !release["draft"].as_bool().unwrap_or(false))
         .filter_map(|release| {
+            let signed_sums = crate::update::trust::SUMS_NAMES.iter().find_map(|name| {
+                Some(Box::new((
+                    download(release, name)?,
+                    download(release, &crate::update::trust::signature_name(name))?,
+                )))
+            });
             Some(Release {
                 tag: release["tag_name"].as_str()?.to_owned(),
                 published_at: release["published_at"].as_str().unwrap_or("").to_owned(),
@@ -95,6 +125,7 @@ pub fn newest(releases: &serde_json::Value, asset: &str) -> Option<Release> {
                 asset_url: download(release, asset)?,
                 sha256_url: download(release, &format!("{asset}.sha256"))?,
                 digest: digest(release),
+                signed_sums,
             })
         })
         .max_by(|a, b| a.published_at.cmp(&b.published_at))
@@ -109,6 +140,10 @@ pub struct Installed {
     /// The archive's SHA-256, as published and checked.
     pub sha256: String,
     pub installed_at: u64,
+    /// Its checksum file carried a trusted signature (written only when
+    /// true, so older Pickaxe versions still read the record).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub signed: bool,
     /// The version before it, kept to roll back to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous: Option<Box<Installed>>,
@@ -165,7 +200,8 @@ pub fn check(home: &Path) -> Result<Check, String> {
 }
 
 /// Downloads `release`, checks it against its published SHA-256 (and the
-/// one GitHub records, when the release list gives it) and installs it.
+/// one GitHub records, when the release list gives it, and the signed
+/// checksum file, when it counts) and installs it.
 pub fn install(home: &Path, release: &Release) -> Result<Installed, String> {
     let published =
         http::get(&release.sha256_url, "*/*", 64 << 10, TIMEOUT)?.ok("the release's .sha256")?;
@@ -176,6 +212,26 @@ pub fn install(home: &Path, release: &Release) -> Result<Installed, String> {
             release.asset
         ));
     }
+    let signed = match release.signed_sums.as_deref() {
+        Some((sums_url, signature_url)) if release.may_be_signed() => {
+            let sums = http::get(sums_url, "*/*", 64 << 10, TIMEOUT)?.ok("SHA256SUMS")?;
+            let signature =
+                http::get(signature_url, "*/*", 4 << 10, TIMEOUT)?.ok("SHA256SUMS.minisig")?;
+            signed_checksum(
+                &sums,
+                &String::from_utf8_lossy(&signature),
+                &release.asset,
+                crate::update::trust::P2POOL_TRUSTED_KEYS,
+            )?
+        }
+        _ => None,
+    };
+    if signed.is_some_and(|signed| signed != expected) {
+        return Err(format!(
+            "{}: its .sha256 file and the signed SHA256SUMS disagree; nothing was installed",
+            release.asset
+        ));
+    }
     let archive = http::get(
         &release.asset_url,
         "application/octet-stream",
@@ -183,7 +239,32 @@ pub fn install(home: &Path, release: &Release) -> Result<Installed, String> {
         TIMEOUT,
     )?
     .ok(&release.asset)?;
-    install_archive(home, &release.tag, &release.asset, &archive, expected)
+    let mut installed = install_archive(home, &release.tag, &release.asset, &archive, expected)?;
+    if signed.is_some() {
+        installed.signed = true;
+        save(home, &installed)?;
+    }
+    Ok(installed)
+}
+
+/// The archive's SHA-256 from a signed checksum file: `None` when no key
+/// is compiled in for P2Pool (it then counts as unsigned); an error when
+/// the signature does not verify, so such a release is never installed.
+pub(crate) fn signed_checksum(
+    sums: &[u8],
+    signature: &str,
+    asset: &str,
+    keys: &[&str],
+) -> Result<Option<[u8; 32]>, String> {
+    use crate::update::trust::{self, Trust};
+    match trust::verify(sums, Some(signature), keys) {
+        Trust::Signed { .. } => {
+            let sums = std::str::from_utf8(sums).map_err(|_| "SHA256SUMS is not text")?;
+            trust::sums_entry(sums, asset).map(Some)
+        }
+        Trust::Unsigned(trust::Unsigned::NoKey) => Ok(None),
+        Trust::Unsigned(why) => Err(format!("{asset}: {}; nothing was installed", why.why())),
+    }
 }
 
 /// The SHA-256 a `.sha256` file publishes: `HEX`, `HEX  NAME` or
@@ -267,6 +348,7 @@ pub fn install_archive(
         installed_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_secs()),
+        signed: false,
         previous,
     };
     save(home, &record)?;
@@ -326,7 +408,7 @@ fn safe_name(name: &str) -> String {
 /// which Windows 10 and later, Linux and macOS have; it refuses members
 /// outside the folder.
 fn extract(archive: &Path, into: &Path) -> Result<(), String> {
-    let output = std::process::Command::new("tar")
+    let output = crate::child_process::command("tar")
         .arg("-xf")
         .arg(archive)
         .arg("-C")
@@ -399,12 +481,16 @@ pub(crate) mod tests {
             format!("https://example.test/{zip}.sha256")
         );
         assert_eq!(release.digest, Some([0xcd; 32]));
+        // No signed checksum file published: it installs as unsigned.
+        assert_eq!(release.signed_sums, None);
+        assert!(!release.may_be_signed());
         assert!(newest(&list, "p2poolv2_node-riscv64.tar.xz").is_none());
         let current = Installed {
             tag: "v0.0.1-alpha".into(),
             binary: "x".into(),
             sha256: String::new(),
             installed_at: 0,
+            signed: false,
             previous: None,
         };
         assert_eq!(
@@ -415,6 +501,35 @@ pub(crate) mod tests {
             compare(None, release),
             Check::Available { current: None, .. }
         ));
+    }
+
+    #[test]
+    fn a_signed_checksum_file_is_used_only_with_a_key_and_must_verify() {
+        use crate::update::trust::tests::{KEY, SIGNATURE, SIGNED};
+        let zip = "p2poolv2_node-x86_64-pc-windows-msvc.zip";
+        let list = json!([{ "tag_name": "v0.0.3", "published_at": "2026-12-01T00:00:00Z",
+            "assets": [asset(zip), asset(&format!("{zip}.sha256")),
+                       asset("SHA256SUMS"), asset("SHA256SUMS.minisig")] }]);
+        let release = newest(&list, zip).unwrap();
+        assert_eq!(
+            release.signed_sums.as_deref(),
+            Some(&(
+                "https://example.test/SHA256SUMS".into(),
+                "https://example.test/SHA256SUMS.minisig".into()
+            ))
+        );
+        // No P2Pool key in this build: the checksum-only behaviour stays.
+        assert!(!release.may_be_signed());
+        assert_eq!(signed_checksum(b"anything", SIGNATURE, zip, &[]), Ok(None));
+        // With a key, a signature that does not verify installs nothing.
+        assert!(signed_checksum(b"other sums", SIGNATURE, zip, &[KEY])
+            .unwrap_err()
+            .contains("nothing was installed"));
+        // A verified file must name the archive (this one, the signed test
+        // vector, names none).
+        assert!(signed_checksum(SIGNED, SIGNATURE, zip, &[KEY])
+            .unwrap_err()
+            .contains("names no"));
     }
 
     #[test]
@@ -443,7 +558,7 @@ pub(crate) mod tests {
         }
         let name = asset_name().unwrap_or("p2poolv2_node.tar.xz");
         let out = dir.join(name);
-        let mut tar = std::process::Command::new("tar");
+        let mut tar = crate::child_process::command("tar");
         if name.ends_with(".zip") {
             tar.arg("-a").arg("-c").arg("-f");
         } else {

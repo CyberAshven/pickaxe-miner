@@ -4,6 +4,11 @@
 //! blocks it is sent with `bitcoin::Block`; this is not live chain proof.
 
 use super::super::{
+    extensions::{
+        ExtensionMessage, RequestExtensions, RequestTransactionDataKept,
+        RequestTransactionDataTransactions, LARGE_TEMPLATES, PAYOUT_OUTPUTS,
+        REQUEST_TRANSACTION_DATA_KEPT, REQUEST_TRANSACTION_DATA_TRANSACTIONS,
+    },
     journal::TestDirectory,
     server::{ServerStats, TemplateServerStats},
     server_tests::{pool_node, Running},
@@ -13,6 +18,7 @@ use super::super::{
     wire::{encoded, extension_frame},
 };
 use super::convert::tests::sri_coinbase;
+use super::large::Received;
 use serde_json::{json, Value};
 use std::{
     net::TcpStream,
@@ -223,7 +229,7 @@ impl Client {
         assert_eq!(target, compact_target(message.n_bits).unwrap());
         let parent = Parent {
             previous: message.prev_hash.as_ref().try_into().unwrap(),
-            time: message.header_timestamp,
+            time: message.ntime_start,
             bits: message.n_bits,
         };
         (template, parent)
@@ -234,12 +240,69 @@ impl Client {
             SubmitSolution {
                 template_id: solved.id,
                 version: solved.version,
-                header_timestamp: solved.time,
-                header_nonce: solved.nonce,
+                ntime: solved.time,
+                nonce: solved.nonce,
                 coinbase_tx: solved.sent.as_slice().try_into().unwrap(),
             },
             MESSAGE_TYPE_SUBMIT_SOLUTION,
         );
+    }
+
+    /// #### BCH large templates: RequestExtensions `request_id` for
+    /// `requested`, and the server's answer.
+    fn negotiate(&mut self, request_id: u16, requested: &[u16]) -> SerializedFrame {
+        self.sender
+            .send(
+                RequestExtensions {
+                    request_id,
+                    requested: requested.to_vec(),
+                }
+                .frame()
+                .unwrap(),
+            )
+            .unwrap();
+        self.receive()
+    }
+
+    /// #### BCH large templates: the push of `template`, frame by frame up
+    /// to the core Success, read by `received` (which checks the list
+    /// against the template's merkle path): each frame's extension type,
+    /// message type and payload.
+    fn push(&mut self, received: &mut Received, template: &Template) -> Vec<(u16, u8, Vec<u8>)> {
+        let mut frames = Vec::new();
+        loop {
+            let mut frame = self.receive();
+            let header = frame.header();
+            let parts = (
+                header.ext_type(),
+                header.msg_type(),
+                frame.payload().to_vec(),
+            );
+            match (parts.0, parts.1) {
+                (LARGE_TEMPLATES, REQUEST_TRANSACTION_DATA_KEPT) => {
+                    received.kept(&parts.2).unwrap()
+                }
+                (LARGE_TEMPLATES, REQUEST_TRANSACTION_DATA_TRANSACTIONS) => {
+                    received.page(&parts.2).unwrap()
+                }
+                (0, MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_SUCCESS) => {
+                    let data: RequestTransactionDataSuccess =
+                        binary_sv2::from_bytes(frame.payload()).unwrap();
+                    let last = data
+                        .transaction_list
+                        .iter()
+                        .map(|tx| Arc::from(tx.as_ref()))
+                        .collect();
+                    received
+                        .finish(data.template_id, last, &template.path)
+                        .unwrap();
+                    frames.push(parts);
+                    return frames;
+                }
+                other => panic!("unexpected frame {other:#x?}"),
+            }
+            frames.push(parts);
+        }
     }
 
     /// A template's transactions, or the error code.
@@ -308,6 +371,18 @@ fn solve(
         time: parent.time,
         nonce,
     }
+}
+
+/// #### BCH large templates: the test transactions numbered `numbers`, in
+/// CTOR order as a node lists them, and their bytes.
+fn sorted(numbers: impl IntoIterator<Item = u32>) -> (Vec<Value>, Vec<Vec<u8>>) {
+    let mut txs: Vec<Value> = numbers.into_iter().map(transaction).collect();
+    txs.sort_by_key(|tx| tx["txid"].as_str().unwrap().to_owned());
+    let bytes = txs
+        .iter()
+        .map(|tx| hex::decode(tx["data"].as_str().unwrap()).unwrap())
+        .collect();
+    (txs, bytes)
 }
 
 fn counts(stats: &ServerStats) -> TemplateServerStats {
@@ -661,11 +736,13 @@ fn client_frames_over_64_kib_close_the_session() {
 }
 
 // #### Template Distribution extensions
-// What: a RequestExtensions right after setup (request 7 for 0x4C54 and
-// 0x0002, in the spec's layout) is answered with RequestExtensions.Error:
+// What: a RequestExtensions right after setup (request 7 for 0x0002 and
+// 0x5052, in the spec's layout) is answered with RequestExtensions.Error:
 // extension type 0x0001 without the channel bit, the same request id, both
 // extensions unsupported and none required. The session then serves
-// templates and transaction data as usual.
+// templates and transaction data as usual, and nothing follows a template
+// unasked. #### BCH large templates: a request without 0x4C54 leaves the
+// session standard.
 // Look here if: tdp::server::extension or the setup steps change.
 #[test]
 fn request_extensions_is_answered_with_its_error_and_templates_follow() {
@@ -675,7 +752,7 @@ fn request_extensions_is_answered_with_its_error_and_templates_follow() {
         EXTENSION_TYPE_EXTENSIONS_NEGOTIATION,
         MESSAGE_TYPE_REQUEST_EXTENSIONS,
         false,
-        &[7, 0, 2, 0, 0x54, 0x4c, 2, 0],
+        &[7, 0, 2, 0, 2, 0, 0x52, 0x50],
     );
     let mut reply = client.receive();
     assert_eq!(
@@ -688,11 +765,137 @@ fn request_extensions_is_answered_with_its_error_and_templates_follow() {
     // request_id | unsupported_extensions: 2 x U16 | required_extensions: 0.
     assert_eq!(
         reply.payload().to_vec(),
-        [7, 0, 2, 0, 0x54, 0x4c, 2, 0, 0, 0]
+        [7, 0, 2, 0, 2, 0, 0x52, 0x50, 0, 0]
     );
     client.constraints(122);
     let (template, _) = client.future_template();
+    assert!(client.quiet(Duration::from_millis(500)));
     assert!(client.request(template.id).is_ok());
+}
+
+// #### BCH large templates
+// What: RequestExtensions for 0x0002, 0x4C54 and 0x5052 (request 2) is
+// answered with RequestExtensions.Success listing only 0x4C54. Each
+// template's NewTemplate and SetNewPrevHash are then followed, unasked, by
+// its transactions (three fit the core Success alone), which rebuild its
+// merkle path; RequestTransactionData is still answered; a 0x4C54 message
+// from the client then closes the session.
+// Look here if: tdp::server::extension or the session's pushes change.
+#[test]
+fn large_templates_are_granted_and_each_template_is_pushed() {
+    let node = pool_node();
+    let (txs, bytes) = sorted(1..=3);
+    node.lock().unwrap().transactions = txs;
+    let server = Running::templates(node, Arc::new(TestDirectory::new()));
+    let mut client = Client::setup(&server);
+    let mut reply = client.negotiate(2, &[0x0002, LARGE_TEMPLATES, PAYOUT_OUTPUTS]);
+    assert_eq!(
+        (reply.header().ext_type(), reply.header().msg_type()),
+        (
+            EXTENSION_TYPE_EXTENSIONS_NEGOTIATION,
+            MESSAGE_TYPE_REQUEST_EXTENSIONS_SUCCESS
+        )
+    );
+    // request_id | supported_extensions: 1 x U16.
+    assert_eq!(reply.payload().to_vec(), [2, 0, 1, 0, 0x54, 0x4c]);
+    client.constraints(122);
+    let (template, _) = client.future_template();
+    let mut received = Received::default();
+    received.announced(template.id);
+    let frames = client.push(&mut received, &template);
+    assert_eq!(frames.len(), 1, "one Success");
+    let pushed = received.pushed(template.id).unwrap();
+    let pushed: Vec<Vec<u8>> = pushed.transactions.iter().map(|tx| tx.to_vec()).collect();
+    assert_eq!(pushed, bytes);
+    assert!(client.quiet(Duration::from_millis(300)));
+    assert_eq!(client.request(template.id), Ok(bytes));
+    client.send_extension(
+        LARGE_TEMPLATES,
+        REQUEST_TRANSACTION_DATA_KEPT,
+        false,
+        &[0; 19],
+    );
+    assert!(client.closed_within(Duration::from_secs(3)));
+}
+
+// #### BCH large templates
+// What: after a block the next template (7 to 12, where the first had 1 to
+// 10) is pushed as a delta against the first: Kept naming it, bit i set
+// exactly when the first's i-th transaction stays, then only 11 and 12 in
+// the core Success; the client's rebuilt list is the node's and checks
+// against the merkle path. A RequestTransactionData after it gets the whole
+// list.
+// Look here if: the session's pushes or its base change.
+#[test]
+fn a_negotiating_client_gets_a_delta_after_a_new_parent() {
+    let node = pool_node();
+    let (first_txs, first) = sorted(1..=10);
+    let (second_txs, second) = sorted(7..=12);
+    {
+        let mut node = node.lock().unwrap();
+        node.transactions = first_txs.clone();
+        // The block on the first template stays known once the node moves.
+        node.spendable = first_txs;
+    }
+    let server = Running::templates(node.clone(), Arc::new(TestDirectory::new()));
+    let mut client = Client::setup(&server);
+    client.negotiate(1, &[LARGE_TEMPLATES]);
+    client.constraints(122);
+    let (template, parent) = client.future_template();
+    let mut received = Received::default();
+    received.announced(template.id);
+    client.push(&mut received, &template);
+    node.lock().unwrap().transactions = second_txs;
+    client.submit(&solve(&template, &parent, 1, false, None));
+    let (next, _) = client.future_template();
+    received.announced(next.id);
+    let frames = client.push(&mut received, &next);
+    assert_eq!(frames.len(), 2, "Kept, then the Success");
+    let kept = RequestTransactionDataKept::decode(&frames[0].2).unwrap();
+    assert_eq!(
+        (kept.template_id, kept.base_template_id, kept.kept.len()),
+        (next.id, template.id, 2)
+    );
+    for (index, tx) in first.iter().enumerate() {
+        let bit = kept.kept[index / 8] >> (index % 8) & 1 == 1;
+        assert_eq!(bit, second.contains(tx), "{index}");
+    }
+    let mut success = frames[1].2.clone();
+    let data: RequestTransactionDataSuccess = binary_sv2::from_bytes(&mut success).unwrap();
+    assert_eq!(data.transaction_list.iter().count(), 2);
+    let pushed: Vec<Vec<u8>> = received
+        .pushed(next.id)
+        .unwrap()
+        .transactions
+        .iter()
+        .map(|tx| tx.to_vec())
+        .collect();
+    assert_eq!(pushed, second);
+    assert_eq!(client.request(next.id), Ok(second));
+}
+
+// #### BCH large templates
+// What: a RequestExtensions after the constraints closes the session, as
+// Knuth's provider closes it (template_provider.cpp:392).
+// Look here if: tdp::server::extension changes.
+#[test]
+fn request_extensions_after_the_constraints_closes_the_session() {
+    let server = Running::templates(pool_node(), Arc::new(TestDirectory::new()));
+    let mut client = Client::setup(&server);
+    client.constraints(122);
+    client.future_template();
+    client
+        .sender
+        .send(
+            RequestExtensions {
+                request_id: 1,
+                requested: vec![LARGE_TEMPLATES],
+            }
+            .frame()
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(client.closed_within(Duration::from_secs(3)));
 }
 
 // #### Template Distribution extensions
@@ -765,4 +968,102 @@ fn a_template_distribution_frame_with_the_channel_bit_closes_the_session() {
     later.future_template();
     later.channel_constraints(221);
     assert!(later.closed_within(Duration::from_secs(3)));
+}
+
+// #### BCH large templates
+// What: Pickaxe's own template client against this server, over Noise: it
+// asks for 0x4C54, is granted it, and builds its template from the push,
+// which rebuilds the node's transactions and their merkle path.
+// Look here if: either end's negotiation or pushes change.
+#[test]
+fn pickaxes_template_client_takes_its_templates_pushed() {
+    use super::super::provider::TemplateSource;
+    let node = pool_node();
+    let (txs, bytes) = sorted(1..=3);
+    node.lock().unwrap().transactions = txs;
+    let server = Running::templates(node, Arc::new(TestDirectory::new()));
+    let mut source = super::client::TdpSource::new(
+        super::client::TdpAddress {
+            address: server.templates.unwrap().to_string(),
+            authority: Some(server.authority),
+        },
+        122,
+        Box::new(|_, _| Ok(None)),
+    );
+    let (_, template) = source.refresh().unwrap();
+    let got: Vec<Vec<u8>> = template
+        .transactions()
+        .iter()
+        .map(|tx| tx.to_vec())
+        .collect();
+    assert_eq!(got, bytes);
+    assert!(source.large_templates());
+}
+
+// #### BCH large templates
+// What: a template of 20,000 transactions (1.2 MB, over one 1 MiB page) is
+// pushed as a RequestTransactionData.Transactions page and the core
+// Success, and a RequestTransactionData for it is answered the same way,
+// in pages; both give the node's list, and the push checks against the
+// template's merkle path.
+// Look here if: the session's pushes or its answers in pages change.
+#[test]
+fn a_template_over_one_page_is_pushed_and_answered_in_pages() {
+    let node = pool_node();
+    let (txs, bytes) = sorted(1..=20_000);
+    node.lock().unwrap().transactions = txs;
+    let server = Running::templates(node, Arc::new(TestDirectory::new()));
+    let mut client = Client::setup(&server);
+    client.negotiate(1, &[LARGE_TEMPLATES]);
+    client.constraints(122);
+    let (template, _) = client.future_template_within(Duration::from_secs(15));
+    let mut received = Received::default();
+    received.announced(template.id);
+    let frames = client.push(&mut received, &template);
+    let kinds: Vec<(u16, u8)> = frames.iter().map(|frame| (frame.0, frame.1)).collect();
+    assert_eq!(
+        kinds,
+        [
+            (LARGE_TEMPLATES, REQUEST_TRANSACTION_DATA_TRANSACTIONS),
+            (0, MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_SUCCESS)
+        ]
+    );
+    let pushed: Vec<Vec<u8>> = received
+        .pushed(template.id)
+        .unwrap()
+        .transactions
+        .iter()
+        .map(|tx| tx.to_vec())
+        .collect();
+    assert_eq!(pushed, bytes);
+    client.send(
+        RequestTransactionData {
+            template_id: template.id,
+        },
+        MESSAGE_TYPE_REQUEST_TRANSACTION_DATA,
+    );
+    let mut answer = Vec::new();
+    let mut pages = 0;
+    loop {
+        let mut frame = client.receive();
+        let header = frame.header();
+        match (header.ext_type(), header.msg_type()) {
+            (LARGE_TEMPLATES, REQUEST_TRANSACTION_DATA_TRANSACTIONS) => {
+                let page = RequestTransactionDataTransactions::decode(frame.payload()).unwrap();
+                assert_eq!(page.template_id, template.id);
+                answer.extend(page.transactions);
+                pages += 1;
+            }
+            (0, MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_SUCCESS) => {
+                let data: RequestTransactionDataSuccess =
+                    binary_sv2::from_bytes(frame.payload()).unwrap();
+                assert_eq!(data.template_id, template.id);
+                answer.extend(data.transaction_list.iter().map(|tx| tx.as_ref().to_vec()));
+                break;
+            }
+            other => panic!("unexpected frame {other:#x?}"),
+        }
+    }
+    assert_eq!(pages, 1);
+    assert_eq!(answer, bytes);
 }

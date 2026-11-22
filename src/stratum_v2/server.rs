@@ -36,7 +36,9 @@ use std::{
 use stratum_core::bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
 
 const MAX_CONNECTIONS: usize = 64;
-const TEMPLATE_RECOVERY_GRACE: Duration = Duration::from_secs(3);
+/// #### Pool modes: also how long your own P2Pool node may serve no work
+/// before devices leave it for a fallback pool (`sv1::Preferred::down`).
+pub(super) const TEMPLATE_RECOVERY_GRACE: Duration = Duration::from_secs(3);
 
 // No Debug: contains a local authority secret and payout configuration.
 pub struct ServerConfig {
@@ -1605,9 +1607,10 @@ fn offer(
         own
     });
     template.declare(plan);
-    // #### PR #65: P2Pool coinbases are prepared off this thread (see
+    // #### PR #65: P2Pool coinbases (and the pool's payout outputs, 0x5052)
+    // are prepared off this thread (see
     // `start_preparation`); the offer ends when they are.
-    if template.is_p2pool() {
+    if template.needs_preparation() {
         offered.retry = None;
         offered.waiting = Some(Preparation {
             generation,
@@ -1912,7 +1915,7 @@ fn failed_offer(shared: &Shared, offered: &mut Offered, incoming: &BchTemplate, 
             job.template.previous_hash == incoming.previous_hash
                 && job.template.bits == incoming.bits
                 && job.serial >> 32
-                    == if job.template.is_p2pool() {
+                    == if job.template.needs_preparation() {
                         u64::from(offered.cohort)
                     } else {
                         plan
@@ -2197,7 +2200,7 @@ impl JobAvailability {
                     self.generation.is_some()
                         && self.parent == Some((job.template.previous_hash, job.template.bits))
                         && self.serial.map(|serial| serial >> 32) == Some(job.serial >> 32)
-                        && job.generation > acknowledged
+                        && job.template.declaration_id(job.generation) > acknowledged
                 })
             {
                 return Ok(Vec::new());
@@ -2364,6 +2367,9 @@ fn serve_declarator(
             let expired = session.expire(now)?;
             responses.frames.extend(expired.frames);
             responses.refused = expired.refused.or(responses.refused);
+            // Requested Payout Outputs (0x5052): PayoutOutputsStale once
+            // the pool's donation or fee changes (`DeclaratorSession::poll`).
+            responses.frames.extend(session.poll(declarator)?.frames);
             // #### PR #42: a Full-Template session's frames may take 16 MiB
             // (`Limits::JD`); a Coinbase-only one keeps a device's limits.
             if session.full_template() && !raised {
@@ -2457,13 +2463,19 @@ fn serve_device(
             // ASIC-exclusive token the donation is that token's share of work.
             // #### merge-mining v2: a public pool miner's own donation choice
             // sets this connection's rate (see `MiningSession::donation_choice`).
-            let chosen = mining.donation_choice();
-            let donation = || -> Result<JobDonation, String> {
+            // #### one donation, the higher rate: the connection's rate is
+            // the higher of the pool's and the login's, less the miner's own
+            // visible donation (see `MiningSession::public_donation`).
+            let donation = |mining: &mut MiningSession| -> Result<JobDonation, String> {
                 if let Some(rate) = config.token_donation {
                     return Ok(JobDonation::Token(rate));
                 }
-                if let Some(choice) = chosen.filter(|_| config.public.is_some()) {
-                    return Ok(JobDonation::Bch(choice));
+                if config.public.is_some() {
+                    let server = *config
+                        .donation
+                        .read()
+                        .map_err(|_| "donation setting unavailable".to_owned())?;
+                    return Ok(JobDonation::Bch(mining.public_donation(server)));
                 }
                 if config
                     .uplink
@@ -2492,11 +2504,12 @@ fn serve_device(
                     hold: shared.hold.lock().ok().and_then(|hold| *hold),
                 })
             };
+            let job_donation = donation(&mut mining)?;
             for frame in availability.update(
                 &mut mining,
                 current_job()?,
                 Instant::now(),
-                donation()?,
+                job_donation,
                 fee,
                 acknowledged(),
             )? {
@@ -2530,11 +2543,12 @@ fn serve_device(
                 }
                 // A node failure or tip change may have occurred while waiting
                 // for a device frame; resample before validating that frame.
+                let job_donation = donation(&mut mining)?;
                 for update in availability.update(
                     &mut mining,
                     current_job()?,
                     Instant::now(),
-                    donation()?,
+                    job_donation,
                     fee,
                     acknowledged(),
                 )? {
@@ -2568,6 +2582,14 @@ fn serve_device(
                                     .work
                                     .add(&target, payout.donation_work, payout.fee_work);
                             }
+                        }
+                    }
+                    // #### one donation, the higher rate: a donation
+                    // channel's share is donation work in the work split,
+                    // and repays no quota of the miner's own jobs.
+                    if let Some(target) = mining.donation_share.take() {
+                        if let Ok(mut stats) = shared.stats.lock() {
+                            stats.work.add(&target, true, false);
                         }
                     }
                 }
@@ -2756,15 +2778,31 @@ fn serve_device(
                     if let Some(identity) = mining.identity.take() {
                         stats.device_stats.set_worker(device, &identity);
                     }
+                    // #### one donation, the higher rate: the miner's
+                    // effective rate and own Pickaxe credit, on a public
+                    // pool.
+                    stats
+                        .device_stats
+                        .set_donation(device, mining.donation_terms());
                     // #### merge-mining v2: a job refused token merge
                     // mining (the own-root check) says so on the dashboard.
                     if let Some(reason) = mining.token_refusal.take() {
                         stats.tokens_refused = Some(reason);
                     }
+                    // A share naming its worker (extension 0x0002) counts
+                    // on that worker's row (`Devices::worker_share`).
                     if let Some(event) = responses.share_event {
-                        stats
-                            .device_stats
-                            .share(device, event, false, Instant::now());
+                        match responses.worker.as_deref() {
+                            Some(worker) => stats.device_stats.worker_share(
+                                device,
+                                worker,
+                                event,
+                                Instant::now(),
+                            ),
+                            None => stats
+                                .device_stats
+                                .share(device, event, false, Instant::now()),
+                        }
                     }
                 }
                 accepted = next_accepted;
@@ -3281,6 +3319,7 @@ mod retry_tests {
                 tokens: Mutex::new(VecDeque::new()),
                 consumed: std::sync::atomic::AtomicUsize::new(0),
             })),
+            payouts: None,
             full_template: true,
         });
         let (events, _receive) = mpsc::sync_channel(1);
@@ -3400,6 +3439,7 @@ mod retry_tests {
                 },
                 pool_target: [255; 32],
                 p2pool: None,
+                payouts: None,
                 full_template: true,
             });
             let mut template =
@@ -3565,6 +3605,7 @@ mod p2pool_tests {
             },
             pool_target: [255; 32],
             p2pool: Some(Arc::new(crate::p2pool::jd::fake::plan(url, owner, tokens))),
+            payouts: None,
             full_template: true,
         })
     }

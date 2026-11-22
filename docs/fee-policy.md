@@ -53,6 +53,19 @@ if a later build changes recipient addresses. Journal versions 3 and 4 remain
 readable; new direct rewards use version 5. Existing Chipnet local-key rewards
 retain their previous recovery rules; new claims do not use that wallet.
 
+A node that refuses a claim as not final yet (`non-BIP68-final`,
+`bad-txns-nonfinal` or `non-final`: the baton it spends needs a confirmation)
+has answered, and no server holds the claim. The runtime then writes
+`<journal>.parent-not-final`, one line `<parent txid> <tip height>`, keeps its
+connection, and sends the same bytes again once the tip is higher: on Fulcrum
+after a block notice (or a read at most every 30 s), on a node after its tip
+height, the one call made every 2 s while the claim waits, has moved. The
+record is removed before every send, so a lost reply or a crash leaves the
+claim attempted with an unknown outcome, which is never sent again and waits
+for proof as before. The journal and `.parent-attempted` keep their format;
+an older build ignores the record. A start with such a claim waits for the
+block the same way and ends on Ctrl+C, keeping the journal.
+
 Validation:
 
 ```powershell
