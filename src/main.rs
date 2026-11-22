@@ -9,7 +9,7 @@ use pickaxe_miner::{
     reach, rigs, runtime, search, self_test, stratum_v2, telemetry, tui, tx,
 };
 
-use config::RuntimeConfig;
+use config::{RuntimeConfig, SessionSettings};
 use electrum::{ElectrumSession, LiveJob};
 use search::SearchHandle;
 use std::io::{self, BufRead, Write};
@@ -747,6 +747,17 @@ fn runtime_config_from_cli_with_base(
     if let Some(value) = &args.node_zmq {
         cfg.set_node_zmq(value)?;
     }
+    // #### Pool modes: your own P2Pool's settings, over a profile's.
+    args.check_p2pool_flags()?;
+    if let Some(address) = &args.node_p2p {
+        cfg.p2pool.node_p2p = Some(config::validate_node_p2p(address)?);
+    }
+    if let Some(donation) = args.p2pool_donation {
+        cfg.p2pool.donation = Some(donation);
+    }
+    if args.p2pool_standalone {
+        cfg.p2pool.standalone = true;
+    }
     if let Some(source) = &args.source {
         cfg.set_source(source)?;
     }
@@ -757,6 +768,37 @@ fn runtime_config_from_cli_with_base(
 /// Builds the effective runtime configuration from CLI options.
 fn runtime_config_from_cli(args: &cli::Cli) -> Result<RuntimeConfig, String> {
     runtime_config_from_cli_with_base(args, RuntimeConfig::default())
+}
+
+/// The command line names the GPUs to mine on (`--backend`, `--device`,
+/// `--include-integrated`), so they win over a saved profile's.
+fn cli_names_gpus(args: &cli::Cli) -> bool {
+    args.backend.is_some() || args.device.is_some() || args.include_integrated
+}
+
+/// What the command line changes in the setup's saved profiles, with the
+/// GPUs it named (`selected_gpus`) when it names any.
+fn setup_overrides(args: &cli::Cli, selected_gpus: &[backend::GpuDevice]) -> tui::SetupOverrides {
+    tui::SetupOverrides {
+        network: if args.chipnet {
+            Some(config::MiningNetwork::Chipnet)
+        } else {
+            args.network
+                .as_deref()
+                .map(|value| config::MiningNetwork::parse(value).expect("validated CLI network"))
+        },
+        token: args.token.clone(),
+        intensity: args.intensity,
+        fulcrum: args.fulcrum.clone(),
+        node_rpc: args.node_rpc.clone(),
+        source: args.source.clone(),
+        gpus: cli_names_gpus(args).then(|| {
+            selected_gpus
+                .iter()
+                .map(|gpu| (gpu.backend, gpu.index))
+                .collect()
+        }),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -840,6 +882,9 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
             runtime::RuntimeEvent::DirectRewardAccepted { txid, recipient } => serde_json::json!({
                 "event": "direct_reward_accepted", "txid": txid, "recipient": recipient,
             }),
+            runtime::RuntimeEvent::ClaimWaitsForBlock { txid, height } => serde_json::json!({
+                "event": "claim_waits_for_block", "txid": txid, "height": height,
+            }),
             runtime::RuntimeEvent::Error(error) => {
                 serde_json::json!({"event": "error", "error": error})
             }
@@ -906,6 +951,9 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
         runtime::RuntimeEvent::DirectRewardAccepted { txid, .. } => {
             println!("direct reward accepted: tx={txid}")
         }
+        runtime::RuntimeEvent::ClaimWaitsForBlock { txid, height } => println!(
+            "claim waits for its baton to confirm: tx={txid} refused at height {height}; sent again after the next block"
+        ),
         runtime::RuntimeEvent::Error(error) => eprintln!("runtime error: {error}"),
         // #### PR #42
         runtime::RuntimeEvent::NodeDown { reason } => {
@@ -1254,28 +1302,13 @@ fn run_headless_mining(
     Ok(None)
 }
 
-/// What a mining session saves back to its profile when it stops.
-struct SessionSettings {
-    intensity: u8,
-    address: String,
-    token_donation: Option<pickaxe_miner::donation::TokenDonation>,
-}
-
+/// Saves what a mining session changed back to its profile when it stops.
 fn persist_session_profile(
     path: &std::path::Path,
     name: &str,
     session: &SessionSettings,
 ) -> Result<(), String> {
-    let mut profiles = config::MiningProfiles::load_optional(path)?;
-    let profile = profiles
-        .profiles
-        .iter_mut()
-        .find(|profile| profile.name.eq_ignore_ascii_case(name))
-        .ok_or("mining profile was renamed or removed during this session")?;
-    profile.settings.intensity = Some(session.intensity);
-    profile.settings.address = Some(session.address.clone());
-    profile.settings.token_donation_bps = session.token_donation;
-    profiles.save(path)
+    config::MiningProfiles::save_session(path, name, session)
 }
 
 /// Dispatches the requested CLI command and mining mode.
@@ -1305,22 +1338,8 @@ fn run_as_rig(
     json: bool,
     status: Option<&std::path::Path>,
 ) {
-    let result = (|| {
-        let _gpu_lock = mining_lock::acquire_gpu_lock()?;
-        let stop = Arc::new(AtomicBool::new(false));
-        pickaxe_miner::session_control::install_stop(&stop)?;
-        rigs::run_rig(
-            coordinators,
-            name,
-            Some(payout).filter(|payout| !payout.trim().is_empty()),
-            gpus,
-            intensity,
-            json,
-            stop,
-            status,
-        )
-    })();
-    if let Err(error) = result {
+    if let Err(error) = rigs::mine_as_rig(coordinators, name, payout, gpus, intensity, json, status)
+    {
         eprintln!("error: {error}");
         exit_after_error(1);
     }
@@ -1354,9 +1373,9 @@ fn coordinators(addresses: &[String], keys: &[String]) -> Result<Vec<(String, St
 }
 
 /// #### PR #42: whether a start from a Linux desktop without a terminal
-/// reopens in one: never for a headless run (`--no-tui`, `--json`) or a
+/// reopens in one: never for a headless run (`--no-tui`, `--json`), a
 /// farm system's (`farm-os`), which may run without a terminal while the
-/// desktop is up.
+/// desktop is up, or the desktop window (`gui`), which needs none.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn should_relaunch(
     args: &[std::ffi::OsString],
@@ -1366,7 +1385,7 @@ fn should_relaunch(
 ) -> bool {
     let headless = args
         .iter()
-        .any(|arg| arg == "--no-tui" || arg == "--json" || arg == "farm-os");
+        .any(|arg| arg == "--no-tui" || arg == "--json" || arg == "farm-os" || arg == "gui");
     !stdin_tty && !stdout_tty && desktop && !headless
 }
 
@@ -1457,6 +1476,24 @@ fn main() {
         }
         profiles = true;
     }
+    restart_into_update();
+}
+
+/// Restart (U on the profiles, the window's Restart) asked for while no
+/// session ran: once the screens have closed, the installed update takes
+/// this program's place and starts with the same command line.
+fn restart_into_update() {
+    if !pickaxe_miner::update::restart_requested() {
+        return;
+    }
+    let args = cli::parse();
+    let Ok(config_path) = config::config_path(args.config.as_deref()) else {
+        return;
+    };
+    let window = matches!(args.command, Some(cli::Commands::Gui { .. }));
+    if let Some(why) = pickaxe_miner::update::restart_if_asked(&config_path, window) {
+        eprintln!("{why}");
+    }
 }
 
 fn run_application(open_profiles: bool) {
@@ -1532,6 +1569,25 @@ fn run_application(open_profiles: bool) {
             exit_after_error(2);
         }
     };
+
+    // Pickaxe's own updates (docs/updates.md), for the sessions a person
+    // starts: an installed update takes this program's place at the start
+    // (unless another Pickaxe runs or a claim is pending), then the check
+    // runs in the background. `--no-update-check` leaves both out.
+    pickaxe_miner::update::init(&config_path);
+    let window = matches!(args.command, Some(cli::Commands::Gui { .. }));
+    if matches!(
+        args.command,
+        None | Some(cli::Commands::Mine) | Some(cli::Commands::Gui { .. })
+    ) && !args.no_update_check
+    {
+        let waiting = if open_profiles {
+            None
+        } else {
+            pickaxe_miner::update::at_start(&config_path, window)
+        };
+        pickaxe_miner::update::start(&config_path, args.no_tui || args.json, waiting);
+    }
 
     match args.command.clone().unwrap_or(cli::Commands::Mine) {
         // #### PR #40: the read-only view of a miner without a screen.
@@ -1623,6 +1679,19 @@ fn run_application(open_profiles: bool) {
                 Err("this build has no stratum-v2 feature, which P2Pool needs".into())
             };
             if let Err(error) = result {
+                eprintln!("error: {error}");
+                exit_after_error(1);
+            }
+        }
+        // Pickaxe's own updates: check, install, roll back, status, settings.
+        cli::Commands::Update {
+            command,
+            check,
+            yes,
+        } => {
+            if let Err(error) =
+                pickaxe_miner::update::command::run(&config_path, command.as_ref(), check, yes)
+            {
                 eprintln!("error: {error}");
                 exit_after_error(1);
             }
@@ -1916,29 +1985,7 @@ fn run_application(open_profiles: bool) {
                             exit_after_error(2);
                         }
                     }
-                    let overrides = tui::SetupOverrides {
-                        network: if args.chipnet {
-                            Some(config::MiningNetwork::Chipnet)
-                        } else {
-                            args.network.as_deref().map(|value| {
-                                config::MiningNetwork::parse(value).expect("validated CLI network")
-                            })
-                        },
-                        token: args.token.clone(),
-                        intensity: args.intensity,
-                        fulcrum: args.fulcrum.clone(),
-                        node_rpc: args.node_rpc.clone(),
-                        source: args.source.clone(),
-                        gpus: (args.backend.is_some()
-                            || args.device.is_some()
-                            || args.include_integrated)
-                            .then(|| {
-                                selected_gpus
-                                    .iter()
-                                    .map(|gpu| (gpu.backend, gpu.index))
-                                    .collect()
-                            }),
-                    };
+                    let overrides = setup_overrides(&args, &selected_gpus);
                     let setup = match tui::run_setup(
                         cfg,
                         devices,
@@ -2085,27 +2132,15 @@ fn run_application(open_profiles: bool) {
             let rig_hub = match rigs_listen {
                 None => None,
                 Some(listen) => {
-                    match rigs::RigHub::start(listen, &config_path.with_extension("rigs-key")) {
+                    // #### PR #32: a public GPU pool.
+                    match rigs::start_coordinator(
+                        listen,
+                        &config_path.with_extension("rigs-key"),
+                        rigs_public.then_some((rigs_fee, rigs_fee_address.as_deref())),
+                        cfg.network,
+                        &cfg.payout_address,
+                    ) {
                         Ok(hub) => {
-                            // #### PR #32: a public GPU pool.
-                            if rigs_public {
-                                let address = match config::validate_payout_address(
-                                    cfg.network,
-                                    rigs_fee_address
-                                        .as_deref()
-                                        .unwrap_or(cfg.payout_address.as_str()),
-                                ) {
-                                    Ok(address) => address,
-                                    Err(error) => {
-                                        eprintln!("error: pool fee address: {error}");
-                                        exit_after_error(2);
-                                    }
-                                };
-                                hub.set_public(Some(rigs::PublicRigs {
-                                    fee_bps: rigs_fee.map_or(0, u16::from),
-                                    address,
-                                }));
-                            }
                             // #### PR #40: where rigs reach this coordinator.
                             let interfaces = reach::Interfaces::detect();
                             let connect: Vec<_> = hub
@@ -2170,6 +2205,32 @@ fn run_application(open_profiles: bool) {
                     eprintln!("error: {error}");
                     exit_after_error(1);
                 }
+            }
+        }
+        // The desktop window: the setup and dashboard, mining the same
+        // sessions as the terminal.
+        cli::Commands::Gui { start } => {
+            #[cfg(feature = "gui")]
+            let result = pickaxe_miner::gui::run(pickaxe_miner::gui::Start {
+                cfg,
+                config_path,
+                backend: backend_kind,
+                selection: effective_device,
+                start,
+                cli_node_zmq: args.node_zmq.is_some(),
+                // The GPUs the command line names are found with the rest,
+                // once the window is up.
+                overrides: setup_overrides(&args, &[]),
+                cli_gpus: cli_names_gpus(&args),
+            });
+            #[cfg(not(feature = "gui"))]
+            let result: Result<(), String> = {
+                let _ = (cfg, config_path, backend_kind, effective_device, start);
+                Err("this build has no desktop window; build with --features gui".into())
+            };
+            if let Err(error) = result {
+                eprintln!("error: {error}");
+                exit_after_error(1);
             }
         }
         cli::Commands::Repl => run_repl(cfg),
@@ -2429,6 +2490,8 @@ mod tests {
             &["mine", "--no-tui"][..],
             &["mine", "--json"][..],
             &["farm-os", "mine", "--pool", "x"][..],
+            &["gui"][..],
+            &["gui", "--start"][..],
         ] {
             assert!(
                 !should_relaunch(&args(headless), false, false, true),

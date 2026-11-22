@@ -39,8 +39,35 @@ pub(super) struct Tokens {
     photon: Option<RuntimeSnapshot>,
 }
 
+/// Shows token sessions in place of this dashboard: the desktop window
+/// (`pickaxe gui`) reads and steers the same `Miners`, and the session's
+/// workers, claims and saving stay exactly as they are here.
+pub trait SessionView: Send + Sync {
+    /// Shows the session until `finished` or the viewer stops it.
+    fn show(
+        &self,
+        miners: &Miners<'_>,
+        gpus: &[GpuDevice],
+        finished: &dyn Fn() -> bool,
+    ) -> Result<(), String>;
+}
+
+static SESSION_VIEW: std::sync::OnceLock<Box<dyn SessionView>> = std::sync::OnceLock::new();
+
+/// Sends every later token session to `view` instead of the terminal.
+pub fn show_sessions_in(view: Box<dyn SessionView>) -> Result<(), String> {
+    SESSION_VIEW
+        .set(view)
+        .map_err(|_| "token sessions already have a view".to_owned())
+}
+
+/// Whether token sessions show in a view other than the terminal.
+pub fn sessions_shown_elsewhere() -> bool {
+    SESSION_VIEW.get().is_some()
+}
+
 /// The event source may already name its token; label it only once.
-fn label_event(token: &str, message: &str) -> String {
+pub(crate) fn label_event(token: &str, message: &str) -> String {
     if message.strip_prefix(token).is_some_and(|tail| {
         tail.is_empty() || tail.starts_with(char::is_whitespace) || tail.starts_with(':')
     }) {
@@ -70,7 +97,7 @@ pub fn run_electric(
 }
 
 impl Miners<'_> {
-    fn stop(&self) {
+    pub fn stop(&self) {
         if let Some(stop) = self.stop {
             stop.store(true, Ordering::SeqCst);
         }
@@ -80,7 +107,7 @@ impl Miners<'_> {
         // Ownership stays with the caller, which joins and stops supervisors.
     }
 
-    fn pause(&self, paused: bool) -> Result<(), String> {
+    pub fn pause(&self, paused: bool) -> Result<(), String> {
         for (_, runtime) in &self.runtimes {
             if paused {
                 runtime.pause()?;
@@ -94,7 +121,7 @@ impl Miners<'_> {
         Ok(())
     }
 
-    fn intensity(&self, value: u8) -> Result<(), String> {
+    pub fn intensity(&self, value: u8) -> Result<(), String> {
         for (_, runtime) in &self.runtimes {
             runtime.set_intensity(value)?;
         }
@@ -117,6 +144,9 @@ pub fn run_miners(
         }
     }
     let _stop = StopOnExit(miners);
+    if let Some(view) = SESSION_VIEW.get() {
+        return view.show(miners, gpus, finished);
+    }
     let mut terminal = TerminalSession::enter()?;
     crossterm::execute!(io::stdout(), crossterm::event::EnableBracketedPaste)
         .map_err(|e| format!("enable address paste: {e}"))?;
@@ -441,7 +471,10 @@ fn token_key(key: KeyEvent, miners: &Miners<'_>, state: &mut TuiState) -> Result
             let up = matches!(key.code, KeyCode::Right | KeyCode::Char('+'));
             if let Some((_, runtime)) = miners.runtimes.iter().find(|(t, _)| *t == token) {
                 let snapshot = runtime.snapshot();
-                let next = snapshot.token_donation.adjusted(up);
+                let next = snapshot
+                    .token_donation
+                    .adjusted(up)
+                    .raised_to(snapshot.donation_default);
                 apply_result(
                     runtime.set_donation(next),
                     &format!("Donation {next}"),
@@ -453,7 +486,9 @@ fn token_key(key: KeyEvent, miners: &Miners<'_>, state: &mut TuiState) -> Result
                         .summary()
                         .donation
                         .unwrap_or(crate::electric::DONATION_DEFAULT);
-                    let next = current.adjusted(up);
+                    let next = current
+                        .adjusted(up)
+                        .raised_to(crate::electric::DONATION_DEFAULT);
                     apply_result(
                         monitor.request_donation(miners.network, next),
                         &format!("ELECTRIC donation {next}"),
@@ -515,6 +550,11 @@ fn token_key(key: KeyEvent, miners: &Miners<'_>, state: &mut TuiState) -> Result
             }
             _ => {}
         }
+        return Ok(false);
+    }
+    // Pickaxe's own update: U downloads it, never restarts this session.
+    if let Some(crate::update::Press::Said(text)) = update_key(key.code, false) {
+        state.status_line = text;
         return Ok(false);
     }
     match key.code {
@@ -717,7 +757,7 @@ fn render_miners(frame: &mut Frame<'_>, state: &TuiState) {
                 |e| e.uptime.as_secs_f64()
             ))
         ))
-        .block(Block::bordered()),
+        .block(with_update_notice(Block::bordered())),
         parts[0],
     );
     frame.render_widget(
@@ -1035,12 +1075,11 @@ pub(super) mod tests {
         assert_eq!(monitor.summary().donation.unwrap().bps(), 450);
         token_key(key(KeyCode::Left), &miners, &mut state).unwrap();
         token_key(key(KeyCode::Left), &miners, &mut state).unwrap();
-        assert_eq!(monitor.summary().donation.unwrap().bps(), 350);
-        // #### 2026-10-24: down to 0%, and no lower.
+        assert_eq!(monitor.summary().donation.unwrap().bps(), 400);
         for _ in 0..8 {
             token_key(key(KeyCode::Left), &miners, &mut state).unwrap();
         }
-        assert_eq!(monitor.summary().donation.unwrap().bps(), 0);
+        assert_eq!(monitor.summary().donation.unwrap().bps(), 400);
         assert!(!monitor.stopped());
         token_key(key(KeyCode::Esc), &miners, &mut state).unwrap();
         assert!(!token_key(key(KeyCode::Char('b')), &miners, &mut state).unwrap());

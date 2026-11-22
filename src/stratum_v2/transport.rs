@@ -6,6 +6,7 @@
 use std::{
     io::{self, Read, Write},
     net::{Shutdown, TcpStream},
+    thread,
     time::{Duration, Instant},
 };
 use stratum_core::{
@@ -305,14 +306,18 @@ impl Receiver {
         let deadline = Instant::now() + self.limits.frame_deadline;
         let mut bytes_read = 0usize;
         loop {
-            let len = self.decoder.writable_len();
+            let len = self.decoder.read_len();
             bytes_read = bytes_read
                 .checked_add(len)
                 .ok_or("SV2 frame size overflow")?;
             if bytes_read > self.limits.wire_budget() {
                 return Err("SV2 frame exceeds size limit".into());
             }
-            read_until(&mut self.stream, self.decoder.writable(), deadline)?;
+            // The window is filled whole before the decoder counts it.
+            read_until(&mut self.stream, self.decoder.read_buf(), deadline)?;
+            self.decoder
+                .advance(len)
+                .map_err(|_| "SV2 authentication or framing failed")?;
             let state = self.state.take().ok_or("SV2 connection is closed")?;
             match self
                 .decoder
@@ -326,7 +331,7 @@ impl Receiver {
                     self.state = Some(state);
                     return Ok(Some(frame));
                 }
-                Decrypted::Incomplete(_, state) => self.state = Some(state),
+                Decrypted::Incomplete(state) => self.state = Some(state),
             }
         }
     }
@@ -369,11 +374,52 @@ fn read_until(
             Ok(0) => return Err("SV2 peer disconnected during frame".into()),
             Ok(n) => output = &mut output[n..],
             Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
-            Err(_) => return Err("SV2 frame read failed or timed out".into()),
+            Err(e) if out_of_buffers(&e) => thread::sleep(NO_BUFFERS_PAUSE),
+            Err(e) if timed_out_early(&e, deadline) => (),
+            Err(e) => return Err(io_failure("SV2 frame read failed or timed out", &e)),
         }
     }
     Ok(())
 }
+
+/// What: the OS had no buffer space for this read or write just now
+/// (WSAENOBUFS 10055 on Windows, ENOBUFS 105 on Linux, 55 on macOS).
+/// Why: it passes once memory frees up, so the frame waits within its own
+/// deadline instead of closing the session mid-frame; a closed sender left
+/// the peer with a failed read.
+/// Look here if: a large frame's send or read fails under memory pressure.
+fn out_of_buffers(error: &io::Error) -> bool {
+    let code = error.raw_os_error();
+    (cfg!(windows) && code == Some(10055))
+        || (cfg!(target_os = "linux") && code == Some(105))
+        || (cfg!(target_os = "macos") && code == Some(55))
+}
+
+/// What: a read or write that reports a timeout before the frame's own
+/// deadline has passed.
+/// Why: the socket timeout is set to what is left of the frame's deadline, so
+/// an earlier timeout is not the frame's; the loop sets the timeout again and,
+/// once the deadline has passed, ends with "SV2 frame deadline exceeded".
+/// Look here if: a frame read or write gives up before its deadline.
+fn timed_out_early(error: &io::Error, deadline: Instant) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    ) && Instant::now() < deadline
+}
+
+/// A frame read or write failure, naming the OS error after the fixed text
+/// (`telemetry::connection_reason` matches the fixed text as a prefix).
+fn io_failure(what: &str, error: &io::Error) -> String {
+    match error.raw_os_error() {
+        Some(code) => format!("{what} ({:?}, OS error {code})", error.kind()),
+        None => format!("{what} ({:?})", error.kind()),
+    }
+}
+
+/// The pause before trying again a read or write the OS refused for lack of
+/// buffer space.
+const NO_BUFFERS_PAUSE: Duration = Duration::from_millis(20);
 
 /// #### PR #42: the most one write call sends
 /// What: a frame is written in slices of at most 256 KiB.
@@ -393,7 +439,9 @@ fn write_until(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> R
             Ok(0) => return Err("SV2 peer disconnected during write".into()),
             Ok(n) => bytes = &bytes[n..],
             Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
-            Err(_) => return Err("SV2 frame write failed or timed out".into()),
+            Err(e) if out_of_buffers(&e) => thread::sleep(NO_BUFFERS_PAUSE),
+            Err(e) if timed_out_early(&e, deadline) => (),
+            Err(e) => return Err(io_failure("SV2 frame write failed or timed out", &e)),
         }
     }
     Ok(())
@@ -402,7 +450,7 @@ fn write_until(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{net::TcpListener, thread};
+    use std::net::TcpListener;
     use stratum_core::{
         binary_sv2,
         bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey},
@@ -580,7 +628,11 @@ mod tests {
         )
         .unwrap();
         let (mut to_server, mut from_server) = client.split();
-        let (mut to_client, _) = accepted.join().unwrap().split();
+        // Both halves of the server's session stay open until the client has
+        // read the frame: closing a Windows socket while sent data is still on
+        // its way resets the connection, and the client's read then fails with
+        // ConnectionReset (OS error 10054) although the send succeeded.
+        let (mut to_client, from_client) = accepted.join().unwrap().split();
         to_client.set_limits(Limits {
             frame_deadline: test_deadline,
             ..Limits::TDP_SERVER
@@ -589,10 +641,22 @@ mod tests {
             frame_deadline: test_deadline,
             ..Limits::TDP_CLIENT
         });
-        let sent = thread::spawn(move || to_client.send(big(&vec![7u8; 4 << 20])));
-        let frame = from_server.receive(test_deadline).unwrap().unwrap();
+        let sent = thread::spawn(move || {
+            let result = to_client.send(big(&vec![7u8; 4 << 20]));
+            (result, to_client)
+        });
+        let frame = match from_server.receive(test_deadline) {
+            Ok(Some(frame)) => frame,
+            other => panic!(
+                "receive: {:?}; send: {:?}",
+                other.map(|frame| frame.map(|frame| frame.encoded_length())),
+                sent.join().map(|(result, _)| result)
+            ),
+        };
         assert_eq!(frame.encoded_length(), 6 + 3 + (4 << 20));
-        sent.join().unwrap().unwrap();
+        let (result, _to_client) = sent.join().unwrap();
+        result.unwrap();
+        drop(from_client);
         assert!(to_server
             .send(big(&vec![7u8; Limits::TDP_CLIENT.max_out]))
             .is_err());

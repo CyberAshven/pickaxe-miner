@@ -2,14 +2,20 @@
 //! One Template Distribution client: SetupConnection, its coinbase output
 //! constraints, then this server's templates as the node worker publishes
 //! them, transaction data on request, and its solutions relayed to the node.
+//! #### BCH large templates: a client that negotiates 0x4C54 is pushed each
+//! template's transactions (see `large`).
 
 use super::super::{
+    extensions::{
+        negotiation_answer, ExtensionMessage, RequestExtensions, LARGE_TEMPLATES, NEGOTIATION,
+        REQUEST_EXTENSIONS,
+    },
     server::{update_relay_stats, Relay, Shared},
     template::{BchTemplate, Hash},
     transport::{Limits, Receiver, Sender, Session},
-    wire::{encoded, extension_frame},
+    wire::encoded,
 };
-use super::{convert, COINBASE_FIXED, MAX_RETAINED, STALE_GRACE};
+use super::{convert, large::Pusher, COINBASE_FIXED, MAX_RETAINED, STALE_GRACE};
 use std::{
     collections::VecDeque,
     net::TcpStream,
@@ -17,15 +23,10 @@ use std::{
     time::{Duration, Instant},
 };
 use stratum_core::{
-    binary_sv2::{self, Seq064K},
+    binary_sv2,
     codec_sv2::SerializedFrame,
     common_messages_sv2::{
         self as common, Protocol, SetupConnection, SetupConnectionError, SetupConnectionSuccess,
-    },
-    extensions_sv2::{
-        RequestExtensions, RequestExtensionsError, CHANNEL_BIT_REQUEST_EXTENSIONS_ERROR,
-        EXTENSION_TYPE_EXTENSIONS_NEGOTIATION, MESSAGE_TYPE_REQUEST_EXTENSIONS,
-        MESSAGE_TYPE_REQUEST_EXTENSIONS_ERROR,
     },
     template_distribution_sv2::{
         CoinbaseOutputConstraints, RequestTransactionData, SubmitSolution,
@@ -68,6 +69,9 @@ struct Active {
     resend: Option<Instant>,
     last_constraints: Instant,
     requests: VecDeque<Instant>,
+    /// #### BCH large templates: the pushes, once the client negotiated
+    /// 0x4C54.
+    large: Option<Pusher>,
 }
 
 /// Serves one client until it leaves, breaks the protocol or the server
@@ -104,11 +108,12 @@ fn session_loop(
     // RequestExtensions before its constraints. Extension frames are
     // answered or skipped, and the constraints keep one deadline.
     let deadline = Instant::now() + SETUP_DEADLINE;
+    let mut large = false;
     let reserve = loop {
         let Some(mut frame) = next_frame(receiver, shared, deadline)? else {
             return Ok(());
         };
-        if !extension(&mut frame, sender)? {
+        if !extension(&mut frame, sender, &mut large, true)? {
             break constraints(&mut frame)?
                 .ok_or("template client sent no coinbase constraints")?;
         }
@@ -121,6 +126,7 @@ fn session_loop(
         resend: None,
         last_constraints: Instant::now(),
         requests: VecDeque::new(),
+        large: large.then(Pusher::default),
     };
     while !shared.stop.load(Ordering::Relaxed) {
         let now = Instant::now();
@@ -128,6 +134,23 @@ fn session_loop(
             old.stale_since
                 .is_none_or(|since| now < since + STALE_GRACE)
         });
+        // #### BCH large templates
+        // What: with 0x4C54 negotiated, transaction data goes out one frame
+        // at a time as the socket takes it, never a whole template at once.
+        // An answer the client asked for, with any push ahead of it, goes
+        // out before anything else is read or offered; otherwise a waiting
+        // frame from the client, or a new template, goes before the next
+        // frame of a push, and a new template abandons a push not yet
+        // finished. Without the extension nothing here runs.
+        // Why: Knuth's listener does the same (template_provider.cpp
+        // :784-793): a slow client holds up only its own session, and its
+        // solutions never wait behind a push.
+        // Look here if: a negotiating client's pushes stall, or its
+        // solutions or new templates wait behind one.
+        if active.answering() {
+            active.send_data(sender)?;
+            continue;
+        }
         let job = shared
             .job
             .read()
@@ -145,6 +168,13 @@ fn session_loop(
                 active.resend = None;
                 active.offer(&job.template, sender, shared, relay)?;
             }
+        }
+        if active.sending() {
+            match receiver.receive(Duration::from_millis(1))? {
+                Some(mut frame) => active.handle(&mut frame, sender, shared, relay)?,
+                None => active.send_data(sender)?,
+            }
+            continue;
         }
         if let Some(mut frame) = receiver.receive(Duration::from_millis(100))? {
             active.handle(&mut frame, sender, shared, relay)?;
@@ -226,47 +256,57 @@ fn constraints(frame: &mut SerializedFrame) -> Result<Option<u32>, String> {
 
 // #### Template Distribution extensions
 // What: a frame of a non-zero extension type (the channel bit aside) is an
-// extension's, not Template Distribution's. RequestExtensions (extension
-// 0x0001, message 0x00) is answered with RequestExtensions.Error, every
-// requested extension unsupported and none required, since this provider
-// supports none; any other extension's frame is discarded. Template
-// Distribution has no channel messages, so a frame of extension 0 with the
-// channel bit is an error, and a malformed RequestExtensions is one too.
-// Why: SV2 requires frames of an unknown extension meant for this end to be
+// extension's, not Template Distribution's. Template Distribution has no
+// channel messages, so a frame of extension 0 with the channel bit is an
+// error. #### BCH large templates: RequestExtensions (extension 0x0001,
+// message 0x00, channel bit clear) before the constraints grants 0x4C54
+// when it is asked for, answering RequestExtensions.Success listing only
+// it; one without it is answered with RequestExtensions.Error, every
+// requested extension unsupported and none required. The latest request
+// decides. A malformed request, or one after the constraints, closes the
+// session. Once 0x4C54 is granted its messages come only from the server,
+// so the client's close the session; any other extension's frame is
+// discarded.
+// Why: Knuth's provider answers so (template_provider.cpp:383-419), and SV2
+// requires frames of an unknown extension meant for this end to be
 // discarded and ignored. A negotiating client sends RequestExtensions right
-// after SetupConnection.Success and waits for the answer; closing the
-// session there dropped it in a loop.
-// Look here if: a client that asks for extensions gets no templates, or an
-// extension's frame closes a template session.
+// after SetupConnection.Success and waits for the answer.
+// Look here if: a client that asks for extensions gets no templates, is
+// pushed data it did not negotiate, or an extension's frame closes a
+// template session.
 /// Answers or discards an extension's frame: true when the frame was one.
-fn extension(frame: &mut SerializedFrame, sender: &mut Sender) -> Result<bool, String> {
+/// Before the constraints (`negotiating`) RequestExtensions is answered and
+/// decides `large`, the 0x4C54 grant.
+fn extension(
+    frame: &mut SerializedFrame,
+    sender: &mut Sender,
+    large: &mut bool,
+    negotiating: bool,
+) -> Result<bool, String> {
     let header = frame.header();
-    if header.ext_type_without_channel_msg() == 0 {
+    let extension = header.ext_type_without_channel_msg();
+    if extension == 0 {
         if header.channel_msg() {
             return Err("unexpected template distribution frame".into());
         }
         return Ok(false);
     }
-    if header.ext_type_without_channel_msg() != EXTENSION_TYPE_EXTENSIONS_NEGOTIATION
-        || header.msg_type() != MESSAGE_TYPE_REQUEST_EXTENSIONS
-        || header.channel_msg()
+    if extension == NEGOTIATION && header.msg_type() == REQUEST_EXTENSIONS && !header.channel_msg()
     {
+        let request =
+            RequestExtensions::decode(frame.payload()).ok_or("malformed extensions request")?;
+        if !negotiating {
+            return Err("template client asked for extensions after its constraints".into());
+        }
+        *large = request.requested.contains(&LARGE_TEMPLATES);
+        sender.send(negotiation_answer(&request, |extension| {
+            extension == LARGE_TEMPLATES
+        })?)?;
         return Ok(true);
     }
-    let request: RequestExtensions =
-        binary_sv2::from_bytes(frame.payload()).map_err(|_| "malformed extensions request")?;
-    let refusal = RequestExtensionsError {
-        request_id: request.request_id,
-        unsupported_extensions: request.requested_extensions,
-        required_extensions: Seq064K::new(Vec::new()).map_err(|_| "extensions list too long")?,
-    };
-    let payload = binary_sv2::to_bytes(refusal).map_err(|_| "extensions answer encoding failed")?;
-    sender.send(extension_frame(
-        EXTENSION_TYPE_EXTENSIONS_NEGOTIATION,
-        MESSAGE_TYPE_REQUEST_EXTENSIONS_ERROR,
-        CHANNEL_BIT_REQUEST_EXTENSIONS_ERROR,
-        &payload,
-    )?)?;
+    if *large && extension == LARGE_TEMPLATES {
+        return Err("template client sent a large templates message".into());
+    }
     Ok(true)
 }
 
@@ -325,8 +365,43 @@ impl Active {
         while self.retained.len() > MAX_RETAINED {
             self.retained.pop_front();
         }
+        // #### BCH large templates: its transactions follow, unasked.
+        if let Some(pusher) = self.large.as_mut() {
+            pusher.push(id, template);
+        }
         shared.template_stats(|stats| stats.sent = stats.sent.saturating_add(1));
         Ok(())
+    }
+
+    /// #### BCH large templates: an answer the client asked for is still
+    /// to be sent.
+    fn answering(&self) -> bool {
+        self.large.as_ref().is_some_and(Pusher::answering)
+    }
+
+    /// #### BCH large templates: transaction data is still to be sent.
+    fn sending(&self) -> bool {
+        self.large.as_ref().is_some_and(Pusher::sending)
+    }
+
+    /// #### BCH large templates: sends the next frame of the transaction
+    /// data under way, built now from a template the client can still
+    /// name.
+    fn send_data(&mut self, sender: &mut Sender) -> Result<(), String> {
+        let Some(pusher) = self.large.as_mut() else {
+            return Ok(());
+        };
+        let retained = &self.retained;
+        let frame = pusher.next_frame(|id| {
+            retained
+                .iter()
+                .find(|old| old.id == id)
+                .map(|old| (&*old.template, old.stale_since.is_some()))
+        })?;
+        match frame {
+            Some(frame) => sender.send(frame),
+            None => Ok(()),
+        }
     }
 
     fn handle(
@@ -337,7 +412,8 @@ impl Active {
         relay: &Relay,
     ) -> Result<(), String> {
         let header = frame.header();
-        if extension(frame, sender)? {
+        let mut granted = self.large.is_some();
+        if extension(frame, sender, &mut granted, false)? {
             return Ok(());
         }
         match header.msg_type() {
@@ -361,6 +437,11 @@ impl Active {
                 }
                 self.requests.push_back(now);
                 let id = request.template_id;
+                // #### BCH large templates: answered with the whole list in
+                // pages after any push under way, never template-too-large.
+                if let Some(pusher) = self.large.as_mut() {
+                    return pusher.request(id);
+                }
                 let reply = match self.retained.iter().find(|old| old.id == id) {
                     None => convert::transaction_data_error(id, "template-id-not-found")?,
                     Some(old) if old.stale_since.is_some() => {

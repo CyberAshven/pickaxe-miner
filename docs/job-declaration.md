@@ -45,8 +45,8 @@ pickaxe_miner stratum-v2 serve --config pool.json --listen 0.0.0.0:3336 \
 
 `--accept-job-declaration` alone accepts both modes; `full` or `coinbase`
 accepts one. It is off by default. It shares the pool's SV2 port and key: a
-client pins one key for both of its sessions. In the setup (Run a pool, ASIC
-pool) the **Miner templates** row under Advanced sets it: off, full template
+client pins one key for both of its sessions. In the setup (Run a pool, ASIC,
+Public Solo Endpoint) the **Miner templates** row under Advanced sets it: off, full template
 and coinbase only, full template only, or coinbase only.
 
 With Full-Template, the pool's first node checks declared templates with
@@ -74,8 +74,8 @@ identity, a token or an address.
   username is at a public pool (an optional `.worker` suffix is allowed),
   optionally followed by `,donation=<percent>`, the miner's own donation
   (0 to 100% in 0.5% steps; see [merge-mining.md](merge-mining.md#the-login-option)).
-  The token's donation rate is that choice, or the pool's setting without
-  one; the fee stays the pool's. One that is not an address, or a malformed
+  The token's donation rate is the higher of that choice and the pool's
+  setting; the fee stays the pool's. One that is not an address, or a malformed
   donation, ends the Job Declaration session, because the spec has no error
   message for it.
 - `coinbase_outputs` names the outputs the coinbase must carry, each worth 0
@@ -166,8 +166,8 @@ The job must be exactly the one declared:
 | `prev_hash` is not the declared parent, or the pool has moved on | `stale-chain-tip` |
 | `nbits` differs | `invalid-nbits` |
 | `version` differs outside the version-rolling bits | `invalid-version` |
-| `min_ntime` before the pool's minimum, or over 10 minutes ahead | `invalid-min-ntime` |
-| on Chipnet, `min_ntime` past the parent's time plus 1200 s on normal bits, or at or before it on the limit's bits while ASERT gives other bits | `invalid-nbits` |
+| `ntime_start` before the pool's minimum, or over 10 minutes ahead | `invalid-ntime-start` |
+| on Chipnet, `ntime_start` past the parent's time plus 1200 s on normal bits, or at or before it on the limit's bits while ASERT gives other bits | `invalid-nbits` |
 | the coinbase version, prefix, sequence, outputs or locktime differ from the declaration | `invalid-coinbase-tx-version`, `invalid-coinbase-prefix`, `invalid-coinbase-tx-input-n-sequence`, `invalid-coinbase-tx-outputs`, `invalid-coinbase-tx-locktime` |
 | the merkle path is not the declared transactions' | `invalid-merkle-path` |
 | the declared extranonce is not the channel's 16 bytes plus 16 | `invalid-coinbase-tx` |
@@ -206,8 +206,8 @@ channel's 16-byte prefix and 16 rollable bytes (at most 100 bytes) ‖
 | `prev_hash` is not the pool's current parent | `stale-chain-tip` |
 | `nbits` differs from the pool's | `invalid-nbits` |
 | `version` differs outside the version-rolling bits | `invalid-version` |
-| `min_ntime` before the template's minimum, or over 10 minutes ahead | `invalid-min-ntime` |
-| on Chipnet, `min_ntime` past the parent's time plus 1200 s on normal bits, or at or before it on the limit's bits while ASERT gives other bits | `invalid-nbits` |
+| `ntime_start` before the template's minimum, or over 10 minutes ahead | `invalid-ntime-start` |
+| on Chipnet, `ntime_start` past the parent's time plus 1200 s on normal bits, or at or before it on the limit's bits while ASERT gives other bits | `invalid-nbits` |
 | the prefix does not start with the minimal BIP34 height push, or the script would exceed 100 bytes | `invalid-coinbase-prefix` |
 | the coinbase version is not 1 or 2 | `invalid-coinbase-tx-version` |
 | the coinbase would be under 65 bytes | `invalid-coinbase-tx` |
@@ -279,7 +279,9 @@ server's Advanced page names it; `stratum-v2 watch` shows the same state and
 counts as the overview line below.
 
 - The pool must be a Pickaxe pool that accepts Job Declaration: other pools'
-  tokens are opaque, so their fee and donation cannot be known.
+  tokens are opaque, so their fee and donation cannot be known, unless the
+  pool names the outputs itself (Requested Payout Outputs, see
+  [Extensions](#extensions)).
 - The identity at the pool is your payout address (the pool pays your blocks
   there); `--upstream-user` must be that address too.
 - An uplink keeps a Job Declaration session and one work-selection channel at
@@ -300,8 +302,9 @@ counts as the overview line below.
 - Full-Template: each template is declared with its transactions, the
   transactions the pool asks for are sent from the template, and the custom
   job is set with the declared token. A template over 65,535 transactions is
-  not declared, and a request for transactions that cannot fit one 16 MiB
-  frame drops that declaration: shares on that template do not reach the
+  not declared (unless the pool granted BCH large templates, see
+  [Extensions](#extensions)), and a request for transactions that cannot fit
+  one 16 MiB frame drops that declaration: shares on that template do not reach the
   pool, though its blocks still go to your node. Coinbase-only: each template
   is set with `SetCustomMiningJob` and an allocated token.
 - Devices connect to the SV1 listener as usual; the SV1 adapter tries the
@@ -335,7 +338,8 @@ counts as the overview line below.
 - The donation is paid in the coinbase, as the pool's rule requires, so there
   is no donation work under Job Declaration, and nothing is donated twice.
   Its rate is the one the pool's tokens carry. At a Pickaxe pool that is the
-  miner's own donation setting, which the client names after the login as
+  higher of the pool's setting and the miner's own, which the client names
+  after the login as
   `,pickaxe-donation=<percent>` (to the 0.5% step below, as of each
   session's start), or a `,donation=` the login names itself
   (`--upstream-user ADDRESS,donation=0.5`). A pool that refuses the option is
@@ -367,6 +371,83 @@ rides it with `--merge-test-token 1000` beside `--job-declaration`; at a
 pool without `--job-declaration` the server refuses the flag, as the pool
 builds the blocks there. Connection info then reads "Merge-mined tokens: on
 while your templates are mined".
+
+## Extensions
+
+A Job Declaration connection negotiates two extensions that the Knuth node
+speaks too, with RequestExtensions (0x0001) right after
+`SetupConnection.Success`. Both are **experimental identifiers shared with
+Knuth**, not in the SV2 extension registry; Pickaxe and Knuth use the same
+identifiers and byte layouts (`src/stratum_v2/extensions.rs`, Knuth's
+`docs/sv2.md`). Integers are little-endian.
+
+| Type | Name | Messages |
+|---|---|---|
+| 0x5052 | Requested Payout Outputs | `RequestPayoutOutputs` (0x00: request id, token, available payout value, height, previous hash, nbits, coinbase prefix), `.Success` (0x01: request id, flags with `EXACT_OUTPUTS` as bit 0, version, sequence, lock time, outputs), `.Error` (0x02: request id, error code), `PayoutOutputsStale` (0x03, empty); error code `stale-payout-outputs` |
+| 0x4C54 | BCH large templates | `DeclareMiningJob.Transactions` (0x01: request id, `SEQ0_64K[U256]`), `ProvideMissingTransactions.Positions` (0x02: request id, `SEQ0_64K[U32]`) |
+
+The pool (`--accept-job-declaration`):
+
+- RequestExtensions after setup grants 0x5052, and 0x4C54 on a Full-Template
+  connection; a request for neither gets `RequestExtensions.Error` naming
+  what was asked and requiring nothing. Frames of an extension that was not
+  granted, or with the channel bit, are discarded.
+- `RequestPayoutOutputs` names a token the connection allocated. The answer
+  has `EXACT_OUTPUTS`, version 2, sequence 0xffffffff, lock time 0 and the
+  token's payout rule's outputs for the value asked (the miner, the pool's
+  fee and the Pickaxe donation at the token's rates, in the allocation's
+  order: the donation and the fee their whole shares, the miner the rest), so
+  a declaration or custom job built from them passes the rule. The token is
+  not spent. An unknown, spent, declared, expired or another connection's
+  token is `invalid-mining-job-token`; a token allocated before the latest
+  `PayoutOutputsStale`, or a height, parent or bits other than the pool's
+  current template's, is `stale-payout-outputs`.
+- When the pool's donation or fee setting changes, each connection granted
+  0x5052 gets `PayoutOutputsStale`.
+- `DeclareMiningJob.Transactions` pages join the `DeclareMiningJob` with the
+  same request id: the declared list is the pages in order, then its own. A
+  paged declaration may list as many of BCH's smallest (65-byte) transactions
+  as a block of the pool's size holds, at most 2,097,152. Its missing
+  transactions are asked for with `ProvideMissingTransactions.Positions` (U32
+  positions in the whole list, up to 65,535 a round); one of up to 65,535
+  keeps the core request. With 0x4C54 a reply that carries only the first of
+  the transactions asked for is taken and the rest asked for again (16 rounds
+  at most, as before).
+
+The client (`--job-declaration`):
+
+- Right after the JD setup it asks for 0x5052 and, in Full-Template, 0x4C54.
+  No answer within 10 seconds, or a pool that closes the connection on the
+  request (as Pickaxe pools did before), is not a refusal: that JD connection
+  is closed and one new connection sets up without asking. A refusal leaves
+  both off, and the coinbase is built as without them. A required extension
+  the client does not implement ends the session (the fallback). A P2Pool
+  session does not ask.
+- With 0x5052 each template's coinbase is prepared before devices get it
+  (the preparation P2Pool's coinbases use): the client takes a held token,
+  sends `RequestPayoutOutputs` with the template's revenue, height, parent,
+  bits and the coinbase script before the extranonce, and builds the coinbase
+  from exactly the returned outputs, version, sequence and lock time, checked
+  as Knuth checks them (no other flag, version 1 or 2, a final lock time,
+  outputs within the token's reservation, without token data, paying the
+  whole revenue). The declaration and the custom job carry that coinbase. A
+  pool whose tokens are opaque can then be mined too.
+- One exception: a Full-Template template that merge-mines tokens at a
+  Pickaxe pool builds its outputs from the token's rates with the commitment
+  as output 0, as without the extension, because exact outputs leave no room
+  for it. Elsewhere under exact outputs tokens are not merge-mined, and the
+  client says why.
+- `PayoutOutputsStale` drops every token held (new ones are allocated); an
+  answer on a token from before it asks again with a fresh one, at most 8
+  times. The next template refresh declares on the new outputs.
+  `stale-payout-outputs` on a fresh token (the pool's node is on another
+  block) fails only that template, which is offered again within seconds;
+  any other refusal, a malformed answer or no answer within 10 seconds falls
+  back to the pool's own jobs.
+- With 0x4C54 a template over 65,535 transactions is declared: full pages of
+  65,535 ids go first, and `DeclareMiningJob` carries the last 1 to 65,535.
+  Positions requests are answered like the core request, and a reply that
+  cannot fit one frame carries the longest prefix that does.
 
 ## Not yet
 

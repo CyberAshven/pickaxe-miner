@@ -92,9 +92,13 @@ pub struct Channel {
     rolled: usize,
     /// #### PR #56: a Job Declaration lane in the compact layout.
     compact: bool,
-    /// #### merge-mining v2: a public pool miner's own donation choice
-    /// (`,donation=` in their login), which every job of theirs keeps.
+    /// #### merge-mining v2: a public pool miner's donation rate, which
+    /// every job of theirs keeps. #### one donation, the higher rate: the
+    /// connection's rate (`MiningSession::public_donation`).
     donation: Option<crate::donation::bch::BchDonation>,
+    /// #### one donation, the higher rate: a public pool channel paying the
+    /// Pickaxe donation's own address: every job is donation work.
+    pays_donation: bool,
     /// #### merge-mining v2: why token merge mining was refused for the
     /// latest job (the own-root check), until the server takes it for the
     /// dashboard.
@@ -108,7 +112,7 @@ pub enum JobKind {
     Own,
     /// A Job Declaration client's, set with SetCustomMiningJob; shares may
     /// not be older than its start time.
-    Custom { min_ntime: u32 },
+    Custom { ntime_start: u32 },
 }
 
 #[derive(Clone)]
@@ -267,6 +271,7 @@ impl Channel {
             compact: false,
             token_refusal: None,
             donation: None,
+            pays_donation: false,
         })
     }
 
@@ -317,19 +322,29 @@ impl Channel {
         mut payout: BchPayout,
     ) -> Result<&Job, String> {
         // #### merge-mining v2: the miner's own donation choice
-        // What: a public pool miner who chose a donation in their login
-        // gets it on every job: the coinbase's reward part, the token
-        // donation slot and (with the session's work allocation at the same
-        // rate, see `MiningSession::donation_choice`) the donation work. At
-        // 0% no job is donation work.
-        // Why: the Pickaxe donation is the miner's choice, down to 0, even
-        // on someone else's pool; the operator's fee is unaffected.
+        // What: a public pool miner's rate is on every job of theirs: the
+        // coinbase's reward part, the token donation slot and (with the
+        // session's work allocation at the same rate, see
+        // `MiningSession::public_donation`) the donation work. At 0% no job
+        // is donation work. #### one donation, the higher rate: the rate is
+        // the connection's (the higher of the pool's and the login's, less
+        // the miner's own visible donation), not the login's alone.
+        // Why: the Pickaxe donation is paid once, at the higher rate; the
+        // operator's fee is unaffected.
         // Look here if: a miner's `,donation=` does not change their jobs.
         // Until the session's work allocation is at the miner's rate (its
         // first job, see `MiningSession::donation_choice`), the token work
         // flags follow only the BCH work this job keeps: a pool default's
         // token donation or fee work never rides a miner's first job.
-        if let Some(choice) = self.donation {
+        // #### one donation, the higher rate: a donation channel's jobs are
+        // all donation work: the coinbase and the token leaves pay the
+        // donation whole, and no fee is taken from them.
+        if self.pays_donation {
+            payout.donation_work = true;
+            payout.fee_work = false;
+            payout.token_donation_work = payout.token_donation_work.map(|_| true);
+            payout.token_fee_work = payout.token_fee_work.map(|_| false);
+        } else if let Some(choice) = self.donation {
             if payout.donation != choice {
                 payout.donation = choice;
                 payout.donation_work &= u16::from(choice) != 0;
@@ -553,7 +568,7 @@ impl Channel {
         bytes.extend(std::iter::repeat_n(0, self.rollable()));
         bytes.extend_from_slice(&parts.suffix);
         let merkle_root = fold(double_sha256(&bytes), &parts.merkle_path);
-        let min_ntime = template.min_time;
+        let ntime_start = template.min_time;
         self.retain_previous(&template);
         self.job = Some(Job {
             id,
@@ -564,7 +579,7 @@ impl Channel {
             target: self.target,
             payout: BchPayout::default(),
             aux: None,
-            kind: JobKind::Custom { min_ntime },
+            kind: JobKind::Custom { ntime_start },
         });
         Ok(self.job.as_ref().unwrap())
     }
@@ -756,7 +771,7 @@ impl Channel {
             JobKind::Own => share.time > now.saturating_add(60),
             // #### PR #42: a custom job's shares follow the client's start
             // time, up to a minute past it or past now.
-            JobKind::Custom { min_ntime } => share.time > now.max(min_ntime).saturating_add(60),
+            JobKind::Custom { ntime_start } => share.time > now.max(ntime_start).saturating_add(60),
         };
         if share.time < job.template.current_time || late {
             return Err("invalid-ntime");
@@ -932,10 +947,24 @@ impl Channel {
         &self.payout
     }
 
-    /// #### merge-mining v2: a public pool miner's donation choice, set
-    /// before the first job.
+    /// #### merge-mining v2: a public pool miner's donation rate, set before
+    /// the first job (#### one donation, the higher rate: and whenever the
+    /// connection's rate changes).
     pub fn set_donation(&mut self, donation: Option<crate::donation::bch::BchDonation>) {
         self.donation = donation;
+    }
+
+    /// #### one donation, the higher rate: this public pool channel pays the
+    /// Pickaxe donation's own address, so its jobs are donation work; set
+    /// before the first job.
+    pub fn set_pays_donation(&mut self) {
+        self.pays_donation = true;
+    }
+
+    /// #### one donation, the higher rate: whether this channel's jobs are
+    /// all donation work.
+    pub fn pays_donation(&self) -> bool {
+        self.pays_donation
     }
 
     /// #### merge-mining v2: the token floor this channel's device may mine
@@ -2094,6 +2123,7 @@ mod tests {
             },
             pool_target,
             p2pool: None,
+            payouts: None,
             full_template: true,
         };
         let mut raw = rpc_template();
@@ -2316,6 +2346,7 @@ mod tests {
             },
             pool_target: [0xff; 32],
             p2pool: None,
+            payouts: None,
             full_template: true,
         };
         template.declare(Arc::new(plan.clone()));
@@ -2404,6 +2435,7 @@ mod tests {
             },
             pool_target: [0xff; 32],
             p2pool: None,
+            payouts: None,
             full_template: true,
         };
         template.declare(Arc::new(plan.clone()));

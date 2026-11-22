@@ -9,6 +9,7 @@ use super::{
     server::{self, ServerConfig, ServerStats},
     telemetry::{AddressIssue, DeviceSnapshot},
     template::{compact_target, BchTemplate},
+    view::{ConnectInfo, PanelFrame, ServerControl, ServerFrame, ServerView},
 };
 use crate::{
     cli::StratumV2Command,
@@ -40,7 +41,8 @@ use std::{
 
 /// Runs a `stratum-v2` command. `profile` names the setup profile a server
 /// started from (#### PR #42: a donation changed on its Advanced page is
-/// saved there too).
+/// saved there too). A server shows in the view `view::show_servers_in`
+/// set, when there is one, instead of the terminal.
 pub fn run(
     action: StratumV2Command,
     config: &RuntimeConfig,
@@ -49,6 +51,27 @@ pub fn run(
     json: bool,
     profile: Option<&str>,
 ) -> Result<(), String> {
+    serve(
+        action,
+        config,
+        config_path,
+        no_tui,
+        json,
+        profile,
+        super::view::shown_in(),
+    )
+}
+
+/// `run`, with the view that takes the terminal dashboard's place.
+fn serve(
+    action: StratumV2Command,
+    config: &RuntimeConfig,
+    config_path: &Path,
+    no_tui: bool,
+    json: bool,
+    profile: Option<&str>,
+    view: Option<&dyn ServerView>,
+) -> Result<(), String> {
     if let StratumV2Command::Status = action {
         print!("{}", super::status_report());
         return Ok(());
@@ -56,14 +79,40 @@ pub fn run(
     if let StratumV2Command::Watch = action {
         return watch(config_path);
     }
+    // #### Pool modes: the flags that go together, checked before P2Pool
+    // installs or starts.
+    check_pool_flags(&action)?;
+    // A view's Stop ends the server between its startup steps too, before
+    // it takes the view's other requests; returning drops what started.
+    let stop_asked = || view.is_some_and(ServerView::stop_requested);
+    if stop_asked() {
+        return Ok(());
+    }
     // #### PR #61: your own P2Pool node, started here and mined at as this
     // server's pool under your share address.
-    let own_p2pool = match &action {
-        StratumV2Command::Serve {
-            own_p2pool: true, ..
-        } => Some(crate::p2pool::own::OwnNode::start(config, config_path)?),
-        _ => None,
+    // #### Pool modes: with the operator's settings in P2Pool's own
+    // configuration.
+    let own_p2pool = match own_options(&action, config)? {
+        Some(options) => Some(crate::p2pool::own::OwnNode::start(
+            config,
+            config_path,
+            &options,
+        )?),
+        None => None,
     };
+    // #### Pool modes: a Non-custodial Pool (or P2Pool v2): your own P2Pool
+    // with --public; each miner mines there under their own payout.
+    let pool_mode =
+        own_p2pool.is_some() && matches!(&action, StratumV2Command::Serve { public: true, .. });
+    let logins = |p2pool: bool| {
+        pool_mode.then_some(super::sv1::MinerLogins {
+            network: config.network,
+            p2pool,
+        })
+    };
+    if stop_asked() {
+        return Ok(());
+    }
     // #### PR #40
     // Pool mode: SV1 devices mine at a remote SV2 pool through the adapter,
     // and no local node or SV2 server runs.
@@ -73,7 +122,13 @@ pub fn run(
             std::slice::from_ref(&own.url),
             &[],
             Some(&own.identity),
-        )?,
+        )?
+        .into_iter()
+        .map(|pool| super::sv1::Upstream {
+            miners: logins(true),
+            ..pool
+        })
+        .collect(),
         (
             StratumV2Command::Serve {
                 upstream,
@@ -88,9 +143,17 @@ pub fn run(
         _ => Vec::new(),
     };
     // #### PR #42: solo mining's fallback pools.
+    // #### Pool modes: and your own P2Pool node's, where in a pool each
+    // miner mines under their own payout.
     let fallbacks = match &action {
         StratumV2Command::Serve { fallback_pool, .. } if !fallback_pool.is_empty() => {
             fallback_upstreams(config, fallback_pool)?
+                .into_iter()
+                .map(|pool| super::sv1::Upstream {
+                    miners: logins(false),
+                    ..pool
+                })
+                .collect()
         }
         _ => Vec::new(),
     };
@@ -276,11 +339,17 @@ pub fn run(
         _ => None,
     };
     let reserve = super::tdp::reserve_for(tokens.is_some());
+    if stop_asked() {
+        return Ok(());
+    }
     let node = if (pools.is_empty() || declaring) && header_work.is_none() {
         Some(preflight_sources(config, &providers, reserve)?)
     } else {
         None
     };
+    if stop_asked() {
+        return Ok(());
+    }
     let serving = node.is_some() || header_work.is_some();
     // #### PR #40
     // The node's client and version, such as "Bitcoin Cash Node 29.1.0",
@@ -292,13 +361,14 @@ pub fn run(
         .map(|info| info.client);
     // #### PR #42: whether the pool knows this server by another name than
     // the payout address, for the Advanced page.
-    let custom_user = matches!(
-        &action,
-        StratumV2Command::Serve {
-            upstream_user: Some(_),
-            ..
-        }
-    );
+    let custom_user = pool_mode
+        || matches!(
+            &action,
+            StratumV2Command::Serve {
+                upstream_user: Some(_),
+                ..
+            }
+        );
     let StratumV2Command::Serve {
         listen,
         sv1_listen,
@@ -407,9 +477,25 @@ pub fn run(
             Ok(pool)
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let pools = at_pools(pools);
+    let mut pools = at_pools(pools);
     let fallbacks = at_pools(fallbacks);
-    let listener = serving
+    // #### Pool modes: failover for your own P2Pool node
+    // What: with --fallback-pool, devices leave your own P2Pool node once it
+    // has served no work (its light not green) for the solo fallback's 3 s
+    // grace, take the first fallback pool that takes them, and come back
+    // once it has served for 30 s without a break: `sv1::Preferred`, marked
+    // from P2Pool's light by the dashboard loop below.
+    // Why: the solo fallback's rule, with P2Pool as the source devices
+    // prefer.
+    // Look here if: devices stay on a P2Pool node that serves no work, or
+    // bounce off it every 30 s.
+    if own_p2pool.is_some() {
+        for pool in &mut pools {
+            pool.prefer = None;
+            pool.serving = preferred.clone();
+        }
+    }
+    let listener = (serving || pool_mode)
         .then(|| TcpListener::bind(listen))
         .transpose()
         .map_err(|_| "cannot bind mining listener")?;
@@ -439,7 +525,7 @@ pub fn run(
         .map(TcpListener::local_addr)
         .transpose()
         .map_err(|_| "cannot read template listener")?;
-    let authority_secret = serving
+    let authority_secret = (serving || pool_mode)
         .then(|| load_authority(&config_path.with_extension("sv2-key")))
         .transpose()?;
     let public_key = authority_secret
@@ -452,6 +538,8 @@ pub fn run(
     // remains pinned.
     let public_pool = public.clone();
     let upstreams = match (bound, public_key) {
+        // #### Pool modes: your own P2Pool node, then its fallback pools.
+        _ if own_p2pool.is_some() => pools.iter().chain(&fallbacks).cloned().collect(),
         _ if !pools.is_empty() && !declaring => pools.clone(),
         (Some(mut local), Some(public)) => {
             if local.ip().is_unspecified() {
@@ -491,9 +579,19 @@ pub fn run(
     };
     // The pools as the dashboard and status show them; never the identity.
     // #### PR #40: a public pool says so on the dashboard, with its fee.
-    let pool_suffix = public_pool_suffix(public.as_ref());
+    // #### Pool modes: by its mode's name.
+    let mode_name = match &own_p2pool {
+        Some(own) if pool_mode && own.standalone => "Non-custodial Pool",
+        Some(_) if pool_mode => "P2Pool v2",
+        _ => "Public Solo Endpoint",
+    };
+    let pool_suffix = public_pool_suffix(public.as_ref(), mode_name);
     // #### PR #61: your own P2Pool node by name, not its local address.
     let pool_address = (!pools.is_empty()).then(|| match &own_p2pool {
+        Some(own) if pool_mode => format!(
+            "your P2Pool ({}; each miner under their own address)",
+            own.tag
+        ),
         Some(own) => format!("your P2Pool node ({})", own.tag),
         None => pools
             .iter()
@@ -536,9 +634,13 @@ pub fn run(
             )
         }),
     });
+    if stop_asked() {
+        return Ok(());
+    }
     let stop = Arc::new(AtomicBool::new(false));
     crate::session_control::install_stop(&stop)?;
-    let mut terminal = if no_tui || json {
+    // A view shows the server in the terminal's place, and prints nothing.
+    let mut terminal = if no_tui || json || view.is_some() {
         None
     } else {
         Some(TerminalSession::enter()?)
@@ -616,6 +718,21 @@ pub fn run(
             ],
         )),
         (None, None) => None,
+    };
+    // #### Pool modes: the SV2 door takes the mining listener.
+    let (listener, door_listener) = if pool_mode {
+        (None, listener)
+    } else {
+        (listener, None)
+    };
+    let door = match (door_listener, authority_secret) {
+        (Some(listener), Some(secret)) => {
+            let (stop, stats, upstreams) = (stop.clone(), stats.clone(), upstreams.clone());
+            Some(thread::spawn(move || {
+                super::door::run(listener, upstreams, secret, stop, stats)
+            }))
+        }
+        _ => None,
     };
     let worker = match (work, listener, authority_secret) {
         (Some((legacy_sources, sources)), Some(listener), Some(authority_secret)) => {
@@ -731,7 +848,13 @@ pub fn run(
     // info page (`i`) every address, Tailscale's included, ready to copy.
     let interfaces = crate::reach::Interfaces::detect();
     let devices_hint = device_hint(bound, sv1_bound, interfaces);
-    let serve_mode = if !pools.is_empty() {
+    // A view has its own Connection info, so no key to name.
+    let devices_at = device_addresses(bound, sv1_bound, interfaces);
+    let serve_mode = if pool_mode {
+        ServeMode::P2PoolPool {
+            standalone: own_p2pool.as_ref().is_some_and(|own| own.standalone),
+        }
+    } else if !pools.is_empty() {
         ServeMode::JoinPool
     } else if public_pool.is_some() {
         ServeMode::Public
@@ -749,7 +872,7 @@ pub fn run(
     // #### PR #42: for the Connection info page.
     let job_declaration_on = declaring || declarator.is_some();
     let result = (|| {
-        if terminal.is_none() {
+        if terminal.is_none() && view.is_none() {
             // The pool's identity may be a payout address: never printed.
             println!(
                 "{}",
@@ -781,11 +904,30 @@ pub fn run(
         let mut panel: Option<DevicePanel> = None;
         // #### end PR #42 ####
         let mut connect: Option<ConnectPage> = None;
+        // A view's Connection info, read again when the view asks, as
+        // opening the page (`i`) does.
+        let connect_page = |interfaces| ConnectPage {
+            lines: connect_lines(bound, sv1_bound, authority.as_deref(), interfaces),
+            templates: template_lines(tp_bound, interfaces),
+            key: authority.clone(),
+            mode: serve_mode,
+            job_declaration: job_declaration_on,
+            note: None,
+        };
+        let mut view_connect = view.map(|_| ConnectInfo::from(&connect_page(interfaces)));
         while !stop.load(Ordering::Relaxed)
             && worker.as_ref().is_none_or(|worker| !worker.is_finished())
         {
-            if firmware.as_ref().is_some_and(|worker| worker.is_finished()) {
+            if firmware.as_ref().is_some_and(|worker| worker.is_finished())
+                || door.as_ref().is_some_and(|door| door.is_finished())
+            {
                 break;
+            }
+            // #### Pool modes: devices leave your own P2Pool node for a
+            // fallback pool while it is not green, and come back after it
+            // has been green for 30 s.
+            if let (Some(own), Some(preferred)) = (own_p2pool.as_ref(), preferred.as_ref()) {
+                preferred.set(own.serving(), Instant::now());
             }
             let snapshot = stats
                 .lock()
@@ -822,71 +964,22 @@ pub fn run(
                     devices_saved = Some(list);
                 }
             }
+            let texts = PageText {
+                network: config.network.as_str(),
+                pools: pool_address.as_deref(),
+                declaring,
+                node_client: node_client.as_deref(),
+                snapshot: &snapshot,
+                donation: donation_value,
+                pool_suffix: &pool_suffix,
+                sv2: bound,
+                sv1: sv1_bound,
+                setting_error,
+                authority: authority.as_deref(),
+            };
             if let Some(terminal) = terminal.as_mut() {
-                let overview_text = if let Some(pool) = pool_address.as_ref().filter(|_| !declaring)
-                {
-                    format!(
-                        "{} · Pool {pool} (SV2, encrypted)\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\n{}\nThe pool builds the blocks; the donation is that share of mining work under the donation address at the pool.\nConnection errors: SV1 {}\nSV1 {}",
-                        config.network.as_str(),
-                        snapshot.connections,
-                        snapshot.sessions_started,
-                        snapshot.shares_accepted,
-                        snapshot.shares_rejected,
-                        snapshot.sv1_local_rejected,
-                        work_line(&snapshot, true),
-                        snapshot.sv1_connection_errors,
-                        sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
-                    )
-                } else {
-                    format!(
-                    "{} · Node {}{} · Height {} · Donation {}{}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\n{}\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}{}\nSV2 {} · SV1 {}\n{}\n{}{}{}{}",
-                    config.network.as_str(), if snapshot.template_ready { "Ready" } else { "Waiting" }, node_label(node_client.as_deref(), &snapshot),
-                    snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), donation_summary(donation_value), pool_suffix, snapshot.connections, snapshot.sessions_started,
-                    snapshot.shares_accepted, snapshot.shares_rejected, snapshot.sv1_local_rejected, work_line(&snapshot, false), snapshot.blocks_accepted, snapshot.blocks_pending,
-                    snapshot.blocks_rejected, snapshot.block_retries, snapshot.last_block_result.unwrap_or("Waiting"),
-                    snapshot.connection_errors, snapshot.sv1_connection_errors,
-                    snapshot.template_failures, snapshot.last_template_error.unwrap_or("None"), notices_suffix(&snapshot),
-                    bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
-                    sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
-                    setting_error.map(str::to_owned).unwrap_or_else(|| format!("Authority {}", authority.as_deref().unwrap_or("—"))),
-                    records_line(&snapshot),
-                    templates_line(&snapshot),
-                    jd_line(&snapshot),
-                    jd_client_line(&snapshot, pool_address.as_deref()),
-                    )
-                };
-                let online = devices.iter().filter(|device| device.connected).count();
-                let total_rate: f64 = devices
-                    .iter()
-                    .filter(|device| device.connected)
-                    .filter_map(|device| device.hashrate_estimate)
-                    .sum();
-                let header = if let Some(pool) = pool_address.as_ref().filter(|_| !declaring) {
-                    format!(
-                        "{} · Pool {pool} (SV2, encrypted) · the pool builds blocks and pays\n{online} of {} workers online · {} · Shares {} accepted / {} rejected\n{devices_hint}",
-                        config.network.as_str(),
-                        devices.len(),
-                        crate::telemetry::format_hash_rate(total_rate),
-                        snapshot.shares_accepted,
-                        snapshot.shares_rejected,
-                    )
-                } else {
-                    format!(
-                        "{} · Node {}{} · Height {} · Donation {}{}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending\n{devices_hint}",
-                        config.network.as_str(),
-                        if snapshot.template_ready { "Ready" } else { "Waiting" },
-                        node_label(node_client.as_deref(), &snapshot),
-                        snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()),
-                        donation_summary(donation_value),
-                        pool_suffix,
-                        devices.len(),
-                        crate::telemetry::format_hash_rate(total_rate),
-                        snapshot.shares_accepted,
-                        snapshot.shares_rejected,
-                        snapshot.blocks_accepted,
-                        snapshot.blocks_pending,
-                    )
-                };
+                let overview_text = texts.overview();
+                let header = texts.header(&devices, &devices_hint);
                 let lights = status_lights(
                     own_p2pool.as_ref(),
                     pool_address.is_some() && !declaring,
@@ -996,41 +1089,21 @@ pub fn run(
                                             Instant::now(),
                                         )
                                     });
-                                    if let Some(mut view) = opened {
-                                        // #### PR #42: where devices reach
-                                        // this server, for the pool pages.
-                                        view.set_server_urls(
-                                            connect_lines(
-                                                bound,
-                                                sv1_bound,
-                                                authority.as_deref(),
-                                                crate::reach::Interfaces::detect(),
-                                            )
-                                            .into_iter()
-                                            .map(|line| (line.place, line.sv2, line.url))
-                                            .collect(),
-                                        );
-                                        view.identify(&fleet);
-                                        panel = Some(view);
+                                    if let Some(view) = opened {
+                                        panel = Some(ready_panel(
+                                            view,
+                                            bound,
+                                            sv1_bound,
+                                            authority.as_deref(),
+                                            &fleet,
+                                        ));
                                     }
                                 }
                                 // #### end PR #42 ####
                                 KeyCode::Char('a') | KeyCode::Char('A') => advanced = !advanced,
                                 KeyCode::Char('i') | KeyCode::Char('I') if !advanced => {
-                                    let interfaces = crate::reach::Interfaces::detect();
-                                    connect = Some(ConnectPage {
-                                        lines: connect_lines(
-                                            bound,
-                                            sv1_bound,
-                                            authority.as_deref(),
-                                            interfaces,
-                                        ),
-                                        templates: template_lines(tp_bound, interfaces),
-                                        key: authority.clone(),
-                                        mode: serve_mode,
-                                        job_declaration: job_declaration_on,
-                                        note: None,
-                                    });
+                                    connect =
+                                        Some(connect_page(crate::reach::Interfaces::detect()));
                                 }
                                 KeyCode::Esc => advanced = false,
                                 KeyCode::Tab if !advanced => overview = !overview,
@@ -1042,19 +1115,18 @@ pub fn run(
                                 | KeyCode::Right
                                     if advanced =>
                                 {
-                                    let next = donation_value.adjusted(matches!(
-                                        key.code,
-                                        KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Right
-                                    ));
-                                    if next != donation_value {
-                                        match save_donation(config_path, profile, next) {
-                                            Ok(()) => {
-                                                *donation.write().map_err(|_| "donation setting unavailable")? = next;
-                                                setting_error = None;
-                                            }
-                                            Err(()) => setting_error = Some("Could not save donation; previous setting retained"),
-                                        }
-                                    }
+                                    step_donation(
+                                        &donation,
+                                        matches!(
+                                            key.code,
+                                            KeyCode::Char('+')
+                                                | KeyCode::Char('=')
+                                                | KeyCode::Right
+                                        ),
+                                        config_path,
+                                        profile,
+                                        &mut setting_error,
+                                    )?;
                                 }
                                 KeyCode::Char('q') => stop.store(true, Ordering::Relaxed),
                                 KeyCode::Char('c')
@@ -1091,6 +1163,86 @@ pub fn run(
                         }
                     }
                 }
+            } else if let Some(view) = view {
+                // What the terminal pages show, then the view's requests as
+                // their keys apply them.
+                let frame = ServerFrame {
+                    network: config.network,
+                    title: dashboard_title,
+                    mode: serve_mode,
+                    joining: pool_address.is_some() && !declaring,
+                    pool: pool_address.clone(),
+                    node_client: node_client.clone(),
+                    lights: status_lights(
+                        own_p2pool.as_ref(),
+                        pool_address.is_some() && !declaring,
+                        &snapshot,
+                        &devices,
+                    ),
+                    header: texts.header(&devices, &devices_at),
+                    overview: texts.overview(),
+                    advanced: advanced_text(donation_value, pool_address.is_some()),
+                    started: started.clone(),
+                    devices_hint: devices_at.clone(),
+                    connect: view_connect.clone().unwrap_or_default(),
+                    donation: donation_value,
+                    setting_error,
+                    panel: panel.as_ref().map(|open| PanelFrame {
+                        text: open.text(),
+                        input: open.input(),
+                    }),
+                    devices: devices.clone(),
+                    // The rows are in `devices`; the device addresses stay
+                    // here (see the devices file).
+                    stats: ServerStats {
+                        device_stats: Default::default(),
+                        ..snapshot
+                    },
+                };
+                view.show(frame);
+                for control in view.controls() {
+                    match control {
+                        ServerControl::Stop => stop.store(true, Ordering::Relaxed),
+                        ServerControl::Donation { up } => {
+                            step_donation(&donation, up, config_path, profile, &mut setting_error)?
+                        }
+                        ServerControl::ReadAddresses => {
+                            view_connect = Some(ConnectInfo::from(&connect_page(
+                                crate::reach::Interfaces::detect(),
+                            )));
+                        }
+                        // As Enter on a row: `devices` holds the rows shown.
+                        ServerControl::OpenDevice(label) => {
+                            let opened = stats.lock().ok().and_then(|stats| {
+                                DevicePanel::for_label(
+                                    &stats.device_stats,
+                                    &devices,
+                                    &label,
+                                    Instant::now(),
+                                )
+                            });
+                            if let Some(opened) = opened {
+                                panel = Some(ready_panel(
+                                    opened,
+                                    bound,
+                                    sv1_bound,
+                                    authority.as_deref(),
+                                    &fleet,
+                                ));
+                            }
+                        }
+                        ServerControl::PanelKey(key) => {
+                            if panel
+                                .as_mut()
+                                .is_some_and(|open| open.handle_key(key.into(), &fleet))
+                            {
+                                panel = None;
+                            }
+                        }
+                        ServerControl::ClosePanel => panel = None,
+                    }
+                }
+                thread::sleep(VIEW_INTERVAL);
             } else {
                 println!("{status}");
                 thread::sleep(Duration::from_secs(1));
@@ -1117,7 +1269,126 @@ pub fn run(
             .map_err(|_| "mining server stopped unexpectedly")?,
         None => Ok(()),
     };
-    result.and(server_result).and(firmware_result)
+    let door_result = match door {
+        Some(door) => door
+            .join()
+            .map_err(|_| "mining listener stopped unexpectedly")?,
+        None => Ok(()),
+    };
+    result
+        .and(server_result)
+        .and(firmware_result)
+        .and(door_result)
+}
+
+// #### Pool modes: flags that go together
+// What: fallback pools with --public only for a pool that runs your own
+// P2Pool (a Public Solo Endpoint mines your node, whose templates do not
+// fail over); with your own P2Pool, the fee only from the coinbase (P2Pool
+// pays it in each block) and no Job Declaration from miners (P2Pool builds
+// the jobs).
+// Look here if: a Pool-mode command is refused, or a Public Solo Endpoint
+// takes fallback pools.
+fn check_pool_flags(action: &StratumV2Command) -> Result<(), String> {
+    let StratumV2Command::Serve {
+        own_p2pool,
+        public,
+        fallback_pool,
+        pool_fee_mode,
+        accept_job_declaration,
+        ..
+    } = action
+    else {
+        return Ok(());
+    };
+    if *public && !own_p2pool && !fallback_pool.is_empty() {
+        return Err(
+            "--fallback-pool with --public needs --own-p2pool: a Public Solo Endpoint mines \
+             your own node"
+                .into(),
+        );
+    }
+    if *own_p2pool
+        && matches!(
+            pool_fee_mode,
+            Some(crate::donation::bch::FeeMode::Work | crate::donation::bch::FeeMode::Both)
+        )
+    {
+        return Err(
+            "with --own-p2pool, P2Pool pays the fee in the coinbase of each block: use \
+             --pool-fee-mode coinbase (work and both mine the fee as work, which P2Pool \
+             cannot)"
+                .into(),
+        );
+    }
+    if *own_p2pool && accept_job_declaration.is_some() {
+        return Err(
+            "--accept-job-declaration is not taken with --own-p2pool: P2Pool builds the jobs"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// #### Pool modes: what `--own-p2pool`'s flags set in P2Pool: with
+/// --public the operator's fee (`--pool-fee`, `--pool-fee-address`, by
+/// default the payout address), in any mode the pool signature
+/// (`--pool-tag`), and from `config.p2pool` (a profile's, or
+/// `--p2pool-donation`, `--p2pool-standalone`, `--node-p2p`) P2Pool's own
+/// donation (1% by default), standalone or linked, and the node's P2P
+/// port. `None` without `--own-p2pool`.
+fn own_options(
+    action: &StratumV2Command,
+    config: &RuntimeConfig,
+) -> Result<Option<crate::p2pool::own::Options>, String> {
+    let StratumV2Command::Serve {
+        own_p2pool: true,
+        public,
+        pool_fee,
+        pool_fee_address,
+        pool_tag,
+        ..
+    } = action
+    else {
+        return Ok(None);
+    };
+    let config::SavedP2Pool {
+        donation,
+        standalone,
+        node_p2p,
+    } = &config.p2pool;
+    use crate::p2pool::launch::{Operator, DEFAULT_DONATION_BPS};
+    let fee = match pool_fee.filter(|rate| *public && u16::from(*rate) > 0) {
+        Some(rate) => Some((
+            u16::from(rate),
+            config::validate_coinbase_address(
+                config.network,
+                pool_fee_address
+                    .as_deref()
+                    .unwrap_or(config.payout_address.as_str()),
+            )
+            .map_err(|_| "the pool fee address must be a q or p address on this network")?,
+        )),
+        None => None,
+    };
+    let operator = Operator {
+        fee,
+        signature: pool_tag
+            .as_deref()
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_owned),
+        donation: donation.map_or(DEFAULT_DONATION_BPS, u16::from),
+    };
+    operator.validate()?;
+    Ok(Some(crate::p2pool::own::Options {
+        operator: Some(operator),
+        standalone: *standalone,
+        node_p2p: node_p2p
+            .as_deref()
+            .map(config::validate_node_p2p)
+            .transpose()?,
+    }))
 }
 
 // #### PR #61
@@ -1241,6 +1512,8 @@ fn pool_upstreams(
                 public: false,
                 prefer: None,
                 fixed_version: false,
+                miners: None,
+                serving: None,
             })
         })
         .collect()
@@ -1280,6 +1553,8 @@ fn fallback_upstreams(
                 public: false,
                 prefer: None,
                 fixed_version: false,
+                miners: None,
+                serving: None,
             })
         })
         .collect()
@@ -1312,6 +1587,57 @@ fn save_donation(path: &Path, profile: Option<&str>, value: BchDonation) -> Resu
         profiles.save(&profiles_path).map_err(|_| ())?;
     }
     Ok(())
+}
+
+/// The Advanced page's donation change, from its keys or a view: one 0.5%
+/// step, saved before new jobs use it. A save that fails keeps the old
+/// setting and says so in `setting_error`.
+fn step_donation(
+    donation: &RwLock<BchDonation>,
+    up: bool,
+    config_path: &Path,
+    profile: Option<&str>,
+    setting_error: &mut Option<&'static str>,
+) -> Result<(), String> {
+    let current = *donation
+        .read()
+        .map_err(|_| "donation setting unavailable")?;
+    let next = current.adjusted(up);
+    if next != current {
+        match save_donation(config_path, profile, next) {
+            Ok(()) => {
+                *donation
+                    .write()
+                    .map_err(|_| "donation setting unavailable")? = next;
+                *setting_error = None;
+            }
+            Err(()) => *setting_error = Some("Could not save donation; previous setting retained"),
+        }
+    }
+    Ok(())
+}
+
+/// How often a view gets a frame and its requests are applied.
+const VIEW_INTERVAL: Duration = Duration::from_millis(200);
+
+/// A Device panel opened from the workers page or a view: told where
+/// devices reach this server (#### PR #42: for its pool pages), and asking
+/// the device what it is.
+fn ready_panel(
+    mut panel: DevicePanel,
+    sv2: Option<std::net::SocketAddr>,
+    sv1: Option<std::net::SocketAddr>,
+    authority: Option<&str>,
+    fleet: &Arc<Fleet>,
+) -> DevicePanel {
+    panel.set_server_urls(
+        connect_lines(sv2, sv1, authority, crate::reach::Interfaces::detect())
+            .into_iter()
+            .map(|line| (line.place, line.sv2, line.url))
+            .collect(),
+    );
+    panel.identify(fleet);
+    panel
 }
 
 /// #### PR #42: what the server started with.
@@ -1461,14 +1787,8 @@ fn donation_summary(donation: BchDonation) -> String {
     format!("{donation} ({work} of work · {reward} of block rewards and token wins)")
 }
 
-/// Advanced settings: the donation, adjustable from 0% to 100%.
-fn render_advanced(
-    frame: &mut Frame<'_>,
-    donation: BchDonation,
-    error: Option<&str>,
-    pool: bool,
-    started: &str,
-) {
+/// What the Advanced page says the donation pays, and how it changes.
+fn advanced_text(donation: BchDonation, pool: bool) -> String {
     let (work, reward) = donation.shares();
     // #### PR #40: at a pool the whole donation is mining work (#### PR #48:
     // accepted shares weighted by difficulty).
@@ -1484,10 +1804,23 @@ fn render_advanced(
              the whole {donation} as mining work instead."
         )
     };
+    format!(
+        "{split}\nThe default is 1.50%; any setting from 0% to 100% works, in 0.5% steps. \
+         Changes apply to new jobs and are saved."
+    )
+}
+
+/// Advanced settings: the donation, adjustable from 0% to 100%.
+fn render_advanced(
+    frame: &mut Frame<'_>,
+    donation: BchDonation,
+    error: Option<&str>,
+    pool: bool,
+    started: &str,
+) {
     let mut text = format!(
-        "Donation  {donation}\n\n{split}\nThe default is 1.50%; any setting from 0% to 100% \
-         works, in 0.5% steps. Changes apply to new jobs and are saved.\n\n{started}\n←/→ or \
-         +/-  Change donation · a or Esc  Back"
+        "Donation  {donation}\n\n{}\n\n{started}\n←/→ or +/-  Change donation · a or Esc  Back",
+        advanced_text(donation, pool)
     );
     if let Some(error) = error {
         text.push_str(&format!("\n\n{error}"));
@@ -1608,6 +1941,112 @@ fn with_lights<'a>(lights: Vec<ratatui::text::Line<'a>>, text: &'a str) -> ratat
     ratatui::text::Text::from(lines)
 }
 
+/// One tick's overview and workers-page texts, for the terminal pages and
+/// a `ServerView` alike.
+struct PageText<'a> {
+    network: &'a str,
+    /// The pools in failover order, or your own P2Pool node by name.
+    pools: Option<&'a str>,
+    /// This server declares its node's templates to the pool.
+    declaring: bool,
+    node_client: Option<&'a str>,
+    snapshot: &'a ServerStats,
+    donation: BchDonation,
+    pool_suffix: &'a str,
+    sv2: Option<std::net::SocketAddr>,
+    sv1: Option<std::net::SocketAddr>,
+    /// Why the last donation change was not saved; shown instead of the
+    /// authority key.
+    setting_error: Option<&'a str>,
+    authority: Option<&'a str>,
+}
+
+impl PageText<'_> {
+    /// The pool devices mine at, when it builds the blocks.
+    fn joined(&self) -> Option<&str> {
+        self.pools.filter(|_| !self.declaring)
+    }
+
+    /// The overview page's status.
+    fn overview(&self) -> String {
+        let snapshot = self.snapshot;
+        let sv1_bound = self.sv1;
+        let bound = self.sv2;
+        // #### Pool modes: a Non-custodial Pool or P2Pool v2 names itself
+        // first (the suffix is empty when joining someone's pool).
+        if let Some(pool) = self.joined() {
+            format!(
+                "{}{} · Pool {pool} (SV2, encrypted)\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\n{}\nThe pool builds the blocks; the donation is that share of mining work under the donation address at the pool.\nConnection errors: SV1 {}\nSV1 {}",
+                self.network,
+                self.pool_suffix,
+                snapshot.connections,
+                snapshot.sessions_started,
+                snapshot.shares_accepted,
+                snapshot.shares_rejected,
+                snapshot.sv1_local_rejected,
+                work_line(snapshot, true),
+                snapshot.sv1_connection_errors,
+                sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
+            )
+        } else {
+            format!(
+            "{} · Node {}{} · Height {} · Donation {}{}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\n{}\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}{}\nSV2 {} · SV1 {}\n{}\n{}{}{}{}",
+            self.network, if snapshot.template_ready { "Ready" } else { "Waiting" }, node_label(self.node_client, snapshot),
+            snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), donation_summary(self.donation), self.pool_suffix, snapshot.connections, snapshot.sessions_started,
+            snapshot.shares_accepted, snapshot.shares_rejected, snapshot.sv1_local_rejected, work_line(snapshot, false), snapshot.blocks_accepted, snapshot.blocks_pending,
+            snapshot.blocks_rejected, snapshot.block_retries, snapshot.last_block_result.unwrap_or("Waiting"),
+            snapshot.connection_errors, snapshot.sv1_connection_errors,
+            snapshot.template_failures, snapshot.last_template_error.unwrap_or("None"), notices_suffix(snapshot),
+            bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
+            sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
+            self.setting_error.map(str::to_owned).unwrap_or_else(|| format!("Authority {}", self.authority.unwrap_or("—"))),
+            records_line(snapshot),
+            templates_line(snapshot),
+            jd_line(snapshot),
+            jd_client_line(snapshot, self.pools),
+            )
+        }
+    }
+
+    /// The workers page's header, ending with where devices connect.
+    fn header(&self, devices: &[DeviceSnapshot], devices_hint: &str) -> String {
+        let snapshot = self.snapshot;
+        let online = devices.iter().filter(|device| device.connected).count();
+        let total_rate: f64 = devices
+            .iter()
+            .filter(|device| device.connected)
+            .filter_map(|device| device.hashrate_estimate)
+            .sum();
+        if let Some(pool) = self.joined() {
+            format!(
+                "{}{} · Pool {pool} (SV2, encrypted) · the pool builds blocks and pays\n{online} of {} workers online · {} · Shares {} accepted / {} rejected\n{devices_hint}",
+                self.network,
+                self.pool_suffix,
+                devices.len(),
+                crate::telemetry::format_hash_rate(total_rate),
+                snapshot.shares_accepted,
+                snapshot.shares_rejected,
+            )
+        } else {
+            format!(
+                "{} · Node {}{} · Height {} · Donation {}{}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending\n{devices_hint}",
+                self.network,
+                if snapshot.template_ready { "Ready" } else { "Waiting" },
+                node_label(self.node_client, snapshot),
+                snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()),
+                donation_summary(self.donation),
+                self.pool_suffix,
+                devices.len(),
+                crate::telemetry::format_hash_rate(total_rate),
+                snapshot.shares_accepted,
+                snapshot.shares_rejected,
+                snapshot.blocks_accepted,
+                snapshot.blocks_pending,
+            )
+        }
+    }
+}
+
 fn render_dashboard(
     frame: &mut Frame<'_>,
     title: &str,
@@ -1629,32 +2068,10 @@ fn render_dashboard(
             .wrap(Wrap { trim: false }),
         areas[0],
     );
-    let rows = devices.iter().skip(offset).map(|device| {
-        Row::new(vec![
-            device.label.clone(),
-            device.protocol.to_owned(),
-            if device.connected {
-                "Online"
-            } else {
-                "Offline"
-            }
-            .to_owned(),
-            device.model.clone().unwrap_or_else(|| "—".into()),
-            device
-                .hashrate_estimate
-                .map(crate::telemetry::format_hash_rate)
-                .unwrap_or_else(|| "Measuring".into()),
-            power(device.power_w),
-            device.accepted.to_string(),
-            device.rejected.to_string(),
-            device
-                .adapter_error
-                .or(device.connection_error)
-                .or(device.last_rejection)
-                .unwrap_or("—")
-                .to_owned(),
-        ])
-    });
+    let rows = devices
+        .iter()
+        .skip(offset)
+        .map(|device| Row::new(device_cells(device)));
     let title = format!(
         "Devices · {} sessions · {} onward",
         devices.len(),
@@ -1675,24 +2092,51 @@ fn render_dashboard(
                 Constraint::Min(10),
             ],
         )
-        .header(
-            Row::new([
-                "Device",
-                "Via",
-                "State",
-                "Model",
-                "Est. 5m",
-                "Power",
-                "Accepted",
-                "Rejected",
-                "Last issue",
-            ])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
-        )
+        .header(Row::new(DEVICE_COLUMNS).style(Style::default().add_modifier(Modifier::BOLD)))
         .block(Block::bordered().title(title)),
         areas[1],
     );
     frame.render_widget(Paragraph::new("Tab  Workers · ↑/↓ PgUp/PgDn  Devices · a  Advanced settings · q  Stop server\nRate uses validated shares; 30s warm-up, up to 5m window."), areas[2]);
+}
+
+/// The overview's devices table: its columns, and a device's row.
+pub const DEVICE_COLUMNS: [&str; 9] = [
+    "Device",
+    "Via",
+    "State",
+    "Model",
+    "Est. 5m",
+    "Power",
+    "Accepted",
+    "Rejected",
+    "Last issue",
+];
+
+pub fn device_cells(device: &DeviceSnapshot) -> Vec<String> {
+    vec![
+        device.label.clone(),
+        device.protocol.to_owned(),
+        if device.connected {
+            "Online"
+        } else {
+            "Offline"
+        }
+        .to_owned(),
+        device.model.clone().unwrap_or_else(|| "—".into()),
+        device
+            .hashrate_estimate
+            .map(crate::telemetry::format_hash_rate)
+            .unwrap_or_else(|| "Measuring".into()),
+        power(device.power_w),
+        device.accepted.to_string(),
+        device.rejected.to_string(),
+        device
+            .adapter_error
+            .or(device.connection_error)
+            .or(device.last_rejection)
+            .unwrap_or("—")
+            .to_owned(),
+    ]
 }
 
 /// A device's reported power draw: "140 W".
@@ -1714,7 +2158,7 @@ fn ago(seconds: Option<u64>) -> String {
 }
 
 /// A share difficulty in thousands, millions and so on: "4.10K".
-fn format_difficulty(difficulty: Option<f64>) -> String {
+pub fn format_difficulty(difficulty: Option<f64>) -> String {
     let Some(mut value) = difficulty.filter(|value| value.is_finite() && *value > 0.0) else {
         return "—".into();
     };
@@ -1760,51 +2204,7 @@ fn render_workers(
             .wrap(Wrap { trim: false }),
         areas[0],
     );
-    let rate = |value: Option<f64>| {
-        value
-            .map(crate::telemetry::format_hash_rate)
-            .unwrap_or_else(|| "Measuring".into())
-    };
-    let rows = devices.iter().map(|device| {
-        let total = device.accepted + device.rejected;
-        Row::new(vec![
-            device.label.clone(),
-            if device.connected {
-                "Online"
-            } else {
-                "Offline"
-            }
-            .to_owned(),
-            rate(device.hashrate_estimate),
-            rate(device.hashrate_hour),
-            device
-                .reported_hashrate
-                .map(crate::telemetry::format_hash_rate)
-                .unwrap_or_else(|| "—".into()),
-            device
-                .temperature_c
-                .map(|temperature| format!("{temperature:.0} °C"))
-                .unwrap_or_else(|| "—".into()),
-            device.fan.clone().unwrap_or_else(|| "—".into()),
-            device.accepted.to_string(),
-            device.rejected.to_string(),
-            if total == 0 {
-                "—".to_owned()
-            } else {
-                format!("{:.2}%", device.rejected as f64 * 100.0 / total as f64)
-            },
-            ago(device.last_share_seconds),
-            format_difficulty(device.difficulty),
-            device.protocol.clone(),
-            device
-                .adapter_error
-                .as_deref()
-                .or(device.connection_error.as_deref())
-                .or(device.last_rejection.as_deref())
-                .unwrap_or("—")
-                .to_owned(),
-        ])
-    });
+    let rows = devices.iter().map(|device| Row::new(device.cells()));
     let title = match state.selected() {
         Some(index) if index < devices.len() => {
             format!("Workers · {} · row {} selected", devices.len(), index + 1)
@@ -1835,29 +2235,12 @@ fn render_workers(
                 Constraint::Length(8),
                 Constraint::Length(10),
                 Constraint::Length(10),
+                Constraint::Length(17),
                 Constraint::Length(4),
                 Constraint::Min(10),
             ],
         )
-        .header(
-            Row::new([
-                "Worker",
-                "Status",
-                "Now (5m)",
-                "1 hour",
-                "Device says",
-                "Temp",
-                "Fan",
-                "Accepted",
-                "Rejected",
-                "Reject",
-                "Last share",
-                "Difficulty",
-                "Via",
-                "Last issue",
-            ])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
-        )
+        .header(Row::new(WORKER_COLUMNS).style(Style::default().add_modifier(Modifier::BOLD)))
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .block(Block::bordered().title(title)),
         areas[1],
@@ -1892,6 +2275,10 @@ struct WorkerLine {
     model: Option<String>,
     firmware: Option<String>,
     power_w: Option<f64>,
+    /// #### one donation, the higher rate: a public pool miner's effective
+    /// donation and their own Pickaxe's credit.
+    donation_bps: Option<u16>,
+    own_donation_bps: Option<u16>,
 }
 
 impl From<&DeviceSnapshot> for WorkerLine {
@@ -1915,13 +2302,98 @@ impl From<&DeviceSnapshot> for WorkerLine {
             model: device.model.clone(),
             firmware: device.firmware.clone(),
             power_w: device.power_w,
+            donation_bps: device.donation_bps,
+            own_donation_bps: device.own_donation_bps,
         }
+    }
+}
+
+/// The workers table's columns.
+pub const WORKER_COLUMNS: [&str; 15] = [
+    "Worker",
+    "Status",
+    "Now (5m)",
+    "1 hour",
+    "Device says",
+    "Temp",
+    "Fan",
+    "Accepted",
+    "Rejected",
+    "Reject",
+    "Last share",
+    "Difficulty",
+    "Donation",
+    "Via",
+    "Last issue",
+];
+
+/// A worker's row of the workers table, as the terminal shows it.
+pub fn worker_cells(device: &DeviceSnapshot) -> Vec<String> {
+    WorkerLine::from(device).cells()
+}
+
+impl WorkerLine {
+    /// The row's cells, under `WORKER_COLUMNS`.
+    fn cells(&self) -> Vec<String> {
+        let rate = |value: Option<f64>| {
+            value
+                .map(crate::telemetry::format_hash_rate)
+                .unwrap_or_else(|| "Measuring".into())
+        };
+        let total = self.accepted + self.rejected;
+        vec![
+            self.label.clone(),
+            if self.connected { "Online" } else { "Offline" }.to_owned(),
+            rate(self.hashrate_estimate),
+            rate(self.hashrate_hour),
+            self.reported_hashrate
+                .map(crate::telemetry::format_hash_rate)
+                .unwrap_or_else(|| "—".into()),
+            self.temperature_c
+                .map(|temperature| format!("{temperature:.0} °C"))
+                .unwrap_or_else(|| "—".into()),
+            self.fan.clone().unwrap_or_else(|| "—".into()),
+            self.accepted.to_string(),
+            self.rejected.to_string(),
+            if total == 0 {
+                "—".to_owned()
+            } else {
+                format!("{:.2}%", self.rejected as f64 * 100.0 / total as f64)
+            },
+            ago(self.last_share_seconds),
+            format_difficulty(self.difficulty),
+            // #### one donation, the higher rate: the miner's effective
+            // donation and their own Pickaxe's credit, never an address.
+            super::telemetry::donation_text(self.donation_bps, self.own_donation_bps)
+                .unwrap_or_else(|| "—".into()),
+            self.protocol.clone(),
+            self.adapter_error
+                .as_deref()
+                .or(self.connection_error.as_deref())
+                .or(self.last_rejection.as_deref())
+                .unwrap_or("—")
+                .to_owned(),
+        ]
     }
 }
 
 /// Where devices connect, with wildcard listeners shown at this computer's
 /// address on the local network; Connection info (`i`) has every address.
 fn device_hint(
+    sv2: Option<std::net::SocketAddr>,
+    sv1: Option<std::net::SocketAddr>,
+    interfaces: crate::reach::Interfaces,
+) -> String {
+    let addresses = device_addresses(sv2, sv1, interfaces);
+    if addresses.is_empty() {
+        addresses
+    } else {
+        format!("{addresses} · i  Connection info")
+    }
+}
+
+/// `device_hint` without the terminal's key for Connection info.
+fn device_addresses(
     sv2: Option<std::net::SocketAddr>,
     sv1: Option<std::net::SocketAddr>,
     interfaces: crate::reach::Interfaces,
@@ -1934,15 +2406,12 @@ fn device_hint(
     };
     match (sv1, sv2) {
         (Some(sv1), Some(sv2)) => format!(
-            "Point devices at: SV1 stratum+tcp://{} · SV2 {} · i  Connection info",
+            "Point devices at: SV1 stratum+tcp://{} · SV2 {}",
             shown(sv1),
             shown(sv2)
         ),
-        (Some(sv1), None) => format!(
-            "Point devices at: SV1 stratum+tcp://{} · i  Connection info",
-            shown(sv1)
-        ),
-        (None, Some(sv2)) => format!("Point devices at: SV2 {} · i  Connection info", shown(sv2)),
+        (Some(sv1), None) => format!("Point devices at: SV1 stratum+tcp://{}", shown(sv1)),
+        (None, Some(sv2)) => format!("Point devices at: SV2 {}", shown(sv2)),
         (None, None) => String::new(),
     }
 }
@@ -1950,13 +2419,16 @@ fn device_hint(
 /// #### PR #40
 /// What this server is, for what a device's username means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ServeMode {
+pub enum ServeMode {
     /// Blocks pay this server's payout address.
     Solo,
     /// Each miner's username is their payout address.
     Public,
     /// Devices mine at a remote pool through this computer.
     JoinPool,
+    /// #### Pool modes: a Non-custodial Pool (`standalone`) or P2Pool v2:
+    /// each miner mines at your own P2Pool under their own payout.
+    P2PoolPool { standalone: bool },
     /// #### PR #42: devices mine this ASIC-exclusive token instead of BCH.
     Token(&'static str),
 }
@@ -1964,10 +2436,11 @@ enum ServeMode {
 /// #### PR #40
 /// One address devices connect to: where it works from and the line to
 /// paste into a device (or, for SV2, into another Pickaxe's Join a pool).
-struct ConnectLine {
-    place: crate::reach::Place,
-    sv2: bool,
-    url: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectLine {
+    pub place: crate::reach::Place,
+    pub sv2: bool,
+    pub url: String,
 }
 
 /// #### PR #40
@@ -2050,19 +2523,31 @@ fn connect_json(lines: &[ConnectLine]) -> serde_json::Value {
         .collect()
 }
 
+/// The Connection info page's heading over its SV1 or SV2 lines.
+pub fn connect_heading(sv2: bool) -> &'static str {
+    if sv2 {
+        "SV2 firmware (Braiins OS, Bitaxe), or another Pickaxe's Join a pool"
+    } else {
+        "Most ASICs speak SV1 (stock Antminer, Avalon and Whatsminer firmware)"
+    }
+}
+
+/// The Connection info page's heading over its template lines.
+pub const TEMPLATES_HEADING: &str =
+    "SV2 pools and P2Pool take this node's templates here (SV2 Template Distribution, with the \
+     same key)";
+
+/// The Connection info page's line when no listener is open.
+pub const NO_LISTENER: &str = "No listener is open.";
+
 /// #### PR #40: the Connection info page's text.
 fn connect_text(page: &ConnectPage) -> String {
-    use crate::reach::Place;
     let mut text = String::from("How devices connect\n");
     let mut group = None;
     for (index, line) in page.lines.iter().enumerate() {
         if group != Some(line.sv2) {
             group = Some(line.sv2);
-            text.push_str(if line.sv2 {
-                "\nSV2 firmware (Braiins OS, Bitaxe), or another Pickaxe's Join a pool:\n"
-            } else {
-                "\nMost ASICs speak SV1 (stock Antminer, Avalon and Whatsminer firmware):\n"
-            });
+            text.push_str(&format!("\n{}:\n", connect_heading(line.sv2)));
         }
         text.push_str(&format!(
             "  {}  {:<14} {}\n",
@@ -2072,8 +2557,57 @@ fn connect_text(page: &ConnectPage) -> String {
         ));
     }
     if page.lines.is_empty() {
-        text.push_str("\nNo listener is open.\n");
+        text.push_str(&format!("\n{NO_LISTENER}\n"));
     }
+    text.push_str(&connect_notes(page));
+    // #### PR #42: where pools take this node's templates.
+    if !page.templates.is_empty() {
+        text.push_str(&format!("\n{TEMPLATES_HEADING}:\n"));
+        for (index, line) in page.templates.iter().enumerate() {
+            text.push_str(&format!(
+                "  {}  {:<14} {}\n",
+                page.lines.len() + index + 1,
+                line.place.label(),
+                line.url
+            ));
+        }
+        if let Some(config) = template_config(page) {
+            text.push_str("An SRI pool or Job Declaration client takes them with:\n");
+            for line in config.lines() {
+                text.push_str(&format!("  {line}\n"));
+            }
+        }
+    }
+    text.push_str(&format!(
+        "\n{}  Copy a line · i or Esc  Back · q  Stop server",
+        match page.lines.len() + page.templates.len() {
+            0 | 1 => "1".to_owned(),
+            count => format!("1-{count}"),
+        }
+    ));
+    if let Some(note) = &page.note {
+        text.push_str(&format!("\n\n{note}"));
+    }
+    text
+}
+
+/// #### PR #42: what an SRI pool or Job Declaration client puts in its
+/// config to take this node's templates, once they are served.
+fn template_config(page: &ConnectPage) -> Option<String> {
+    let (Some(first), Some(key)) = (page.templates.first(), page.key.as_deref()) else {
+        return None;
+    };
+    Some(format!(
+        "[template_provider_type.Sv2Tp]\naddress = \"{}\"\npublic_key = \"{key}\"\n",
+        first.url
+    ))
+}
+
+/// The Connection info page's notes after the addresses: what to put as
+/// the username and password, and who can reach them.
+fn connect_notes(page: &ConnectPage) -> String {
+    use crate::reach::Place;
+    let mut text = String::new();
     // #### PR #42: a token instead of BCH.
     if let ServeMode::Token(token) = page.mode {
         text.push_str(&format!(
@@ -2092,7 +2626,9 @@ fn connect_text(page: &ConnectPage) -> String {
             "\nUsername: the miner's own BCH address (q or p; the prefix may be left out), \
              optionally followed by .name; the blocks they find pay it. SV2 devices give it \
              as their user identity. Adding ,donation=<percent> (0 to 100 in 0.5% steps) \
-             sets that miner's own Pickaxe donation.\nMerge-mined tokens: each miner mines \
+             raises that miner's Pickaxe donation above your setting, never below it; \
+             what their own Pickaxe visibly donates is credited.\nMerge-mined tokens: each \
+             miner mines \
              a root of their own; its token wins pay them, minus their donation and your fee \
              as each token allows.\n"
         }
@@ -2110,6 +2646,15 @@ fn connect_text(page: &ConnectPage) -> String {
              This computer mines at the pool for you.\nMerge-mined tokens are off at a pool: \
              the pool builds the blocks, so this computer cannot add token commitments. Mine \
              solo, or at a pool with Job Declaration, to merge-mine.\n"
+        }
+        // #### Pool modes
+        ServeMode::P2PoolPool { .. } => {
+            "\nUsername: the miner's own BCH address, a q (P2PKH) address because P2Pool \
+             pays shares to a key (the prefix may be left out), optionally followed by \
+             .name. P2Pool runs here: every block found pays everyone mining here by their \
+             work, minus the Pickaxe donation, P2Pool's donation and your fee. Adding \
+             ,donation=<percent> (0 to 100 in 0.5% steps) raises that miner's Pickaxe \
+             donation above yours, never lowers it; it is mined as work.\n"
         }
     });
     // #### PR #42: where miners' own templates go.
@@ -2142,39 +2687,18 @@ fn connect_text(page: &ConnectPage) -> String {
              pool, pointed at an SV2 line above; only encrypted SV2 crosses the internet.\n",
         );
     }
-    // #### PR #42: where pools take this node's templates.
-    if !page.templates.is_empty() {
-        text.push_str(
-            "\nSV2 pools and P2Pool take this node's templates here (SV2 Template \
-             Distribution, with the same key):\n",
-        );
-        for (index, line) in page.templates.iter().enumerate() {
-            text.push_str(&format!(
-                "  {}  {:<14} {}\n",
-                page.lines.len() + index + 1,
-                line.place.label(),
-                line.url
-            ));
-        }
-        if let (Some(first), Some(key)) = (page.templates.first(), page.key.as_deref()) {
-            text.push_str(&format!(
-                "An SRI pool or Job Declaration client takes them with:\n  \
-                 [template_provider_type.Sv2Tp]\n  address = \"{}\"\n  public_key = \"{key}\"\n",
-                first.url
-            ));
-        }
-    }
-    text.push_str(&format!(
-        "\n{}  Copy a line · i or Esc  Back · q  Stop server",
-        match page.lines.len() + page.templates.len() {
-            0 | 1 => "1".to_owned(),
-            count => format!("1-{count}"),
-        }
-    ));
-    if let Some(note) = &page.note {
-        text.push_str(&format!("\n\n{note}"));
-    }
     text
+}
+
+impl From<&ConnectPage> for ConnectInfo {
+    fn from(page: &ConnectPage) -> Self {
+        Self {
+            lines: page.lines.clone(),
+            templates: page.templates.clone(),
+            notes: connect_notes(page),
+            template_config: template_config(page),
+        }
+    }
 }
 
 fn render_connect(frame: &mut Frame<'_>, page: &ConnectPage) {
@@ -2509,6 +3033,7 @@ fn watch_panel(devices_file: &Path, row: &WorkerLine) -> DevicePanel {
     if let Some(file) = &file {
         view.set_server_urls(file.server_urls());
     }
+    view.set_donation(row.donation_bps, row.own_donation_bps);
     view
 }
 // #### end PR #42 ####
@@ -2837,11 +3362,13 @@ fn watch(config_path: &Path) -> Result<(), String> {
 /// #### PR #40
 /// A public pool's note after the donation: each miner's blocks pay them,
 /// and the operator's fee comes off what the donation leaves.
-fn public_pool_suffix(public: Option<&super::payout::PublicPool>) -> String {
+/// #### Pool modes: named by its mode: "Public Solo Endpoint, fee 2.00%
+/// from coinbase", or "Non-custodial Pool" or "P2Pool v2".
+fn public_pool_suffix(public: Option<&super::payout::PublicPool>, mode: &str) -> String {
     match public.map(|public| public.fee) {
         None => String::new(),
-        Some(None) => " · Public pool, no fee".into(),
-        Some(Some(fee)) => format!(" · Public pool, fee {} from {}", fee.rate, fee.mode),
+        Some(None) => format!(" · {mode}, no fee"),
+        Some(Some(fee)) => format!(" · {mode}, fee {} from {}", fee.rate, fee.mode),
     }
 }
 
@@ -3355,6 +3882,137 @@ pub(crate) fn load_authority(path: &Path) -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #### Pool modes: a `stratum-v2 serve` command line.
+    fn serve(extra: &[&str]) -> StratumV2Command {
+        let mut args = vec![
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--sv1-listen",
+            "127.0.0.1:0",
+        ];
+        args.extend_from_slice(extra);
+        match <crate::cli::Cli as clap::Parser>::try_parse_from(args)
+            .unwrap()
+            .command
+        {
+            Some(crate::cli::Commands::StratumV2 { command }) => command,
+            _ => panic!("not a stratum-v2 command"),
+        }
+    }
+
+    // #### Pool modes: the operator's settings and what P2Pool cannot do
+    // What: --pool-fee and --pool-fee-address (with --public), --pool-tag
+    // and P2Pool's own settings become P2Pool's fee in basis points, fee
+    // address, signature and donation; fee modes work and both, a
+    // signature over 16 bytes, a fee over 10% and miners' own templates
+    // are refused with --own-p2pool, and fallback pools with --public only
+    // with --own-p2pool.
+    // Look here if: `check_pool_flags` or `own_options` change.
+    #[test]
+    fn pool_mode_flags_reach_p2pools_config_and_what_p2pool_cannot_do_is_refused() {
+        let network = config::MiningNetwork::Chipnet;
+        let payout = crate::tx::cashaddr_with_version(0, &[3; 20], network);
+        let fee_address = crate::tx::cashaddr_with_version(8, &[4; 20], network);
+        let mut config = RuntimeConfig {
+            network,
+            payout_address: payout.clone(),
+            ..RuntimeConfig::default()
+        };
+        for mode in ["work", "both"] {
+            let error = check_pool_flags(&serve(&[
+                "--own-p2pool",
+                "--public",
+                "--pool-fee",
+                "2",
+                "--pool-fee-mode",
+                mode,
+            ]))
+            .unwrap_err();
+            assert!(error.contains("coinbase"), "{error}");
+        }
+        check_pool_flags(&serve(&[
+            "--own-p2pool",
+            "--public",
+            "--pool-fee-mode",
+            "coinbase",
+            "--fallback-pool",
+            "stratum2+tcp://a.example:3336/KEY",
+        ]))
+        .unwrap();
+        // A Public Solo Endpoint keeps its own node: no fallback pools.
+        assert!(check_pool_flags(&serve(&[
+            "--public",
+            "--fallback-pool",
+            "stratum2+tcp://a.example:3336/KEY",
+        ]))
+        .unwrap_err()
+        .contains("--own-p2pool"));
+        assert!(check_pool_flags(&serve(&[
+            "--own-p2pool",
+            "--public",
+            "--accept-job-declaration"
+        ]))
+        .is_err());
+        // The operator's settings, as P2Pool takes them.
+        config.p2pool = config::SavedP2Pool {
+            donation: Some("0.5".parse().unwrap()),
+            standalone: true,
+            node_p2p: Some("192.168.1.20:48333".into()),
+        };
+        let options = own_options(
+            &serve(&[
+                "--own-p2pool",
+                "--public",
+                "--pool-fee",
+                "2.5",
+                "--pool-fee-address",
+                &fee_address,
+                "--pool-tag",
+                "/MyPool/",
+            ]),
+            &config,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            options.operator,
+            Some(crate::p2pool::launch::Operator {
+                fee: Some((250, fee_address.clone())),
+                signature: Some("/MyPool/".into()),
+                donation: 50,
+            })
+        );
+        assert!(options.standalone);
+        assert_eq!(options.node_p2p.as_deref(), Some("192.168.1.20:48333"));
+        // For your own devices: no fee; P2Pool's donation defaults to 1%.
+        config.p2pool = config::SavedP2Pool::default();
+        let options = own_options(&serve(&["--own-p2pool"]), &config)
+            .unwrap()
+            .unwrap();
+        let operator = options.operator.unwrap();
+        assert_eq!((operator.fee, operator.donation), (None, 100));
+        assert!(!options.standalone);
+        // P2Pool's limits.
+        assert!(own_options(
+            &serve(&["--own-p2pool", "--pool-tag", "/SeventeenBytes!/"]),
+            &config
+        )
+        .unwrap_err()
+        .contains("16"));
+        assert!(own_options(
+            &serve(&["--own-p2pool", "--public", "--pool-fee", "10.5"]),
+            &config
+        )
+        .unwrap_err()
+        .contains("10%"));
+        config.p2pool.donation = Some("10.5".parse().unwrap());
+        assert!(own_options(&serve(&["--own-p2pool"]), &config)
+            .unwrap_err()
+            .contains("0.5 steps"));
+        assert!(own_options(&serve(&[]), &config).unwrap().is_none());
+    }
 
     /// #### PR #65: the CLI has the same source requirement as setup;
     /// Electrum headers/UTXOs never stand in for a BCH block template.
@@ -4794,5 +5452,256 @@ mod tests {
         assert!(load_authority(&path).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"bad");
         fs::remove_file(path).unwrap();
+    }
+
+    /// A view in the terminal's place: the frames it was shown, and the
+    /// requests it sends, one list a tick.
+    #[derive(Default)]
+    struct ScriptedView {
+        frames: Mutex<Vec<ServerFrame>>,
+        script: Mutex<std::collections::VecDeque<Vec<ServerControl>>>,
+        /// Stop was asked for before the server took requests.
+        stop: AtomicBool,
+    }
+
+    impl ServerView for ScriptedView {
+        fn show(&self, frame: ServerFrame) {
+            self.frames.lock().unwrap().push(frame);
+        }
+
+        fn controls(&self) -> Vec<ServerControl> {
+            self.script.lock().unwrap().pop_front().unwrap_or_default()
+        }
+
+        fn stop_requested(&self) -> bool {
+            self.stop.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Pool mode with an SV1 listener on a loopback port the system picks:
+    /// no node and no device.
+    fn pool_serve() -> (StratumV2Command, RuntimeConfig) {
+        let config = RuntimeConfig {
+            network: crate::config::MiningNetwork::Chipnet,
+            payout_address: crate::config::CHIPNET_DONATION_ADDRESS.into(),
+            ..RuntimeConfig::default()
+        };
+        let mut encoded = vec![1, 0];
+        encoded.extend([7u8; 32]);
+        let key = stratum_core::bitcoin::base58::encode_check(&encoded);
+        let address = format!("stratum2+tcp://127.0.0.1:9/{key}");
+        let crate::cli::Cli {
+            command: Some(crate::cli::Commands::StratumV2 { command: action }),
+            ..
+        } = <crate::cli::Cli as clap::Parser>::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--sv1-listen",
+            "127.0.0.1:0",
+            "--upstream",
+            &address,
+        ])
+        .unwrap()
+        else {
+            panic!("not a serve command")
+        };
+        (action, config)
+    }
+
+    // The desktop window's hook: a server shown in a view hands it what its
+    // pages show each tick, applies its requests as the terminal's keys do
+    // (the donation is saved first) and stops on its Stop.
+    #[test]
+    fn a_view_shows_the_server_and_steers_it() {
+        use super::super::view::PanelKey;
+        let (action, config) = pool_serve();
+        let dir = super::super::journal::TestDirectory::new();
+        let path = dir.0.join("chipnet.json");
+        let view = ScriptedView::default();
+        view.script.lock().unwrap().extend([
+            vec![
+                ServerControl::Donation { up: true },
+                // No such worker: nothing opens, and a key goes nowhere.
+                ServerControl::OpenDevice("nobody #1".into()),
+                ServerControl::PanelKey(PanelKey::Esc),
+                ServerControl::ReadAddresses,
+            ],
+            Vec::new(),
+            vec![ServerControl::Stop],
+        ]);
+        super::serve(action, &config, &path, false, false, None, Some(&view)).unwrap();
+        let frames = view.frames.into_inner().unwrap();
+        assert_eq!(frames.len(), 3, "a frame each tick until Stop");
+        let first = &frames[0];
+        assert_eq!(first.network, crate::config::MiningNetwork::Chipnet);
+        assert_eq!(first.mode, ServeMode::JoinPool);
+        assert!(first.joining);
+        assert_eq!(first.pool.as_deref(), Some("127.0.0.1:9"));
+        assert_eq!(first.donation, BchDonation::default());
+        assert!(first.devices.is_empty() && first.panel.is_none());
+        assert!(
+            first.header.contains("0 of 0 workers online"),
+            "{}",
+            first.header
+        );
+        assert!(first
+            .devices_hint
+            .starts_with("Point devices at: SV1 stratum+tcp://127.0.0.1:"));
+        assert!(
+            !first.header.contains("Connection info"),
+            "{}",
+            first.header
+        );
+        assert!(first.overview.contains("Pool 127.0.0.1:9 (SV2, encrypted)"));
+        assert_eq!(first.lights.first().map(|light| light.0), Some("Pool"));
+        assert!(first.connect.lines.iter().all(|line| !line.sv2));
+        assert!(first.connect.lines[0]
+            .url
+            .starts_with("stratum+tcp://127.0.0.1:"));
+        assert!(first.connect.notes.contains("Password: anything"));
+        // The step was saved before the next frame showed it.
+        let two: BchDonation = "2".parse().unwrap();
+        assert_eq!(frames[1].donation, two);
+        assert!(frames[1].setting_error.is_none());
+        assert!(frames[1]
+            .advanced
+            .starts_with("2.00% of each device's mining work"));
+        assert_eq!(
+            config::SavedConfig::load(&path).unwrap().bch_donation_bps,
+            Some(two)
+        );
+        assert!(frames.iter().all(|frame| frame.panel.is_none()));
+        // The status file is written as without a view; no frame holds the
+        // payout (the pool's identity here).
+        assert!(status_path(&path).exists());
+        for frame in &frames {
+            assert!(!format!("{frame:?}").contains(&config.payout_address));
+        }
+    }
+
+    // A Stop asked for while the server starts ends it there: closing the
+    // window then never waits for the server to take requests.
+    #[test]
+    fn a_stop_during_startup_ends_the_server_before_it_serves() {
+        let (action, config) = pool_serve();
+        let dir = super::super::journal::TestDirectory::new();
+        let path = dir.0.join("chipnet.json");
+        let view = ScriptedView::default();
+        view.stop.store(true, Ordering::Relaxed);
+        super::serve(action, &config, &path, false, false, None, Some(&view)).unwrap();
+        assert!(view.frames.lock().unwrap().is_empty());
+        assert!(!status_path(&path).exists(), "it never served");
+    }
+
+    // #### Pool modes: the dashboard header names the server's mode and its
+    // fee, in the terminal and in the window (the same `PageText`); joining
+    // someone's pool names none.
+    #[test]
+    fn the_header_names_the_servers_mode_and_fee() {
+        let public = |fee: Option<&str>, mode| super::super::payout::PublicPool {
+            fee: fee.map(|rate| crate::donation::bch::PoolFee {
+                rate: rate.parse().unwrap(),
+                mode,
+            }),
+            address: crate::config::CHIPNET_DONATION_ADDRESS.into(),
+        };
+        let coinbase = crate::donation::bch::FeeMode::Coinbase;
+        assert_eq!(public_pool_suffix(None, "Public Solo Endpoint"), "");
+        assert_eq!(
+            public_pool_suffix(Some(&public(None, coinbase)), "Public Solo Endpoint"),
+            " · Public Solo Endpoint, no fee"
+        );
+        let stats = super::super::server::ServerStats::default();
+        for (mode, pools) in [
+            ("Public Solo Endpoint", None),
+            (
+                "Non-custodial Pool",
+                Some("your P2Pool (v0.1.0; each miner under their own address)"),
+            ),
+            (
+                "P2Pool v2",
+                Some("your P2Pool (v0.1.0; each miner under their own address)"),
+            ),
+        ] {
+            let suffix = public_pool_suffix(Some(&public(Some("2"), coinbase)), mode);
+            let texts = PageText {
+                network: "chipnet",
+                pools,
+                declaring: false,
+                node_client: None,
+                snapshot: &stats,
+                donation: BchDonation::default(),
+                pool_suffix: &suffix,
+                sv2: None,
+                sv1: None,
+                setting_error: None,
+                authority: None,
+            };
+            let named = format!("{mode}, fee 2.00% from coinbase");
+            assert!(
+                texts.header(&[], "").contains(&named),
+                "{}",
+                texts.header(&[], "")
+            );
+            assert!(texts.overview().contains(&named), "{}", texts.overview());
+            assert!(!texts.header(&[], "").contains("Public pool"));
+        }
+        let texts = PageText {
+            network: "chipnet",
+            pools: Some("pool.example:3336"),
+            declaring: false,
+            node_client: None,
+            snapshot: &stats,
+            donation: BchDonation::default(),
+            pool_suffix: "",
+            sv2: None,
+            sv1: None,
+            setting_error: None,
+            authority: None,
+        };
+        assert!(texts
+            .header(&[], "")
+            .starts_with("chipnet · Pool pool.example:3336 (SV2, encrypted)"));
+    }
+
+    // A view's Connection info is the terminal page's, apart from its keys.
+    #[test]
+    fn a_views_connection_info_matches_the_page() {
+        let interfaces = crate::reach::Interfaces {
+            local: Some("192.168.0.160".parse().unwrap()),
+            tailscale: Some("100.101.102.103".parse().unwrap()),
+        };
+        let page = ConnectPage {
+            lines: connect_lines(
+                Some("0.0.0.0:3336".parse().unwrap()),
+                Some("0.0.0.0:3333".parse().unwrap()),
+                Some("KEY"),
+                interfaces,
+            ),
+            templates: template_lines(Some("0.0.0.0:48442".parse().unwrap()), interfaces),
+            key: Some("KEY".into()),
+            mode: ServeMode::Solo,
+            job_declaration: false,
+            note: None,
+        };
+        let info = ConnectInfo::from(&page);
+        let text = connect_text(&page);
+        assert_eq!(info.lines, page.lines);
+        assert_eq!(info.templates, page.templates);
+        assert!(text.contains(&info.notes));
+        assert!(info.notes.contains("Username: any name for the device"));
+        let config = info.template_config.unwrap();
+        assert!(config.contains("public_key = \"KEY\""), "{config}");
+        for line in config.lines() {
+            assert!(text.contains(&format!("  {line}\n")), "{line}");
+        }
+        for heading in [
+            connect_heading(false),
+            connect_heading(true),
+            TEMPLATES_HEADING,
+        ] {
+            assert!(text.contains(&format!("\n{heading}:\n")), "{heading}");
+        }
     }
 }

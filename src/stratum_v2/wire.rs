@@ -99,14 +99,27 @@ pub struct MiningSession {
     /// connection's logins (`None` inside: the pool's setting), fixed by its
     /// first channel.
     donation_choice: Option<Option<crate::donation::bch::BchDonation>>,
+    /// #### one donation, the higher rate: on a public pool, the server's
+    /// donation rate as last given (`public_donation`), and the donation
+    /// this connection's own Pickaxe visibly mines on its donation channels.
+    server_donation: Option<crate::donation::bch::BchDonation>,
+    own_donation: super::own_donation::OwnDonation,
+    /// #### one donation, the higher rate: the target of the latest share
+    /// accepted on a donation channel, taken by the server for the work
+    /// split (such shares repay no quota of the connection's own jobs).
+    pub donation_share: Option<Hash>,
     /// #### merge-mining v2: the client asked for the merge-mining
     /// disclosure extension (`merge::disclosure`).
     merge_disclosure: bool,
+    /// The client was granted Worker-Specific Hashrate Tracking (0x0002):
+    /// its extended shares may name their worker.
+    worker_hashrate: bool,
     /// #### merge-mining v2: leaf log lines (JSON) for jobs on a public
     /// pool's standard channels, taken by the server for its leaf log.
     pub leaf_log: Vec<String>,
 }
 
+#[derive(Default)]
 pub struct Responses {
     pub frames: Vec<SerializedFrame>,
     pub blocks: Vec<ValidatedShare>,
@@ -123,6 +136,9 @@ pub struct Responses {
     /// #### PR #42: accepted shares that win a header-shaped token (never
     /// blocks).
     pub header_wins: Vec<ValidatedShare>,
+    /// The worker the share named (extension 0x0002), for the workers
+    /// table, which shows it as a name only (`telemetry::worker_name`).
+    pub worker: Option<String>,
 }
 
 impl MiningSession {
@@ -162,7 +178,11 @@ impl MiningSession {
             fixed_version: false,
             token_refusal: None,
             donation_choice: None,
+            server_donation: None,
+            own_donation: Default::default(),
+            donation_share: None,
             merge_disclosure: false,
+            worker_hashrate: false,
             leaf_log: Vec::new(),
         })
     }
@@ -215,7 +235,9 @@ impl MiningSession {
     // What: a public pool connection's first channel fixes its donation
     // choice (its login's `,donation=`, or none for the pool's setting); a
     // later channel whose login chooses otherwise is refused with
-    // `donation-mismatch`.
+    // `donation-mismatch`. #### one donation, the higher rate: a donation
+    // channel (one paying the donation's own address) neither fixes nor
+    // needs a choice.
     // Why: the work allocation that makes donation-work jobs runs per
     // connection, at one rate; a proxy carrying miners with different
     // choices would otherwise donate at the wrong rate for some of them.
@@ -223,6 +245,67 @@ impl MiningSession {
     /// The donation this connection's miners chose, if they chose one.
     pub fn donation_choice(&self) -> Option<crate::donation::bch::BchDonation> {
         self.donation_choice.flatten()
+    }
+
+    // #### one donation, the higher rate
+    // What: on a public pool, the rate this connection's miner channels'
+    // jobs carry: the effective rate (the higher of the server's and the
+    // login's, `payout::effective_donation`), less what the connection's own
+    // Pickaxe visibly donates on its donation channel over the last hour
+    // (`own_donation`), the rest taken as a share of the work left on the
+    // miner's own channels. Each miner channel keeps it (`Channel::
+    // set_donation`), so a channel's first job carries it too.
+    // Why: the miner pays the higher rate once; a login's text never lowers
+    // it, only donation work the server sees does.
+    // Look here if: a miner with their own Pickaxe pays twice, or a typed
+    // `,pickaxe-donation=0` lowers what the server takes.
+    /// The rate this public pool connection's miner channels carry, with the
+    /// server's rate `server`; the channels are given it too.
+    pub fn public_donation(
+        &mut self,
+        server: crate::donation::bch::BchDonation,
+    ) -> crate::donation::bch::BchDonation {
+        self.server_donation = Some(server);
+        let rate = self.miner_donation();
+        for channel in self.channels.values_mut() {
+            if !channel.pays_donation() {
+                channel.set_donation(Some(rate));
+            }
+        }
+        rate
+    }
+
+    /// The effective rate: the higher of the server's (as last given, or
+    /// before that the jobs') and this connection's login's.
+    fn effective_donation(&self) -> crate::donation::bch::BchDonation {
+        let server = self.server_donation.unwrap_or(self.payout_policy.donation);
+        super::payout::effective_donation(server, self.donation_choice())
+    }
+
+    /// The rate the server takes on the miner's own channels: the effective
+    /// rate less the verified own donation.
+    fn miner_donation(&self) -> crate::donation::bch::BchDonation {
+        let effective = self.effective_donation();
+        super::own_donation::charged(effective, self.own_donation.credit(effective))
+    }
+
+    /// #### one donation, the higher rate: on a public pool with a miner
+    /// channel open, the effective rate and the own Pickaxe's credit, for
+    /// the workers page; never an address.
+    pub fn donation_terms(
+        &self,
+    ) -> Option<(
+        crate::donation::bch::BchDonation,
+        crate::donation::bch::BchDonation,
+    )> {
+        self.public.as_ref()?;
+        self.channels
+            .values()
+            .any(|channel| !channel.pays_donation())
+            .then(|| {
+                let effective = self.effective_donation();
+                (effective, self.own_donation.credit(effective))
+            })
     }
 
     /// #### PR #42: the server mines a token that fixes the version slot:
@@ -334,7 +417,7 @@ impl MiningSession {
                 if channel.settle(&template.target, None, maximum) {
                     frames.push(mining(Mining::SetTarget(SetTarget {
                         channel_id: channel.id,
-                        maximum_target: (&channel.target).into(),
+                        target: (&channel.target).into(),
                     }))?);
                 }
                 continue;
@@ -351,7 +434,7 @@ impl MiningSession {
             if channel.settle(&template.target, tokens.as_ref(), maximum) {
                 frames.push(mining(Mining::SetTarget(SetTarget {
                     channel_id: channel.id,
-                    maximum_target: (&channel.target).into(),
+                    target: (&channel.target).into(),
                 }))?);
             }
             channel.install_with_payout(id, generation, template.clone(), payout)?;
@@ -363,7 +446,7 @@ impl MiningSession {
                 if tokens.is_some() && channel.drop_token_floor(maximum) {
                     frames.push(mining(Mining::SetTarget(SetTarget {
                         channel_id: channel.id,
-                        maximum_target: (&channel.target).into(),
+                        target: (&channel.target).into(),
                     }))?);
                 }
             }
@@ -414,7 +497,7 @@ impl MiningSession {
             if channel.custom_only {
                 frames.push(mining(Mining::SetTarget(SetTarget {
                     channel_id: channel.id,
-                    maximum_target: (&target).into(),
+                    target: (&target).into(),
                 }))?);
                 continue;
             }
@@ -425,7 +508,7 @@ impl MiningSession {
             *next_id = next_id.checked_add(1).ok_or("job identifiers exhausted")?;
             frames.push(mining(Mining::SetTarget(SetTarget {
                 channel_id: channel.id,
-                maximum_target: (&target).into(),
+                target: (&target).into(),
             }))?);
             channel.install_with_payout(*next_id, generation, template, payout)?;
             if let Some(reason) = channel.take_token_refusal() {
@@ -443,45 +526,45 @@ impl MiningSession {
 
     pub fn receive(&mut self, mut frame: SerializedFrame, now: u32) -> Result<Responses, String> {
         let header = frame.header();
-        // #### merge-mining v2: the extensions negotiation (type 0x0001):
-        // the disclosure extension is granted when asked for, every other
-        // extension left out of the answer.
-        if header.ext_type_without_channel_msg() == super::merge::disclosure::NEGOTIATION
-            && header.msg_type() == super::merge::disclosure::REQUEST_EXTENSIONS
-            && !header.channel_msg()
-        {
-            use super::merge::disclosure::{
-                extensions_payload, requested_extensions, EXTENSION, NEGOTIATION,
-                REQUEST_EXTENSIONS_SUCCESS,
+        // #### merge-mining v2: the extensions negotiation (type 0x0001).
+        // What: RequestExtensions after setup grants the merge-mining
+        // disclosure (0x4D4D) and Worker-Specific Hashrate Tracking (0x0002)
+        // when asked, in the order asked; a request for neither gets
+        // RequestExtensions.Error naming what was asked and requiring
+        // nothing. Every other extension frame (an extension this server
+        // does not implement or did not grant, or 0x0001 with the channel
+        // bit) is discarded.
+        // Why: sv2-spec 3.2.1 has a receiver ignore extension messages it
+        // does not know; Knuth answers and discards the same way, so a
+        // Knuth or SRI proxy that asks for 0x0002 keeps its connection.
+        // Look here if: a client that negotiates extensions is closed, or a
+        // worker name is read without the grant.
+        let extension = header.ext_type_without_channel_msg();
+        if extension != 0 {
+            use super::extensions::{
+                negotiation_answer, ExtensionMessage, RequestExtensions, NEGOTIATION,
+                REQUEST_EXTENSIONS, WORKER_HASHRATE,
             };
+            use super::merge::disclosure::EXTENSION as DISCLOSURE;
+            if extension != NEGOTIATION
+                || header.msg_type() != REQUEST_EXTENSIONS
+                || header.channel_msg()
+            {
+                return Ok(Responses::default());
+            }
             if self.setup_flags.is_none() {
                 return Err("extensions requested before setup".into());
             }
-            let (request, asked) =
-                requested_extensions(frame.payload()).ok_or("malformed extensions request")?;
-            let granted: Vec<u16> = asked
-                .into_iter()
-                .filter(|extension| *extension == EXTENSION)
-                .collect();
-            self.merge_disclosure |= !granted.is_empty();
+            let request =
+                RequestExtensions::decode(frame.payload()).ok_or("malformed extensions request")?;
+            self.merge_disclosure |= request.requested.contains(&DISCLOSURE);
+            self.worker_hashrate |= request.requested.contains(&WORKER_HASHRATE);
             return Ok(Responses {
-                frames: vec![extension_frame(
-                    NEGOTIATION,
-                    REQUEST_EXTENSIONS_SUCCESS,
-                    false,
-                    &extensions_payload(request, &granted),
-                )?],
-                blocks: Vec::new(),
-                token_wins: Vec::new(),
-                share_event: None,
-                accepted_work: None,
-                custom_job: None,
-                forward: Vec::new(),
-                header_wins: Vec::new(),
+                frames: vec![negotiation_answer(&request, |extension| {
+                    matches!(extension, DISCLOSURE | WORKER_HASHRATE)
+                })?],
+                ..Responses::default()
             });
-        }
-        if header.ext_type_without_channel_msg() != 0 {
-            return Err("unsupported SV2 extension".into());
         }
         let mut frames = Vec::new();
         let mut blocks = Vec::new();
@@ -566,14 +649,31 @@ impl MiningSession {
                 token_wins,
                 share_event,
                 accepted_work,
-                custom_job: None,
-                forward: Vec::new(),
-                header_wins: Vec::new(),
+                ..Responses::default()
             });
         }
         let flags = self
             .setup_flags
             .ok_or("SetupConnection is required first")?;
+        // What: the bytes after a SubmitSharesExtended's own fields (its
+        // 24 fixed bytes and the B0_32 extranonce) are TLV fields
+        // (sv2-spec 3.4.3), read by `extensions::share_worker`; a
+        // SubmitSharesStandard is exactly its 24 bytes.
+        // Why: the reference parser stops at the message's own fields and
+        // takes any trailing bytes; Knuth closes on bytes that are not whole
+        // fields, and on anything after a standard share.
+        // Look here if: a proxy's named shares close its connection.
+        let payload_len = frame.payload().len();
+        let trailing = if header.msg_type() == MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED {
+            let payload = frame.payload();
+            payload
+                .get(24)
+                .and_then(|extranonce| payload.get(25 + usize::from(*extranonce)..))
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let msg: Mining = (header.msg_type(), frame.payload())
             .try_into()
             .map_err(|_| "malformed mining message")?;
@@ -583,6 +683,7 @@ impl MiningSession {
         let mut custom_job = None;
         let mut forward = Vec::new();
         let mut header_wins = Vec::new();
+        let mut worker = None;
         match msg {
             Mining::OpenStandardMiningChannel(request) => {
                 let maximum = request
@@ -622,6 +723,9 @@ impl MiningSession {
                 }
             }
             Mining::SubmitSharesStandard(request) => {
+                if payload_len != 24 {
+                    return Err("malformed mining message".into());
+                }
                 let share = Share {
                     channel_id: request.channel_id,
                     job_id: request.job_id,
@@ -644,26 +748,43 @@ impl MiningSession {
                 )?);
             }
             Mining::SubmitSharesExtended(request) => {
-                let share = Share {
-                    channel_id: request.channel_id,
-                    job_id: request.job_id,
-                    sequence: request.sequence_number,
-                    version: request.version,
-                    time: request.ntime,
-                    nonce: request.nonce,
-                    extranonce: request.extranonce.as_ref(),
-                };
-                share_event = Some(self.submit(
-                    share,
-                    ChannelKind::Extended,
-                    now,
-                    &mut frames,
-                    &mut blocks,
-                    &mut token_wins,
-                    &mut forward,
-                    &mut header_wins,
-                    &mut accepted_work,
-                )?);
+                // Extension 0x0002: the worker behind the share, once
+                // granted; a name over 32 bytes refuses the share.
+                match super::extensions::share_worker(&trailing, self.worker_hashrate) {
+                    Ok(named) => {
+                        worker = named;
+                        let share = Share {
+                            channel_id: request.channel_id,
+                            job_id: request.job_id,
+                            sequence: request.sequence_number,
+                            version: request.version,
+                            time: request.ntime,
+                            nonce: request.nonce,
+                            extranonce: request.extranonce.as_ref(),
+                        };
+                        share_event = Some(self.submit(
+                            share,
+                            ChannelKind::Extended,
+                            now,
+                            &mut frames,
+                            &mut blocks,
+                            &mut token_wins,
+                            &mut forward,
+                            &mut header_wins,
+                            &mut accepted_work,
+                        )?);
+                    }
+                    Err(Some(code)) => {
+                        self.rejected = self.rejected.saturating_add(1);
+                        frames.push(mining(Mining::SubmitSharesError(SubmitSharesError {
+                            channel_id: request.channel_id,
+                            sequence_number: request.sequence_number,
+                            error_code: code.try_into().map_err(|_| "error code too long")?,
+                        }))?);
+                        share_event = Some(ShareEvent::Rejected(code));
+                    }
+                    Err(None) => return Err("malformed mining message".into()),
+                }
             }
             Mining::UpdateChannel(request) => {
                 let result = self
@@ -672,7 +793,7 @@ impl MiningSession {
                     .ok_or("invalid-channel-id")
                     .and_then(|channel| {
                         let maximum: Hash = request
-                            .maximum_target
+                            .max_target
                             .as_ref()
                             .try_into()
                             .map_err(|_| "max-target-out-of-range")?;
@@ -690,7 +811,7 @@ impl MiningSession {
                         self.maximum_targets.insert(request.channel_id, maximum);
                         mining(Mining::SetTarget(SetTarget {
                             channel_id: request.channel_id,
-                            maximum_target: (&target).into(),
+                            target: (&target).into(),
                         }))?
                     }
                     Err(code) => mining(Mining::UpdateChannelError(UpdateChannelError {
@@ -758,6 +879,7 @@ impl MiningSession {
             custom_job,
             forward,
             header_wins,
+            worker,
         })
     }
 
@@ -799,13 +921,13 @@ impl MiningSession {
         if (request.version ^ context.version) & !VERSION_ROLLING_MASK != 0 {
             return Err("invalid-version");
         }
-        if request.min_ntime < context.min_time || request.min_ntime > now.saturating_add(600) {
-            return Err("invalid-min-ntime");
+        if request.ntime_start < context.min_time || request.ntime_start > now.saturating_add(600) {
+            return Err("invalid-ntime-start");
         }
         // #### PR #48: on Chipnet, the bits its start time needs: not normal
         // bits past the parent's time plus 1200 s, nor the limit's at or
         // before it while ASERT gives other bits (`BchTemplate::wrong_bits`).
-        if context.wrong_bits(request.min_ntime) {
+        if context.wrong_bits(request.ntime_start) {
             return Err("invalid-nbits");
         }
         let prefix = request.coinbase_prefix.as_ref();
@@ -852,7 +974,7 @@ impl MiningSession {
         let template = Arc::new(BchTemplate::custom(
             &context,
             request.version,
-            request.min_ntime,
+            request.ntime_start,
             merkle_path.clone(),
         ));
         self.channels
@@ -918,11 +1040,11 @@ impl MiningSession {
         if (request.version ^ template.version) & !VERSION_ROLLING_MASK != 0 {
             return Err("invalid-version");
         }
-        if request.min_ntime < context.min_time || request.min_ntime > now.saturating_add(600) {
-            return Err("invalid-min-ntime");
+        if request.ntime_start < context.min_time || request.ntime_start > now.saturating_add(600) {
+            return Err("invalid-ntime-start");
         }
         // #### PR #48: the bits its start time needs, as above.
-        if template.wrong_bits(request.min_ntime) {
+        if template.wrong_bits(request.ntime_start) {
             return Err("invalid-nbits");
         }
         let shape = &job.shape;
@@ -958,7 +1080,7 @@ impl MiningSession {
             return Err("invalid-coinbase-tx");
         }
         let id = self.next_custom_id()?;
-        let template = Arc::new(template.with_header(request.version, request.min_ntime));
+        let template = Arc::new(template.with_header(request.version, request.ntime_start));
         self.channels
             .get_mut(&request.channel_id)
             .ok_or("invalid-channel-id")?
@@ -1053,22 +1175,40 @@ impl MiningSession {
         if !meets_target(&template.target, &maximum) {
             return Ok(vec![open_error(request, "max-target-out-of-range")?]);
         }
-        if identity != super::sv1::LOCAL_IDENTITY {
-            self.identity = Some(identity.to_owned());
-        }
         // #### PR #40: in a public pool, the user's own address; ####
         // merge-mining v2: and their donation choice.
-        let (payout, donation) = match &self.public {
-            Some(_) => match super::payout::identity_login(self.network, identity) {
-                Ok(login) => (login.payout, login.donation),
-                Err(error) if error == super::payout::DONATION_OPTION_ERROR => {
-                    return Ok(vec![open_error(request, "invalid-donation")?]);
-                }
-                Err(_) => return Ok(vec![open_error(request, "unknown-user")?]),
-            },
+        let login = self
+            .public
+            .as_ref()
+            .map(|_| super::payout::identity_login(self.network, identity));
+        // #### one donation, the higher rate: the donation's channel
+        // What: on a public pool, a channel whose login pays the Pickaxe
+        // donation's own address (the SV1 adapter's donation channel at a
+        // remote pool, on the device's own connection) mines donation work
+        // only: every job pays the donation whole, with no fee, and its
+        // accepted work is the connection's verified own donation. It
+        // neither fixes nor checks the connection's donation choice, its
+        // login's options are ignored, and it never names the device.
+        // Why: the miner's own Pickaxe donates there; the server credits
+        // that work instead of taking the donation a second time.
+        // Look here if: an adapter's donation channel is refused with
+        // donation-mismatch, or its work is charged a fee.
+        let pays_donation = matches!(
+            &login,
+            Some(Ok(login)) if super::payout::is_donation(self.network, &login.payout)
+        );
+        if identity != super::sv1::LOCAL_IDENTITY && !pays_donation {
+            self.identity = Some(identity.to_owned());
+        }
+        let (payout, donation) = match login {
+            Some(Ok(login)) => (login.payout, login.donation),
+            Some(Err(error)) if error == super::payout::DONATION_OPTION_ERROR => {
+                return Ok(vec![open_error(request, "invalid-donation")?]);
+            }
+            Some(Err(_)) => return Ok(vec![open_error(request, "unknown-user")?]),
             None => (self.payout.clone(), None),
         };
-        if self.public.is_some() {
+        if self.public.is_some() && !pays_donation {
             match self.donation_choice {
                 Some(choice) if choice != donation => {
                     return Ok(vec![open_error(request, "donation-mismatch")?]);
@@ -1089,7 +1229,14 @@ impl MiningSession {
         )?;
         if let Some(public) = &self.public {
             channel.set_operator(Some(&public.address))?;
-            channel.set_donation(donation);
+            // #### one donation, the higher rate: a miner channel's first
+            // job carries the connection's rate with this login's choice
+            // (see `public_donation`); a donation channel's is donation work.
+            if pays_donation {
+                channel.set_pays_donation();
+            } else {
+                channel.set_donation(Some(self.miner_donation()));
+            }
         }
         if let Some(lanes) = &self.lanes {
             channel.set_lane(lanes.next.fetch_add(1, Ordering::Relaxed), compact);
@@ -1217,7 +1364,30 @@ impl MiningSession {
                 // client's (its payout here is a placeholder), so its work
                 // repays no quota and is not counted as anyone's here.
                 if !share.template.is_header_only() && !share.template.is_declared() {
-                    *accepted_work = Some((share.share_target, share.payout));
+                    // #### one donation, the higher rate: on a public pool,
+                    // each share on the server's own jobs counts toward the
+                    // connection's own donation measure: a donation
+                    // channel's as verified donation work, a miner
+                    // channel's with what the credit spared it. A donation
+                    // channel's share repays no quota of the miner's jobs.
+                    let channel = self.channels.get(&id);
+                    let pays_donation = channel.is_some_and(Channel::pays_donation);
+                    if self.public.is_some() && !channel.is_some_and(|channel| channel.custom_only)
+                    {
+                        let forgone = u16::from(self.effective_donation())
+                            .saturating_sub(u16::from(share.payout.donation));
+                        self.own_donation.record(
+                            now,
+                            super::telemetry::expected_hashes(&share.share_target),
+                            pays_donation,
+                            forgone,
+                        );
+                    }
+                    if pays_donation {
+                        self.donation_share = Some(share.share_target);
+                    } else {
+                        *accepted_work = Some((share.share_target, share.payout));
+                    }
                 }
                 // #### PR #42: best share from the carried hash
                 // What: the best-share difficulty uses the hash the channel's
@@ -1332,14 +1502,14 @@ fn frames_for(
         ChannelKind::Standard => Mining::NewMiningJob(NewMiningJob {
             channel_id,
             job_id: job.id,
-            min_ntime: Sv2Option::new(immediate.then_some(job.template.current_time)),
+            ntime_start: Sv2Option::new(immediate.then_some(job.template.current_time)),
             version: job.template.version,
             merkle_root: (&job.standard_coinbase.merkle_root).into(),
         }),
         ChannelKind::Extended => Mining::NewExtendedMiningJob(NewExtendedMiningJob {
             channel_id,
             job_id: job.id,
-            min_ntime: Sv2Option::new(immediate.then_some(job.template.current_time)),
+            ntime_start: Sv2Option::new(immediate.then_some(job.template.current_time)),
             version: job.template.version,
             // #### PR #42: none for a token that fixes the version.
             version_rolling_allowed: job.template.version_mask() != 0,
@@ -1371,7 +1541,7 @@ fn frames_for(
             channel_id,
             job_id: job.id,
             prev_hash: (&job.template.previous_hash).into(),
-            min_ntime: job.template.current_time,
+            ntime_start: job.template.current_time,
             nbits: job.template.bits,
         }))?);
     }
@@ -1527,7 +1697,7 @@ mod tests {
         header[..4].copy_from_slice(&version.to_le_bytes());
         header[4..36].copy_from_slice(prev.prev_hash.as_ref());
         header[36..68].copy_from_slice(&root);
-        header[68..72].copy_from_slice(&prev.min_ntime.to_le_bytes());
+        header[68..72].copy_from_slice(&prev.ntime_start.to_le_bytes());
         header[72..76].copy_from_slice(&prev.nbits.to_le_bytes());
         let target = super::super::template::compact_target(prev.nbits).unwrap();
         let nonce = (0u32..1000)
@@ -1556,7 +1726,7 @@ mod tests {
         assert_eq!(update.len(), 1, "same-tip work must not reset the parent");
         let next: NewMiningJob = binary_sv2::from_bytes(update[0].payload()).unwrap();
         assert!(!next.is_future());
-        assert_eq!(next.min_ntime.into_inner(), Some(1700000025));
+        assert_eq!(next.ntime_start.into_inner(), Some(1700000025));
         let result = server.receive(submit(0), 1700000010).unwrap();
         assert_eq!(result.blocks.len(), 1);
         let solved = &result.blocks[0];
@@ -1734,12 +1904,18 @@ mod tests {
     /// #### PR #42: opens a channel of `kind` and builds its first job as a
     /// device does, from the frames alone.
     fn open_device(server: &mut MiningSession, kind: ChannelKind) -> DeviceJob {
+        open_device_as(server, kind, "device")
+    }
+
+    /// #### one donation, the higher rate: `open_device` under `identity`
+    /// (an extended channel's; a standard channel's is always "device").
+    fn open_device_as(server: &mut MiningSession, kind: ChannelKind, identity: &str) -> DeviceJob {
         let request = match kind {
             ChannelKind::Standard => open(),
             ChannelKind::Extended => mining(Mining::OpenExtendedMiningChannel(
                 OpenExtendedMiningChannel {
                     request_id: 2,
-                    user_identity: "device".try_into().unwrap(),
+                    user_identity: identity.try_into().unwrap(),
                     nominal_hash_rate: 1e12,
                     max_target: (&[255; 32]).into(),
                     min_extranonce_size: DEVICE_EXTRANONCE_SIZE as u16,
@@ -1752,7 +1928,7 @@ mod tests {
         let (previous, time, bits) = {
             let prev: SetNewPrevHash = binary_sv2::from_bytes(frames[2].payload()).unwrap();
             let previous: Hash = prev.prev_hash.as_ref().try_into().unwrap();
-            (previous, prev.min_ntime, prev.nbits)
+            (previous, prev.ntime_start, prev.nbits)
         };
         let (channel, job, version, root, coinbase) = match kind {
             ChannelKind::Standard => {
@@ -1991,11 +2167,11 @@ mod tests {
         let mut frames = server.set_job(10, 4, Arc::new(plain)).unwrap();
         assert_eq!(frames.len(), 2);
         let set: SetTarget = binary_sv2::from_bytes(frames[0].payload()).unwrap();
-        assert_eq!(set.maximum_target.as_ref(), share_target);
+        assert_eq!(set.target.as_ref(), share_target);
         // ...and with them again, to the floor, which the job carries.
         let mut frames = server.set_job(11, 5, Arc::new(tokens)).unwrap();
         let set: SetTarget = binary_sv2::from_bytes(frames[0].payload()).unwrap();
-        assert_eq!(set.maximum_target.as_ref(), floor);
+        assert_eq!(set.target.as_ref(), floor);
         let channel = server.channels.values().next().unwrap();
         assert_eq!(channel.job().unwrap().target, floor);
     }
@@ -2052,7 +2228,7 @@ mod tests {
         token: Vec<u8>,
         version: u32,
         prev: Hash,
-        min_ntime: u32,
+        ntime_start: u32,
         bits: u32,
         tx_version: u32,
         prefix: Vec<u8>,
@@ -2091,7 +2267,7 @@ mod tests {
                 token,
                 version: 0x2000_0000,
                 prev: [0xab; 32],
-                min_ntime: NOW,
+                ntime_start: NOW,
                 bits: 0x207f_ffff,
                 tx_version: 2,
                 prefix,
@@ -2107,7 +2283,7 @@ mod tests {
                 token: self.token.as_slice().try_into().unwrap(),
                 version: self.version,
                 prev_hash: (&self.prev).into(),
-                min_ntime: self.min_ntime,
+                ntime_start: self.ntime_start,
                 nbits: self.bits,
                 coinbase_tx_version: self.tx_version,
                 coinbase_prefix: self.prefix.as_slice().try_into().unwrap(),
@@ -2186,9 +2362,11 @@ mod tests {
             ("stale-chain-tip", Box::new(|job| job.prev = [0xcd; 32])),
             ("invalid-nbits", Box::new(|job| job.bits = 0x207f_fffe)),
             ("invalid-version", Box::new(|job| job.version ^= 1)),
+            // stratum-core 0.7 renamed SRI's code from `invalid-min-ntime`;
+            // the server's literal must keep matching SRI's.
             (
-                "invalid-min-ntime",
-                Box::new(|job| job.min_ntime = 1_699_999_999),
+                ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_NTIME_START,
+                Box::new(|job| job.ntime_start = 1_699_999_999),
             ),
             (
                 "invalid-coinbase-prefix",
@@ -2280,20 +2458,20 @@ mod tests {
             (MIN_DIFFICULTY_BITS, parent, NOW + 101, None),
             (MIN_DIFFICULTY_BITS, schedule, NOW, None),
         ];
-        for (generation, (bits, parent_time, min_ntime, refused)) in (5..).zip(cases) {
+        for (generation, (bits, parent_time, ntime_start, refused)) in (5..).zip(cases) {
             server
                 .set_job(generation, generation.into(), pool(bits, parent_time))
                 .unwrap();
             let job = CustomJob {
                 bits,
-                min_ntime,
+                ntime_start,
                 ..CustomJob::valid(&declarator)
             };
             let outcome = set_custom(&mut server, channel, &job);
             assert_eq!(
                 outcome.err().as_deref(),
                 refused,
-                "{bits:#x} {parent_time} {min_ntime}"
+                "{bits:#x} {parent_time} {ntime_start}"
             );
         }
     }
@@ -2425,12 +2603,12 @@ mod tests {
             ("invalid-nbits", Box::new(|job| job.bits = 0x207f_fffe)),
             ("invalid-version", Box::new(|job| job.version ^= 1)),
             (
-                "invalid-min-ntime",
-                Box::new(|job| job.min_ntime = 1_699_999_999),
+                ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_NTIME_START,
+                Box::new(|job| job.ntime_start = 1_699_999_999),
             ),
             // #### PR #48: a start past the parent's time plus 1200 s needs
             // the limit's bits (see `BchTemplate::wrong_bits`).
-            ("invalid-nbits", Box::new(|job| job.min_ntime = NOW + 101)),
+            ("invalid-nbits", Box::new(|job| job.ntime_start = NOW + 101)),
             (
                 "invalid-coinbase-tx-version",
                 Box::new(|job| job.tx_version = 1),
@@ -2857,9 +3035,10 @@ mod tests {
             NEGOTIATION
         );
         assert_eq!(reply[0].header().msg_type(), REQUEST_EXTENSIONS_SUCCESS);
+        // Worker-Specific Hashrate Tracking (0x0002) is granted too.
         assert_eq!(
             requested_extensions(reply[0].payload()),
-            Some((5, vec![EXTENSION]))
+            Some((5, vec![EXTENSION, 0x0002]))
         );
         let (channel, _, _) = open_extended(&mut server, "device").unwrap();
         // The next job's frames end with its leaves.
@@ -2931,11 +3110,12 @@ mod tests {
     }
 
     // #### merge-mining v2: one donation choice per connection
-    // What: on a public pool a login's `,donation=` is that miner's donation
-    // on every job: at 0 the coinbase pays the miner and the fee, nothing to
-    // the donation, even when the session's policy says 1.5%; a later
-    // channel choosing otherwise is refused (donation-mismatch), and a
-    // malformed choice is refused (invalid-donation).
+    // What: on a public pool a login's `,donation=` is fixed per
+    // connection: a later channel choosing otherwise is refused
+    // (donation-mismatch), and a malformed choice is refused
+    // (invalid-donation). #### one donation, the higher rate: a typed 0
+    // no longer lowers the pool's 1.5%: the coinbase still pays the
+    // donation.
     // Look here if: login options or `donation_choice` change.
     #[test]
     fn a_public_pool_login_chooses_its_donation_per_connection() {
@@ -2961,14 +3141,13 @@ mod tests {
             open_extended(&mut server, &format!("{miner}.rig1,donation=0")).unwrap();
         assert_eq!(server.donation_choice(), Some("0".parse().unwrap()));
         let job = server.channels[&channel].job().unwrap();
-        assert_eq!(u16::from(job.payout.donation), 0);
-        assert!(!job.payout.donation_work);
+        assert_eq!(u16::from(job.payout.donation), 150);
         let tx: stratum_core::bitcoin::Transaction =
             stratum_core::bitcoin::consensus::deserialize(&job.standard_coinbase.bytes).unwrap();
         assert!(tx
             .output
             .iter()
-            .all(|output| output.script_pubkey.as_bytes() != donor.as_slice()));
+            .any(|output| output.script_pubkey.as_bytes() == donor.as_slice()));
         // The same choice may open another channel; another may not.
         assert!(open_extended(&mut server, &format!("{miner}.rig2,donation=0")).is_ok());
         assert_eq!(
@@ -2994,6 +3173,143 @@ mod tests {
         assert_eq!(
             server.channels[&channel].job().unwrap().payout.donation,
             Default::default()
+        );
+    }
+
+    // #### one donation, the higher rate
+    // What: on a public pool the higher of the pool's rate and the login's
+    // applies from a channel's first job (host 0 and miner 1.5% is 1.5%,
+    // host 1.5% and miner 3% is 3%, in the token leaves' donation slot as
+    // well). The SV1 adapter's donation channel opens on the device's own
+    // connection beside a login with `,pickaxe-donation=0` and mines
+    // donation work, without a fee. The typed 0 credits nothing; once a
+    // bucket closes with that channel's accepted work at 1.5% of the
+    // connection's, a 2% host takes 0.51% of the device channel's work
+    // (0.5% of all of it). Donation channel shares repay no quota.
+    // Look here if: `public_donation`, donation channels or the own
+    // donation credit change.
+    #[test]
+    fn a_public_pool_takes_the_higher_rate_once_and_credits_only_donation_work() {
+        use super::super::merge::split::Slot;
+        use crate::donation::bch::BchDonation;
+        let declarator = super::super::jd::server::tests::declarator();
+        let miner = payout();
+        let network = MiningNetwork::Chipnet;
+        let donation = crate::donation::bch::address(network);
+        let donor = crate::tx::cashaddr_to_p2pkh_locking(donation).unwrap();
+        let rate = |text: &str| text.parse::<BchDonation>().unwrap();
+        let public = |server: &mut MiningSession, host: &str| {
+            server.set_public(Some(declarator.public.clone()));
+            server.receive(setup(4), NOW).unwrap();
+            server.public_donation(rate(host));
+        };
+        // Host 0, a login's 1.5%: 1.5% from the first job.
+        let mut server = session();
+        public(&mut server, "0");
+        let identity = format!("{miner}.rig1,donation=1.5");
+        let device = open_device_as(&mut server, ChannelKind::Extended, &identity);
+        let job = server.channels[&device.channel].job().unwrap();
+        assert_eq!(job.payout.donation, rate("1.5"));
+        assert_eq!(server.public_donation(rate("0")), rate("1.5"));
+        // Host 1.5%, a login's 3%: 3%, also in the token leaves' slot (two
+        // thirds of it).
+        let mut server = MiningSession::new(network, payout(), [7; 12], [255; 32]).unwrap();
+        server
+            .set_job(9, 3, Arc::new(token_template(0x207f_ffff, true)))
+            .unwrap();
+        public(&mut server, "1.5");
+        let (channel, _, _) = open_extended(&mut server, &format!("{miner},donation=3")).unwrap();
+        let job = server.channels[&channel].job().unwrap();
+        assert_eq!(job.payout.donation, rate("3"));
+        let split = job.aux.as_ref().unwrap().entries[0].split;
+        assert_eq!(split.donation_slot(), &Slot::new(200, &donor).unwrap());
+        assert_eq!(server.donation_terms(), Some((rate("3"), rate("0"))));
+        // The adapter at a 2% host: a typed `,pickaxe-donation=0` keeps 2%.
+        let mut server = session();
+        public(&mut server, "2");
+        let identity = format!("{miner}.rig1,pickaxe-donation=0");
+        let device = open_device_as(&mut server, ChannelKind::Extended, &identity);
+        assert_eq!(
+            server.channels[&device.channel]
+                .job()
+                .unwrap()
+                .payout
+                .donation,
+            rate("2")
+        );
+        // Its donation channel on the same connection: never a mismatch,
+        // donation work whole, no fee, no worker name.
+        server.identity = None;
+        let own = open_device_as(&mut server, ChannelKind::Extended, donation);
+        assert!(server.identity.is_none());
+        let job = server.channels[&own.channel].job().unwrap();
+        assert!(job.payout.donation_work && !job.payout.fee_work);
+        let tx: stratum_core::bitcoin::Transaction =
+            stratum_core::bitcoin::consensus::deserialize(&job.standard_coinbase.bytes).unwrap();
+        assert!(tx
+            .output
+            .iter()
+            .filter(|output| output.value.to_sat() > 0)
+            .all(|output| output.script_pubkey.as_bytes() == donor.as_slice()));
+        // Device shares alone: the closed bucket credits nothing.
+        let mut typed = session();
+        public(&mut typed, "2");
+        let alone = open_device_as(&mut typed, ChannelKind::Extended, &identity);
+        for nonce in 0..10 {
+            let share = submit_share(&alone, ChannelKind::Extended, nonce, nonce);
+            typed.receive(share, NOW).unwrap();
+        }
+        let share = submit_share(&alone, ChannelKind::Extended, 10, 10);
+        typed.receive(share, NOW + 300).unwrap();
+        assert_eq!(typed.public_donation(rate("2")), rate("2"));
+        assert_eq!(typed.donation_terms(), Some((rate("2"), rate("0"))));
+        // 3 donation shares in every 200: once the bucket closes, 1.5% is
+        // credited and the host takes 0.51% of the device channel's work.
+        let mut sequence = [0u32; 2];
+        for share in 0..200u32 {
+            let (job, index) = if share % 67 == 0 {
+                (&own, 1)
+            } else {
+                (&device, 0)
+            };
+            let frame = submit_share(job, ChannelKind::Extended, sequence[index], sequence[index]);
+            sequence[index] += 1;
+            let responses = server.receive(frame, NOW).unwrap();
+            assert!(matches!(
+                responses.share_event,
+                Some(ShareEvent::Accepted(_))
+            ));
+            // A donation share repays no quota of the miner's jobs.
+            assert_eq!(responses.accepted_work.is_none(), index == 1);
+            assert_eq!(server.donation_share.take().is_some(), index == 1);
+        }
+        assert_eq!(sequence, [197, 3]);
+        assert_eq!(server.public_donation(rate("2")), rate("2"), "before");
+        let frame = submit_share(&device, ChannelKind::Extended, 197, 197);
+        server.receive(frame, NOW + 300).unwrap();
+        let charged = server.public_donation(rate("2"));
+        assert_eq!(u16::from(charged), 51);
+        assert_eq!(server.donation_terms(), Some((rate("2"), rate("1.5"))));
+        let payout = BchPayout {
+            donation: charged,
+            ..BchPayout::default()
+        };
+        let template = Arc::new(BchTemplate::from_rpc(&rpc_template()).unwrap());
+        server.set_job_with_payout(10, 4, template, payout).unwrap();
+        assert_eq!(
+            server.channels[&device.channel]
+                .job()
+                .unwrap()
+                .payout
+                .donation,
+            charged
+        );
+        assert!(
+            server.channels[&own.channel]
+                .job()
+                .unwrap()
+                .payout
+                .donation_work
         );
     }
 
@@ -3111,5 +3427,181 @@ mod tests {
             1,
             "BCH work is unchanged"
         );
+    }
+
+    /// `frame` (a share) with `trailing` bytes after its own fields.
+    fn followed(mut frame: SerializedFrame, trailing: &[u8]) -> SerializedFrame {
+        let header = frame.header();
+        let mut payload = frame.payload().to_vec();
+        payload.extend_from_slice(trailing);
+        extension_frame(
+            header.ext_type_without_channel_msg(),
+            header.msg_type(),
+            header.channel_msg(),
+            &payload,
+        )
+        .unwrap()
+    }
+
+    // What: Knuth's extensions on the mining server. RequestExtensions is
+    // granted for 0x0002 (with 0x4D4D when asked, in the order asked) and
+    // refused with RequestExtensions.Error naming what was asked when it
+    // asks for neither; a frame of an unknown or ungranted extension, and a
+    // RequestExtensions with the channel bit, are discarded without closing;
+    // a malformed RequestExtensions closes.
+    // Look here if: the negotiation in `MiningSession::receive` changes.
+    #[test]
+    fn worker_tracking_is_granted_and_unknown_extensions_are_discarded() {
+        use super::super::extensions::{
+            ExtensionMessage, RequestExtensions, RequestExtensionsError, RequestExtensionsSuccess,
+            NEGOTIATION, REQUEST_EXTENSIONS_ERROR, REQUEST_EXTENSIONS_SUCCESS, WORKER_HASHRATE,
+        };
+        let ask = |requested: Vec<u16>| {
+            RequestExtensions {
+                request_id: 5,
+                requested,
+            }
+            .frame()
+            .unwrap()
+        };
+        let mut server = session();
+        server.receive(setup(4), NOW).unwrap();
+        let mut reply = server
+            .receive(ask(vec![0x0003, WORKER_HASHRATE, 0x4D4D]), NOW)
+            .unwrap()
+            .frames;
+        assert_eq!(reply.len(), 1);
+        assert_eq!(reply[0].header().ext_type(), NEGOTIATION);
+        assert_eq!(reply[0].header().msg_type(), REQUEST_EXTENSIONS_SUCCESS);
+        assert_eq!(
+            RequestExtensionsSuccess::decode(reply[0].payload()),
+            Some(RequestExtensionsSuccess {
+                request_id: 5,
+                supported: vec![WORKER_HASHRATE, 0x4D4D],
+            })
+        );
+        assert!(server.worker_hashrate && server.merge_disclosure);
+        let mut refusing = session();
+        refusing.receive(setup(4), NOW).unwrap();
+        let mut reply = refusing.receive(ask(vec![0x0003]), NOW).unwrap().frames;
+        assert_eq!(reply[0].header().msg_type(), REQUEST_EXTENSIONS_ERROR);
+        assert_eq!(
+            RequestExtensionsError::decode(reply[0].payload()),
+            Some(RequestExtensionsError {
+                request_id: 5,
+                unsupported: vec![0x0003],
+                required: Vec::new(),
+            })
+        );
+        assert!(!refusing.worker_hashrate);
+        // Discarded: another extension's frame, a Knuth JD extension's, the
+        // negotiation with the channel bit, and a client's 0x4D4D frame;
+        // the connection stays.
+        for frame in [
+            extension_frame(0x0003, 0x00, false, &[1, 2, 3]).unwrap(),
+            extension_frame(0x5052, 0x00, false, &[]).unwrap(),
+            extension_frame(NEGOTIATION, 0x00, true, &[5, 0, 1, 0, 2, 0]).unwrap(),
+            extension_frame(0x4D4D, 0x00, true, &[]).unwrap(),
+        ] {
+            let responses = refusing.receive(frame, NOW).unwrap();
+            assert!(responses.frames.is_empty());
+        }
+        assert!(!refusing.worker_hashrate);
+        assert!(refusing
+            .receive(
+                extension_frame(NEGOTIATION, 0x00, false, &[1]).unwrap(),
+                NOW
+            )
+            .is_err());
+        // Before setup it is still refused.
+        assert!(session().receive(ask(vec![WORKER_HASHRATE]), NOW).is_err());
+    }
+
+    // What: TLV fields after SubmitSharesExtended. Without the grant whole
+    // fields are ignored and the share is taken; with it the first
+    // user_identity names the worker (other fields ignored), a share
+    // without one is taken, and one over 32 bytes is refused with
+    // user-identity-too-long (counted, the connection stays). Bytes that are
+    // not whole fields close the connection either way; any byte after a
+    // SubmitSharesStandard closes it.
+    // Look here if: shares from a proxy that names workers are refused or
+    // close its connection.
+    #[test]
+    fn extended_shares_name_their_worker_once_granted() {
+        use super::super::extensions::{
+            ExtensionMessage, RequestExtensions, Tlv, USER_IDENTITY_TOO_LONG, WORKER_HASHRATE,
+        };
+        let field = |tlvs: &[Tlv]| -> Vec<u8> {
+            tlvs.iter().flat_map(|tlv| tlv.encode().unwrap()).collect()
+        };
+        // knuth: src/node/test/sv2_mining_session.cpp:788 (worker-hashrate
+        // head): user_identity "rig-7".
+        let rig = [0x02, 0x00, 0x01, 0x05, 0x00, b'r', b'i', b'g', b'-', b'7'];
+        let named = field(&[
+            Tlv {
+                extension: 0x0003,
+                field: 0x01,
+                value: vec![1, 2],
+            },
+            Tlv::user_identity("rig-7"),
+            Tlv {
+                extension: WORKER_HASHRATE,
+                field: 0x02,
+                value: vec![9],
+            },
+        ]);
+        for granted in [false, true] {
+            let mut server = session();
+            server.receive(setup(4), NOW).unwrap();
+            if granted {
+                let ask = RequestExtensions {
+                    request_id: 1,
+                    requested: vec![WORKER_HASHRATE],
+                };
+                server.receive(ask.frame().unwrap(), NOW).unwrap();
+            }
+            let device = open_device(&mut server, ChannelKind::Extended);
+            let share = |nonce: u32| submit_share(&device, ChannelKind::Extended, nonce, nonce);
+            let taken = server.receive(followed(share(1), &rig), NOW).unwrap();
+            assert!(matches!(taken.share_event, Some(ShareEvent::Accepted(_))));
+            assert_eq!(taken.worker.as_deref(), granted.then_some("rig-7"));
+            let taken = server.receive(followed(share(2), &named), NOW).unwrap();
+            assert!(matches!(taken.share_event, Some(ShareEvent::Accepted(_))));
+            assert_eq!(taken.worker.as_deref(), granted.then_some("rig-7"));
+            let plain = server.receive(share(3), NOW).unwrap();
+            assert!(matches!(plain.share_event, Some(ShareEvent::Accepted(_))));
+            assert_eq!(plain.worker, None);
+            let long = field(&[Tlv {
+                extension: WORKER_HASHRATE,
+                field: 0x01,
+                value: vec![b'w'; 33],
+            }]);
+            let mut refused = server.receive(followed(share(4), &long), NOW).unwrap();
+            if granted {
+                let error: SubmitSharesError =
+                    binary_sv2::from_bytes(refused.frames[0].payload()).unwrap();
+                assert_eq!(error.error_code.as_ref(), USER_IDENTITY_TOO_LONG.as_bytes());
+                assert_eq!(error.sequence_number, 4);
+                assert!(matches!(
+                    refused.share_event,
+                    Some(ShareEvent::Rejected(USER_IDENTITY_TOO_LONG))
+                ));
+            } else {
+                assert!(matches!(refused.share_event, Some(ShareEvent::Accepted(_))));
+            }
+            // knuth: src/node/test/sv2_mining_session.cpp:791-792.
+            for malformed in [
+                &[0x00][..],
+                &[0x02, 0x00, 0x01],
+                &[0x02, 0x00, 0x01, 0x05, 0x00, b'r', b'i'],
+            ] {
+                assert!(server.receive(followed(share(5), malformed), NOW).is_err());
+            }
+            let standard = open_device(&mut server, ChannelKind::Standard);
+            let strict = submit_share(&standard, ChannelKind::Standard, 6, 6);
+            assert!(server.receive(followed(strict, &rig), NOW).is_err());
+            let strict = submit_share(&standard, ChannelKind::Standard, 7, 7);
+            assert!(server.receive(strict, NOW).is_ok());
+        }
     }
 }

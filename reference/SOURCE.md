@@ -6,11 +6,10 @@ Version string: M67.38-MainContinuousWins-v1
 
 ## Included
 
-- index.html
 - miner.js
 - photon-miner.wgsl
-- test-vectors.js
-- generator-table.bin (64 KiB fixed-base table)
+
+`index.html`, `test-vectors.js` and `generator-table.bin` (64 KiB fixed-base table) were mirrored too and removed on 2026-11-20 as unused; the browser package builds its own table.
 
 ## Not included
 
@@ -21,5 +20,5 @@ REFERENCE ONLY. Product path is native Rust (CLI → GPU), not a web rewrite.
 ## vox (added 2026-09-21)
 
 - https://github.com/2qx/vox
-- Local: `reference/vox/`
+- No longer mirrored here (removed 2026-11-20): nothing in Pickaxe builds or tests it, and its JavaScript dependencies only added update and supply-chain surface. Cite the upstream repository and commit.
 - Unspent v3 DeFi apps — companion reference alongside PHOTON; see `reference/README.md`.

@@ -51,6 +51,27 @@ pub struct Cli {
     #[arg(long = "node-zmq", global = true, value_name = "URL")]
     pub node_zmq: Option<String>,
 
+    /// #### Pool modes: the node's P2P port, HOST:PORT, where your own
+    /// P2Pool hears of new blocks from a node without ZMQ notices (Knuth,
+    /// BCHD). Default: the node's host with port 8333 (mainnet) or 48333
+    /// (Chipnet), used when the node gives no ZMQ notices. With
+    /// `stratum-v2 serve --own-p2pool`.
+    #[arg(long = "node-p2p", global = true, value_name = "HOST:PORT")]
+    pub node_p2p: Option<String>,
+
+    /// #### Pool modes: P2Pool's own donation, separate from the Pickaxe
+    /// donation (--donation): 0 to 10 percent in 0.5 steps (default 1,
+    /// P2Pool's own default). With `stratum-v2 serve --own-p2pool`.
+    #[arg(long, global = true, value_name = "PERCENT")]
+    pub p2pool_donation: Option<crate::donation::bch::BchDonation>,
+
+    /// #### Pool modes: run your own P2Pool alone on its own share chain
+    /// (the Non-custodial Pool), its P2P port on this computer only and no
+    /// peers. Without it, P2Pool links with other P2Pool nodes (P2Pool
+    /// v2). With `stratum-v2 serve --own-p2pool`.
+    #[arg(long, global = true)]
+    pub p2pool_standalone: bool,
+
     /// Fulcrum servers for PHOTON jobs, comma-separated: wss:// or ws://,
     /// or #### PR #42: a home server over plain TCP (tcp://HOST:PORT, such
     /// as tcp://umbrel.local:50001), taken only on this computer or the home
@@ -63,6 +84,11 @@ pub struct Cli {
 
     #[arg(long, global = true)]
     pub no_tui: bool,
+
+    /// Don't check for, install or apply Pickaxe updates in this run
+    /// (`pickaxe update set --check off` keeps checks off).
+    #[arg(long, global = true)]
+    pub no_update_check: bool,
 
     #[arg(long, global = true)]
     pub json: bool,
@@ -198,6 +224,31 @@ pub enum Commands {
         #[command(subcommand)]
         command: P2poolCommand,
     },
+    /// Pickaxe's own updates from its GitHub releases (see docs/updates.md):
+    /// with no subcommand, install the newest release. A release installs
+    /// by itself only when signed with the key built into Pickaxe; an
+    /// unsigned one needs your confirmation. It replaces this version at
+    /// the next start.
+    #[command(args_conflicts_with_subcommands = true)]
+    Update {
+        #[command(subcommand)]
+        command: Option<UpdateCommand>,
+        /// Only say whether a newer release is out.
+        #[arg(long)]
+        check: bool,
+        /// Install an unsigned release without asking (it is still checked
+        /// against the release's SHA256SUMS).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Open the desktop window: the mining setup and dashboard, mining the
+    /// same sessions as the terminal (builds with the `gui` feature).
+    Gui {
+        /// Start mining with the saved settings as soon as the GPUs are
+        /// found, as pressing Start mining would.
+        #[arg(long)]
+        start: bool,
+    },
     #[command(hide = true)]
     Repl,
 }
@@ -211,6 +262,10 @@ pub enum P2poolCommand {
         /// Start the installed version without installing a newer one.
         #[arg(long)]
         no_update: bool,
+        /// Run alone on its own share chain: dial no peers and take none
+        /// (the P2P port on this computer only).
+        #[arg(long)]
+        standalone: bool,
     },
     /// Install the newest P2Pool release after checking it against the
     /// SHA-256 published beside it.
@@ -221,8 +276,16 @@ pub enum P2poolCommand {
     },
     /// Go back to the P2Pool version installed before this one.
     Rollback,
-    /// The installed and newest versions, and the settings.
+    /// The installed and newest versions, the settings and the peer counts.
     Status,
+    /// The P2Pool servers a start may dial: the seeds, yours and the ones
+    /// P2Pool was connected to before, each with its last check.
+    Peers {
+        /// Check them now (one TCP connect each, 2 s at most) and show
+        /// what the next start dials.
+        #[arg(long)]
+        check: bool,
+    },
     /// Change the settings: automatic updates, the share chain, peers.
     Set {
         /// on (the default) or off: off, a newer release waits for
@@ -232,13 +295,37 @@ pub enum P2poolCommand {
         /// main or mini (the default; shares 256 times easier).
         #[arg(long, value_name = "main|mini")]
         share_chain: Option<String>,
-        /// Another P2Pool node to join, such as /ip4/203.0.113.7/tcp/6884;
-        /// repeat for more.
+        /// Another P2Pool node to join, such as /ip4/203.0.113.7/tcp/6884
+        /// or /dns4/pool.example.com/tcp/6884; repeat for more. Always
+        /// dialed, before the seeds and the peers P2Pool learned.
         #[arg(long = "peer", value_name = "ADDRESS")]
         peers: Vec<String>,
-        /// Forget the saved peers (this node then starts its own share chain).
+        /// Forget your saved peers (the seeds and learned peers are still
+        /// dialed; `run --standalone` dials none).
         #[arg(long)]
         no_peers: bool,
+    },
+}
+
+/// `pickaxe update`'s subcommands.
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum UpdateCommand {
+    /// Go back to the Pickaxe version that ran before this one, at the next
+    /// start.
+    Rollback,
+    /// The running, installed and previous versions, the last check and the
+    /// settings (asks GitHub nothing).
+    Status,
+    /// Change the settings: automatic updates and checks.
+    Set {
+        /// on: signed releases install by themselves (the default when
+        /// this build has a signing key); off: a newer release waits for
+        /// `pickaxe update` or U.
+        #[arg(long, value_name = "on|off")]
+        auto_update: Option<String>,
+        /// off: never check for releases.
+        #[arg(long, value_name = "on|off")]
+        check: Option<String>,
     },
 }
 
@@ -407,20 +494,25 @@ pub enum StratumV2Command {
         /// #### PR #61
         /// Mine at your own BCH P2Pool node, which Pickaxe installs, keeps
         /// updated and runs with --node-rpc, --node-zmq and --address (see
-        /// docs/p2pool.md). SV1 devices connect to --sv1-listen.
-        #[arg(long, requires = "sv1_listen", conflicts_with_all = ["upstream", "public"])]
+        /// docs/p2pool.md). SV1 devices connect to --sv1-listen. With
+        /// --public it is a pool for other people: see --public.
+        #[arg(long, requires = "sv1_listen", conflicts_with = "upstream")]
         own_p2pool: bool,
         /// #### PR #40
         /// Run a public pool: each miner's username is their own payout
         /// address (q or p, optionally with .worker) and the blocks they find
         /// pay them; the Pickaxe donation comes off first, then your fee.
+        /// #### Pool modes: with --own-p2pool, a Non-custodial Pool: miners
+        /// share every block by their work through your P2Pool, each under
+        /// their own P2PKH (q) address; P2Pool pays your fee.
         #[arg(long, conflicts_with = "upstream")]
         public: bool,
         /// The public pool's fee: a percentage of what the donation leaves,
-        /// 0 to 100 (default 0).
+        /// 0 to 100 (default 0). With --own-p2pool, P2Pool's fee: at most 10.
         #[arg(long, requires = "public")]
         pool_fee: Option<crate::donation::bch::BchDonation>,
         /// Where the fee comes from: coinbase, work or both (default coinbase).
+        /// With --own-p2pool only coinbase: P2Pool pays it in each block.
         #[arg(long, requires = "public")]
         pool_fee_mode: Option<crate::donation::bch::FeeMode>,
         /// The fee's address, q or p (such as a multisig); defaults to the
@@ -430,7 +522,8 @@ pub enum StratumV2Command {
         /// #### PR #40
         /// The pool's name, written into the coinbase of every block this
         /// server builds (at most 20 printable characters), such as /MyPool/.
-        /// Not with --upstream: the pool there builds the blocks.
+        /// Not with --upstream: the pool there builds the blocks. With
+        /// --own-p2pool, P2Pool's pool signature: at most 16 characters.
         #[arg(long, value_name = "TEXT", conflicts_with = "upstream")]
         pool_tag: Option<String>,
         /// #### PR #40
@@ -521,12 +614,14 @@ pub enum StratumV2Command {
         /// pool (stratum2+tcp://HOST:PORT/KEY) while your node gives no work,
         /// and come back once it has served for 30 seconds. Repeat for more,
         /// tried in order; the donation works there as at any pool. Needs
-        /// --sv1-listen; not with --upstream or --public.
+        /// --sv1-listen; not with --upstream, nor with --public unless
+        /// --own-p2pool. #### Pool modes: with --own-p2pool, while your
+        /// P2Pool node serves no work.
         #[arg(
             long,
             value_name = "ADDRESS",
             requires = "sv1_listen",
-            conflicts_with_all = ["upstream", "public"]
+            conflicts_with = "upstream"
         )]
         fallback_pool: Vec<String>,
         /// #### PR #42
@@ -626,6 +721,33 @@ pub enum FarmOsCommand {
     },
 }
 
+impl Cli {
+    /// #### Pool modes: --node-p2p, --p2pool-donation and
+    /// --p2pool-standalone are your own P2Pool's settings, taken only by
+    /// `stratum-v2 serve --own-p2pool`.
+    pub fn check_p2pool_flags(&self) -> Result<(), String> {
+        let given =
+            self.node_p2p.is_some() || self.p2pool_donation.is_some() || self.p2pool_standalone;
+        let own = matches!(
+            &self.command,
+            Some(Commands::StratumV2 {
+                command: StratumV2Command::Serve {
+                    own_p2pool: true,
+                    ..
+                },
+            })
+        );
+        if given && !own {
+            return Err(
+                "--node-p2p, --p2pool-donation and --p2pool-standalone go with stratum-v2 \
+                 serve --own-p2pool"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Parses command-line arguments into the supported miner commands;
 /// #### PR #42: `farm-os mine ...` becomes Pickaxe's own `mine` first (see
 /// `farm_os::mine_argv`).
@@ -678,6 +800,115 @@ mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn update_commands_parse_like_p2pools() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.command);
+        assert_eq!(
+            parse(&["pickaxe", "update", "--check"]).unwrap(),
+            Some(Commands::Update {
+                command: None,
+                check: true,
+                yes: false
+            })
+        );
+        assert_eq!(
+            parse(&["pickaxe", "update", "--yes"]).unwrap(),
+            Some(Commands::Update {
+                command: None,
+                check: false,
+                yes: true
+            })
+        );
+        assert_eq!(
+            parse(&[
+                "pickaxe",
+                "update",
+                "set",
+                "--auto-update",
+                "off",
+                "--check",
+                "on"
+            ])
+            .unwrap(),
+            Some(Commands::Update {
+                command: Some(UpdateCommand::Set {
+                    auto_update: Some("off".into()),
+                    check: Some("on".into()),
+                }),
+                check: false,
+                yes: false
+            })
+        );
+        for command in ["rollback", "status"] {
+            assert!(matches!(
+                parse(&["pickaxe", "update", command]).unwrap(),
+                Some(Commands::Update {
+                    command: Some(UpdateCommand::Rollback | UpdateCommand::Status),
+                    ..
+                })
+            ));
+        }
+        // A flag of `update` itself does not mix with its subcommands.
+        assert!(parse(&["pickaxe", "update", "--yes", "rollback"]).is_err());
+        let cli = Cli::try_parse_from(["pickaxe", "mine", "--no-update-check"]).unwrap();
+        assert!(cli.no_update_check);
+    }
+
+    #[test]
+    fn p2pool_peer_commands_parse() {
+        let peers = Cli::try_parse_from(["pickaxe", "p2pool", "peers", "--check"]).unwrap();
+        assert!(matches!(
+            peers.command,
+            Some(Commands::P2pool {
+                command: P2poolCommand::Peers { check: true }
+            })
+        ));
+        let listed = Cli::try_parse_from(["pickaxe", "p2pool", "peers"]).unwrap();
+        assert!(matches!(
+            listed.command,
+            Some(Commands::P2pool {
+                command: P2poolCommand::Peers { check: false }
+            })
+        ));
+        let alone = Cli::try_parse_from(["pickaxe", "p2pool", "run", "--standalone"]).unwrap();
+        assert!(matches!(
+            alone.command,
+            Some(Commands::P2pool {
+                command: P2poolCommand::Run {
+                    no_update: false,
+                    standalone: true
+                }
+            })
+        ));
+        let set = Cli::try_parse_from([
+            "pickaxe",
+            "p2pool",
+            "set",
+            "--no-peers",
+            "--peer",
+            "/dns4/pool.example.com/tcp/6884",
+            "--peer",
+            "/ip4/203.0.113.7/tcp/6884",
+        ])
+        .unwrap();
+        let Some(Commands::P2pool {
+            command: P2poolCommand::Set {
+                peers, no_peers, ..
+            },
+        }) = set.command
+        else {
+            panic!("{:?}", set.command);
+        };
+        assert!(no_peers);
+        assert_eq!(
+            peers,
+            [
+                "/dns4/pool.example.com/tcp/6884",
+                "/ip4/203.0.113.7/tcp/6884"
+            ]
+        );
+    }
 
     #[test]
     fn required_command_shape_parses() {
@@ -1256,7 +1487,8 @@ mod tests {
 
     // #### PR #42
     // What: --fallback-pool needs --sv1-listen, repeats in order, and
-    // conflicts with --upstream and --public.
+    // conflicts with --upstream. #### Pool modes: with --public it parses;
+    // the server refuses it unless --own-p2pool (`command::check_pool_flags`).
     // Look here if: the Serve flags change.
     #[test]
     fn fallback_pools_need_sv1_listen_and_conflict_with_upstream_and_public() {
@@ -1301,7 +1533,70 @@ mod tests {
             "--fallback-pool",
             "stratum2+tcp://a.example:3336/KEY",
         ])
-        .is_err());
+        .is_ok());
+    }
+
+    // #### Pool modes
+    // What: --own-p2pool takes --public and --fallback-pool; P2Pool's own
+    // settings (--p2pool-donation, --p2pool-standalone, --node-p2p) parse
+    // anywhere on the line but go only with serve --own-p2pool.
+    // Look here if: the Pool-mode flags change.
+    #[test]
+    fn your_own_p2pool_takes_public_fallbacks_and_its_own_settings() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(
+                [
+                    "pickaxe",
+                    "stratum-v2",
+                    "serve",
+                    "--sv1-listen",
+                    "0.0.0.0:3333",
+                ]
+                .iter()
+                .chain(args)
+                .collect::<Vec<_>>(),
+            )
+        };
+        let cli = parse(&[
+            "--own-p2pool",
+            "--public",
+            "--pool-fee",
+            "2",
+            "--pool-tag",
+            "/MyPool/",
+            "--fallback-pool",
+            "stratum2+tcp://a.example:3336/KEY",
+            "--p2pool-donation",
+            "0.5",
+            "--p2pool-standalone",
+            "--node-p2p",
+            "192.168.1.20:8333",
+        ])
+        .unwrap();
+        cli.check_p2pool_flags().unwrap();
+        assert_eq!(cli.p2pool_donation, Some("0.5".parse().unwrap()));
+        assert!(cli.p2pool_standalone);
+        assert_eq!(cli.node_p2p.as_deref(), Some("192.168.1.20:8333"));
+        let Some(Commands::StratumV2 {
+            command:
+                StratumV2Command::Serve {
+                    own_p2pool: true,
+                    public: true,
+                    fallback_pool,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("serve options missing")
+        };
+        assert_eq!(fallback_pool.len(), 1);
+        // Not with --upstream, and P2Pool's settings only with your own.
+        assert!(parse(&["--own-p2pool", "--upstream", "pool.example:3336"]).is_err());
+        let solo = parse(&["--p2pool-standalone"]).unwrap();
+        assert!(solo
+            .check_p2pool_flags()
+            .unwrap_err()
+            .contains("--own-p2pool"));
     }
 
     // #### PR #40
