@@ -513,13 +513,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${RUNNER_OS}" == "Windows" ]]; then bin=target/release/pickaxe_miner.exe; gui=target/release/pickaxe_gui.exe; else bin=target/release/pickaxe_miner; gui=target/release/pickaxe_gui; fi
-          cp "${bin}" target/release/pickaxe_cli
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then bin=target/release/pickaxe_miner.exe; gui=target/release/pickaxe_gui.exe; saved=target/release/pickaxe_cli.exe; else bin=target/release/pickaxe_miner; gui=target/release/pickaxe_gui; saved=target/release/pickaxe_cli; fi
+          cp "${bin}" "${saved}"
           cargo build --locked --release --features gui
-          test "$("${bin}" --version)" = "$(target/release/pickaxe_cli --version)"
+          test "$("${bin}" --version)" = "$("${saved}" --version)"
           "${bin}" --help | grep -q 'gui'
           cp "${bin}" "${gui}"
-          mv target/release/pickaxe_cli "${bin}"
+          mv "${saved}" "${bin}"
 
       - name: Package Linux
         if: runner.os == 'Linux'
