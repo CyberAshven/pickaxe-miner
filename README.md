@@ -254,6 +254,15 @@ Linux:
 ./pickaxe
 ```
 
+Debian or Ubuntu (amd64 / arm64):
+
+```bash
+sudo apt install ./pickaxe-miner_VERSION_ARCH.deb
+pickaxe
+```
+
+See [release package notes](docs/packages.md) for architecture and glibc requirements.
+
 Windows PowerShell:
 
 ```powershell

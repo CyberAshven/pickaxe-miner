@@ -939,7 +939,10 @@ jobs:
           set -euo pipefail
           version="${TAG#pickaxe-miner-v}"
           for arch in amd64 arm64; do
-            case "${arch}" in amd64) target=x86_64 ;; arm64) target=arm64 ;; esac
+            case "${arch}" in
+              amd64) target=x86_64; libc_dep='libc6 (>= 2.28)' ;;
+              arm64) target=arm64; libc_dep='libc6 (>= 2.39)' ;;
+            esac
             archive="input/${arch}/${TAG}-linux-${target}.tar.gz"
             stage="$(mktemp -d)"
             root="${stage}/root"
@@ -954,7 +957,7 @@ jobs:
           Priority: optional
           Architecture: ${arch}
           Maintainer: Pickaxe Miner maintainers
-          Depends: libc6, libvulkan1, ocl-icd-libopencl1, libudev1, libx11-6, libxkbcommon0, libwayland-client0, libwayland-cursor0, libwayland-egl1
+          Depends: ${libc_dep}, libvulkan1, ocl-icd-libopencl1, libudev1, libx11-6, libxkbcommon0, libwayland-client0, libwayland-cursor0, libwayland-egl1
           Description: Bitcoin Cash and CashTokens GPU miner
            Pickaxe provides PHOTON and ELECTRIC GPU mining, BCH ASIC services,
            and a desktop GUI. GPU drivers are supplied by the host system.
@@ -976,7 +979,7 @@ jobs:
           retention-days: 14
 
   runtime-docker:
-    name: Build and publish headless GPU runtime
+    name: Build and validate headless GPU runtime
     needs:
       - validate
       - farm-os
@@ -985,7 +988,6 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      packages: write
     steps:
       - name: Checkout release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

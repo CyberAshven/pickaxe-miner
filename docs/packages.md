@@ -26,9 +26,11 @@ pickaxe --version
 /opt/pickaxe-miner/pickaxe-gui gui
 ```
 
-Use the `arm64` package on 64-bit ARM Debian or Ubuntu. GPU driver and device
-support remain host responsibilities; the package supplies the Vulkan and
-OpenCL loader dependencies, not proprietary GPU drivers. The archive remains
+The amd64 package requires glibc 2.28 or newer. The arm64 package requires
+glibc 2.39 or newer (for example Ubuntu 24.04 or Debian 13); it will not
+install on Debian 12. GPU driver and device support remain host
+responsibilities; the package supplies the Vulkan and OpenCL loader
+dependencies, not proprietary GPU drivers. The archive remains
 available for users who prefer not to install a system package.
 
 ## Desktop GUI
