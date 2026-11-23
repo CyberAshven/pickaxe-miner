@@ -5,6 +5,9 @@
 - [Development and branch flow](development.md)
 - [GPU code map](gpu-sources.md): every GPU kernel, what builds it and where it runs, and which GPUs mine
 - [Portable builds](portable.md): Apple Silicon, the browser miner and optional DirectX 12 on Windows
+- [Desktop window](desktop-window.md): GUI release binaries, setup and dashboard
+- [Release packages](packages.md): Windows, Linux, Debian, macOS and farm downloads
+- [Docker runtime](container.md): headless GPU container and device passthrough
 - [Browser T2](browser-t2.md)
 - [PHOTON protocol profile](protocol-profile.md)
 - [ELECTRIC](electric-token.md): native GPU mining, signed fee-pot claims, funding QR and owner recovery on Mainnet and Chipnet

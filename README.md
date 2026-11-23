@@ -7,7 +7,7 @@ and pool or farm operation from one terminal application. A browser WebGPU miner
 is also available for PHOTON.
 
 [Download the latest release](https://github.com/CyberAshven/pickaxe-miner/releases/latest)
- · [Guides](docs/README.md) · [Development and releases](docs/development.md)
+ · [Guides](docs/README.md) · [Container guide](docs/container.md) · [Development and releases](docs/development.md)
 
 This README describes the current branch. For a downloaded build, its release
 notes describe the features included in that package.
@@ -412,7 +412,9 @@ cargo run --release -- benchmark
 - Fulcrum/Electrum connectivity
 - Native BCH node validation and transaction broadcast
 - Interactive Ratatui interface
-- Desktop window for GPU mining (egui, `--features gui`)
+- Desktop window for GPU mining (separate GUI-enabled release executable)
+- Debian packages for amd64 and arm64, alongside portable archives
+- Headless x86_64 GPU runtime container on GitHub Container Registry
 - Headless and JSON operation
 - Persistent, bounded GPU memory architecture
 - Stale-job and generation protection

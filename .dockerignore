@@ -1,0 +1,7 @@
+.git
+.github
+.oss-scanner
+target
+**/node_modules
+**/__pycache__
+*.deb

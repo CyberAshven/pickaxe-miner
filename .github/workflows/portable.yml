@@ -108,12 +108,18 @@ jobs:
           cargo build --locked --release --no-default-features --features portable-wgpu
           target/release/pickaxe_miner --version
           target/release/pickaxe_miner --help
+          cp target/release/pickaxe_miner target/release/pickaxe_cli
+          cargo build --locked --release --features gui
+          target/release/pickaxe_miner --help | grep -q gui
+          cp target/release/pickaxe_miner target/release/pickaxe_gui
+          mv target/release/pickaxe_cli target/release/pickaxe_miner
       - name: Package command-line archive
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
           archive="pickaxe-miner-v${version}-macos-arm64"
           mkdir -p "dist/$archive"
           cp target/release/pickaxe_miner "dist/$archive/pickaxe"
+          cp target/release/pickaxe_gui "dist/$archive/pickaxe-gui"
           cp LICENSE docs/portable.md "dist/$archive/"
           git rev-parse HEAD > "dist/$archive/SOURCE_COMMIT.txt"
           tar -czf "dist/$archive.tar.gz" -C dist "$archive"
