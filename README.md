@@ -122,7 +122,7 @@ Run `pickaxe` for the setup, or use the command line.
 | Mine PHOTON on your GPUs | GPU mining | `pickaxe mine --address <yours>` | [Quick start](#quick-start-mainnet-tui) |
 | Mine ELECTRIC on your GPUs | GPU mining, ELECTRIC; fund its fee pot | `pickaxe electric mine --address <yours>` | [docs/electric-token.md](docs/electric-token.md) |
 | Split your GPUs between both tokens | GPU mining, Hash split | `pickaxe split --share photon=80 --share electric=20 --address <yours>` | [docs/hash-split.md](docs/hash-split.md) |
-| Mine GPU tokens from a desktop window | – | `pickaxe gui` (a build with `--features gui`) | [docs/desktop-window.md](docs/desktop-window.md) |
+| Mine GPU tokens from a desktop window | – | `pickaxe-gui gui` (release) or `pickaxe gui` (source build with `--features gui`) | [docs/desktop-window.md](docs/desktop-window.md) |
 | Mine with GPUs on many machines | GPU mining; rigs: Join a GPU pool or farm | coordinator `--rigs-listen 0.0.0.0:3340`, rigs `--coordinator HOST:3340 --coordinator-key KEY` | [docs/farm.md](docs/farm.md) |
 | Join someone's GPU pool | GPU mining, Join a GPU pool or farm | `pickaxe mine --coordinator HOST:3340 --coordinator-key KEY --address <yours>` | [docs/farm.md](docs/farm.md) |
 | Mine on HiveOS, mmpOS or RaveOS | – | the release's custom-miner package for your system | [docs/farm-os.md](docs/farm-os.md) |
