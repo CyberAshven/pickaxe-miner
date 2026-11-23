@@ -11,7 +11,7 @@ LABEL org.opencontainers.image.source="https://github.com/CyberAshven/pickaxe-mi
       org.opencontainers.image.version="${PICKAXE_VERSION}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates libgcc-s1 libudev1 libvulkan1 ocl-icd-libopencl1 \
+      ca-certificates libgcc-s1 libudev1 libvulkan1 mesa-vulkan-drivers ocl-icd-libopencl1 \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /opt/pickaxe-miner /data
 

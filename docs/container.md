@@ -22,8 +22,8 @@ For NVIDIA CUDA, install the NVIDIA driver and NVIDIA Container Toolkit on
 the host, then use `--gpus all`; the host driver is exposed by the container
 runtime. The image includes the release's sm_120 PTX only, so use a compatible
 NVIDIA GPU and driver. For Vulkan/OpenCL devices, pass the host's GPU device
-nodes (commonly `--device /dev/dri`) and ensure the host has a compatible
-Vulkan or OpenCL driver. GPU access is not emulated: the container does not
+nodes (commonly `--device /dev/dri`). Mesa Vulkan drivers are included in
+the image; OpenCL still requires a compatible vendor driver/ICD from the host. GPU access is not emulated: the container does not
 provide a CPU mining fallback.
 
 The published runtime image currently targets **Linux x86_64**. The Linux
