@@ -957,7 +957,7 @@ jobs:
           Priority: optional
           Architecture: ${arch}
           Maintainer: Pickaxe Miner maintainers
-          Depends: ${libc_dep}, libvulkan1, ocl-icd-libopencl1, libudev1, libx11-6, libxkbcommon0, libwayland-client0, libwayland-cursor0, libwayland-egl1
+          Depends: ${libc_dep}, libvulkan1, ocl-icd-libopencl1, libudev1, libx11-6, libx11-xcb1, libxcursor1, libxi6, libxrandr2, libxinerama1, libxxf86vm1, libxfixes3, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libwayland-egl1
           Description: Bitcoin Cash and CashTokens GPU miner
            Pickaxe provides PHOTON and ELECTRIC GPU mining, BCH ASIC services,
            and a desktop GUI. GPU drivers are supplied by the host system.
