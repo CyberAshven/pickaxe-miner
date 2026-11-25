@@ -31,7 +31,7 @@ on:
       - ".github/workflows/release.yml"
       - ".github/workflows/scanner-docker.yml"
       - "Dockerfile"
-      - ".dockerignore"
+      - "Dockerfile.dockerignore"
       - "docker/**"
       - ".oss-scanner/**"
       - ".github/workflows/portable.yml"
@@ -967,8 +967,20 @@ jobs:
             dpkg-deb --info "pickaxe-miner_${version}_${arch}.deb"
             mkdir "${stage}/check"
             dpkg-deb --extract "pickaxe-miner_${version}_${arch}.deb" "${stage}/check"
-            "${stage}/check/opt/pickaxe-miner/pickaxe" --version
-            "${stage}/check/opt/pickaxe-miner/pickaxe-gui" --version
+            for binary in pickaxe pickaxe-gui; do
+              program="${stage}/check/opt/pickaxe-miner/${binary}"
+              if [[ "${arch}" == "$(dpkg --print-architecture)" ]]; then
+                "${program}" --version | grep -F "pickaxe ${version}"
+              else
+                # This runner cannot run another architecture's binary; check
+                # that the package holds one built for its own.
+                case "${arch}" in
+                  arm64) machine='ARM aarch64' ;;
+                  amd64) machine='x86-64' ;;
+                esac
+                file -b "${program}" | tee /dev/stderr | grep -qF "${machine}"
+              fi
+            done
             rm -rf "${stage}"
           done
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
