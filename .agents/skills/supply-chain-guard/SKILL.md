@@ -107,7 +107,7 @@ Exit status: 2 for a HIT, 1 for REVIEW items only, 0 for clean.
 |---|---|---|
 | Loader markers (case-insensitive): `global\.o *= *['"]`, `global\[['"]!['"]\] *=`, `global\.i *= *['"]A8-`, `_\$_[0-9a-f]{4}`, PolinRider's `rmcej` seed, its Ethereum dead-drop address and its command paths under `/0x/` | HIT | PolinRider-style loaders |
 | Code after 150+ blanks on one line | HIT | Code hidden off the right edge of the editor |
-| Run of 4+ variation selectors or private-use characters, other than U+FE0F repeated alone | HIT | GlassWorm's invisible payload |
+| Run of 4+ variation selectors or private-use characters | HIT | GlassWorm's invisible payload |
 | Run of 4+ Unicode tag characters | REVIEW | Text hidden for AI agents ("ASCII smuggling") |
 | Text direction controls | REVIEW | Trojan Source |
 | `"runOn": "folderOpen"` | HIT | Editor-task launchers (Contagious Interview, PolinRider) |
