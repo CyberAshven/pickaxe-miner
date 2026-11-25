@@ -73,7 +73,7 @@ ggrep() { g grep -I -n "${CACHED[@]}" "$@"; }
 echo "supply-chain-guard scan: $LABEL"
 
 # 1. Loader markers: PolinRider's globals and _$_ tables, its seed string,
-#    the Ethereum dead-drop address and C2 paths, the 2026-11-16 loader.
+#    the Ethereum dead-drop address and C2 paths.
 MARKERS='global\.o *= *['"'"'"]|global\[['"'"'"]!['"'"'"]\] *=|global\.i *= *['"'"'"]A8-|_\$_[0-9a-f]{4}|rmcej%ot[b]%|0xa322e5f3d311d3080e6f0121063e9adc2490ef1[a]|/0x/c?l[s]\b'
 emit HIT "loader marker" "$(ggrep -i -E "$MARKERS" "${SRC[@]}" 2>/dev/null)"
 
@@ -83,12 +83,16 @@ emit HIT "code after a long run of blanks" \
 
 # 3. Invisible characters. GlassWorm encodes its payload as a long run of
 #    variation selectors or private-use characters; emoji use single
-#    selectors, so only runs of four or more count. Zero-width spaces and
-#    joiners are left out: translations and Persian text are full of them.
-#    Tag characters can carry text an AI agent reads and a person cannot
-#    see. Direction controls (Trojan Source) can make code read differently
-#    from how it runs.
-INVISIBLE_RUN='[\x{FE00}-\x{FE0F}\x{E000}-\x{F8FF}\x{E0100}-\x{E01EF}]{4,}'
+#    selectors, so only runs of four or more count. A run that repeats
+#    U+FE0F alone carries no data (all-contributors writes its accessibility
+#    badge that way), so a run counts only with another selector or a
+#    private-use character in it. Zero-width spaces and joiners are left
+#    out: translations and Persian text are full of them. Tag characters
+#    can carry text an AI agent reads and a person cannot see. Direction
+#    controls (Trojan Source) can make code read differently from how it
+#    runs.
+INVISIBLE='\x{FE00}-\x{FE0F}\x{E000}-\x{F8FF}\x{E0100}-\x{E01EF}'
+INVISIBLE_RUN="(?<![$INVISIBLE])(?=[$INVISIBLE]{4,})[$INVISIBLE]*?[\x{FE00}-\x{FE0E}\x{E000}-\x{F8FF}\x{E0100}-\x{E01EF}]"
 emit HIT "run of invisible characters" \
     "$(LC_ALL=C.UTF-8 ggrep -P "$INVISIBLE_RUN" "${SRC[@]}" 2>/dev/null | head -50)"
 emit REVIEW "run of Unicode tag characters" \
