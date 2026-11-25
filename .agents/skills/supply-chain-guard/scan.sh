@@ -83,16 +83,12 @@ emit HIT "code after a long run of blanks" \
 
 # 3. Invisible characters. GlassWorm encodes its payload as a long run of
 #    variation selectors or private-use characters; emoji use single
-#    selectors, so only runs of four or more count. A run that repeats
-#    U+FE0F alone carries no data (all-contributors writes its accessibility
-#    badge that way), so a run counts only with another selector or a
-#    private-use character in it. Zero-width spaces and joiners are left
-#    out: translations and Persian text are full of them. Tag characters
-#    can carry text an AI agent reads and a person cannot see. Direction
-#    controls (Trojan Source) can make code read differently from how it
-#    runs.
-INVISIBLE='\x{FE00}-\x{FE0F}\x{E000}-\x{F8FF}\x{E0100}-\x{E01EF}'
-INVISIBLE_RUN="(?<![$INVISIBLE])(?=[$INVISIBLE]{4,})[$INVISIBLE]*?[\x{FE00}-\x{FE0E}\x{E000}-\x{F8FF}\x{E0100}-\x{E01EF}]"
+#    selectors, so only runs of four or more count. Zero-width spaces and
+#    joiners are left out: translations and Persian text are full of them.
+#    Tag characters can carry text an AI agent reads and a person cannot
+#    see. Direction controls (Trojan Source) can make code read differently
+#    from how it runs.
+INVISIBLE_RUN='[\x{FE00}-\x{FE0F}\x{E000}-\x{F8FF}\x{E0100}-\x{E01EF}]{4,}'
 emit HIT "run of invisible characters" \
     "$(LC_ALL=C.UTF-8 ggrep -P "$INVISIBLE_RUN" "${SRC[@]}" 2>/dev/null | head -50)"
 emit REVIEW "run of Unicode tag characters" \
