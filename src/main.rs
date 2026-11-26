@@ -1413,6 +1413,18 @@ fn console_closes_on_exit() -> bool {
     attached == 1
 }
 
+/// What: lets go of the console Explorer opened for the window program (a
+/// double-click on pickaxe-gui.exe), and says whether it did.
+/// Why: the window needs no console, and one left open behind it looks like
+/// a second program; a console started from a shell is the shell's, and
+/// stays. An error after this opens a console again to show it.
+/// Look here if: a black console sits behind the window, or a window that
+/// failed to open closes without a word.
+#[cfg(all(windows, feature = "gui"))]
+fn release_explorer_console() -> bool {
+    console_closes_on_exit() && unsafe { windows_sys::Win32::System::Console::FreeConsole() } != 0
+}
+
 /// The Linux launcher marks the terminal it opened for the miner.
 #[cfg(not(windows))]
 fn console_closes_on_exit() -> bool {
@@ -1426,6 +1438,11 @@ fn relaunch_in_terminal() {
     let desktop =
         std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // pickaxe-gui started with no arguments opens the window: no terminal.
+    let raw: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if cli::window_by_default(&raw, cfg!(feature = "gui")).is_some() {
+        return;
+    }
     if !should_relaunch(
         &args,
         std::io::stdin().is_terminal(),
@@ -2210,6 +2227,8 @@ fn run_application(open_profiles: bool) {
         // The desktop window: the setup and dashboard, mining the same
         // sessions as the terminal.
         cli::Commands::Gui { start } => {
+            #[cfg(all(windows, feature = "gui"))]
+            let released = release_explorer_console();
             #[cfg(feature = "gui")]
             let result = pickaxe_miner::gui::run(pickaxe_miner::gui::Start {
                 cfg,
@@ -2229,6 +2248,11 @@ fn run_application(open_profiles: bool) {
                 Err("this build has no desktop window; build with --features gui".into())
             };
             if let Err(error) = result {
+                #[cfg(all(windows, feature = "gui"))]
+                if released {
+                    // A console again, so the reason can be read.
+                    unsafe { windows_sys::Win32::System::Console::AllocConsole() };
+                }
                 eprintln!("error: {error}");
                 exit_after_error(1);
             }
