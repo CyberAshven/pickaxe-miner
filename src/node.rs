@@ -247,7 +247,36 @@ impl NativePhotonSession {
         )?;
 
         let observed_baton = if txout.is_null() {
-            match resolve_native_mempool_baton(&self.url, &self.baton, &self.deployment) {
+            // #### Knuth compatibility: blocks first, the UTXO scan last
+            // What: when the cached baton is gone and blocks were found since
+            // the last read, the baton is followed through those blocks
+            // (getblock, verbosity 2) to its newest output, which gettxout or
+            // the mempool then gives. The full UTXO scan stays the last resort.
+            // Why: Knuth has no scantxoutset, so on Knuth every baton spent in
+            // a block sent the miner back to Fulcrum; on BCHN the scan takes
+            // seconds where a few getblock calls do.
+            // Look here if: a node loses the baton after a block, or a miner
+            // on a node rescans the UTXO set after every claim.
+            let followed = if height > self.snapshot.job.height {
+                follow_native_baton_through_blocks(
+                    &self.url,
+                    &self.baton,
+                    self.snapshot.job.height,
+                    height,
+                    &self.deployment,
+                )
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
+            let resolved = match followed {
+                Some(moved) => {
+                    native_baton_at_tip(&self.url, &moved, height, &bestblock, &self.deployment)
+                }
+                None => resolve_native_mempool_baton(&self.url, &self.baton, &self.deployment),
+            };
+            match resolved {
                 Ok(successor) => successor,
                 Err(refresh_error) => {
                     let bootstrap = bootstrap_native_photon(&self.url, &self.deployment).map_err(|bootstrap_error| {
@@ -295,6 +324,81 @@ pub fn fetch_photon_live_job(
 ) -> Result<LiveJob, String> {
     let session = NativePhotonSession::connect_failover(endpoints, deployment)?;
     Ok(session.snapshot().job.clone())
+}
+
+/// #### Knuth compatibility: the most blocks a refresh follows the baton
+/// through before it falls back to scanning the UTXO set (a day of blocks).
+const MAX_NATIVE_PHOTON_FOLLOW_BLOCKS: u32 = 144;
+
+/// #### Knuth compatibility
+/// The baton after `from` as the blocks `after + 1 ..= tip` moved it, in
+/// block and transaction order; `None` when none of them spent it.
+fn follow_native_baton_through_blocks(
+    url: &str,
+    from: &NativePhotonBaton,
+    after: u32,
+    tip: u32,
+    deployment: &PhotonDeployment,
+) -> Result<Option<NativePhotonBaton>, String> {
+    if tip.saturating_sub(after) > MAX_NATIVE_PHOTON_FOLLOW_BLOCKS {
+        return Err(format!(
+            "{} blocks since the last read; following the baton stops at {}",
+            tip.saturating_sub(after),
+            MAX_NATIVE_PHOTON_FOLLOW_BLOCKS
+        ));
+    }
+    let mut current = from.clone();
+    let mut moved = false;
+    for height in after.saturating_add(1)..=tip {
+        let hash = rpc_call(url, "getblockhash", json!([height]))?;
+        let block = rpc_call(url, "getblock", json!([hash, 2]))?;
+        let transactions = block
+            .get("tx")
+            .and_then(Value::as_array)
+            .ok_or("getblock omitted its transactions")?;
+        for transaction in transactions {
+            let txid = transaction
+                .get("txid")
+                .and_then(Value::as_str)
+                .ok_or("getblock gave a transaction without a txid")?;
+            if let Some(next) =
+                parse_native_mempool_successor(txid, transaction, &current, deployment)?
+            {
+                current = next;
+                moved = true;
+            }
+        }
+    }
+    Ok(moved.then_some(current))
+}
+
+/// #### Knuth compatibility
+/// The baton a block left (`moved`) as it stands at the tip: its unspent
+/// output from gettxout, or the mempool chain that spends it.
+fn native_baton_at_tip(
+    url: &str,
+    moved: &NativePhotonBaton,
+    height: u32,
+    bestblock: &str,
+    deployment: &PhotonDeployment,
+) -> Result<NativePhotonBaton, String> {
+    let txout = rpc_call(
+        url,
+        "gettxout",
+        json!([moved.txid.clone(), moved.vout, true]),
+    )?;
+    if txout.is_null() {
+        resolve_native_mempool_baton(url, moved, deployment)
+    } else {
+        parse_native_gettxout_baton(
+            &moved.txid,
+            moved.vout,
+            height,
+            bestblock,
+            &txout,
+            deployment,
+        )
+    }
 }
 
 /// Initializes native PHOTON state from canonical source evidence.
@@ -2894,6 +2998,98 @@ mod gbt_tests {
             verify_photon_state_equivalence(&native_snapshot, &canonical_snapshot).unwrap_err();
         assert!(field_error.contains("baton_value_sats"), "{field_error}");
         assert_eq!(native.age, 10);
+    }
+
+    #[test]
+    fn a_baton_spent_in_a_new_block_is_followed_without_a_utxo_scan() {
+        // #### Knuth compatibility
+        // What: the cached baton (33…:0, read at height 1000) was spent in
+        // block 1001; refresh finds the spend in that block with getblock and
+        // reads the new baton with gettxout. The scripted node has no
+        // scantxoutset, as Knuth has none: calling it would break the script.
+        // Look here if: a node without scantxoutset loses the baton after a
+        // block.
+        let txid = "33".repeat(32);
+        let successor_txid = "55".repeat(32);
+        let bestblock = "44".repeat(32);
+        let block_hash = "66".repeat(32);
+        let confirmed_commitment = format!(
+            "01000000{}",
+            "ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000"
+        );
+        let successor_commitment = format!(
+            "02000000{}",
+            "ab9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000"
+        );
+        let cached = live_job_from_fulcrum_values(
+            "wss://fixture.invalid",
+            json!(["Fulcrum", "1.5"]),
+            &json!({"height": 1000, "hex": FIXTURE_HEADER_HEX}),
+            &json!([{
+                "tx_hash": txid,
+                "tx_pos": 0,
+                "height": 990,
+                "value": 15_971_500,
+                "token_data": {
+                    "category": MAINNET_CATEGORY_HEX,
+                    "amount": "2100000000000000",
+                    "nft": {"capability": "mutable", "commitment": confirmed_commitment}
+                }
+            }]),
+        )
+        .unwrap();
+        assert_eq!(cached.height, 1000);
+        let successor_token_data = json!({
+            "category": MAINNET_CATEGORY_HEX,
+            "amount": "2099995000000001",
+            "nft": {"capability": "mutable", "commitment": successor_commitment}
+        });
+        let block = json!({
+            "hash": block_hash,
+            "height": 1001,
+            "tx": [{
+                "txid": "77".repeat(32),
+                "vin": [{"coinbase": "03e90300"}],
+                "vout": [{"n": 0, "value": 3.125, "scriptPubKey": {"hex": "6a"}}]
+            }, {
+                "txid": successor_txid,
+                "vin": [{"txid": txid, "vout": 0}],
+                "vout": [{
+                    "n": 0,
+                    "value": 0.15970885,
+                    "scriptPubKey": {"hex": COVENANT_LOCKING_BYTECODE_HEX},
+                    "tokenData": successor_token_data
+                }]
+            }]
+        });
+        let successor_txout = json!({
+            "bestblock": bestblock,
+            "confirmations": 1,
+            "value": 0.15970885,
+            "scriptPubKey": {"hex": COVENANT_LOCKING_BYTECODE_HEX},
+            "tokenData": successor_token_data,
+        });
+        let (endpoint, server) = serve_json_rpc_sequence(vec![
+            (
+                "getblockchaininfo",
+                json!({"blocks": 1001, "bestblockhash": bestblock.clone()}),
+            ),
+            ("gettxout", Value::Null),
+            ("getblockhash", json!(block_hash)),
+            ("getblock", block),
+            ("gettxout", successor_txout.clone()),
+            ("getbestblockhash", json!(bestblock.clone())),
+            ("gettxout", successor_txout),
+        ]);
+        let mut session =
+            NativePhotonSession::unverified_for_test(&endpoint, &MAINNET_PHOTON, &cached);
+        let refreshed = session.refresh().unwrap();
+        server.join().unwrap();
+        assert_eq!(refreshed.job.baton_txid, successor_txid);
+        assert_eq!(refreshed.job.baton_vout, 0);
+        assert_eq!(refreshed.job.baton_height, 1001);
+        assert_eq!(refreshed.job.height, 1001);
+        assert_eq!(refreshed.tip_hash, bestblock);
     }
 
     #[test]
