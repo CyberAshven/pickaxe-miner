@@ -23,6 +23,8 @@ on:
     paths-ignore:
       - "**.md"
       - "docs/**"
+      - ".agents/**"
+      - ".github/workflows/release.yml"
   pull_request:
     branches:
       - master
