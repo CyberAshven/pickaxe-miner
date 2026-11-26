@@ -3691,7 +3691,7 @@ mod gbt_tests {
                 template.size_limit
             ),
         );
-        assert!(u64::from(template.height) >= tip + 1);
+        assert!(u64::from(template.height) > tip);
 
         // 3. The PHOTON baton through the node, against Fulcrum's.
         let fulcrum = crate::electrum::ElectrumSession::connect_failover_for_deployment(
