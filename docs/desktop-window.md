@@ -16,11 +16,17 @@ screens.
 
 Release archives include a separate GUI-enabled executable beside the usual
 terminal binary: `pickaxe-gui` on Linux and macOS, or `pickaxe-gui.exe` on
-Windows. Start it with:
+Windows. A double-click on it opens the window, as does starting it with no
+arguments:
 
 ```sh
-./pickaxe-gui gui
+./pickaxe-gui
 ```
+
+On Windows the console that a double-click opens closes once the window
+starts; if the window cannot open, a console comes back with the reason.
+With arguments, `pickaxe-gui` runs them like `pickaxe` does (`pickaxe-gui
+gui --start` opens the window and starts mining the saved profile).
 
 The original `pickaxe` / `pickaxe.exe` remains the terminal build, so a
 machine without a desktop can continue using the same TUI or headless command.
