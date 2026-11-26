@@ -5,14 +5,12 @@ description: Use before cloning, checking out, building, linting, testing, insta
 
 # Supply-chain guard
 
-On 2026-11-16 an obfuscated JavaScript loader was found in `eslint.config.mjs`
-on CyberAshven/bchd (16 branches) and on the bitcoin-cash-explorer repos
-(BitcoinCash1 `main`, CyberAshven `feat/p2p-light-client`). It sat at the end
-of a line, after hundreds of spaces, so an editor showed a normal file. It
-was delivered by rewriting existing commits (same message, author and author
-date; new committer date in `+0000`) and force-pushing them under the
-owner's account. Any `eslint` run would have executed it. It is the
-PolinRider campaign, and the same families keep coming back. The rules below
+Injected loaders are a live threat to open-source repositories. The PolinRider
+campaign appends an obfuscated JavaScript loader to a tool config file, at the
+end of a line after hundreds of spaces, so an editor shows a normal file. It
+arrives in rewritten commits (same message, author and author date; a new
+committer date) force-pushed with stolen account access, and any lint or
+build run executes it. The same families keep coming back. The rules below
 keep such code from ever running here.
 
 ## What runs code without being asked
@@ -107,7 +105,7 @@ Exit status: 2 for a HIT, 1 for REVIEW items only, 0 for clean.
 
 | Check | Level | Catches |
 |---|---|---|
-| Loader markers (case-insensitive): `global\.o *= *['"]`, `global\[['"]!['"]\] *=`, `global\.i *= *['"]A8-`, `_\$_[0-9a-f]{4}`, PolinRider's `rmcej` seed, its Ethereum dead-drop address and its command paths under `/0x/` | HIT | PolinRider and our 2026-11-16 loader |
+| Loader markers (case-insensitive): `global\.o *= *['"]`, `global\[['"]!['"]\] *=`, `global\.i *= *['"]A8-`, `_\$_[0-9a-f]{4}`, PolinRider's `rmcej` seed, its Ethereum dead-drop address and its command paths under `/0x/` | HIT | PolinRider-style loaders |
 | Code after 150+ blanks on one line | HIT | Code hidden off the right edge of the editor |
 | Run of 4+ variation selectors or private-use characters | HIT | GlassWorm's invisible payload |
 | Run of 4+ Unicode tag characters | REVIEW | Text hidden for AI agents ("ASCII smuggling") |
@@ -135,8 +133,6 @@ the owner's account that nobody in a session made is not.
 | Shai-Hulud (npm worm, 2025–2026) | Trojanized releases of real packages, published with stolen npm tokens | `preinstall`/`postinstall` running `bundle.js`, `setup_bun.js` or `bun_environment.js`; TruffleHog to harvest tokens; republishes every package the token can reach | Tokens and keys; deletes home-folder files when it finds none |
 | chalk/debug (September 2025) | A phished maintainer of chalk, debug and ~16 other packages | Browser code that swapped crypto addresses just before a transaction was signed | Payments sent to the attacker |
 | GlassWorm (VS Code extensions, 2025) | Compromised extensions on the VS Code Marketplace and OpenVSX | Payload encoded in invisible Unicode; command server read from Solana transaction memos | Credentials, wallets, more extensions |
-| Our incident (2026-11-16) | Rewritten commits force-pushed as CyberAshven | `global\.o='8-hhn11666';var _\$_6a5e=` after hundreds of spaces in `eslint.config.mjs` | Ran on any `eslint` call |
-
 Bitcoin Cash projects are a target because these campaigns are after
 wallets. A change that touches payment addresses, signing or wallet code
 gets the same scrutiny as a config file.
