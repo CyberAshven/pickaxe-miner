@@ -23,7 +23,7 @@ Install the package with apt, which resolves its runtime libraries:
 ```sh
 sudo apt install ./pickaxe-miner_VERSION_amd64.deb
 pickaxe --version
-/opt/pickaxe-miner/pickaxe-gui gui
+pickaxe-gui
 ```
 
 The amd64 package requires glibc 2.28 or newer. The arm64 package requires
@@ -35,9 +35,10 @@ available for users who prefer not to install a system package.
 
 ## Desktop GUI
 
-The normal `pickaxe` executable remains the terminal build. Launch the
-separate GUI executable with its `gui` command, for example
-`./pickaxe-gui gui` on Linux/macOS or `.\\pickaxe-gui.exe gui` in PowerShell.
+The normal `pickaxe` executable remains the terminal build. The separate
+GUI executable opens the window when started with no arguments: a
+double-click on `pickaxe-gui.exe` on Windows, or `./pickaxe-gui` on
+Linux/macOS (`pickaxe-gui` once the Debian package is installed).
 See [Desktop window](desktop-window.md) for its setup and dashboard.
 
 ## Docker
