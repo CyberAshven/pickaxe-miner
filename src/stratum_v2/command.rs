@@ -881,6 +881,8 @@ fn serve(
         }
         let mut device_offset = 0usize;
         let mut setting_error = None;
+        // What U last said about Pickaxe's own update, until the next key.
+        let mut update_said: Option<String> = None;
         let mut advanced = false;
         // The workers table opens first; Tab switches to the overview.
         let mut overview = false;
@@ -1020,7 +1022,7 @@ fn serve(
                                 &header,
                                 &lines,
                                 &mut selection.table,
-                                SERVE_FOOTER,
+                                &serve_footer(update_said.as_deref()),
                                 &lights,
                             )
                         }
@@ -1077,6 +1079,17 @@ fn serve(
                                 }
                                 continue;
                             }
+                            // Pickaxe's own update, as on the token
+                            // dashboards: U downloads it (a restart waits for
+                            // the profiles, so it never stops the server), X
+                            // hides the notice.
+                            if let Some(crate::update::Press::Said(said)) =
+                                crate::tui::update_key(key.code, false)
+                            {
+                                update_said = (!said.is_empty()).then_some(said);
+                                continue;
+                            }
+                            update_said = None;
                             match key.code {
                                 _ if super::panel::opens_panel(&key, !advanced && !overview) => {
                                     // `devices` holds this frame's rows in
@@ -1827,7 +1840,9 @@ fn render_advanced(
     }
     frame.render_widget(
         Paragraph::new(text)
-            .block(Block::bordered().title("Pickaxe · Advanced settings"))
+            .block(crate::tui::with_update_notice(
+                Block::bordered().title("Pickaxe · Advanced settings"),
+            ))
             .wrap(Wrap { trim: false }),
         frame.area(),
     );
@@ -2064,7 +2079,9 @@ fn render_dashboard(
     .split(frame.area());
     frame.render_widget(
         Paragraph::new(with_lights(lights, status))
-            .block(Block::bordered().title(title))
+            .block(crate::tui::with_update_notice(
+                Block::bordered().title(title.to_owned()),
+            ))
             .wrap(Wrap { trim: false }),
         areas[0],
     );
@@ -2200,7 +2217,9 @@ fn render_workers(
     .split(frame.area());
     frame.render_widget(
         Paragraph::new(with_lights(lights, header))
-            .block(Block::bordered().title("Pickaxe · BCH ASIC mining · Workers"))
+            .block(crate::tui::with_update_notice(
+                Block::bordered().title("Pickaxe · BCH ASIC mining · Workers"),
+            ))
             .wrap(Wrap { trim: false }),
         areas[0],
     );
@@ -2250,7 +2269,19 @@ fn render_workers(
 }
 
 // #### PR #42: Enter opens the Device panel for the highlighted row.
-const SERVE_FOOTER: &str = "Tab  Overview · ↑/↓ PgUp/PgDn  Select · Enter  Device panel · i  Connection info · a  Advanced settings · q  Stop server\nNow and 1 hour come from validated shares (30s warm-up); Device says, Temp and Fan are the device's own report.";
+/// The workers page's footer: its keys, then what U last said about
+/// Pickaxe's own update in place of the note under them.
+fn serve_footer(update_said: Option<&str>) -> String {
+    match update_said {
+        Some(said) => format!(
+            "{}\n{said}",
+            SERVE_FOOTER.lines().next().unwrap_or_default()
+        ),
+        None => SERVE_FOOTER.to_owned(),
+    }
+}
+
+const SERVE_FOOTER: &str ="Tab  Overview · ↑/↓ PgUp/PgDn  Select · Enter  Device panel · i  Connection info · a  Advanced settings · q  Stop server\nNow and 1 hour come from validated shares (30s warm-up); Device says, Temp and Fan are the device's own report.";
 const WATCH_FOOTER: &str = "↑/↓ PgUp/PgDn  Select · Enter  Device panel · q  Quit (the server keeps running)\nThe server's saved status; Now and 1 hour come from validated shares. Device actions go straight to the device.";
 
 /// One row of the workers table, from the live server or its saved status.
@@ -2704,7 +2735,9 @@ impl From<&ConnectPage> for ConnectInfo {
 fn render_connect(frame: &mut Frame<'_>, page: &ConnectPage) {
     frame.render_widget(
         Paragraph::new(connect_text(page))
-            .block(Block::bordered().title("Pickaxe · Connection info"))
+            .block(crate::tui::with_update_notice(
+                Block::bordered().title("Pickaxe · Connection info"),
+            ))
             .wrap(Wrap { trim: false }),
         frame.area(),
     );
@@ -3882,6 +3915,16 @@ pub(crate) fn load_authority(path: &Path) -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_u_says_about_an_update_takes_the_workers_notes_line() {
+        assert_eq!(serve_footer(None), SERVE_FOOTER);
+        let said = serve_footer(Some("Downloading Pickaxe v0.0.5…"));
+        let lines: Vec<&str> = said.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], SERVE_FOOTER.lines().next().unwrap());
+        assert_eq!(lines[1], "Downloading Pickaxe v0.0.5…");
+    }
 
     /// #### Pool modes: a `stratum-v2 serve` command line.
     fn serve(extra: &[&str]) -> StratumV2Command {
