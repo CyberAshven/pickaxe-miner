@@ -30,6 +30,9 @@ on:
     paths:
       - ".github/workflows/release.yml"
       - ".github/workflows/scanner-docker.yml"
+      - "Dockerfile"
+      - "Dockerfile.dockerignore"
+      - "docker/**"
       - ".oss-scanner/**"
       - ".github/workflows/portable.yml"
       - "Cargo.toml"
@@ -506,6 +509,18 @@ jobs:
           printf '%s\n' "${help}" | grep -q 'mine'
           test "$(${bin} --version | tr -d '\r')" = "pickaxe ${version}"
 
+      - name: Build desktop GUI executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then bin=target/release/pickaxe_miner.exe; gui=target/release/pickaxe_gui.exe; saved=target/release/pickaxe_cli.exe; else bin=target/release/pickaxe_miner; gui=target/release/pickaxe_gui; saved=target/release/pickaxe_cli; fi
+          cp "${bin}" "${saved}"
+          cargo build --locked --release --features gui
+          test "$("${bin}" --version)" = "$("${saved}" --version)"
+          "${bin}" --help | grep -q 'gui'
+          cp "${bin}" "${gui}"
+          mv "${saved}" "${bin}"
+
       - name: Package Linux
         if: runner.os == 'Linux'
         shell: bash
@@ -531,6 +546,7 @@ jobs:
           package="pickaxe-miner-v${version}-linux-${ARCH}"
           mkdir -p "dist/${package}"
           install -m 0755 "${bin}" "dist/${package}/pickaxe"
+          install -m 0755 target/release/pickaxe_gui "dist/${package}/pickaxe-gui"
 
           if [[ "${ARCH}" == "x86_64" ]]; then
           mkdir -p "dist/${package}/cuda/build"
@@ -642,6 +658,7 @@ jobs:
           $packageDir = Join-Path 'dist' $packageName
           New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
           Copy-Item -LiteralPath $binary -Destination (Join-Path $packageDir 'pickaxe.exe')
+          Copy-Item -LiteralPath 'target/release/pickaxe_gui.exe' -Destination (Join-Path $packageDir 'pickaxe-gui.exe')
 
           if ($env:ARCH -eq 'arm64') {
             @(
@@ -768,22 +785,32 @@ jobs:
           ref: ${{ needs.validate.outputs.sha }}
           persist-credentials: false
 
-      - name: Install Rust stable
+      - name: Install GUI build dependencies and Rust stable
         shell: bash
         run: |
           set -euo pipefail
+          dnf install -y libX11-devel libxkbcommon-devel wayland-devel
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
           echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
 
-      - name: Build release
+      - name: Build release binaries for older Linux
         shell: bash
-        run: cargo build --locked --release
+        run: |
+          set -euo pipefail
+          cargo build --locked --release
+          cp target/release/pickaxe_miner target/release/pickaxe_cli
+          cargo build --locked --release --features gui
+          target/release/pickaxe_miner --help | grep -q gui
+          cp target/release/pickaxe_miner target/release/pickaxe_gui
+          mv target/release/pickaxe_cli target/release/pickaxe_miner
 
-      - name: Upload the binary
+      - name: Upload the binaries
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: compat-linux-x86_64
-          path: target/release/pickaxe_miner
+          path: |
+            target/release/pickaxe_miner
+            target/release/pickaxe_gui
           if-no-files-found: error
           retention-days: 14
 
@@ -831,23 +858,26 @@ jobs:
           TAG: ${{ needs.validate.outputs.tag }}
         run: |
           set -euo pipefail
-          bin=compat/pickaxe_miner
-          chmod 0755 "${bin}"
-          newest="$(readelf -V "${bin}" | grep -o 'GLIBC_2\.[0-9]*' | sort -u -t. -k2,2n | tail -n 1)"
-          echo "Newest glibc symbol: ${newest}"
-          if (( ${newest#GLIBC_2.} > 28 )); then
-            echo "${bin} needs ${newest}; older Linux cannot run it" >&2
-            exit 1
-          fi
-          if readelf -d "${bin}" | grep -E 'NEEDED.*(libssl|libcrypto)'; then
-            echo "${bin} links OpenSSL" >&2
-            exit 1
-          fi
+          for bin in compat/pickaxe_miner compat/pickaxe_gui; do
+            chmod 0755 "${bin}"
+            newest="$(readelf -V "${bin}" | grep -o 'GLIBC_2\.[0-9]*' | sort -u -t. -k2,2n | tail -n 1)"
+            echo "${bin}: newest glibc symbol ${newest}"
+            if (( ${newest#GLIBC_2.} > 28 )); then
+              echo "${bin} needs ${newest}; older Linux cannot run it" >&2
+              exit 1
+            fi
+            if readelf -d "${bin}" | grep -E 'NEEDED.*(libssl|libcrypto)'; then
+              echo "${bin} links OpenSSL" >&2
+              exit 1
+            fi
+          done
           version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
-          test "$("${bin}" --version)" = "pickaxe ${version}"
+          test "$(compat/pickaxe_miner --version)" = "pickaxe ${version}"
+          test "$(compat/pickaxe_gui --version)" = "pickaxe ${version}"
           package="${TAG}-linux-x86_64"
           tar -C dist -xzf "dist/${package}.tar.gz"
-          install -m 0755 "${bin}" "dist/${package}/pickaxe"
+          install -m 0755 compat/pickaxe_miner "dist/${package}/pickaxe"
+          install -m 0755 compat/pickaxe_gui "dist/${package}/pickaxe-gui"
           tar -C dist -czf "dist/${package}.tar.gz" "${package}"
           rm -rf "dist/${package}"
 
@@ -881,6 +911,117 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  debian:
+    name: Debian packages
+    needs:
+      - validate
+      - farm-os
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Download Linux x86_64 archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-linux-x86_64
+          path: input/amd64
+      - name: Download Linux ARM64 archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-linux-arm64
+          path: input/arm64
+      - name: Build and verify Debian packages
+        shell: bash
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#pickaxe-miner-v}"
+          for arch in amd64 arm64; do
+            case "${arch}" in
+              amd64) target=x86_64; libc_dep='libc6 (>= 2.28)' ;;
+              arm64) target=arm64; libc_dep='libc6 (>= 2.39)' ;;
+            esac
+            archive="input/${arch}/${TAG}-linux-${target}.tar.gz"
+            stage="$(mktemp -d)"
+            root="${stage}/root"
+            mkdir -p "${root}/opt/pickaxe-miner" "${root}/usr/bin" "${root}/DEBIAN"
+            tar -xzf "${archive}" --strip-components=1 -C "${root}/opt/pickaxe-miner"
+            ln -s /opt/pickaxe-miner/pickaxe "${root}/usr/bin/pickaxe"
+            ln -s /opt/pickaxe-miner/pickaxe-gui "${root}/usr/bin/pickaxe-gui"
+            cat > "${root}/DEBIAN/control" <<CONTROL
+          Package: pickaxe-miner
+          Version: ${version}
+          Section: utils
+          Priority: optional
+          Architecture: ${arch}
+          Maintainer: Pickaxe Miner maintainers
+          Depends: ${libc_dep}, libvulkan1, ocl-icd-libopencl1, libudev1, libx11-6, libx11-xcb1, libxcursor1, libxi6, libxrandr2, libxinerama1, libxxf86vm1, libxfixes3, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libwayland-egl1
+          Description: Bitcoin Cash and CashTokens GPU miner
+           Pickaxe provides PHOTON and ELECTRIC GPU mining, BCH ASIC services,
+           and a desktop GUI. GPU drivers are supplied by the host system.
+          CONTROL
+            chmod 0644 "${root}/DEBIAN/control"
+            dpkg-deb --build --root-owner-group "${root}" "pickaxe-miner_${version}_${arch}.deb"
+            dpkg-deb --info "pickaxe-miner_${version}_${arch}.deb"
+            mkdir "${stage}/check"
+            dpkg-deb --extract "pickaxe-miner_${version}_${arch}.deb" "${stage}/check"
+            for binary in pickaxe pickaxe-gui; do
+              program="${stage}/check/opt/pickaxe-miner/${binary}"
+              if [[ "${arch}" == "$(dpkg --print-architecture)" ]]; then
+                "${program}" --version | grep -F "pickaxe ${version}"
+              else
+                # This runner cannot run another architecture's binary; check
+                # that the package holds one built for its own.
+                case "${arch}" in
+                  arm64) machine='ARM aarch64' ;;
+                  amd64) machine='x86-64' ;;
+                esac
+                file -b "${program}" | tee /dev/stderr | grep -qF "${machine}"
+              fi
+            done
+            rm -rf "${stage}"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-debian
+          path: "*.deb"
+          if-no-files-found: error
+          retention-days: 14
+
+  runtime-docker:
+    name: Build and validate headless GPU runtime
+    needs:
+      - validate
+      - farm-os
+    if: needs.validate.outputs.mode != 'skip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      - name: Download verified Linux x86_64 package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-linux-x86_64
+          path: dist
+      - name: Build runtime image
+        shell: bash
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#pickaxe-miner-v}"
+          image="ghcr.io/cyberashven/pickaxe-miner"
+          docker build --build-arg "PICKAXE_ARCHIVE=${TAG}-linux-x86_64.tar.gz" --build-arg "PICKAXE_VERSION=${version}" -t "${image}:${version}" .
+          docker image inspect "${image}:${version}" >/dev/null
+
   checksums:
     name: Checksum release assets
     needs:
@@ -888,6 +1029,8 @@ jobs:
       - build
       - farm-os
       - portable
+      - debian
+      - runtime-docker
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -948,12 +1091,15 @@ jobs:
             "${TAG}-linux-arm64.tar.gz" "${TAG}-windows-arm64.zip" \
             "${TAG}-macos-arm64.tar.gz" "${TAG}-browser.tar.gz" \
             "pickaxe-hiveos-${farm}.tar.gz" "pickaxe-mmpos-${farm}.tar.gz" \
-            "pickaxe-raveos-${farm}.zip" > SHA256SUMS.txt
+            "pickaxe-raveos-${farm}.zip" \
+            "pickaxe-miner_${version}_amd64.deb" "pickaxe-miner_${version}_arm64.deb" > SHA256SUMS.txt
           cat SHA256SUMS.txt
           {
             echo "Pickaxe Miner v${version}"
             echo
-            echo "Packages: Windows x86_64, Linux x86_64, Windows ARM64, Linux ARM64, macOS Apple Silicon and browser WebGPU."
+            echo "Packages: Windows x86_64, Linux x86_64, Windows ARM64, Linux ARM64, Debian amd64/arm64, macOS Apple Silicon and browser WebGPU."
+            echo "Desktop GUI executable is included separately as pickaxe-gui (pickaxe-gui.exe on Windows)."
+            echo "Headless x86_64 GPU runtime container: ghcr.io/cyberashven/pickaxe-miner:${version} (Vulkan/OpenCL; CUDA with NVIDIA Container Toolkit)."
             echo "Every package is built from the same source commit."
             echo "Bundled NVIDIA CUDA PTX is sm_120 only."
             echo "NVIDIA CUDA T2 mining uses the Rust backend."
@@ -993,6 +1139,7 @@ jobs:
       - validate
       - checksums
       - scanner-docker
+      - runtime-docker
     if: needs.validate.outputs.mode == 'publish' || needs.validate.outputs.mode == 'create' || needs.validate.outputs.mode == 'replace'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -1001,8 +1148,15 @@ jobs:
       id-token: write
       attestations: write
       artifact-metadata: write
+      packages: write
 
     steps:
+      - name: Checkout release source for the runtime image
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+
       - name: Download release bundle
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -1060,6 +1214,10 @@ jobs:
             "dist/pickaxe-raveos-${farm}.zip"
             "dist/${TAG}-linux-x86_64.tar.gz"
             "dist/${TAG}-windows-x86_64.zip"
+            "dist/${TAG}-linux-arm64.tar.gz"
+            "dist/${TAG}-windows-arm64.zip"
+            "dist/pickaxe-miner_${version}_amd64.deb"
+            "dist/pickaxe-miner_${version}_arm64.deb"
             "dist/${TAG}-macos-arm64.tar.gz"
             "dist/${TAG}-browser.tar.gz"
             "dist/SHA256SUMS.txt"
@@ -1078,4 +1236,22 @@ jobs:
             exit 1
           else
             gh release create "${TAG}"               --repo "${GH_REPO}"               "${tag_args[@]}"               --title "${release_title}"               --notes-file dist/RELEASE_NOTES.md               "${prerelease_args[@]}"               "${assets[@]}"
+
+          fi
+
+      - name: Publish headless runtime image
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#pickaxe-miner-v}"
+          image="ghcr.io/cyberashven/pickaxe-miner"
+          docker build --build-arg "PICKAXE_ARCHIVE=${TAG}-linux-x86_64.tar.gz" --build-arg "PICKAXE_VERSION=${version}" -t "${image}:${version}" .
+          echo "${GH_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+          docker push "${image}:${version}"
+          if [[ "${version}" != *-* ]]; then
+            docker tag "${image}:${version}" "${image}:latest"
+            docker push "${image}:latest"
           fi

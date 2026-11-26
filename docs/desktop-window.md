@@ -14,7 +14,17 @@ screens.
 
 ## Build and run
 
-The window is a cargo feature, not yet in the release downloads:
+Release archives include a separate GUI-enabled executable beside the usual
+terminal binary: `pickaxe-gui` on Linux and macOS, or `pickaxe-gui.exe` on
+Windows. Start it with:
+
+```sh
+./pickaxe-gui gui
+```
+
+The original `pickaxe` / `pickaxe.exe` remains the terminal build, so a
+machine without a desktop can continue using the same TUI or headless command.
+To build the GUI executable yourself:
 
 ```sh
 cargo build --release --features gui
