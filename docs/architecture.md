@@ -463,8 +463,9 @@ Answered (2026-10-10):
   BCHN's do. It has no `scantxoutset` and no transaction index, so the GPU
   token reader follows the baton through new blocks with `getblock` instead
   of rescanning the UTXO set, and looks up a confirmed transaction with its
-  block hash. Its own Template Provider (`sv2.enabled`, plaintext until
-  k-nuth/kth#807) is reached as `sv2tp-plain://127.0.0.1:8442`.
+  block hash. Its own Template Provider (`sv2.enabled`) is used once it
+  speaks Noise (k-nuth/kth#807), as `sv2tp://HOST:PORT/KEY` like any other
+  provider; Pickaxe does not take templates over an unencrypted link.
 - Pools with Stratum V2 Job Declaration for BCH: none to list yet. CashStratum
   (behind SoloFury's BCH endpoint) has Job Declaration code, but its Noise
   certificate version keeps SV2 clients out (cashstratum/cashstratum#3); a
