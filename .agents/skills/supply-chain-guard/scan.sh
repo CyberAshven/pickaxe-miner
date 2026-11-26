@@ -73,7 +73,7 @@ ggrep() { g grep -I -n "${CACHED[@]}" "$@"; }
 echo "supply-chain-guard scan: $LABEL"
 
 # 1. Loader markers: PolinRider's globals and _$_ tables, its seed string,
-#    the Ethereum dead-drop address and C2 paths, the 2026-11-16 loader.
+#    the Ethereum dead-drop address and C2 paths.
 MARKERS='global\.o *= *['"'"'"]|global\[['"'"'"]!['"'"'"]\] *=|global\.i *= *['"'"'"]A8-|_\$_[0-9a-f]{4}|rmcej%ot[b]%|0xa322e5f3d311d3080e6f0121063e9adc2490ef1[a]|/0x/c?l[s]\b'
 emit HIT "loader marker" "$(ggrep -i -E "$MARKERS" "${SRC[@]}" 2>/dev/null)"
 

@@ -49,8 +49,10 @@ jobs:
               && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
             args+=(--range "$BASE..$HEAD_SHA")
           fi
-          bash "$RUNNER_TEMP/scan.sh" "${args[@]}"
-          status=$?
+          # GitHub runs this step with bash -e: take the scanner's status
+          # here, or a "review" exit would end the step as a failure.
+          status=0
+          bash "$RUNNER_TEMP/scan.sh" "${args[@]}" || status=$?
           case $status in
             0) ;;
             1) echo "::warning::supply-chain-guard listed items to review; read them in this log before merging" ;;
