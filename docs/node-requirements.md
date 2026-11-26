@@ -27,7 +27,7 @@ Knuth was checked live, read-only, against Knuth 1.7.0 on Chipnet on
 | `getrawmempool` (verbose: `depends`, `spentby`) | a baton already spent in the mempool | ✅ | ✅ answers; its mempool was empty when checked |
 | `getmempoolinfo` | `mempoolminfee`, the mempool's dynamic fee minimum | ✅ | ⚠️ leaves `mempoolminfee` out (k-nuth/kth#1085, open); Pickaxe then uses `relayfee`, the minimum such a node enforces |
 | `sendrawtransaction` | claims and refunds | ✅ | ✅ |
-| `scantxoutset` | finding the PHOTON baton on a first start with no known baton; an ELECTRIC fee pot's coins on a node-only setup | ✅ (also its own `tok(<category>)` scan object) | ❌ Method not found: requested from Knuth, see [below](#scantxoutset-on-knuth) |
+| `scantxoutset` | finding the PHOTON baton on a first start with no known baton; an ELECTRIC fee pot's coins on a node-only setup | ✅ (also its own `tok(<category>)` scan object) | ❌ Method not found: requested as k-nuth/kth#1092, see [below](#scantxoutset-on-knuth) |
 | ZMQ `zmqpubhashblock` | new blocks reach the ASICs at once | ✅ | ❌ no ZMQ: the ASIC server asks the node for its tip about every 250 ms instead |
 
 `testmempoolaccept` is not used by Pickaxe (Knuth master has it since
@@ -58,8 +58,9 @@ on a first start, and picks the unspent whose `tokenData` has PHOTON's
 category and a mutable NFT. After that it follows the baton through the
 mempool and new blocks, and scans again only as a last resort (more than 144
 blocks behind, or the baton lost). Knuth can already walk its UTXO set, so
-the call is a whole-set pass with no new index, as on BCHN. It has been
-proposed to Knuth (k-nuth/kth#773 tracks its JSON-RPC gaps).
+the call is a whole-set pass with no new index, as on BCHN. It is
+requested as k-nuth/kth#1092, an RPC for the node's own operator (row 47
+of k-nuth/kth#773, which tracks Knuth's JSON-RPC gaps).
 
 ## Checking a node
 
