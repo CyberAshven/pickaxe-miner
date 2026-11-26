@@ -3647,6 +3647,9 @@ mod gbt_tests {
     // Why: the operator wants Pickaxe proven compatible with Knuth.
     // Look here if: a Knuth release changes what it answers.
     #[test]
+    // Builds only with the ASIC server (`stratum-v2`), whose template code
+    // it checks.
+    #[cfg(feature = "stratum-v2")]
     #[ignore = "requires PICKAXE_KNUTH_RPC pointing to a Chipnet Knuth node"]
     fn live_knuth_answers_everything_pickaxe_asks_of_a_node() {
         use crate::config::MiningNetwork;
