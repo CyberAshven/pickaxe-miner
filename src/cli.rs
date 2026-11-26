@@ -753,6 +753,9 @@ impl Cli {
 /// `farm_os::mine_argv`).
 pub fn parse() -> Cli {
     let raw: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(argv) = window_by_default(&raw, cfg!(feature = "gui")) {
+        return Cli::parse_from(argv);
+    }
     if raw.get(1).is_some_and(|arg| arg == "farm-os") && raw.get(2).is_some_and(|arg| arg == "mine")
     {
         let rest: Vec<String> = raw[3..]
@@ -770,8 +773,72 @@ pub fn parse() -> Cli {
     Cli::parse()
 }
 
+/// What: the command line `pickaxe-gui` (the releases' window build) runs
+/// with when it gets no arguments, as a double-click starts it: `gui`.
+/// `window_built` says whether this build has the window.
+/// Why: the window ships as a separate program so that a click on it opens
+/// the window; `pickaxe` with no arguments keeps opening the terminal setup,
+/// and `pickaxe-gui` with arguments runs them as they are.
+/// Look here if: a double-click on pickaxe-gui opens the terminal setup, or
+/// the Linux launcher reopens it in a terminal.
+pub fn window_by_default(
+    raw: &[std::ffi::OsString],
+    window_built: bool,
+) -> Option<Vec<std::ffi::OsString>> {
+    let [program] = raw else {
+        return None;
+    };
+    // The name after the last / or \ (either OS's separator), without .exe.
+    let path = program.to_string_lossy().to_ascii_lowercase();
+    let name = path.rsplit(['/', '\\']).next().unwrap_or_default();
+    let stem = name.strip_suffix(".exe").unwrap_or(name);
+    (window_built && matches!(stem, "pickaxe-gui" | "pickaxe_gui"))
+        .then(|| vec![program.clone(), "gui".into()])
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pickaxe_gui_without_arguments_opens_the_window() {
+        use super::window_by_default;
+        use std::ffi::OsString;
+        let argv = |items: &[&str]| items.iter().map(OsString::from).collect::<Vec<_>>();
+        for program in [
+            "pickaxe-gui",
+            "./pickaxe-gui",
+            "/opt/pickaxe-miner/pickaxe-gui",
+            r"C:\Pickaxe\pickaxe-gui.exe",
+            r"C:\Pickaxe\Pickaxe-GUI.EXE",
+            "target/release/pickaxe_gui",
+        ] {
+            let parsed =
+                window_by_default(&argv(&[program]), true).unwrap_or_else(|| panic!("{program}"));
+            assert_eq!(parsed, argv(&[program, "gui"]));
+            let cli = <super::Cli as clap::Parser>::try_parse_from(&parsed).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(super::Commands::Gui { start: false })
+            ));
+        }
+        // The terminal program, arguments given, or a build without the window:
+        // the command line is left as it is.
+        assert_eq!(window_by_default(&argv(&["pickaxe"]), true), None);
+        assert_eq!(
+            window_by_default(&argv(&[r"C:\Pickaxe\pickaxe.exe"]), true),
+            None
+        );
+        assert_eq!(
+            window_by_default(&argv(&["pickaxe-gui", "mine"]), true),
+            None
+        );
+        assert_eq!(
+            window_by_default(&argv(&["pickaxe-gui", "--version"]), true),
+            None
+        );
+        assert_eq!(window_by_default(&argv(&["pickaxe-gui"]), false), None);
+        assert_eq!(window_by_default(&[], true), None);
+    }
+
     #[test]
     fn electric_key_options_are_shared_and_exclude_legacy_mode() {
         use clap::Parser;

@@ -1,0 +1,6 @@
+# Build context of the runtime image (Dockerfile) only: BuildKit reads this
+# file for that Dockerfile alone. The source-audit image in .oss-scanner/
+# copies the whole tree, .github included, because its tests read it.
+*
+!dist/
+!docker/
