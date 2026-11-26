@@ -3634,4 +3634,215 @@ mod gbt_tests {
             "scantxoutset read timed out after {elapsed:?}: {result:?}"
         );
     }
+
+    // #### Knuth compatibility: a live check against a real Knuth node
+    // What: everything Pickaxe asks of a node, run read-only against the Knuth
+    // node in PICKAXE_KNUTH_RPC (http://USER:PASSWORD@HOST:PORT, Chipnet):
+    // the setup's node check, ASIC templates, the PHOTON baton read through
+    // the node and compared with a Chipnet Fulcrum server, a confirmed
+    // transaction found without a transaction index, the baton followed
+    // through recent blocks from a past claim, and block submission and
+    // broadcast wired to their answers (invalid data only, so nothing is
+    // published).
+    // Why: the operator wants Pickaxe proven compatible with Knuth.
+    // Look here if: a Knuth release changes what it answers.
+    #[test]
+    #[ignore = "requires PICKAXE_KNUTH_RPC pointing to a Chipnet Knuth node"]
+    fn live_knuth_answers_everything_pickaxe_asks_of_a_node() {
+        use crate::config::MiningNetwork;
+        use crate::protocol::{CHIPNET_FULCRUM_WSS_BOOTSTRAP, CHIPNET_PHOTON};
+        let url = std::env::var("PICKAXE_KNUTH_RPC").expect("PICKAXE_KNUTH_RPC required");
+        let shown = redact_url(&url);
+        let report = |step: &str, outcome: &str| println!("{step:<44} {outcome}");
+
+        // 1. The setup's node check.
+        let check = check_node(&url, MiningNetwork::Chipnet);
+        report("setup node check", &check.summary());
+        let NodeCheck::Ready {
+            info,
+            follows_photon,
+        } = check
+        else {
+            panic!("{shown}: not ready")
+        };
+        assert!(
+            info.client.to_ascii_lowercase().contains("knuth"),
+            "{}",
+            info.client
+        );
+        assert!(follows_photon, "the check must find gettxout");
+
+        // 2. ASIC templates.
+        let mut provider = crate::stratum_v2::provider::TemplateProvider::new(
+            crate::stratum_v2::provider::NativeNodeRpc::new(url.clone()),
+            MiningNetwork::Chipnet,
+        );
+        let tip = rpc_call(&url, "getblockcount", json!([]))
+            .unwrap()
+            .as_u64()
+            .unwrap();
+        let (_, template) = provider.refresh().expect("template");
+        report(
+            "ASIC template",
+            &format!(
+                "height {} ({} transactions), size limit {}",
+                template.height,
+                template.transactions().len(),
+                template.size_limit
+            ),
+        );
+        assert!(u64::from(template.height) >= tip + 1);
+
+        // 3. The PHOTON baton through the node, against Fulcrum's.
+        let fulcrum = crate::electrum::ElectrumSession::connect_failover_for_deployment(
+            &CHIPNET_FULCRUM_WSS_BOOTSTRAP
+                .iter()
+                .map(|url| url.to_string())
+                .collect::<Vec<_>>(),
+            &CHIPNET_PHOTON,
+        )
+        .expect("a Chipnet Fulcrum server")
+        .fetch_live_job()
+        .expect("Fulcrum's PHOTON job");
+        let mut session =
+            NativePhotonSession::resume(std::slice::from_ref(&url), &CHIPNET_PHOTON, &fulcrum)
+                .expect("the node confirms Fulcrum's baton");
+        let native = session.refresh().expect("refresh through the node").job;
+        report(
+            "PHOTON baton via Knuth vs Fulcrum",
+            &format!(
+                "{}:{} at {} (Fulcrum {}:{})",
+                &native.baton_txid[..12],
+                native.baton_vout,
+                native.baton_height,
+                &fulcrum.baton_txid[..12],
+                fulcrum.baton_vout
+            ),
+        );
+        if native.height == fulcrum.height {
+            assert_eq!(native.baton_txid, fulcrum.baton_txid);
+            assert_eq!(native.baton_vout, fulcrum.baton_vout);
+            assert_eq!(native.commitment_hex, fulcrum.commitment_hex);
+            assert_eq!(native.token_amount, fulcrum.token_amount);
+        }
+
+        // 4. A confirmed transaction without a transaction index.
+        if native.baton_height > 0 {
+            let raw = crate::electrum::node_raw_transaction(&url, &native.baton_txid)
+                .expect("lookup")
+                .expect("the baton's transaction");
+            let bytes = hex::decode(&raw).unwrap();
+            let mut id = crate::stratum_v2::template::double_sha256(&bytes);
+            id.reverse();
+            assert_eq!(hex::encode(id), native.baton_txid);
+            report(
+                "confirmed transaction lookup",
+                "found by its block, id matches",
+            );
+        }
+
+        // 5. The baton followed through blocks from a past claim.
+        let deployment = &CHIPNET_PHOTON;
+        let mut followed = None;
+        for height in (tip.saturating_sub(MAX_NATIVE_PHOTON_FOLLOW_BLOCKS as u64)..=tip).rev() {
+            let hash = rpc_call(&url, "getblockhash", json!([height])).unwrap();
+            let block = rpc_call(&url, "getblock", json!([hash, 2])).unwrap();
+            for transaction in block["tx"].as_array().unwrap() {
+                let spends_a_baton = transaction["vout"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|output| native_transaction_output_is_photon_baton(output, deployment));
+                if !spends_a_baton {
+                    continue;
+                }
+                // The claim's spent baton, rebuilt from the input it names.
+                let input = &transaction["vin"].as_array().unwrap()[0];
+                let previous = NativePhotonBaton {
+                    txid: input["txid"].as_str().unwrap().to_owned(),
+                    vout: input["vout"].as_u64().unwrap() as u32,
+                    height: 0,
+                    value_sats: 0,
+                    commitment_hex: String::new(),
+                    token_amount: 0,
+                };
+                followed = Some((height, previous));
+                break;
+            }
+            if followed.is_some() {
+                break;
+            }
+        }
+        // Without a claim in the last 144 blocks, the block that made the
+        // current baton is followed from the one before it.
+        let mut stop_at = u32::try_from(tip).unwrap();
+        if followed.is_none() && native.baton_height > 0 {
+            let hash = rpc_call(&url, "getblockhash", json!([native.baton_height])).unwrap();
+            let block = rpc_call(&url, "getblock", json!([hash, 2])).unwrap();
+            let claim = block["tx"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|transaction| transaction["txid"] == native.baton_txid.as_str())
+                .expect("the baton's block holds its transaction");
+            let input = &claim["vin"].as_array().unwrap()[0];
+            followed = Some((
+                u64::from(native.baton_height),
+                NativePhotonBaton {
+                    txid: input["txid"].as_str().unwrap().to_owned(),
+                    vout: input["vout"].as_u64().unwrap() as u32,
+                    height: 0,
+                    value_sats: 0,
+                    commitment_hex: String::new(),
+                    token_amount: 0,
+                },
+            ));
+            stop_at = native.baton_height;
+        }
+        match followed {
+            Some((claim_height, previous)) => {
+                let tip_now = stop_at;
+                let last = follow_native_baton_through_blocks(
+                    &url,
+                    &previous,
+                    u32::try_from(claim_height).unwrap() - 1,
+                    tip_now,
+                    deployment,
+                )
+                .expect("follow")
+                .expect("the claim moved the baton");
+                report(
+                    "baton followed through blocks",
+                    &format!(
+                        "from the claim at {claim_height} to {}:{} (node now {}:{})",
+                        &last.txid[..12],
+                        last.vout,
+                        &native.baton_txid[..12],
+                        native.baton_vout
+                    ),
+                );
+                if native.baton_height > 0 && native.baton_height <= tip_now {
+                    assert_eq!(last.txid, native.baton_txid);
+                    assert_eq!(last.vout, native.baton_vout);
+                }
+            }
+            None => report(
+                "baton followed through blocks",
+                "no PHOTON claim in the last 144 blocks to follow from",
+            ),
+        }
+
+        // 6. Submission and broadcast reach the node (invalid data only).
+        for (method, params) in [
+            ("submitblock", json!(["00"])),
+            ("sendrawtransaction", json!(["00"])),
+        ] {
+            let error = rpc_call(&url, method, params).expect_err("invalid data must be refused");
+            assert!(
+                !error.to_ascii_lowercase().contains("method not found"),
+                "{method}: {error}"
+            );
+            report(method, &format!("answers, refusing invalid data ({error})"));
+        }
+    }
 }
