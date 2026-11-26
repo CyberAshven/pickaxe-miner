@@ -64,13 +64,38 @@ pub const CLOSED: &str = "template provider closed the connection";
 pub struct TdpAddress {
     pub address: String,
     pub authority: Option<[u8; 32]>,
+    /// #### Knuth's plaintext Template Provider: unencrypted frames, on this
+    /// computer only (`sv2tp-plain://`).
+    pub plain: bool,
 }
 
 impl TdpAddress {
     /// `sv2tp://HOST:PORT/KEY`, the key as SV2 authorities are printed
     /// (Base58Check of version 1 and the 32-byte x-only key).
+    /// #### Knuth's plaintext Template Provider: or
+    /// `sv2tp-plain://HOST:PORT` for a provider on this computer that has no
+    /// encryption yet, such as Knuth's (`sv2.enabled`, port 8442).
     pub fn parse(text: &str) -> Result<Self, String> {
         let text = text.trim();
+        if let Some(rest) = text.strip_prefix("sv2tp-plain://") {
+            let address = rest.trim_end_matches('/');
+            let (host, _) = address
+                .rsplit_once(':')
+                .filter(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
+                .ok_or("an unencrypted template provider is sv2tp-plain://HOST:PORT")?;
+            if !is_loopback(host) {
+                return Err(
+                    "an unencrypted template provider is allowed on this computer only \
+                     (127.0.0.1 or localhost); use sv2tp://HOST:PORT/KEY elsewhere"
+                        .into(),
+                );
+            }
+            return Ok(Self {
+                address: address.to_owned(),
+                authority: None,
+                plain: true,
+            });
+        }
         let rest = text
             .strip_prefix("sv2tp://")
             .ok_or("a template provider is sv2tp://HOST:PORT/KEY")?;
@@ -94,19 +119,24 @@ impl TdpAddress {
             }
             None => None,
         };
-        let loopback = host == "localhost"
-            || host
-                .trim_matches(['[', ']'])
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback());
-        if authority.is_none() && !loopback {
+        if authority.is_none() && !is_loopback(host) {
             return Err("a template provider on another computer needs its key".into());
         }
         Ok(Self {
             address: address.to_owned(),
             authority,
+            plain: false,
         })
     }
+}
+
+/// Whether `host` names this computer: localhost or a loopback address.
+fn is_loopback(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Confirms a provider's new parent is on this server's network, given its
@@ -228,6 +258,7 @@ impl TdpSource {
         let stream = TcpStream::connect_timeout(&address, Duration::from_secs(10))
             .map_err(|_| "cannot reach the template provider")?;
         let session = match self.address.authority {
+            _ if self.address.plain => Session::plain_loopback(stream, Limits::TDP_CLIENT)?,
             Some(authority) => Session::initiate_with(stream, authority, Limits::TDP_CLIENT)?,
             None => Session::initiate_unpinned(stream, Limits::TDP_CLIENT)?,
         };
@@ -864,6 +895,40 @@ mod tests {
         ] {
             assert!(TdpAddress::parse(bad).is_err(), "{bad}");
         }
+        assert!(!pinned.plain);
+    }
+
+    // #### Knuth's plaintext Template Provider
+    // What: sv2tp-plain://HOST:PORT names an unencrypted provider (Knuth's
+    // default 127.0.0.1:8442), accepted on this computer only; any other
+    // host is refused before a connection is tried.
+    // Look here if: Knuth's provider is refused on localhost, or a
+    // plaintext link to another computer is allowed.
+    #[test]
+    fn unencrypted_providers_are_allowed_on_this_computer_only() {
+        for good in [
+            "sv2tp-plain://127.0.0.1:8442",
+            "sv2tp-plain://localhost:8442/",
+            "sv2tp-plain://[::1]:8442",
+        ] {
+            let parsed = TdpAddress::parse(good).unwrap();
+            assert!(parsed.plain, "{good}");
+            assert!(parsed.authority.is_none(), "{good}");
+        }
+        assert_eq!(
+            TdpAddress::parse("sv2tp-plain://127.0.0.1:8442")
+                .unwrap()
+                .address,
+            "127.0.0.1:8442"
+        );
+        for bad in [
+            "sv2tp-plain://192.168.0.160:8442",
+            "sv2tp-plain://startos.example:3335",
+            "sv2tp-plain://127.0.0.1",
+            "sv2tp-plain://:8442",
+        ] {
+            assert!(TdpAddress::parse(bad).is_err(), "{bad}");
+        }
     }
 
     /// A provider that answers the setup, then sends `frames`.
@@ -902,6 +967,7 @@ mod tests {
         let address = TdpAddress {
             address: listener.local_addr().unwrap().to_string(),
             authority: Some(public),
+            plain: false,
         };
         let thread = std::thread::spawn(move || {
             let (mut sender, mut receiver) = set_up(&listener, &public, &secret, early);
@@ -1031,6 +1097,58 @@ mod tests {
     // guard confirms it. #### PR #48: and carries the parent's time the
     // guard gave.
     // Look here if: the network guard changes.
+    // #### Knuth's plaintext Template Provider
+    // What: a provider with no encryption on this computer, as Knuth's
+    // master runs with sv2.enabled, gives its templates over
+    // sv2tp-plain://: setup, constraints, NewTemplate and SetNewPrevHash, in
+    // plain frames.
+    // Look here if: Pickaxe cannot take Knuth's templates on localhost.
+    #[test]
+    fn an_unencrypted_provider_on_this_computer_gives_templates() {
+        let template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+        let frames = vec![
+            super::super::convert::new_template(5, true, &template).unwrap(),
+            super::super::convert::set_new_prev_hash(5, &template).unwrap(),
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address =
+            TdpAddress::parse(&format!("sv2tp-plain://{}", listener.local_addr().unwrap()))
+                .unwrap();
+        let provider = std::thread::spawn(move || {
+            let session =
+                Session::plain_loopback(listener.accept().unwrap().0, Limits::TDP_SERVER).unwrap();
+            let (mut sender, mut receiver) = session.split();
+            let setup = receiver.receive(Duration::from_secs(5)).unwrap().unwrap();
+            assert_eq!(
+                setup.header().msg_type(),
+                common::MESSAGE_TYPE_SETUP_CONNECTION
+            );
+            sender
+                .send(
+                    encoded(
+                        stratum_core::common_messages_sv2::SetupConnectionSuccess {
+                            used_version: 2,
+                            flags: 0,
+                        },
+                        common::MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+                        false,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            constraints(&mut receiver);
+            for frame in frames {
+                sender.send(frame).unwrap();
+            }
+            let _ = receiver.receive(Duration::from_secs(2));
+        });
+        let mut source = TdpSource::new(address, 122, Box::new(|_, _| Ok(None)));
+        let (generation, refreshed) = source.refresh().unwrap();
+        assert_eq!(generation, 1);
+        assert_eq!(refreshed.height, 325_909);
+        provider.join().unwrap();
+    }
+
     #[test]
     fn the_network_guard_refuses_a_provider_on_another_chain() {
         let template = BchTemplate::from_rpc(&rpc_template()).unwrap();
@@ -1370,6 +1488,7 @@ mod tests {
         let address = TdpAddress {
             address: listener.local_addr().unwrap().to_string(),
             authority: Some(public),
+            plain: false,
         };
         let small = template(1..=3, 0, 0xab);
         let served = small.clone();

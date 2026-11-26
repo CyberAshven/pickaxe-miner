@@ -96,7 +96,7 @@ and [Electrum indexed-UTXO methods](https://electrum-cash-protocol.readthedocs.i
 | **bchn-sv2-bridge** | External AGPL TP for unmodified BCHN over JSON-RPC; tested on mainnet; keeps JD off because unordered JD breaks CTOR. |
 | **Own JSON-RPC template client** | Current implementation feeds the mining server from BCHN full `getblocktemplate` / `submitblock`. GBT-light remains pending. |
 | **Knuth native TP (future integration)** | Upstream has merged SV2 framing and message building blocks. Those changes do not establish a complete, interoperable template provider. |
-| **SV2 Template Providers** (PR #42) | `--template-provider sv2tp://HOST:PORT/KEY` takes templates from another Pickaxe's template server, a node bridge with a Noise shim, or a node with a provider built in (Knuth has the codecs but no listener yet); see [Templates from a provider](#templates-from-a-provider-template-distribution-client). |
+| **SV2 Template Providers** (PR #42) | `--template-provider sv2tp://HOST:PORT/KEY` takes templates from another Pickaxe's template server, a node bridge with a Noise shim, or a node with a provider built in: Knuth's (`sv2.enabled`, unencrypted for now) is `--template-provider sv2tp-plain://127.0.0.1:8442`; see [Templates from a provider](#templates-from-a-provider-template-distribution-client). |
 | **Pickaxe's own template server** (PR #42) | `serve --tp-listen` hands this node's full templates to SV2 pools and P2Pool, the other direction; see [Serving templates to a pool](#serving-templates-to-a-pool-template-distribution). |
 
 **New blocks over ZMQ** (PR #42 follow-up): the server subscribes to the node's `zmqpubhashblock` and refreshes its template as soon as a block is announced, instead of at its next 250 ms tip check; while notices flow it asks the node's tip every 2 s as a safety net. For a node on this computer the endpoint comes from bitcoin.conf (`zmqpubhashblock=tcp://127.0.0.1:28332`, the network's section first); `--node-zmq tcp://HOST:PORT` names one on this computer or the home network, and `--node-zmq off` turns it off; the setup's Advanced section has the same choice as its "Block notices" row. The dashboard shows `ZMQ connected · N blocks`, or why it is not connected while the server keeps polling.
@@ -660,7 +660,15 @@ pickaxe_miner stratum-v2 serve --chipnet --config chipnet.json \
 ```
 
 The key is the provider's authority key; it may be left out only for a
-provider on this computer. Providers are tried in order, then the configured
+provider on this computer.
+
+Knuth serves templates itself when built with `-o sv2=True` and run with
+`--sv2.enabled true` (it listens on `127.0.0.1:8442` by default). Its provider
+sends plain frames until its Noise transport lands (k-nuth/kth#807), so
+Pickaxe reaches it as `sv2tp-plain://127.0.0.1:8442`: no handshake and no
+encryption, which Pickaxe allows only on this computer (localhost or a
+loopback address). A Knuth build with Noise is reached like any other
+provider, `sv2tp://HOST:PORT/KEY`. Providers are tried in order, then the configured
 nodes, and the first that gives a verified template goes first; the server
 fails over across all of them as it does across nodes, with job ids that
 never repeat. The overview names the active one ("templates from template

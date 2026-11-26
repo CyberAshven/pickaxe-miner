@@ -606,7 +606,9 @@ pub enum StratumV2Command {
         /// Take templates from an SV2 Template Provider, tried before your
         /// node: sv2tp://HOST:PORT/KEY, such as another Pickaxe's
         /// --tp-listen. Repeat for more, tried in order. The key may be left
-        /// out only for a provider on this computer.
+        /// out only for a provider on this computer. A provider on this
+        /// computer without encryption, such as Knuth with sv2.enabled, is
+        /// sv2tp-plain://127.0.0.1:8442.
         #[arg(long, value_name = "URL")]
         template_provider: Vec<String>,
         /// #### PR #42

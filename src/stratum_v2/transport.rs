@@ -11,8 +11,8 @@ use std::{
 };
 use stratum_core::{
     codec_sv2::{
-        Decrypted, EncodableFrame, Handshake, NoiseDecoder, NoiseEncoder, SerializedFrame,
-        Transport, TransportDecryptState, TransportEncryptState,
+        Decoded, Decoder, Decrypted, EncodableFrame, Encoder, Handshake, NoiseDecoder,
+        NoiseEncoder, SerializedFrame, Transport, TransportDecryptState, TransportEncryptState,
     },
     noise_sv2::{
         Initiator, Responder, ELLSWIFT_ENCODING_SIZE, INITIATOR_EXPECTED_HANDSHAKE_MESSAGE_SIZE,
@@ -92,6 +92,10 @@ pub struct Sender {
     stream: TcpStream,
     encoder: NoiseEncoder,
     state: Option<TransportEncryptState>,
+    /// #### Knuth's plaintext Template Provider: frames go out unencrypted
+    /// (see `Session::plain_loopback`); `open` says the link still runs.
+    plain: Option<Encoder>,
+    open: bool,
     limits: Limits,
 }
 
@@ -99,6 +103,9 @@ pub struct Receiver {
     stream: TcpStream,
     decoder: NoiseDecoder,
     state: Option<TransportDecryptState>,
+    /// #### Knuth's plaintext Template Provider (see `Sender::plain`).
+    plain: Option<Decoder>,
+    open: bool,
     limits: Limits,
 }
 
@@ -175,6 +182,42 @@ impl Session {
         }
     }
 
+    /// #### Knuth's plaintext Template Provider
+    /// What: a session of plain SV2 frames, with no Noise handshake and no
+    /// encryption, to a peer on this computer only.
+    /// Why: Knuth's Template Provider (`sv2.enabled`) speaks plaintext frames
+    /// until its Noise transport lands, and binds to localhost for that
+    /// reason; on loopback nobody between the node and Pickaxe can read or
+    /// change the templates.
+    /// Look here if: a plaintext session reaches another computer, or Knuth's
+    /// provider cannot be read.
+    pub fn plain_loopback(stream: TcpStream, limits: Limits) -> Result<Self, String> {
+        if !stream.peer_addr().is_ok_and(|peer| peer.ip().is_loopback()) {
+            let _ = stream.shutdown(Shutdown::Both);
+            return Err("an unencrypted template provider is allowed on this computer only".into());
+        }
+        prepare(&stream)?;
+        let write_stream = stream.try_clone().map_err(|_| "cannot split SV2 socket")?;
+        Ok(Self {
+            reader: Receiver {
+                stream,
+                decoder: NoiseDecoder::new(),
+                state: None,
+                plain: Some(Decoder::new()),
+                open: true,
+                limits,
+            },
+            writer: Sender {
+                stream: write_stream,
+                encoder: NoiseEncoder::new(),
+                state: None,
+                plain: Some(Encoder::new()),
+                open: true,
+                limits,
+            },
+        })
+    }
+
     pub fn accept(
         stream: TcpStream,
         authority: &[u8; 32],
@@ -220,12 +263,16 @@ impl Session {
                 stream,
                 decoder: NoiseDecoder::new(),
                 state: Some(decrypt),
+                plain: None,
+                open: true,
                 limits,
             },
             writer: Sender {
                 stream: write_stream,
                 encoder: NoiseEncoder::new(),
                 state: Some(encrypt),
+                plain: None,
+                open: true,
                 limits,
             },
         })
@@ -242,11 +289,17 @@ impl Sender {
             if frame.encoded_length() > self.limits.max_out {
                 return Err("SV2 frame exceeds size limit".into());
             }
-            let state = self.state.as_mut().ok_or("SV2 connection is closed")?;
-            let bytes = self
-                .encoder
-                .encode_transport(frame, state)
-                .map_err(|_| "SV2 frame encoding failed")?;
+            if !self.open {
+                return Err("SV2 connection is closed".into());
+            }
+            let bytes = match self.plain.as_mut() {
+                Some(plain) => plain.encode(frame),
+                None => {
+                    let state = self.state.as_mut().ok_or("SV2 connection is closed")?;
+                    self.encoder.encode_transport(frame, state)
+                }
+            }
+            .map_err(|_| "SV2 frame encoding failed")?;
             write_until(
                 &mut self.stream,
                 bytes.as_ref(),
@@ -261,6 +314,7 @@ impl Sender {
 
     pub fn close(&mut self) {
         self.state = None;
+        self.open = false;
         let _ = self.stream.shutdown(Shutdown::Both);
     }
 
@@ -283,7 +337,7 @@ impl Receiver {
     }
 
     fn receive_inner(&mut self, idle: Duration) -> Result<Option<SerializedFrame>, String> {
-        if self.state.is_none() {
+        if !self.open || (self.plain.is_none() && self.state.is_none()) {
             return Err("SV2 connection is closed".into());
         }
         self.stream
@@ -304,6 +358,9 @@ impl Receiver {
             Err(_) => return Err("SV2 receive failed".into()),
         }
         let deadline = Instant::now() + self.limits.frame_deadline;
+        if self.plain.is_some() {
+            return self.receive_plain(deadline).map(Some);
+        }
         let mut bytes_read = 0usize;
         loop {
             let len = self.decoder.read_len();
@@ -336,8 +393,41 @@ impl Receiver {
         }
     }
 
+    /// #### Knuth's plaintext Template Provider: one unencrypted frame, read
+    /// a chunk at a time within `deadline` and the inbound limit.
+    fn receive_plain(&mut self, deadline: Instant) -> Result<SerializedFrame, String> {
+        let decoder = self.plain.as_mut().ok_or("SV2 connection is closed")?;
+        let mut bytes_read = 0usize;
+        loop {
+            match decoder
+                .next_frame()
+                .map_err(|_| "SV2 framing failed".to_owned())?
+            {
+                Decoded::Frame(frame) => {
+                    if frame.encoded_length() > self.limits.max_in {
+                        return Err("SV2 frame exceeds size limit".into());
+                    }
+                    return Ok(frame);
+                }
+                Decoded::Incomplete => (),
+            }
+            let len = decoder.read_len();
+            bytes_read = bytes_read
+                .checked_add(len)
+                .ok_or("SV2 frame size overflow")?;
+            if bytes_read > self.limits.max_in {
+                return Err("SV2 frame exceeds size limit".into());
+            }
+            read_until(&mut self.stream, decoder.read_buf(), deadline)?;
+            decoder
+                .advance(len)
+                .map_err(|_| "SV2 framing failed".to_owned())?;
+        }
+    }
+
     pub fn close(&mut self) {
         self.state = None;
+        self.open = false;
         let _ = self.stream.shutdown(Shutdown::Both);
     }
 
@@ -508,6 +598,46 @@ mod tests {
             assert_eq!(read(&mut ar), value + 10);
         }
     }
+    // #### Knuth's plaintext Template Provider
+    // What: plain sessions on loopback carry frames both ways without a
+    // handshake, keep idle polls harmless, and carry a frame larger than one
+    // chunk; a closed side refuses to send.
+    // Why: Knuth's provider speaks unencrypted frames until its Noise lands.
+    // Look here if: a frame from Knuth's provider is cut short or garbled.
+    #[test]
+    fn plain_loopback_sessions_round_trip_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            Session::plain_loopback(listener.accept().unwrap().0, Limits::TDP_SERVER).unwrap()
+        });
+        let client =
+            Session::plain_loopback(TcpStream::connect(address).unwrap(), Limits::TDP_CLIENT)
+                .unwrap();
+        let (mut a, mut ar) = client.split();
+        let (mut b, mut br) = server.join().unwrap().split();
+        assert!(br.receive(Duration::from_millis(5)).unwrap().is_none());
+        for value in 0..4 {
+            a.send(message(value)).unwrap();
+            assert_eq!(read(&mut br), value);
+            b.send(message(value + 10)).unwrap();
+            assert_eq!(read(&mut ar), value + 10);
+        }
+        // A frame over one 64 KiB chunk, as a template's transactions are.
+        let payload = vec![7u8; 200_000];
+        let frame: MessageFrame<binary_sv2::B016M<'_>> =
+            MessageFrame::from_message(payload.as_slice().try_into().unwrap(), 0x73, 0, false)
+                .unwrap();
+        let length = frame.encoded_length();
+        b.send(frame).unwrap();
+        let mut received = ar.receive(Duration::from_secs(5)).unwrap().unwrap();
+        assert_eq!(received.encoded_length(), length);
+        assert_eq!(received.header().msg_type(), 0x73);
+        assert!(received.payload().ends_with(&payload));
+        a.close();
+        assert!(a.send(message(1)).is_err());
+    }
+
     #[test]
     fn pinned_authority_rejects_wrong_server_key() {
         let (public, secret) = authority(42);

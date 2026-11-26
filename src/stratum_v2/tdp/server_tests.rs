@@ -986,6 +986,7 @@ fn pickaxes_template_client_takes_its_templates_pushed() {
         super::client::TdpAddress {
             address: server.templates.unwrap().to_string(),
             authority: Some(server.authority),
+            plain: false,
         },
         122,
         Box::new(|_, _| Ok(None)),
