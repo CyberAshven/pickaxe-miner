@@ -3832,7 +3832,18 @@ mod gbt_tests {
             ),
         }
 
-        // 6. Submission and broadcast reach the node (invalid data only).
+        // 6. The claim-fee floor the miner reads (mempool.get_info on a node
+        // session), which needs a minimum even when Knuth reports none.
+        let fees = crate::electrum::node_rpc(&url, "mempool.get_info", &json!([]))
+            .expect("mempool.get_info");
+        let floor = crate::fee::bch_value_to_sats(&fees["mempoolminfee"]).expect("a fee floor");
+        report(
+            "claim-fee floor (mempool.get_info)",
+            &format!("{floor} sats/kB"),
+        );
+        assert!(floor > 0);
+
+        // 7. Submission and broadcast reach the node (invalid data only).
         for (method, params) in [
             ("submitblock", json!(["00"])),
             ("sendrawtransaction", json!(["00"])),
