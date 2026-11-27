@@ -3,7 +3,7 @@
 // The donation stays in the Rust engine (src/browser.rs). Upgrading is
 // replacing these files. Look here if: start, stop, or a reward submission
 // behaves differently from the Pickaxe page.
-import { BrowserMiner, BrowserControls, validate_payout_address, describe_browser_work } from './pkg/pickaxe_miner.js';
+import { BrowserMiner, BrowserControls, validate_payout_address, describe_browser_work, require_browser_token } from './pkg/pickaxe_miner.js';
 import { Electrum, rpcErrorCode } from './rpc.js';
 import { resolveSubmission } from './submission.js';
 import { SnapshotRefresh } from './refresh.js';
@@ -32,6 +32,8 @@ export interface MinerSession {
   hostPercent?: number;
   /** 0 means the token's donation. A host cannot set it lower. */
   donationPercent?: number;
+  /** `photon` today. `electric` and `all` are refused until the browser mines them. */
+  token?: string;
 }
 
 interface RawSnapshot { before: string; unspent: string; after: string; fee: string }
@@ -136,6 +138,7 @@ export async function runMiner(call: MinerSession): Promise<void> {
   };
   const renderTimer = setInterval(render, 1000);
   try {
+    require_browser_token(call.token ?? '');
     address = validate_payout_address(network, address);
     call.onAddress(address);
     const hostAddress = call.hostAddress ?? '';

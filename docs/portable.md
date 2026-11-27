@@ -104,7 +104,8 @@ share, after the donation. Leaving it empty keeps the visitor's share.
 The donation stays at least 4% on PHOTON. A host may raise it, and anything
 above 4% goes to the project donation address. The host cannot lower it.
 `runMiner` logs the work split before mining, and the page should show that
-line. The donation is compiled into that
+line. `token` defaults to PHOTON. `electric` and `all` are refused until the
+browser miner can mine them. The donation is compiled into that
 WebAssembly, not chosen by the page. Pin the release. A later engine arrives
 only when those files are replaced.
 

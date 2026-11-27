@@ -69,6 +69,13 @@ pub async fn verify_portable_engine(table: Vec<u8>, stages: &str) -> Result<Stri
 }
 
 #[wasm_bindgen]
+pub fn require_browser_token(token: &str) -> Result<(), JsValue> {
+    MiningToken::browser_choice(token)
+        .map(|_| ())
+        .map_err(error)
+}
+
+#[wasm_bindgen]
 pub fn describe_browser_work(
     network: &str,
     donation_percent: f64,

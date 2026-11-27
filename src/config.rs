@@ -201,6 +201,19 @@ impl MiningToken {
         }
     }
 
+    /// What a browser page may mine. Empty means PHOTON. ELECTRIC and a
+    /// hash split stay on the desktop miner until the browser grows them.
+    pub fn browser_choice(name: &str) -> Result<Self, String> {
+        let name = name.trim();
+        if name.is_empty() || name.eq_ignore_ascii_case("photon") {
+            return Ok(Self::Photon);
+        }
+        if name.eq_ignore_ascii_case("all") {
+            return Err("the browser miner does not hash-split yet; choose PHOTON".into());
+        }
+        Self::parse(name, MiningNetwork::Mainnet)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Photon => "PHOTON",
@@ -2106,6 +2119,25 @@ mod tests {
     use super::*;
 
     const PAYOUT: &str = "bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh";
+
+    #[test]
+    fn the_browser_call_mines_photon_until_the_others_exist() {
+        assert_eq!(
+            MiningToken::browser_choice("").unwrap(),
+            MiningToken::Photon
+        );
+        assert_eq!(
+            MiningToken::browser_choice(" PHOTON ").unwrap(),
+            MiningToken::Photon
+        );
+        assert!(MiningToken::browser_choice("electric")
+            .unwrap_err()
+            .contains("pickaxe electric"));
+        assert!(MiningToken::browser_choice("all")
+            .unwrap_err()
+            .contains("hash-split"));
+        assert!(MiningToken::browser_choice("nope").is_err());
+    }
 
     #[test]
     fn a_photon_donation_moves_from_its_default_down_to_zero() {
