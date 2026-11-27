@@ -2399,10 +2399,10 @@ mod tests {
     }
 
     #[test]
-    fn release_workflow_prepares_pickaxe_miner_v0_0_4() {
+    fn release_workflow_prepares_pickaxe_miner_v0_0_5() {
         let workflow = include_str!("../.github/workflows/release.yml");
         let version = cargo_package_version(include_str!("../Cargo.toml"));
-        assert_eq!(version, "0.0.4");
+        assert_eq!(version, "0.0.5");
 
         let pattern = release_tag_pattern(workflow);
         assert!(
@@ -2415,13 +2415,13 @@ mod tests {
         assert!(!workflow.lines().any(|line| line.trim() == "- \"v*.*.*\""));
         assert!(workflow.contains("if [[ \"pickaxe-miner-v${version}\" != \"${TAG}\" ]]; then"));
         let tag = format!("pickaxe-miner-v{version}");
-        assert_eq!(tag, "pickaxe-miner-v0.0.4");
+        assert_eq!(tag, "pickaxe-miner-v0.0.5");
         assert_ne!(tag, format!("v{version}"));
 
         assert!(workflow.contains("release_title=\"Pickaxe Miner v${version}\""));
         assert!(workflow.contains("--title \"${release_title}\""));
         let title = format!("Pickaxe Miner v{version}");
-        assert_eq!(title, "Pickaxe Miner v0.0.4");
+        assert_eq!(title, "Pickaxe Miner v0.0.5");
 
         // Linux and Windows packages are named by the matrix's
         // arch, x86_64 and arm64.
