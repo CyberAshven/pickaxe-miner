@@ -1,4 +1,3 @@
-//! #### PR #42
 //! Template Distribution messages from and to a `BchTemplate`, with no I/O:
 //! what a template client receives, and the block its solution makes.
 
@@ -102,7 +101,7 @@ pub fn transaction_data(id: u64, template: &BchTemplate) -> Result<SerializedFra
     .map_err(|_| "template-too-large")
 }
 
-/// #### BCH large templates: `RequestTransactionData.Success` with
+/// `RequestTransactionData.Success` with
 /// `transactions` and empty `excess_data`, the end of a push or of an
 /// answer in pages.
 pub fn transaction_data_success(
@@ -157,10 +156,10 @@ impl Assembled {
 /// checks: an error means there is no block to send (a malformed coinbase
 /// or a witness other than BIP141's one item).
 ///
-/// #### PR #42: the checks (D24)
+/// The checks (D24)
 /// What: the coinbase script must begin with the height push sent, the
 /// version may differ only in the version-rolling bits, the header must
-/// meet the block target (#### PR #48: and on Chipnet not be more than 20
+/// meet the block target (and on Chipnet not be more than 20
 /// minutes after the parent on normal bits, nor at or before then on the
 /// limit's bits unless ASERT gives them), and the block must fit the
 /// size limit. A
@@ -196,7 +195,7 @@ pub fn assemble(template: &BchTemplate, solution: &SubmitSolution) -> Result<Ass
     } else if !meets_target(&double_sha256(&header), &template.target) {
         Some("high-hash")
     } else if template.wrong_bits(solution.ntime) {
-        // #### PR #48: a Chipnet block whose time needs other bits (see
+        // A Chipnet block whose time needs other bits (see
         // `BchTemplate::wrong_bits`).
         Some("bad-diffbits")
     } else if coinbase.len() as u64 > template.coinbase_budget() {
@@ -211,7 +210,7 @@ pub fn assemble(template: &BchTemplate, solution: &SubmitSolution) -> Result<Ass
     })
 }
 
-/// #### PR #42: the BIP141 strip (D20)
+/// The BIP141 strip (D20)
 /// What: a coinbase whose bytes 4 and 5 are 00 01 (BIP141's marker and
 /// flag) loses them and its one 32-byte witness item; any other witness is
 /// refused. A coinbase without them is taken as it is.
@@ -309,7 +308,6 @@ pub(super) mod tests {
         BchTemplate::from_rpc(&rpc_template()).unwrap()
     }
 
-    // #### PR #42
     // What: NewTemplate and SetNewPrevHash for the test template are byte
     // for byte the design's layouts: 45 and 80 bytes, the prefix the height
     // push alone, no outputs, the target compact(nBits).
@@ -346,12 +344,11 @@ pub(super) mod tests {
         );
     }
 
-    // #### PR #42
     // What: a solution's block is the template's block with the client's
     // coinbase, stripped of BIP141's marker, flag and one 32-byte item; a
     // wrong prefix, a version outside the rolling bits or a header above the
     // target is still assembled but marked refused; any other witness, or a
-    // coinbase that is not one, has no block. #### PR #48: so is a Chipnet
+    // coinbase that is not one, has no block. So is a Chipnet
     // header more than 20 minutes after the parent on normal bits, or at or
     // before then on the limit's bits while ASERT gives other bits.
     // Look here if: assemble or strip_bip141 changes.
@@ -413,7 +410,7 @@ pub(super) mod tests {
             let assembled = assemble(&timed, &solution(1, &witness, rolled, time, solved)).unwrap();
             assert_eq!(assembled.refused, refused, "{gap}");
         }
-        // #### PR #48: and one on the limit's bits at or before that point
+        // And one on the limit's bits at or before that point
         // while ASERT gives the parent other bits (the test target stays
         // easy).
         for (gap, refused) in [(1200, Some("bad-diffbits")), (1201, None)] {
@@ -445,7 +442,6 @@ pub(super) mod tests {
         }
     }
 
-    // #### PR #42
     // What: transaction data is one SV2 frame: up to 16,777,215 payload
     // bytes and 65,535 transactions; beyond either it is template-too-large.
     // Look here if: transaction_data changes.

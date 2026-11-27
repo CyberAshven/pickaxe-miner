@@ -1,4 +1,3 @@
-//! #### PR #42
 //! The Device panel: one worker's controls, opened from the highlighted row
 //! of the workers page, online or offline. It names how the device is reached
 //! ("local network", "Tailscale/CGNAT", "IPv6 local"), never its address.
@@ -34,7 +33,6 @@ use std::{
 /// Rows moved by PgUp and PgDn.
 const PAGE: usize = 10;
 
-/// #### PR #42
 /// What: for this long after an offline row's connection closed, its last
 /// address is trusted without confirming the device; after that, the panel
 /// offers actions only when the device there identifies as the make and
@@ -51,7 +49,6 @@ const REPLY_CHARS: usize = 240;
 /// What an address in a device's reply is shown as.
 const HIDDEN: &str = "[address hidden]";
 
-/// #### PR #42
 /// What: the highlighted row of the workers page, kept by its label.
 /// Why: rows re-sort every frame (online first, then by label), so a device
 /// going offline would move an index-based highlight onto another device,
@@ -104,7 +101,6 @@ impl Selection {
     }
 }
 
-/// #### PR #42
 /// What: whether a key on the workers page opens the Device panel: Enter,
 /// or `c` without Ctrl (Ctrl+C stops the server).
 /// Why: one rule, used by the workers page and by its test.
@@ -118,7 +114,6 @@ pub(super) fn opens_panel(key: &KeyEvent, workers_page: bool) -> bool {
         )
 }
 
-/// #### PR #42
 /// What: one worker's Device panel: its make and power, how it is reached,
 /// the actions it offers, and the device's reply to the last one.
 /// Why: the panel opens on any row, offline rows included, with the address
@@ -134,7 +129,7 @@ pub(super) struct DevicePanel {
     offline_for: Option<Duration>,
     /// Model, firmware and power, as the device reports them.
     details: String,
-    /// #### one donation, the higher rate: on a public pool, the miner's
+    /// On a public pool, the miner's
     /// effective Pickaxe donation and their own Pickaxe's credit.
     donation: Option<String>,
     /// The make and model asic-rs read while the device was online.
@@ -146,15 +141,15 @@ pub(super) struct DevicePanel {
     controls: Arc<Mutex<Option<DeviceControls>>>,
     page: Page,
     reply: Arc<Mutex<Option<String>>>,
-    /// #### PR #42: the action a refused login held back, sent again once
+    /// The action a refused login held back, sent again once
     /// the owner enters the device's login (`l`).
     retry: Arc<Mutex<Option<Retry>>>,
-    /// #### PR #42: the device's pools, once read on request.
+    /// The device's pools, once read on request.
     pools: Arc<Mutex<Option<Result<DevicePools, String>>>>,
-    /// #### PR #42: where devices reach this server (place, SV2, address),
+    /// Where devices reach this server (place, SV2, address),
     /// to mark it in a device's pools and to point a device back at it.
     server_urls: Vec<(Place, bool, String)>,
-    /// #### PR #42: a login in use but not saved yet; it is saved after the
+    /// A login in use but not saved yet; it is saved after the
     /// next action the device accepts.
     unsaved_login: Arc<Mutex<Option<(String, String)>>>,
 }
@@ -163,29 +158,29 @@ pub(super) struct DevicePanel {
 enum Page {
     Menu,
     Confirm(DeviceAction),
-    /// #### PR #42: the fan: `a` for automatic, or a speed typed then Enter.
+    /// The fan: `a` for automatic, or a speed typed then Enter.
     Fan(String),
-    /// #### PR #42: the power: a mode by its number, or watts typed then
+    /// The power: a mode by its number, or watts typed then
     /// Enter.
     Power(String),
-    /// #### PR #42: the device's own login.
+    /// The device's own login.
     Login(LoginForm),
-    /// #### PR #42: the device's pools.
+    /// The device's pools.
     Pools,
-    /// #### PR #42: a new first pool, typed.
+    /// A new first pool, typed.
     PoolForm(PoolForm),
-    /// #### PR #42: the pools a change would leave, for confirmation.
+    /// The pools a change would leave, for confirmation.
     PoolConfirm(PoolPlan),
 }
 
-/// #### PR #42: what a refused login held back, sent again after `l`.
+/// What a refused login held back, sent again after `l`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Retry {
     Action(DeviceAction),
     Pools(PoolPlan),
 }
 
-/// #### PR #42: the pool typed on the pool page: address, worker and
+/// The pool typed on the pool page: address, worker and
 /// password (shown as dots).
 #[derive(Clone, PartialEq, Eq)]
 struct PoolForm {
@@ -221,7 +216,7 @@ impl PoolForm {
     }
 }
 
-/// #### PR #42: the login typed on the login page. Its `Debug` output and the
+/// The login typed on the login page. Its `Debug` output and the
 /// screen never show the password.
 #[derive(Clone, PartialEq, Eq)]
 struct LoginForm {
@@ -258,7 +253,7 @@ impl LoginForm {
 /// The longest username or password the login page takes.
 const MAX_LOGIN: usize = 64;
 
-/// #### PR #42: one entry of the panel's menu.
+/// One entry of the panel's menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Item {
     Action(DeviceAction),
@@ -336,14 +331,14 @@ impl DevicePanel {
         panel
     }
 
-    /// #### one donation, the higher rate: the miner's effective donation
+    /// The miner's effective donation
     /// and their own Pickaxe's credit, shown under the details.
     pub(super) fn set_donation(&mut self, effective_bps: Option<u16>, own_bps: Option<u16>) {
         self.donation = super::telemetry::donation_text(effective_bps, own_bps)
             .map(|text| text.replace(" · own ", " · own Pickaxe "));
     }
 
-    /// #### PR #42: the panel for a row of `stratum-v2 watch`, which reads
+    /// The panel for a row of `stratum-v2 watch`, which reads
     /// the address from the server's owner-only devices file.
     pub(super) fn for_line(
         label: String,
@@ -431,7 +426,7 @@ impl DevicePanel {
                 Page::Menu
             }
             (Page::Confirm(_), _) => Page::Menu,
-            // #### PR #42: the fan and power pages. A value is checked
+            // The fan and power pages. A value is checked
             // against what the device accepts, then confirmed like any action.
             (Page::Fan(_) | Page::Power(_), KeyCode::Esc) => Page::Menu,
             (Page::Fan(input), KeyCode::Char('a') | KeyCode::Char('A')) if input.is_empty() => {
@@ -484,7 +479,7 @@ impl DevicePanel {
                 input.pop();
                 Page::Power(input)
             }
-            // #### PR #42: the device's login.
+            // The device's login.
             (Page::Menu, KeyCode::Char('l') | KeyCode::Char('L'))
                 if self.login_shape() != Some(LoginShape::None) && self.login_shape().is_some() =>
             {
@@ -510,7 +505,7 @@ impl DevicePanel {
                 self.log_in(form, firmware, fleet);
                 Page::Menu
             }
-            // #### PR #42: the pool pages.
+            // The pool pages.
             (Page::Pools, KeyCode::Esc) => Page::Menu,
             (Page::Pools, KeyCode::Char('r') | KeyCode::Char('R')) => {
                 self.read_pools(fleet);
@@ -578,7 +573,7 @@ impl DevicePanel {
         false
     }
 
-    /// #### PR #42: the login this device's firmware asks for, once the
+    /// The login this device's firmware asks for, once the
     /// panel offers actions for it.
     fn login_shape(&self) -> Option<LoginShape> {
         match self.offer() {
@@ -587,7 +582,6 @@ impl DevicePanel {
         }
     }
 
-    /// #### PR #42
     /// What: tries a login the owner typed. It is used at once: the device
     /// is identified again with it, and an action a refused login held back
     /// is sent again. It is saved (owner-only) once the device accepts it:
@@ -669,7 +663,7 @@ impl DevicePanel {
         });
     }
 
-    // #### PR #42: pools
+    // Pools
     // What: the pool pages read the device's pools on request, put a typed
     // pool (or this server, `h`) first and keep the others as backups, and
     // write the result only after a confirmation that says what changes.
@@ -922,9 +916,8 @@ impl DevicePanel {
         text.push_str("\ny  Yes, change the pools · any other key  No\n");
         text
     }
-    // #### end PR #42 ####
 
-    /// #### PR #42: the menu: the one-shot actions, then the fan and power
+    /// The menu: the one-shot actions, then the fan and power
     /// settings the device offers.
     fn items(&self) -> Vec<Item> {
         match self.offer() {
@@ -952,7 +945,6 @@ impl DevicePanel {
         }
     }
 
-    /// #### PR #42
     /// What: whether the device that answers at an offline row's last
     /// address is not confirmed as the row's device. It is confirmed when it
     /// identifies as the make and model the row reported while online, or,
@@ -992,7 +984,7 @@ impl DevicePanel {
         self.set_reply(format!("Sending: {}…", action.label()));
         let reply = Arc::clone(&self.reply);
         let fleet = Arc::clone(fleet);
-        // #### PR #42: a refused login holds the action back for `l`; a login
+        // A refused login holds the action back for `l`; a login
         // not saved yet is saved once an action goes through.
         let retry = Arc::clone(&self.retry);
         let unsaved = Arc::clone(&self.unsaved_login);
@@ -1120,7 +1112,7 @@ impl DevicePanel {
                             text.push_str(&format!("{}  {name}\n", index + 1));
                         }
                     }
-                    // #### PR #42: the fan and power pages.
+                    // The fan and power pages.
                     Page::Fan(input) => {
                         let range = found.fan.unwrap_or(FanRange { min: 0, max: 100 });
                         text.push_str(&format!(
@@ -1141,7 +1133,7 @@ impl DevicePanel {
                          {input}_\n\nEsc  Back\n",
                         self.label
                     )),
-                    // #### PR #42: the pool pages.
+                    // The pool pages.
                     Page::Pools => text.push_str(&self.pools_text()),
                     Page::PoolForm(form) => {
                         let cursor = |field: usize| if form.field == field { "_" } else { "" };
@@ -1159,7 +1151,7 @@ impl DevicePanel {
                         ));
                     }
                     Page::PoolConfirm(plan) => text.push_str(&self.confirm_pools_text(plan)),
-                    // #### PR #42: the login page never shows the password.
+                    // The login page never shows the password.
                     Page::Login(form) => {
                         text.push_str(&format!("Login for {}\n", self.label));
                         text.push_str(match &found.firmware {
@@ -1189,7 +1181,7 @@ impl DevicePanel {
                         );
                     }
                 }
-                // #### PR #42: the login, for firmwares that have one.
+                // The login, for firmwares that have one.
                 if self.page == Page::Menu
                     && login_shape(found.firmware.as_deref()) != LoginShape::None
                 {
@@ -1275,7 +1267,6 @@ fn span(duration: Duration) -> String {
     }
 }
 
-/// #### PR #42
 /// What: the line shown for a sent action: the device's reply, or why it was
 /// not done, with every address taken out and at most `REPLY_CHARS`
 /// characters of it.
@@ -1285,7 +1276,7 @@ fn span(duration: Duration) -> String {
 /// hold one. The panel never shows an address.
 /// Look here if: an address shows on the Device panel, or a reply is cut
 /// short or reads oddly.
-/// #### PR #42: the menu of an identified device.
+/// The menu of an identified device.
 fn items_of(found: &DeviceControls) -> Vec<Item> {
     let mut items: Vec<Item> = found.actions.iter().copied().map(Item::Action).collect();
     if found.fan.is_some() {
@@ -1300,7 +1291,7 @@ fn items_of(found: &DeviceControls) -> Vec<Item> {
     items
 }
 
-/// #### PR #42: how a pool's username is shown: its worker part, never a
+/// How a pool's username is shown: its worker part, never a
 /// payout address.
 fn who(user: &str) -> String {
     match worker_name(user) {
@@ -1310,7 +1301,7 @@ fn who(user: &str) -> String {
     }
 }
 
-/// #### PR #42: saves a login that was in use but unsaved, once the device
+/// Saves a login that was in use but unsaved, once the device
 /// accepted an action with it; the note for the reply.
 fn save_unsaved(
     fleet: &Fleet,
@@ -1330,7 +1321,7 @@ fn save_unsaved(
     }
 }
 
-/// #### PR #42: the confirmation question for an action.
+/// The confirmation question for an action.
 fn question(action: DeviceAction, worker: &str) -> String {
     match action {
         DeviceAction::FanAuto => format!("Set the fan of {worker} to automatic?"),
@@ -1343,7 +1334,7 @@ fn question(action: DeviceAction, worker: &str) -> String {
     }
 }
 
-/// #### PR #42: the fan speed typed on the fan page, within what the device
+/// The fan speed typed on the fan page, within what the device
 /// accepts.
 fn fan_choice(input: &str, range: Option<FanRange>) -> Result<DeviceAction, String> {
     let range = range.ok_or_else(|| "This device offers no fan setting.".to_owned())?;
@@ -1358,7 +1349,7 @@ fn fan_choice(input: &str, range: Option<FanRange>) -> Result<DeviceAction, Stri
     }
 }
 
-/// #### PR #42: the power limit typed on the power page.
+/// The power limit typed on the power page.
 fn watts_choice(input: &str) -> Result<DeviceAction, String> {
     match input.parse::<u32>() {
         Ok(watts) if (1..=MAX_WATTS).contains(&watts) => Ok(DeviceAction::PowerWatts(watts)),
@@ -1517,7 +1508,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     // What: Enter (or c) on the workers page opens the panel for the
     // highlighted row, with that device's address, not for the top row;
     // Ctrl+C and the other pages do not open it.
@@ -1644,7 +1634,6 @@ mod tests {
         assert_eq!(panel.offline_for, Some(Duration::from_secs(5)));
     }
 
-    // #### PR #42
     // What: the highlight stays on its device when that device goes offline
     // and the rows re-sort, and when it comes back; it goes to the top row
     // only when its device's row is gone.
@@ -1686,7 +1675,6 @@ mod tests {
         assert_eq!(selection.index(), None);
     }
 
-    // #### PR #42
     // What: an offline row opens with the address its device last connected
     // from, shows how long it has been offline, and never shows the address;
     // a row without a local address, or on a shared or unsettled one,
@@ -1754,7 +1742,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     // What: an offline row offers actions when the device answering at its
     // last address identifies as the make and model the row reported, at
     // any age; never when it identifies as another; and, when they cannot
@@ -1829,7 +1816,6 @@ mod tests {
         assert_eq!(online.actions().len(), 2);
     }
 
-    // #### PR #42
     // What: the pool pages: the device's pools with this server marked and
     // no payout address shown; a new pool needs its port and a confirmation
     // that says what changes; `h` puts this server first with the worker the
@@ -1974,7 +1960,6 @@ mod tests {
         assert!(screen(&panel).contains("Pools: not done. Only devices on the local network"));
     }
 
-    // #### PR #42
     // What: the login page: offered for firmwares with a login, prefilled
     // with the default username, the password shown as dots and never in
     // Debug output, and a login the device does not take saves nothing.
@@ -2046,7 +2031,6 @@ mod tests {
         assert_eq!(panel.page, Page::Menu);
     }
 
-    // #### PR #42
     // What: the fan and power pages: a choice, a value within what the
     // device accepts, and a confirmation before anything is sent.
     // Look here if: handle_key, fan_choice, watts_choice or question changes.
@@ -2132,7 +2116,7 @@ mod tests {
             .is_some_and(|reply| reply.starts_with("Sending")));
     }
 
-    // #### PR #42 (moved from command.rs, where it tested the controls page)
+    // (moved from command.rs, where it tested the controls page)
     // What: an action needs a choice and a confirmation; the reply of a sent
     // action shows on the panel.
     // Look here if: DevicePanel::handle_key or send changes.
@@ -2193,7 +2177,6 @@ mod tests {
         assert!(panel.handle_key(key(KeyCode::Esc), &fleet));
     }
 
-    // #### PR #42
     // What: a device's reply or error never shows an address: reqwest's
     // " for url (…)" part is dropped, and IPv4 and IPv6 addresses, with or
     // without brackets or a port, are hidden; ordinary replies stay as they
@@ -2258,7 +2241,6 @@ mod tests {
         assert!(long.ends_with('…'));
     }
 
-    // #### PR #42
     // What: the panel names the network class, never the address, and
     // offline times read plainly.
     // Look here if: network_class or span changes.

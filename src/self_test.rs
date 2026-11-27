@@ -114,7 +114,7 @@ fn build_reference_shaped_template(
         )
     })
 }
-// #### PR #32: the self-test checks T2 winners
+// The self-test checks T2 winners
 // What: a T2 engine (the portable wgpu engine, CUDA and HIP T2) returns the
 // signature nonce and `tail_j` separately; the candidate is
 // `(nonce << 16) | tail_j`, and `tail_j` tokens move from the reward back to

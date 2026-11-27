@@ -1,4 +1,4 @@
-//! #### PR #53: BCH P2Pool as a dependency Pickaxe manages, as Gupaxx does
+//! BCH P2Pool as a dependency Pickaxe manages, as Gupaxx does
 //! for Monero's P2Pool (docs/p2pool.md). Pickaxe installs the node binary
 //! from P2Pool's own releases, writes its configuration from Pickaxe's node
 //! and payout, runs it as a child process, restarts it when it exits and

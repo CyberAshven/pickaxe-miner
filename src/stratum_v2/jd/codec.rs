@@ -1,4 +1,3 @@
-//! #### PR #42
 //! Coinbase outputs as Job Declaration carries them: a CompactSize count,
 //! then each output's value (8 bytes, little-endian), CompactSize script
 //! length and script.
@@ -114,7 +113,6 @@ fn write_compact_size(value: u64, out: &mut Vec<u8>) {
 mod tests {
     use super::*;
 
-    // #### PR #42
     // What: outputs survive a round trip; a non-minimal count, trailing
     // bytes, a truncated script, a value over the money supply and a count
     // larger than the bytes allow are refused.

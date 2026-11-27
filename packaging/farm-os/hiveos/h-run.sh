@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# #### PR #42: HiveOS starts the miner with this. `pickaxe farm-os mine` maps
+# HiveOS starts the miner with this. `pickaxe farm-os mine` maps
 # the flight sheet's fields to Pickaxe's own flags (src/farm_os.rs).
 # shellcheck disable=SC2154 # CUSTOM_* come from h-manifest.conf.
 set -o pipefail

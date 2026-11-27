@@ -1,4 +1,3 @@
-//! #### PR #42, merge-mining v2
 //! The server's merge-mining hub: the token set jobs carry, the claim
 //! worker's proofs and their journal.
 //!
@@ -55,7 +54,7 @@ pub struct ProvenWin {
     pub height: u32,
 }
 
-/// #### merge-mining v2: the claim broadcast delay
+/// The claim broadcast delay
 /// What: how long after a win its claim may be broadcast, drawn per claim
 /// at random from `min..=max` seconds (5 to 60 by default; `0-0` for none).
 /// Why: a claim broadcast the moment a share is found ties the claim to the
@@ -120,15 +119,15 @@ pub struct TokenHub {
     won: Mutex<VecDeque<(Hash, Hash)>>,
     /// Why token claims are off, after a journal failure.
     off: Mutex<Option<String>>,
-    /// #### merge-mining v2: tSAFA's vaults and claims, when a deployment
+    /// TSAFA's vaults and claims, when a deployment
     /// file was given.
     safa: Option<SafaVaults>,
-    /// #### merge-mining v2: one writer of the proof journal at a time (the
+    /// One writer of the proof journal at a time (the
     /// claim worker adds proofs, the tSAFA claimer moves their states).
     journal: Mutex<()>,
 }
 
-// #### merge-mining v2: tSAFA's threads
+// TSAFA's threads
 // What: with a deployment file, the hub merge-mines one tSAFA thread per
 // job. A thread is minable at a height when Fulcrum lists its vault, its
 // state is older than the height, that state is not already won here and
@@ -160,7 +159,7 @@ struct SafaVaults {
 /// Vaults jobs carried that the hub remembers.
 const MINED_VAULTS: usize = 64;
 
-/// #### merge-mining v2: what the tSAFA claimer did, for the dashboard
+/// What the tSAFA claimer did, for the dashboard
 /// (never an address or a script).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClaimCounts {
@@ -208,7 +207,7 @@ pub fn bits_for_difficulty(difficulty: u64) -> Result<u32, String> {
     Ok((size << 24) | mant)
 }
 
-/// #### PR #42: the share difficulty of a compact target, the inverse of
+/// The share difficulty of a compact target, the inverse of
 /// `bits_for_difficulty`, for display.
 pub fn difficulty_for_bits(bits: u32) -> f64 {
     let mantissa = f64::from(bits & 0x007f_ffff);
@@ -221,7 +220,7 @@ pub fn difficulty_for_bits(bits: u32) -> f64 {
 }
 
 impl TokenHub {
-    // #### PR #42: the Chipnet test token
+    // The Chipnet test token
     // What: a hub that merge-mines the test token, its state anchored to a
     // simulated baton at `target_bits`: a synthetic lock hash and a state
     // hash that each proven win moves.
@@ -281,7 +280,7 @@ impl TokenHub {
         self.set.read().ok().and_then(|set| set.clone())
     }
 
-    // #### merge-mining v2: tSAFA, from its deployment file
+    // TSAFA, from its deployment file
     // What: a hub that merge-mines tSAFA's threads (see `SafaVaults`) and
     // claims its wins through Fulcrum (`safa_tick`). Chipnet only.
     // Why: tSAFA is a test token; only an explicit deployment file starts
@@ -445,7 +444,7 @@ impl TokenHub {
         }
     }
 
-    // #### merge-mining v2: the tSAFA claimer
+    // The tSAFA claimer
     // What: one round of claims: Fulcrum's vaults (jobs follow them), the
     // tip, then each tSAFA row of the journal moves on: a proven win past
     // its `broadcast_after`, once the chain has reached its coinbase height
@@ -539,7 +538,7 @@ impl TokenHub {
                 fresh = true;
             }
         }
-        // #### merge-mining v2: a won tSAFA state is claimed once; the next
+        // A won tSAFA state is claimed once; the next
         // jobs mine another thread.
         if let (true, Some(safa)) = (fresh, &self.safa) {
             safa.generation.fetch_add(1, Ordering::AcqRel);
@@ -577,7 +576,7 @@ impl TokenHub {
                         "category": hex::encode(item.token.category),
                         "state": hex::encode(item.leaf.state_hash),
                         "format": "AuxProof v2",
-                        // #### merge-mining v2: the split preimage the
+                        // The split preimage the
                         // claim reveals, when the leaf carries one.
                         "split": (!item.split.is_none())
                             .then(|| hex::encode(item.split.preimage())),
@@ -587,7 +586,7 @@ impl TokenHub {
                         "proof": hex::encode(bytes),
                         "status": "proven",
                     });
-                    // #### merge-mining v2: what a tSAFA claim needs: the
+                    // What a tSAFA claim needs: the
                     // vault's state, the payout and the split's scripts.
                     if let Some(safa) = self
                         .safa
@@ -686,7 +685,7 @@ fn read_journal(
     }
 }
 
-// #### merge-mining v2: won states survive a restart
+// Won states survive a restart
 // What: a tSAFA hub opens with the states of its journal's live rows
 // (proven or broadcast) already won, newest last, so its jobs skip them
 // (and the thread rule walks past their threads).
@@ -867,7 +866,7 @@ fn advance_claim(
                 }
                 return false;
             }
-            // #### merge-mining v2: a sent claim not yet in the vault
+            // A sent claim not yet in the vault
             // What: while the thread's vault is still in the claim's state
             // but not the claim's output, the claim is asked for first: in
             // the mempool or a block, it is left alone. Gone, it is sent
@@ -932,7 +931,7 @@ fn states(win: &TokenWin) -> Vec<(Hash, Hash)> {
         .collect()
 }
 
-// #### merge-mining v2: each entry's own payout
+// Each entry's own payout
 // What: each won entry is claimed with the payout its own leaf binds, as
 // `BchTemplate::aux_job` chose it (`payout::leaf_terms`): a split token's
 // or a token without split support's, which differ in a job that pays the
@@ -950,7 +949,7 @@ fn claim_payouts(network: MiningNetwork, win: &TokenWin) -> Vec<(u16, Vec<u8>)> 
             Some(miner) => (miner.to_vec(), miner.to_vec()),
             None => return Vec::new(),
         },
-        // #### merge-mining v2: on a public pool, the miner's own leaves
+        // On a public pool, the miner's own leaves
         // (`payout::leaf_terms` with the operator).
         None => {
             let Ok(scripts) = payout::scripts(network, &win.miner, win.operator.as_deref()) else {
@@ -976,7 +975,6 @@ fn claim_payouts(network: MiningNetwork, win: &TokenWin) -> Vec<(u16, Vec<u8>)> 
 mod tests {
     use super::*;
 
-    // #### merge-mining v2
     // What: in a mixed set (a split token and one without split support)
     // each won entry is claimed with the payout its own leaf binds: in a
     // miner job, in the plain token's donation work and in BCH donation
@@ -1054,7 +1052,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     // What: the test token's difficulty becomes a compact target that
     // expands back; the test token is refused off Chipnet; a new hub carries
     // a one-token set and reports it changed once.
@@ -1070,7 +1067,7 @@ mod tests {
             // Compact form keeps the top 16 to 23 bits.
             assert!(got <= expected, "{difficulty}");
             assert!(&expected - &got <= &expected >> 15u32, "{difficulty}");
-            // #### PR #42: and the difficulty shown comes back from it.
+            // And the difficulty shown comes back from it.
             let shown = difficulty_for_bits(bits);
             let wanted = difficulty as f64;
             assert!(
@@ -1180,7 +1177,7 @@ mod tests {
         (hub, path)
     }
 
-    // #### merge-mining v2: tSAFA's threads
+    // TSAFA's threads
     // What: a thread is minable when its state is older than the height,
     // its vault pays a claim and its state was not won here; each job's
     // leaf mines the thread HASH256(payout_hash ‖ height) picks, or the
@@ -1315,7 +1312,7 @@ mod tests {
         saved["entries"].as_array().cloned().unwrap()
     }
 
-    // #### merge-mining v2: won states survive a restart
+    // Won states survive a restart
     // What: a hub reopened on a journal with a proven tSAFA row skips that
     // state: the thread rule walks past its thread, and a share of it is
     // not proven again; a stale or failed row does not count.
@@ -1377,7 +1374,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    // #### merge-mining v2: a tSAFA win, from share to claim
+    // A tSAFA win, from share to claim
     // What: a win of the hub's tSAFA job is proven and journaled with its
     // vault state, payout and split scripts; once its delay has passed and
     // the chain reaches its coinbase height, the claimer builds the claim
@@ -1446,7 +1443,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    // #### merge-mining v2: tSAFA claims that cannot go
+    // TSAFA claims that cannot go
     // What: a win whose thread another claim moved first is "stale"; a
     // broadcast the server refuses is retried later, not at once, and a
     // sent claim whose vault moved to another claim's state is "stale".
@@ -1505,7 +1502,7 @@ mod tests {
         }
     }
 
-    // #### merge-mining v2: a sent claim not yet in the vault
+    // A sent claim not yet in the vault
     // What: a sent claim the chain still knows is left alone however many
     // rounds the vault shows its old state (also after a trade moved the
     // vault); once the chain no longer knows it, a trade's new outpoint
@@ -1570,7 +1567,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    // #### merge-mining v2: the claim broadcast delay
+    // The claim broadcast delay
     #[test]
     fn claim_delays_parse_and_stay_in_range() {
         assert_eq!(ClaimDelay::default(), ClaimDelay { min: 5, max: 60 });

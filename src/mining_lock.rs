@@ -15,7 +15,7 @@ fn gpu_lock_path() -> Result<PathBuf, String> {
     Ok(root.join("Pickaxe").join("gpu.lock"))
 }
 
-/// #### PR #65: owner-pot recovery has one location per OS account and pot
+/// Owner-pot recovery has one location per OS account and pot
 /// identity, even when the same key is selected from another config folder.
 pub(crate) fn pot_journal_path(name: &std::ffi::OsStr) -> Result<PathBuf, String> {
     Ok(electric_journal_dir()?.join(name))
@@ -48,7 +48,7 @@ fn try_lock(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 
-// #### PR #52: current processes mark themselves
+// Current processes mark themselves
 // What: every Pickaxe process holds `run/<pid>.lock` beside the GPU lock
 // while it runs (`register_process`). On Windows a GPU miner refuses to
 // start only beside a `pickaxe_miner.exe` without that live mark: a v0.0.1
@@ -214,7 +214,6 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
-    // #### PR #52
     #[test]
     fn a_marked_process_is_told_from_an_unmarked_one() {
         let mark = register_process().expect("process mark");

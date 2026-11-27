@@ -1,6 +1,5 @@
 # Pickaxe on HiveOS, mmpOS and RaveOS
 
-#### PR #42
 
 Each release has a custom-miner package for three farm systems:
 

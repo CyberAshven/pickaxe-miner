@@ -1,4 +1,4 @@
-//! #### PR #65: return to profiles with the session's pot mode, shares and
+//! Return to profiles with the session's pot mode, shares and
 //! separate donation values. Existing wallet keys and journals stay in place.
 use super::*;
 

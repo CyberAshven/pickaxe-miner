@@ -1,11 +1,10 @@
 # BCH P2Pool, managed by Pickaxe
 
-#### PR #53
 
 Status: `pickaxe p2pool` installs the BCH P2Pool node from P2Pool's own
 releases, keeps it updated, runs it with your node and payout, restarts it
 when it exits, and shows a light for P2Pool and one for the BCH node.
-#### PR #61: the ASIC setup's P2Pool choice is ready: join a P2Pool node, or
+#### The ASIC setup's P2Pool choice is ready: join a P2Pool node, or
 have Pickaxe run your own P2Pool node with your BCH node and mine at it,
 with its lights on the ASIC dashboard (see "Mining at it from the ASIC
 setup").
@@ -154,7 +153,6 @@ an update, `a` automatic updates on or off, `r` restart P2Pool, `q` quit.
 
 ## Mining at it from the ASIC setup
 
-#### PR #61
 
 ASIC mining, **Join a pool**, then **Pool type: P2Pool**. The choices are a
 list; Pickaxe never moves devices from one to another by itself.
@@ -326,7 +324,6 @@ On the operator's Windows PC, in a scratch configuration folder:
 
 ## Live check: your own P2Pool node from the ASIC server (2026-10-19)
 
-#### PR #61
 
 On the operator's Windows PC, with a release build of this branch and the
 P2Pool already installed above: `stratum-v2 serve --network chipnet
@@ -385,7 +382,7 @@ and a real ASIC at it.
 - `p2pool::launch`: standalone and linked configurations (listen address,
   peers, wait), the check made once per start, and the supervisor keeping
   the peers P2Pool dialed out to.
-- #### PR #61: `tui::tests::an_asic_can_join_a_pool_or_a_p2pool_node` and
+- `tui::tests::an_asic_can_join_a_pool_or_a_p2pool_node` and
   `tui::tests::an_asic_can_mine_at_its_own_p2pool_node` (the rows, Start's
   checks, the serve command for each, the profile and its kept choices), and
   `stratum_v2::command::tests::the_dashboard_lights_show_the_pool_and_the_node`.

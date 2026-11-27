@@ -1,6 +1,5 @@
 # Browser T2 validation
 
-#### PR #22
 
 The portable engine reuses each BCH Schnorr signature across 65,536 token-amount
 pairs, as the CUDA T2 engine does. Shared Rust checks transaction eligibility,
@@ -84,7 +83,6 @@ follow-up and must not be attributed to that transport change.
 
 ## Browser network refresh overlap
 
-#### PR #22
 
 The browser previously awaited three sequential server calls before issuing
 more GPU work at every refresh. It now starts the next read while an existing

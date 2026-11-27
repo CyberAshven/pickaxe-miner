@@ -1,4 +1,3 @@
-//! #### PR #42, merge-mining v2
 //! The aux tree: one slot per token category, domain-separated SHA-256.
 //!
 //! - Slot: `u32le(SHA256(0x02 ‖ salt_le4 ‖ category32)[0..4]) mod 2^h`.
@@ -194,7 +193,6 @@ pub fn fold(leaf: Hash, slot: u32, branch: &[Hash]) -> Hash {
 mod tests {
     use super::*;
 
-    // #### merge-mining v2
     #[test]
     fn slot_and_node_follow_the_formulas() {
         let category = [0x5a; 32];
@@ -219,7 +217,6 @@ mod tests {
         assert_eq!(node(&[1; 32], &[2; 32]), sha256(&pair));
     }
 
-    // #### merge-mining v2
     #[test]
     fn layout_prefers_the_smallest_height_then_salt_and_is_deterministic() {
         let one = [[1; 32]];
@@ -256,7 +253,6 @@ mod tests {
         assert_eq!(AuxTree::build(&empty, &[]).root(), [0; 32]);
     }
 
-    // #### merge-mining v2
     #[test]
     fn layouts_refuse_duplicates_too_many_and_no_room() {
         assert_eq!(
@@ -270,7 +266,6 @@ mod tests {
         assert_eq!(Layout::search(&many[..3], 1), Err(LayoutError::NoSalt));
     }
 
-    // #### merge-mining v2
     #[test]
     fn every_branch_folds_to_the_root() {
         for count in [1u8, 2, 3, 5, 8] {

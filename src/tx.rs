@@ -73,7 +73,6 @@ pub fn cashaddr_to_p2pkh_locking(address: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// #### PR #40
 /// The locking script a BCH coinbase output pays for a CashAddr: P2PKH (q),
 /// or P2SH (p), such as a multisig, with a 20-byte or a 32-byte hash. Token
 /// kinds of both decode to the same scripts. A coinbase can pay any of
@@ -141,8 +140,8 @@ pub fn cashaddr_to_coinbase_locking(address: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-/// #### PR #40: encodes any CashAddr version and hash, for tests of P2SH
-/// payouts and of where P2SH is refused. #### PR #51: also the ELECTRIC
+/// Encodes any CashAddr version and hash, for tests of P2SH
+/// payouts and of where P2SH is refused. Also the ELECTRIC
 /// fee pot's P2SH32 address.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn cashaddr_with_version(
@@ -157,7 +156,7 @@ pub(crate) fn cashaddr_with_version(
     cashaddr_with_prefix(prefix, version, hash)
 }
 
-/// #### PR #61: the BCH P2Pool share address of a P2PKH CashAddr: the same
+/// The BCH P2Pool share address of a P2PKH CashAddr: the same
 /// key under the share chain's prefix (`p2pool:` for `bitcoincash:`,
 /// `tp2pool:` for `bchtest:`), as P2Pool's `bch-share-address` prints it.
 /// A miner names it with `p2p=` when the node has no share address of its own.
@@ -1398,7 +1397,7 @@ mod tests {
         assert!(set_payout_value_sats(&mut candidate, 886).is_err());
     }
 
-    // #### PR #61: the vectors P2Pool v0.0.1-alpha's `bch-share-address`
+    // The vectors P2Pool v0.0.1-alpha's `bch-share-address`
     // prints for the two donation addresses; a P2SH address has no share key.
     #[test]
     fn p2pool_share_addresses_match_p2pools_own_encoding() {

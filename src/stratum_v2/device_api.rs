@@ -1,4 +1,3 @@
-//! #### PR #38
 //! Read-only device reports for the workers table: what the miner itself says
 //! about its hash rate, temperature and fans. Only standard read commands are
 //! sent (CGMiner API `summary` and `estats` on port 4028; Bitaxe's
@@ -6,7 +5,6 @@
 //! on the local network are asked, and each device gets one time limit for
 //! its whole report so a slow one cannot hold up the others or shutdown.
 //!
-//! #### PR #40
 //! This is now the extension to asic-rs (see `fleet`): it answers for devices
 //! asic-rs cannot identify, supplies the windowed CGMiner rate and Avalon's
 //! hottest reading, and sends Canaan's work-level commands.
@@ -155,7 +153,6 @@ fn http_complete(reply: &[u8]) -> bool {
         .is_some_and(|length| reply.len() >= end + 4 + length)
 }
 
-/// #### PR #40
 /// What the user may ask a device to do from the workers page, each only
 /// after confirming it there. asic-rs sends what it supports for the device's
 /// make and firmware (see `fleet`); Pickaxe's own commands follow Canaan's
@@ -170,13 +167,13 @@ pub enum DeviceAction {
     LocateOff,
     LowerPower,
     RaisePower,
-    /// #### PR #42: the fan follows the device's temperature.
+    /// The fan follows the device's temperature.
     FanAuto,
-    /// #### PR #42: the fan at a fixed percentage.
+    /// The fan at a fixed percentage.
     FanPercent(u8),
-    /// #### PR #42: a power limit in watts.
+    /// A power limit in watts.
     PowerWatts(u32),
-    /// #### PR #42: a named power mode.
+    /// A named power mode.
     PowerMode(PowerMode),
 }
 
@@ -202,7 +199,7 @@ impl DeviceAction {
     }
 }
 
-/// #### PR #42: a power mode, for firmwares that name their modes: asic-rs's
+/// A power mode, for firmwares that name their modes: asic-rs's
 /// mining modes (stock Antminer, WhatsMiner) and Canaan's work modes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PowerMode {
@@ -273,7 +270,6 @@ const NOT_OFFERED: &str = "this device does not offer that action";
 /// The answer when an Avalon's pools need its web login and none is known.
 pub const WEB_LOGIN_NEEDED: &str = "its web login is needed to change its pools";
 
-/// #### PR #42
 /// What: whether a device's or asic-rs's error says the login was refused,
 /// so the Device panel asks for the device's own login.
 /// Why: firmwares word it differently: HTTP 401 or 403, Canaan's "username
@@ -302,7 +298,7 @@ pub fn login_refused(text: &str) -> bool {
 }
 const NO_ANSWER: &str = "the device did not answer";
 
-// #### PR #42: fan and power settings through Pickaxe's own commands
+// Fan and power settings through Pickaxe's own commands
 // What: Canaan's `ascset 0,fan-spd` (automatic is -1, otherwise 15% to 100%)
 // and `ascset 0,workmode,set` for Avalons, and AxeOS's settings for a Bitaxe
 // or NerdAxe (`PATCH /api/system`). An Avalon's `ascset 0,help` lists which
@@ -453,9 +449,8 @@ fn axeos_request(
         _ => Err(format!("the device answered {status}")),
     }
 }
-// #### end PR #42 ####
 
-// #### PR #42: pools, through Pickaxe's own commands
+// Pools, through Pickaxe's own commands
 // What: an Avalon's pools are read with CGMiner's `pools` and written with
 // Canaan's `setpool` (its web login, slots 0 to 2, then a reboot); a Bitaxe's
 // are read from and written to AxeOS (`stratumURL`, `fallbackStratumURL` and
@@ -747,7 +742,6 @@ pub(super) fn axeos_set_pools_at(web: SocketAddr, pools: &[PoolEntry]) -> Result
     axeos_request(web, "POST", "/api/system/restart", None)?;
     Ok("pools set; the device restarts to use them".into())
 }
-// #### end PR #42 ####
 
 /// One CGMiner `ascset` command for the first device; `Ok` carries the
 /// device's message when it reports success or information.
@@ -883,7 +877,6 @@ pub fn parse_cgminer(reply: &str) -> Option<DeviceReport> {
                     .map(str::to_owned)
                     .or_else(|| bracket_number(text, "Fan1").map(|rpm| format!("{rpm:.0} rpm")));
             }
-            // #### PR #40
             // Avalon Nano power: `PS[0 0 0 4 2756 126 330]` holds the input
             // voltage (27.56 V) fifth and the watts sixth. Larger Avalons put
             // watts fifth, which is what asic-rs reads for every model.
@@ -1063,7 +1056,6 @@ pub(super) mod tests {
         }
     }
 
-    // #### PR #42
     // What: a pool plan puts the new pool first, keeps each old one once as
     // a backup, and lists what does not fit; pool addresses need a port and
     // a stratum scheme.
@@ -1112,7 +1104,6 @@ pub(super) mod tests {
         }
     }
 
-    // #### PR #42
     // What: an Avalon's pools are read in priority order; `setpool` is sent
     // slot by slot with the web login and the device is rebooted; the
     // success message, which repeats the worker and its password, is never
@@ -1169,7 +1160,6 @@ pub(super) mod tests {
         assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
     }
 
-    // #### PR #42
     // What: a Bitaxe's pool and fallback are read from AxeOS, written as
     // host, port, user and password (the old primary becomes the fallback in
     // a plan), and the device is restarted.
@@ -1208,7 +1198,6 @@ pub(super) mod tests {
             .starts_with("POST /api/system/restart HTTP/1.0\r\n"));
     }
 
-    // #### PR #42
     // What: the ways firmwares and asic-rs say a login was refused, and
     // errors that are not refusals.
     // Look here if: login_refused changes.
@@ -1235,7 +1224,6 @@ pub(super) mod tests {
         }
     }
 
-    // #### PR #42
     // What: Pickaxe's own Avalon fan and work-mode commands, byte for byte;
     // a fan speed outside 15% to 100% refused before anything is sent; the
     // device's own refusal shown; an Avalon's help listing read; watts never
@@ -1290,7 +1278,6 @@ pub(super) mod tests {
         );
     }
 
-    // #### PR #42
     // What: a Bitaxe's fan is set under the key its firmware reads
     // (`manualFanSpeed` from AxeOS v2.12, `fanspeed` before), automatic needs
     // no reading first, and AxeOS's 401 for a request from outside its local

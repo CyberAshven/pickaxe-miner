@@ -1,4 +1,3 @@
-//! #### PR #32
 //! GPU rigs that mine as one. The coordinator (`mine --rigs-listen`) is the
 //! miner's own normal process: it keeps the job source, payout, claim journal
 //! and broadcast, and shares its current PHOTON job with rigs over Pickaxe's
@@ -29,14 +28,13 @@ pub struct RigSummary {
     pub rejected: u64,
     /// One line per connected rig, in connection order.
     pub rigs: Vec<RigLine>,
-    /// #### PR #40: a public GPU pool, where each rig names its payout.
+    /// A public GPU pool, where each rig names its payout.
     pub public: bool,
-    /// #### PR #42: a public pool's fee in hundredths of a percent of each
+    /// A public pool's fee in hundredths of a percent of each
     /// rig's mining time.
     pub fee_bps: Option<u16>,
 }
 
-/// #### PR #40
 /// The command each rig runs to join, once per address other computers can
 /// reach this coordinator at (its local network and Tailscale addresses for
 /// a wildcard listener). A public pool's rigs add their own payout, which a
@@ -85,14 +83,14 @@ pub struct RigLine {
     pub rate: f64,
     pub winners: u64,
     pub connected_secs: u64,
-    /// #### PR #42: how long since the rig was last heard, its Pickaxe
+    /// How long since the rig was last heard, its Pickaxe
     /// version, and each of its GPUs as its last report gave them.
     pub last_seen_secs: u64,
     pub version: String,
     pub devices: Vec<RigGpu>,
 }
 
-// #### PR #42: per-rig GPU health
+// Per-rig GPU health
 // What: each rig's report carries its GPUs: name, engine and device, rate,
 // temperature, fan, power, status, winners, rejected winners and the last
 // error. The coordinator keeps at most 64 per rig, cleaned, and shows them
@@ -104,7 +102,7 @@ pub struct RigLine {
 /// The most GPUs a coordinator keeps for one rig.
 pub const MAX_RIG_GPUS: usize = 64;
 
-/// #### PR #42: whether `text` is a coordinator key a rig can pin (a farm
+/// Whether `text` is a coordinator key a rig can pin (a farm
 /// system passes it as the pool's password).
 pub fn is_coordinator_key(text: &str) -> bool {
     #[cfg(feature = "stratum-v2")]
@@ -118,7 +116,7 @@ pub fn is_coordinator_key(text: &str) -> bool {
     }
 }
 
-/// #### PR #42: a rig's status file, every two seconds, for `mine watch`
+/// A rig's status file, every two seconds, for `mine watch`
 /// and the farm systems: its role, version and start, whether it mines,
 /// its coordinator, its rate and winners sent, and each GPU; never a key or
 /// a payout.
@@ -176,7 +174,7 @@ pub struct RigGpu {
     pub name: String,
     pub backend: String,
     pub device: u32,
-    /// #### PR #42: the GPU's PCI bus, which farm systems match GPUs by.
+    /// The GPU's PCI bus, which farm systems match GPUs by.
     pub pci_bus: Option<u32>,
     pub rate: f64,
     pub temperature_c: Option<f64>,
@@ -258,9 +256,7 @@ impl RigGpu {
         }
     }
 }
-// #### end PR #42 ####
 
-/// #### PR #32
 /// A rig's rate since its previous report, from the candidates its GPUs have
 /// tried in all: only the main miner's runtime fills `current_rate`, so a rig
 /// measures its own. The first report has no window and says 0.
@@ -303,7 +299,7 @@ struct WireJob {
     payout_address: String,
     source_identity: String,
     generation_id: u64,
-    /// #### PR #32: the coordinator's token donation; a rig never mines
+    /// The coordinator's token donation; a rig never mines
     /// below the token's minimum, whatever it is sent.
     #[serde(default)]
     donation: Option<crate::donation::TokenDonation>,
@@ -431,15 +427,14 @@ impl TryFrom<WireWinner> for VerifiedWinner {
 struct RigHello {
     name: String,
     gpus: usize,
-    /// #### PR #32: the rig's own payout, which a public GPU pool pays.
+    /// The rig's own payout, which a public GPU pool pays.
     #[serde(default)]
     payout: Option<String>,
-    /// #### PR #42: the rig's Pickaxe version.
+    /// The rig's Pickaxe version.
     #[serde(default)]
     version: Option<String>,
 }
 
-/// #### PR #32
 /// A public GPU pool: each rig mines for the payout it sends, and the
 /// operator's fee is that share of each rig's mining time (after the
 /// donation, which every rig applies itself), paying the fee address. A
@@ -506,7 +501,7 @@ struct RigStats {
     rate: f64,
     gpus: usize,
     winners: u64,
-    /// #### PR #42: each GPU's health; older rigs send none, and older
+    /// Each GPU's health; older rigs send none, and older
     /// coordinators ignore it.
     devices: Vec<RigGpu>,
 }
@@ -614,7 +609,7 @@ mod net {
     const JOB: u8 = 2;
     const WINNER: u8 = 3;
     const STATS: u8 = 4;
-    /// #### PR #32: room for a farm; each rig is one coordinator thread.
+    /// Room for a farm; each rig is one coordinator thread.
     const MAX_RIGS: usize = 1024;
     const MAX_QUEUED_WINNERS: usize = 16;
     /// A rig reports every few seconds; this long without a word closes it.
@@ -674,7 +669,7 @@ mod net {
         job: Option<MiningJob>,
         /// The coordinator's token donation, sent with every job.
         donation: Option<crate::donation::TokenDonation>,
-        /// #### PR #32: a public GPU pool.
+        /// A public GPU pool.
         public: Option<PublicRigs>,
         version: u64,
         winners: VecDeque<VerifiedWinner>,
@@ -690,7 +685,7 @@ mod net {
         rate: f64,
         winners: u64,
         since: Instant,
-        /// #### PR #42: when the rig was last heard, its version and GPUs.
+        /// When the rig was last heard, its version and GPUs.
         heard: Instant,
         version: String,
         devices: Vec<RigGpu>,
@@ -736,7 +731,7 @@ mod net {
                         while !stop.load(Ordering::Relaxed) {
                             match listener.accept() {
                                 Ok((stream, _)) => {
-                                    // #### PR #32: on Windows an accepted
+                                    // On Windows an accepted
                                     // socket inherits the listener's
                                     // non-blocking mode, and the handshake's
                                     // first read would fail at once whenever
@@ -785,7 +780,6 @@ mod net {
             lock(&self.state).job.as_ref().map(|job| job.generation_id)
         }
 
-        /// #### PR #32
         /// Makes this coordinator a public GPU pool: each rig mines for the
         /// payout it sends, and the operator's fee is that share of its time.
         pub fn set_public(&self, public: Option<PublicRigs>) {
@@ -794,7 +788,6 @@ mod net {
             state.version = state.version.wrapping_add(1);
         }
 
-        /// #### PR #32
         /// The token donation rigs mine with; a change is sent to every rig
         /// at once, with the current job.
         pub fn set_donation(&self, donation: crate::donation::TokenDonation) {
@@ -895,7 +888,7 @@ mod net {
         };
         let mut sent = 0u64;
         let mut heard = Instant::now();
-        // #### PR #32: a public pool's rig, its payout and its fee clock.
+        // A public pool's rig, its payout and its fee clock.
         let mut payout: Option<String> = None;
         let mut clock = FeeClock::new(rand::random());
         let mut sent_window = false;
@@ -947,7 +940,7 @@ mod net {
                         let hello: RigHello =
                             serde_json::from_slice(&bytes).map_err(|_| "malformed rig hello")?;
                         let mut state = lock(&state);
-                        // #### PR #32: a public pool pays the rig's own
+                        // A public pool pays the rig's own
                         // payout, so a rig without a valid one is turned away.
                         if state.public.is_some() {
                             let network = state
@@ -1007,7 +1000,7 @@ mod net {
                         if let Some(row) = state.rigs.get_mut(&id) {
                             row.winners = row.winners.saturating_add(1);
                         }
-                        // #### PR #32: a public pool checks a winner against
+                        // A public pool checks a winner against
                         // the exact job this rig was given, then claims it for
                         // that job's payout, under the shared generation.
                         let job = match (&state.public, &payout, &state.job) {
@@ -1124,7 +1117,7 @@ mod net {
         if devices.is_empty() {
             return Err("no GPU selected for mining".into());
         }
-        // #### PR #32: `--rig-name`, or the computer's name (a Linux
+        // `--rig-name`, or the computer's name (a Linux
         // service has no HOSTNAME variable, so /etc/hostname too).
         let name = name
             .map(str::to_owned)
@@ -1160,11 +1153,11 @@ mod net {
         }
         .with_extension("rig-winners.json");
         let mut pending = super::pending::PendingWinners::open(&pending_path)?;
-        // #### PR #42: each GPU's temperature, fan and power for the reports.
+        // Each GPU's temperature, fan and power for the reports.
         let mut telemetry = crate::telemetry::LiveTelemetrySampler::start(
             crate::telemetry::telemetry_sources(gpus),
         );
-        // #### PR #42: the rig's status file, for `mine watch` and farm
+        // The rig's status file, for `mine watch` and farm
         // systems, every two seconds and while it waits.
         let started = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1189,7 +1182,7 @@ mod net {
         while !stop.load(Ordering::Relaxed) {
             match connect_first(&coordinators) {
                 Ok((index, (mut sender, mut receiver))) => {
-                    // #### PR #53: GPU searches are session-local; saved proofs are rechecked on reconnect.
+                    // GPU searches are session-local; saved proofs are rechecked on reconnect.
                     let mut search: Option<SearchHandle> = None;
                     let mut current_job = None;
                     let mut storage_failed = false;
@@ -1243,7 +1236,7 @@ mod net {
                                     sender.send(frame(WINNER, &WireWinner::from(&winner))?)?;
                                 }
                                 current_job = Some(job.clone());
-                                // #### PR #32: the coordinator's donation,
+                                // The coordinator's donation,
                                 // never below the token's minimum.
                                 let policy =
                                     MiningToken::Photon.fee_policy_at(job.network, donation);
@@ -1394,7 +1387,7 @@ mod net {
         Ok(())
     }
 
-    /// #### PR #42: each GPU's report: the search's stats matched by engine
+    /// Each GPU's report: the search's stats matched by engine
     /// and device, the telemetry in `gpus`' order.
     pub(super) fn rig_gpus(
         gpus: &[GpuDevice],
@@ -1569,7 +1562,7 @@ mod tests {
         assert_eq!(kind, 2);
         let wire: WireJob = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(wire, WireJob::from(&job));
-        // #### PR #32: a raised donation reaches the rig with the same job.
+        // A raised donation reaches the rig with the same job.
         let raised = crate::donation::TokenDonation::from_bps(600);
         hub.set_donation(raised);
         let resent = loop {
@@ -1628,7 +1621,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    // #### PR #53: reused coordinator IDs must not resume or forward the old GPU work.
+    // Reused coordinator IDs must not resume or forward the old GPU work.
     #[cfg(all(feature = "stratum-v2", feature = "rust-t2"))]
     #[test]
     #[ignore = "requires an idle CUDA GPU; synthetic jobs, no chain connection"]
@@ -1736,7 +1729,7 @@ mod tests {
         result.unwrap();
     }
 
-    /// #### PR #42: a GPU report with every field set.
+    /// A GPU report with every field set.
     fn healthy_gpu(name: &str) -> RigGpu {
         RigGpu {
             name: name.into(),
@@ -1754,7 +1747,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     // What: a rig's report carries each GPU and reads back unchanged; a
     // report from an older rig (no devices) still parses, and an older
     // coordinator's reading of a new report ignores the devices.
@@ -1784,7 +1776,6 @@ mod tests {
         assert_eq!(older.gpus, 1);
     }
 
-    // #### PR #42
     // What: a report from 64 GPUs with the longest names and errors still
     // fits one rig frame (B064K), and cleaning caps text, drops control
     // characters and out-of-range readings.
@@ -1838,7 +1829,6 @@ mod tests {
         );
     }
 
-    // #### PR #42
     // What: each GPU's report takes the search's stats of the same engine
     // and device (in any order) and the telemetry at its own position; a GPU
     // the search does not list reads as stopped; a hot GPU, one with
@@ -1908,7 +1898,6 @@ mod tests {
         assert_eq!(healthy_gpu("ok").health(), "61°C · fan 40% · 120 W");
     }
 
-    // #### PR #42
     // What: the coordinator keeps a rig's version and the GPUs of its last
     // report, at most 64, cleaned, and when it was last heard.
     // Look here if: the coordinator's STATS or HELLO handling changes.
@@ -1976,7 +1965,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    // #### PR #42
     // What: a rig's status names its role, version, start, state,
     // coordinator (and whether it is the backup), rate, winners sent and
     // each GPU with its bus and readings; it never holds a key or a payout.
@@ -2006,7 +1994,6 @@ mod tests {
         );
     }
 
-    // #### PR #32
     #[test]
     fn a_rig_measures_its_rate_between_reports() {
         let mut window = None;
@@ -2020,7 +2007,6 @@ mod tests {
         assert_eq!(window_rate(&mut window, 10), 0.0);
     }
 
-    // #### PR #32
     #[test]
     fn a_public_pool_rig_mines_for_itself_and_the_operator_in_its_fee_window() {
         let job = sample_job();
@@ -2152,7 +2138,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    // #### PR #40
     #[test]
     fn the_coordinator_shows_the_command_each_rig_runs() {
         use crate::reach::{Interfaces, Place};

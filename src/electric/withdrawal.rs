@@ -1,4 +1,4 @@
-//! #### PR #65: owner-pot Max/send. Quotes reserve the pot in the mining
+//! Owner-pot Max/send. Quotes reserve the pot in the mining
 //! supervisor; approved exact transactions survive shutdown and lost replies.
 use super::{build_refund, recovery::RecoveryKey, Coin, Pot};
 use serde::{Deserialize, Serialize};
@@ -241,7 +241,7 @@ struct Record {
     binding: String,
     plan: Plan,
     next: usize,
-    /// #### PR #65: an attempt to broadcast transfer `next` ended without a
+    /// An attempt to broadcast transfer `next` ended without a
     /// definite refusal (a lost reply, a dropped connection), so the network
     /// may hold it; a later fee refusal elsewhere must not abandon it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -262,7 +262,7 @@ pub(super) trait Link {
     fn spender(&mut self, coin: &Coin) -> Result<Spender, String>;
 }
 
-/// #### PR #65: a poll that did not finish. Quote, journal and pending-send
+/// A poll that did not finish. Quote, journal and pending-send
 /// failures keep the source connection; `source` marks a failed read or
 /// broadcast, after which the supervisor may reconnect.
 #[derive(Debug)]
@@ -293,7 +293,7 @@ fn source(message: String) -> PollError {
     }
 }
 
-/// #### PR #65: a broadcast refused for paying too little. The transaction's
+/// A broadcast refused for paying too little. The transaction's
 /// fee is fixed, so retrying the same bytes cannot succeed.
 /// A server's own refusal of a transaction, as opposed to a broadcast whose
 /// outcome is unknown (a lost reply or a dropped connection).
@@ -403,7 +403,7 @@ impl Transfers {
             .is_some_and(|r| r.next < r.plan.raw.len())
     }
 
-    /// #### PR #65: keeps the exact approved send beside its journal, named
+    /// Keeps the exact approved send beside its journal, named
     /// by its hash like a superseded claim, and releases the pot.
     fn archive(&mut self, label: &str) -> Result<(), String> {
         let record = self.approved.as_ref().ok_or("no approved Max/send")?;
@@ -444,7 +444,7 @@ impl Transfers {
         Ok(spender)
     }
 
-    /// #### PR #65: checks the next approved transfer, broadcasting it when
+    /// Checks the next approved transfer, broadcasting it when
     /// `broadcast` allows. The send is abandoned only when it cannot confirm:
     /// its input was spent by another confirmed transaction, or the network
     /// refused its fee while no transfer left to send is in the mempool or chain.
@@ -577,7 +577,7 @@ impl Transfers {
         )))
     }
 
-    /// #### PR #65: settles an approved send without broadcasting, for a
+    /// Settles an approved send without broadcasting, for a
     /// refund: records propagated transfers and abandons one that can no
     /// longer confirm. Returns what happened when the send ended.
     pub fn settle(&mut self, link: &mut dyn Link) -> Result<Option<String>, PollError> {
@@ -612,7 +612,7 @@ impl Transfers {
                     let key = key.ok_or("owner key unavailable")?;
                     let coins = link.coins().map_err(source)?;
                     let relay_fee = link.relay_fee().map_err(source)?;
-                    // #### PR #65: an unconfirmed coin can vanish with its
+                    // An unconfirmed coin can vanish with its
                     // parent, so quotes spend confirmed coins only.
                     let waiting: u64 = coins
                         .iter()
@@ -819,7 +819,6 @@ mod tests {
         published: Vec<String>,
         attempts: Vec<String>,
         lost_reply: bool,
-        // #### PR #65
         unconfirmed: Vec<Coin>,
         tip: u32,
         spenders: Vec<(Coin, Spender)>,
@@ -1009,7 +1008,6 @@ mod tests {
         assert!(lock(&lock_path).is_ok());
     }
 
-    // #### PR #65
     fn poll(
         txs: &mut Transfers,
         f: &Fixture,

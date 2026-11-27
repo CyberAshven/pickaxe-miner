@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""#### PR #42: the farm-OS packages, built from a fake Linux archive with a
+""" the farm-OS packages, built from a fake Linux archive with a
 stub pickaxe that records its arguments. Standard library only; the shell
 scripts run with bash, the RaveOS scripts with a fake ravinos module."""
 

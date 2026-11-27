@@ -1,4 +1,3 @@
-//! #### PR #42, merge-mining v2
 //! Merge mining for BCH covenant tokens, the v2 common format (no token
 //! exists yet).
 //!

@@ -1,4 +1,3 @@
-//! #### PR #42
 //! The pool side of Job Declaration: the shared `Declarator` (the token book,
 //! the pool's rules, the transactions clients provided and the node check)
 //! and one client's JD session: SetupConnection, AllocateMiningJobToken, and
@@ -146,7 +145,7 @@ fn node_error(error: &str) -> Option<(i64, String)> {
     ))
 }
 
-// #### PR #42: the tip-race mapping
+// The tip-race mapping
 // What: a node refusal that only means the client and the pool are on
 // different tips (no longer the tip, an unknown parent, a coinbase height or
 // time for another tip) is answered stale-chain-tip; any other is
@@ -249,7 +248,7 @@ pub struct Declarator {
     validator: Option<Arc<dyn Validator>>,
     slots: Slots,
     next_owner: AtomicU64,
-    /// #### PR #56: the rollable bytes a work-selection channel is granted;
+    /// The rollable bytes a work-selection channel is granted;
     /// tests lower it to stand in for a pool that grants fewer.
     grant: AtomicUsize,
 }
@@ -283,13 +282,13 @@ impl Declarator {
         }
     }
 
-    /// #### PR #56: the rollable bytes a client's work-selection channel
+    /// The rollable bytes a client's work-selection channel
     /// gets: 16.
     pub fn grant(&self) -> usize {
         self.grant.load(Ordering::Relaxed)
     }
 
-    /// #### PR #56: grants `bytes` instead, as a pool such as BCH P2Pool
+    /// Grants `bytes` instead, as a pool such as BCH P2Pool
     /// grants 8.
     #[cfg(test)]
     pub fn set_grant(&self, bytes: usize) {
@@ -463,7 +462,7 @@ impl DeclaratorSession {
             common::MESSAGE_TYPE_SETUP_CONNECTION if !self.set_up => {
                 let setup: SetupConnection = binary_sv2::from_bytes(frame.payload())
                     .map_err(|_| "malformed setup message")?;
-                // #### PR #42: bit 0 (DECLARE_TX_DATA) asks for
+                // Bit 0 (DECLARE_TX_DATA) asks for
                 // Full-Template, bit 0 clear for Coinbase-only; a mode the
                 // pool does not accept is refused as SRI refuses it.
                 let full = setup.flags & 1 != 0;
@@ -526,7 +525,7 @@ impl DeclaratorSession {
                 self.allocations.push_back(answer_at);
                 responses.not_before = (answer_at > now).then_some(answer_at);
                 let identity = request.user_identifier.as_utf8_or_hex();
-                // #### merge-mining v2: the miner's own donation choice
+                // The miner's own donation choice
                 // (`,donation=`) can raise the token's donation rate; the
                 // pool's fee stays as it is.
                 let login =
@@ -540,7 +539,7 @@ impl DeclaratorSession {
                             }
                         })?;
                 let payout = login.payout;
-                // #### one donation, the higher rate: the token carries the
+                // The token carries the
                 // higher of the pool's rate and the login's, so a custom
                 // job's coinbase pays at least that (no work rotates under
                 // Job Declaration, and nothing is credited).
@@ -626,7 +625,7 @@ impl DeclaratorSession {
                     nbits: push.nbits,
                     version: push.version,
                 };
-                // #### PR #42: PushSolution
+                // PushSolution
                 // What: the newest of the connection's last 8 declared jobs
                 // whose coinbase, rebuilt with the pushed extranonce, gives
                 // a header on its parent and bits that meets the block
@@ -867,7 +866,7 @@ impl DeclaratorSession {
         Ok(responses)
     }
 
-    // #### PR #42: DeclareMiningJob (Full-Template)
+    // DeclareMiningJob (Full-Template)
     // What: at most 30 declarations a minute; the token must be one this
     // connection allocated and not yet declared; the coinbase must parse
     // (one null input, a script of at most 100 bytes beginning with the
@@ -888,7 +887,7 @@ impl DeclaratorSession {
         now: Instant,
         responses: &mut JdResponses,
     ) -> Result<(), Refusal> {
-        // #### 0x4C54: the pages sent ahead of this declaration, if any.
+        // The pages sent ahead of this declaration, if any.
         let paged = self
             .paging
             .take()
@@ -941,7 +940,7 @@ impl DeclaratorSession {
             .map_err(|_| Refusal::new("invalid-mining-job-token", "unknown payout"))?;
         rule.check(&shape.outputs)
             .map_err(|why| Refusal::new("invalid-coinbase-tx", why))?;
-        // #### merge-mining v2: the declared token leaves (see
+        // The declared token leaves (see
         // `policy::check_leaves`).
         super::policy::check_leaves(
             declarator.network,
@@ -953,7 +952,7 @@ impl DeclaratorSession {
         if request.wtxid_list.len() > MAX_DECLARED_TXS {
             return Err(Refusal::new("invalid-job", "more than 65,535 transactions"));
         }
-        // #### 0x4C54: the declared list is every page, then this one's.
+        // The declared list is every page, then this one's.
         let mut txids = match paged {
             Some(Some(txids)) => txids,
             Some(None) => {
@@ -1078,7 +1077,7 @@ impl DeclaratorSession {
         now: Instant,
         responses: &mut JdResponses,
     ) -> Result<(), Refusal> {
-        // #### 0x4C54: a paged declaration is asked by U32 position in the
+        // A paged declaration is asked by U32 position in the
         // whole list (ProvideMissingTransactions.Positions), up to 65,535 a
         // round; the client sends what fits one frame.
         let paged = pending.txids.len() > SEQ_MAX;
@@ -1128,7 +1127,7 @@ impl DeclaratorSession {
         Ok(())
     }
 
-    // #### PR #42: the validator cadence
+    // The validator cadence
     // What: a declaration with every transaction is checked by the pool's
     // node (validateblocktemplate, the whole block without proof of work):
     // the connection's first declaration on each parent, then at most once
@@ -1231,7 +1230,7 @@ fn terms(declarator: &Declarator) -> Result<(u16, u16), String> {
     Ok((u16::from(donation), fee))
 }
 
-/// #### 0x4C54: the most transactions a paged declaration may list: as many
+/// The most transactions a paged declaration may list: as many
 /// of BCH's smallest (65-byte) transactions as a block of `size_limit` bytes
 /// holds, at most `MAX_PAGED_TXS`, never fewer than one SEQ0_64K list.
 fn paged_limit(size_limit: Option<u64>) -> usize {

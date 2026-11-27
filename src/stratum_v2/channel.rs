@@ -1,4 +1,3 @@
-//! #### PR #38
 //! BCH work ownership and share checking, independent of socket/firmware.
 //! Version rolling is restricted to BIP320's general-purpose bits. Devices
 //! receive disjoint coinbases and cannot alter payouts or template tx order.
@@ -30,14 +29,12 @@ pub const VERSION_ROLLING_MASK: u32 = 0x1fff_e000;
 const MAX_SHARES_PER_JOB: usize = 16_384;
 pub const DEVICE_EXTRANONCE_SIZE: usize = 8;
 pub const MAX_ACTIVE_JOBS: usize = 8;
-// #### PR #38
 // Vardiff (SRI's reference rules) aims every device at about 20 shares a
 // minute, one every three seconds, from a 1 TH/s miner to a 1 PH/s one:
 // steady rate estimates for little LAN traffic. The floor keeps a silent or
 // misreported device from asking for a near-zero difficulty.
 pub const SHARES_PER_MINUTE: f32 = 20.0;
 const MIN_HASHRATE: f32 = 1.0e6;
-// #### PR #40
 // Calmer than SRI's rules alone, as ckpool and P2Poolv2 are: decide only on
 // enough evidence (72 shares, four minutes, or a silent minute), and ignore
 // changes under a quarter, which are share luck rather than a different device.
@@ -45,7 +42,7 @@ const VARDIFF_SHARES: u32 = 72;
 const VARDIFF_SECONDS: u64 = 240;
 const VARDIFF_SILENT_SECONDS: u64 = 60;
 const VARDIFF_HYSTERESIS: f64 = 1.25;
-/// #### PR #42: the share-target floor for merge-mined tokens is at most
+/// The share-target floor for merge-mined tokens is at most
 /// this many times easier than vardiff's target: about 5 shares a second at
 /// vardiff's 20 a minute.
 pub const TOKEN_FLOOR_CAP: u8 = 15;
@@ -61,11 +58,11 @@ pub struct Channel {
     pub kind: ChannelKind,
     pub target: Hash,
     /// The session salt and the channel id (16 bytes), or under Job
-    /// Declaration the channel's lane (4 bytes, #### PR #42).
+    /// Declaration the channel's lane (4 bytes).
     pub extranonce_prefix: Vec<u8>,
     network: MiningNetwork,
     payout: String,
-    /// #### PR #40: a public pool operator's fee address.
+    /// A public pool operator's fee address.
     operator: Option<String>,
     job: Option<Job>,
     previous: VecDeque<Job>,
@@ -77,35 +74,35 @@ pub struct Channel {
     /// told: this one, made easier while the block target is easier, and
     /// never easier than the device's maximum.
     desired: Hash,
-    /// #### PR #42: the target vardiff counts shares at and estimates from:
+    /// The target vardiff counts shares at and estimates from:
     /// `target` without the merge-mined token floor (the same while no
     /// token is merge-mined).
     vardiff_target: Hash,
     vardiff: VardiffState,
     /// Vardiff's latest hash rate estimate, the baseline for its next check.
     hashrate: f32,
-    /// #### PR #42: a Job Declaration client's channel: it mines only the
+    /// A Job Declaration client's channel: it mines only the
     /// custom jobs the client sets, with 16 rollable extranonce bytes.
     pub custom_only: bool,
-    /// #### PR #56: the extranonce bytes each share rolls: 8 from a device,
+    /// The extranonce bytes each share rolls: 8 from a device,
     /// 4 on a compact lane, what the pool grants a Job Declaration client.
     rolled: usize,
-    /// #### PR #56: a Job Declaration lane in the compact layout.
+    /// A Job Declaration lane in the compact layout.
     compact: bool,
-    /// #### merge-mining v2: a public pool miner's donation rate, which
+    /// A public pool miner's donation rate, which
     /// every job of theirs keeps. #### one donation, the higher rate: the
     /// connection's rate (`MiningSession::public_donation`).
     donation: Option<crate::donation::bch::BchDonation>,
-    /// #### one donation, the higher rate: a public pool channel paying the
+    /// A public pool channel paying the
     /// Pickaxe donation's own address: every job is donation work.
     pays_donation: bool,
-    /// #### merge-mining v2: why token merge mining was refused for the
+    /// Why token merge mining was refused for the
     /// latest job (the own-root check), until the server takes it for the
     /// dashboard.
     token_refusal: Option<&'static str>,
 }
 
-/// #### PR #42: whose job a channel mines.
+/// Whose job a channel mines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobKind {
     /// The pool's own, from its template.
@@ -124,10 +121,10 @@ pub struct Job {
     pub parts: CoinbaseParts,
     pub target: Hash,
     pub payout: BchPayout,
-    /// #### PR #42: this job's merge-mining (its leaves bind this job's
+    /// This job's merge-mining (its leaves bind this job's
     /// payout), or `None` while no token is merge-mined.
     pub aux: Option<Arc<AuxJob>>,
-    /// #### PR #42: the pool's job or a client's custom job.
+    /// The pool's job or a client's custom job.
     pub kind: JobKind,
 }
 
@@ -149,27 +146,26 @@ pub struct ValidatedShare {
     pub block: bool,
     pub share_target: Hash,
     pub payout: BchPayout,
-    /// #### PR #40: who the block pays, which a public pool's journal records.
+    /// Who the block pays, which a public pool's journal records.
     pub miner: String,
     pub operator: Option<String>,
-    /// #### PR #42: the header's hash, computed once by the check.
+    /// The header's hash, computed once by the check.
     pub hash: Hash,
-    /// #### PR #42: the job's merge-mining, the indices of the entries this
+    /// The job's merge-mining, the indices of the entries this
     /// share wins (those whose target the hash meets), and the coinbase's
     /// merkle branch, which is filled only when it wins one.
     pub aux: Option<Arc<AuxJob>>,
     pub token_wins: Vec<u16>,
     pub merkle_path: Vec<Hash>,
-    /// #### PR #42: the share as the pool takes it, on a Job Declaration
+    /// The share as the pool takes it, on a Job Declaration
     /// job.
     pub forward: Option<super::jd::ForwardShare>,
-    /// #### PR #42: a header-shaped token's win (SAFA): its hash is
+    /// A header-shaped token's win (SAFA): its hash is
     /// positive and at or below the token's target.
     pub header_win: bool,
 }
 
 impl ValidatedShare {
-    /// #### PR #42
     /// What a share that wins merge-mined tokens hands on, or `None` for a
     /// share that wins none (the usual case, which costs nothing).
     pub fn token_win(&self) -> Option<TokenWin> {
@@ -192,7 +188,6 @@ impl ValidatedShare {
     }
 }
 
-/// #### PR #42
 /// A share that wins merge-mined tokens, with everything their proofs need.
 /// It is built only for a win, and the server hands it on without waiting
 /// for disk or network. No `Debug`: it names the miner's payout address.
@@ -212,7 +207,7 @@ pub struct TokenWin {
     pub payout: BchPayout,
     pub miner: String,
     pub operator: Option<String>,
-    /// #### PR #42: a Job Declaration job's plan, whose miner script the
+    /// A Job Declaration job's plan, whose miner script the
     /// leaves bind instead (`JdPlan::token_payout`).
     pub declared: Option<Arc<super::jd::plan::JdPlan>>,
 }
@@ -275,10 +270,10 @@ impl Channel {
         })
     }
 
-    /// #### PR #42: a Job Declaration client's local channel: its
+    /// A Job Declaration client's local channel: its
     /// extranonce prefix is its lane, unique across the server, so that the
     /// job id, the lane and the device's 8 bytes fit the 16 the pool lets
-    /// the client roll. #### PR #56: in the compact layout the lane is its
+    /// the client roll. In the compact layout the lane is its
     /// low 2 bytes and the device rolls 4, to fit a pool's 8.
     pub fn set_lane(&mut self, lane: u32, compact: bool) {
         self.compact = compact;
@@ -291,15 +286,15 @@ impl Channel {
         }
     }
 
-    /// #### PR #42: a Job Declaration client's channel at this pool, which
+    /// A Job Declaration client's channel at this pool, which
     /// rolls the `rolled` bytes granted to it.
     pub fn set_custom_only(&mut self, rolled: usize) {
         self.custom_only = true;
         self.rolled = rolled;
     }
 
-    /// #### PR #42: the rollable extranonce bytes this channel's shares
-    /// carry: 8 from a device (#### PR #56: 4 on a compact lane), 16 from a
+    /// The rollable extranonce bytes this channel's shares
+    /// carry: 8 from a device (4 on a compact lane), 16 from a
     /// Job Declaration client.
     pub fn rollable(&self) -> usize {
         self.rolled
@@ -321,7 +316,7 @@ impl Channel {
         template: Arc<BchTemplate>,
         mut payout: BchPayout,
     ) -> Result<&Job, String> {
-        // #### merge-mining v2: the miner's own donation choice
+        // The miner's own donation choice
         // What: a public pool miner's rate is on every job of theirs: the
         // coinbase's reward part, the token donation slot and (with the
         // session's work allocation at the same rate, see
@@ -336,7 +331,7 @@ impl Channel {
         // first job, see `MiningSession::donation_choice`), the token work
         // flags follow only the BCH work this job keeps: a pool default's
         // token donation or fee work never rides a miner's first job.
-        // #### one donation, the higher rate: a donation channel's jobs are
+        // A donation channel's jobs are
         // all donation work: the coinbase and the token leaves pay the
         // donation whole, and no fee is taken from them.
         if self.pays_donation {
@@ -358,12 +353,11 @@ impl Channel {
         {
             return Err("job identifier already in use".into());
         }
-        // #### PR #38
         // Time rolling overlaps across same-tip refreshes. Commit the job ID
         // before the channel/device extranonce so restarting the firmware's
         // nonce search cannot repeat headers from a retained job. The device
         // cannot overwrite this prefix; its extranonce size stays unchanged.
-        // #### PR #42: the nested extranonce layout
+        // The nested extranonce layout
         // What: under Job Declaration the script carries the pool channel's
         // prefix, then the job id, the plan's pad, this channel's lane and
         // the device's 8 bytes; the job id onwards is what the pool lets
@@ -374,7 +368,7 @@ impl Channel {
         // exactly that shape.
         // Look here if: the pool refuses forwarded shares, or the local
         // devices' coinbases differ from the custom job's.
-        // #### PR #56: a compact plan takes the job id's low 2 bytes (a
+        // A compact plan takes the job id's low 2 bytes (a
         // channel's retained jobs have consecutive ids, so they stay
         // distinct). A lane opened on the other layout cannot carry this
         // plan's jobs: the error ends its connection and the device
@@ -392,7 +386,7 @@ impl Channel {
                 plan.layout().0,
             )
         });
-        // #### PR #42: merge-mined tokens in each job
+        // Merge-mined tokens in each job
         // What: a job built from a template with a token set gets its own
         // merge-mining (`aux`): leaves that bind this job's beneficiary (the
         // miner, or the donation in its work jobs), their tree, and the
@@ -410,12 +404,12 @@ impl Channel {
         let aux = template
             .aux_job(self.network, &self.payout, self.operator.as_deref(), payout)?
             .map(Arc::new);
-        // #### merge-mining v2: under P2Pool the job mines BCH alone (see
+        // Under P2Pool the job mines BCH alone (see
         // `BchTemplate::tokens_refused`).
         if let Some(reason) = template.tokens_refused() {
             self.token_refusal = Some(reason);
         }
-        // #### merge-mining v2: a fresh extranonce per merge-mined job
+        // A fresh extranonce per merge-mined job
         // What: on a standard channel, where this server fills the whole
         // extranonce, a job that commits a token root gets fresh random
         // bytes: the 12 session-salt bytes of its prefix (the channel id
@@ -446,7 +440,6 @@ impl Channel {
         } else {
             extra.extend_from_slice(&self.extranonce_prefix);
         }
-        // #### end PR #42 ####
         let outputs = aux.as_deref().map(|aux| &aux.output);
         let standard_coinbase = template.coinbase_with_aux(
             self.network,
@@ -469,10 +462,10 @@ impl Channel {
             .prefix
             .extend_from_slice(&id.to_le_bytes()[..id_bytes]);
         parts.prefix.extend_from_slice(pad);
-        // #### merge-mining v2: the own-root check (see
+        // The own-root check (see
         // `commitment::check_own_root`): the coinbases devices hash carry
         // this job's commitment as output 0, or the job mines BCH alone.
-        // #### merge-mining v2: and on a public pool, the audit rule (see
+        // And on a public pool, the audit rule (see
         // `disclosure::audit_public`): every leaf pays the miner, or in a
         // work job the donation or the operator.
         let audit = |aux: &AuxJob| -> Result<(), &'static str> {
@@ -520,7 +513,6 @@ impl Channel {
         Ok(self.job.as_ref().unwrap())
     }
 
-    /// #### PR #38
     /// A mempool/time refresh on the same parent does not invalidate work
     /// already in an ASIC pipeline. Retain exact coinbases and tx lists;
     /// a new parent or changed bits still revokes every preceding job.
@@ -542,7 +534,6 @@ impl Channel {
         }
     }
 
-    /// #### PR #42
     /// Installs a Job Declaration client's custom job: `template` is the
     /// header-only template of `BchTemplate::custom`, and `parts` the
     /// client's coinbase around this channel's extranonce prefix and its 16
@@ -593,7 +584,6 @@ impl Channel {
         self.job.as_ref()
     }
 
-    /// #### PR #38
     /// Recomputes the target the device mines at: the desired one, made
     /// easier while the block target is easier (a share that wins a block
     /// must reach the server), never easier than the device's maximum. On
@@ -601,7 +591,7 @@ impl Channel {
     /// on the next normal template, back up; before, the device stayed on
     /// the easy target and flooded shares until it reconnected. Returns
     /// whether the target changed. Vardiff counts afresh when its own target
-    /// changes (#### PR #42: `tokens`, the easiest token target, can make
+    /// changes (`tokens`, the easiest token target, can make
     /// the device's target easier still; see below).
     pub fn settle(&mut self, block: &Hash, tokens: Option<&Hash>, maximum: &Hash) -> bool {
         let mut target = if meets_target(&self.desired, block) {
@@ -612,7 +602,7 @@ impl Channel {
         if !meets_target(&target, maximum) {
             target = *maximum;
         }
-        // #### PR #42: the share-target floor for merge-mined tokens
+        // The share-target floor for merge-mined tokens
         // What: while tokens are merge-mined, the device's target is
         // made easier, up to the easiest token target but never more than
         // TOKEN_FLOOR_CAP (15) times easier than vardiff's target, and never
@@ -645,7 +635,6 @@ impl Channel {
                 };
             }
         }
-        // #### end PR #42 ####
         if target == self.target {
             return false;
         }
@@ -653,12 +642,11 @@ impl Channel {
         true
     }
 
-    /// #### PR #38
     /// Vardiff: once SRI's reference rules see the share rate drift from the
     /// aim, the desired target follows the measured hash rate. Returns the
     /// new target when the device must be told.
     pub fn retarget(&mut self, maximum: &Hash) -> Option<Hash> {
-        // #### PR #42: the share-target floor for merge-mined tokens (see
+        // The share-target floor for merge-mined tokens (see
         // `settle`): a vardiff retarget keeps the floor at the current
         // template's easiest token target.
         let block = self.job.as_ref()?.template.target;
@@ -678,7 +666,7 @@ impl Channel {
             .vardiff
             .try_vardiff(
                 self.hashrate,
-                // #### PR #42: the shares counted are those that meet
+                // The shares counted are those that meet
                 // vardiff's own target, not the token floor's.
                 &Target::from_le_bytes(self.vardiff_target),
                 SHARES_PER_MINUTE,
@@ -749,12 +737,12 @@ impl Channel {
             return Err("invalid-sequence-number");
         }
         self.sequence = Some(share.sequence);
-        // #### PR #42: the template's own version rule (see
+        // The template's own version rule (see
         // `BchTemplate::version_mask`).
         if (share.version ^ job.template.version) & !job.template.version_mask() != 0 {
             return Err("invalid-version");
         }
-        // #### PR #48: wall-clock ntime
+        // Wall-clock ntime
         // What: an own job accepts a timestamp from the template's curtime
         // through one minute past the server's clock. A stale curtime does
         // not shrink that minute.
@@ -769,7 +757,7 @@ impl Channel {
         // server clock is accepted.
         let late = match job.kind {
             JobKind::Own => share.time > now.saturating_add(60),
-            // #### PR #42: a custom job's shares follow the client's start
+            // A custom job's shares follow the client's start
             // time, up to a minute past it or past now.
             JobKind::Custom { ntime_start } => share.time > now.max(ntime_start).saturating_add(60),
         };
@@ -787,7 +775,7 @@ impl Channel {
                 if share.extranonce.len() != self.rollable() {
                     return Err("invalid-extranonce-size");
                 }
-                // #### PR #42: extended shares rebuild from the job's parts
+                // Extended shares rebuild from the job's parts
                 // What: the coinbase is the job's prefix (ending in the job
                 // id), this channel's extranonce prefix, the device's
                 // extranonce and the job's suffix (with any merge-mining
@@ -816,7 +804,7 @@ impl Channel {
             .header(&coinbase, share.version, share.time, share.nonce)
             .map_err(|_| "invalid-ntime")?;
         let hash = double_sha256(&header);
-        // #### PR #42: block suppression
+        // Block suppression
         // What: only BCH block work can be a block; a header-shaped token's
         // job is a win when its hash is positive (byte 31 below 0x80) and
         // at or below the token's target.
@@ -824,7 +812,7 @@ impl Channel {
         // and the draft covenant's signed compare would also pass negative
         // hashes (see `merge::safa::proof_passes`).
         // Look here if: token work is journaled, or a SAFA win is missed.
-        // #### PR #48: on Chipnet, a share more than 20 minutes after the
+        // On Chipnet, a share more than 20 minutes after the
         // parent on normal bits is only a share: the node would refuse its
         // block as bad-diffbits, and saving that block would hold back every
         // later block on the parent (see `BchTemplate::stale_bits`); and
@@ -840,7 +828,6 @@ impl Channel {
             .is_some_and(|token| token.layout == super::template::Layout::Safa)
             && hash[31] & 0x80 == 0
             && meets_target(&hash, &job.template.target);
-        // #### PR #38
         // A job keeps the target it was issued with. After vardiff lowers the
         // difficulty, firmware may apply the new one to work it already holds
         // (cgminer does for new work on the current job), so an older job also
@@ -862,7 +849,7 @@ impl Channel {
             return Err("job-share-limit");
         }
         seen.insert(hash);
-        // #### PR #42: token wins on the share path
+        // Token wins on the share path
         // What: after the duplicate check and the per-job cap, one compare
         // with the job's easiest token target decides whether to look at its
         // entries, which win when the hash meets their target. The
@@ -889,8 +876,7 @@ impl Channel {
         } else {
             job.parts.merkle_path.clone()
         };
-        // #### end PR #42 ####
-        // #### PR #42: shares forwarded to the pool (Job Declaration): the
+        // Shares forwarded to the pool (Job Declaration): the
         // rolled bytes start at the job id, at the end of the job's prefix.
         let forward = job.template.jd_plan().map(|plan| {
             let start = job.parts.prefix.len() - plan.pad.len() - plan.layout().0;
@@ -907,7 +893,7 @@ impl Channel {
         });
         // Vardiff counts shares at the current target only, so work still
         // arriving at an older, easier target cannot inflate its estimate.
-        // #### PR #42: the share-target floor (see `settle`): only shares
+        // The share-target floor (see `settle`): only shares
         // that meet vardiff's own target count, never those that only the
         // token floor accepts.
         if meets_target(&hash, &self.vardiff_target) {
@@ -932,7 +918,6 @@ impl Channel {
         })
     }
 
-    /// #### PR #40
     /// A public pool's operator fee address, set before the first job.
     pub fn set_operator(&mut self, operator: Option<&str>) -> Result<(), String> {
         self.operator = operator
@@ -947,27 +932,27 @@ impl Channel {
         &self.payout
     }
 
-    /// #### merge-mining v2: a public pool miner's donation rate, set before
+    /// A public pool miner's donation rate, set before
     /// the first job (#### one donation, the higher rate: and whenever the
     /// connection's rate changes).
     pub fn set_donation(&mut self, donation: Option<crate::donation::bch::BchDonation>) {
         self.donation = donation;
     }
 
-    /// #### one donation, the higher rate: this public pool channel pays the
+    /// This public pool channel pays the
     /// Pickaxe donation's own address, so its jobs are donation work; set
     /// before the first job.
     pub fn set_pays_donation(&mut self) {
         self.pays_donation = true;
     }
 
-    /// #### one donation, the higher rate: whether this channel's jobs are
+    /// Whether this channel's jobs are
     /// all donation work.
     pub fn pays_donation(&self) -> bool {
         self.pays_donation
     }
 
-    /// #### merge-mining v2: the token floor this channel's device may mine
+    /// The token floor this channel's device may mine
     /// at on `template`: its token set's easiest target, for every device
     /// that mines a root of its own (this server's, or a public pool
     /// miner's). A Job Declaration client's channel at this pool mines the
@@ -979,7 +964,7 @@ impl Channel {
         template.tokens().map(|set| *set.easiest())
     }
 
-    /// #### merge-mining v2: after the own-root check refused the current
+    /// After the own-root check refused the current
     /// job's tokens, settle back to the plain target and give the job that
     /// target too (it was issued at the floor), so a BCH-only job accepts no
     /// token-floor shares. True when the device must be told (SetTarget).
@@ -1003,14 +988,14 @@ impl Channel {
         self.floor_for(&job.template)
     }
 
-    /// #### merge-mining v2: why token merge mining was refused for a job
+    /// Why token merge mining was refused for a job
     /// since the last call, for the dashboard.
     pub fn take_token_refusal(&mut self) -> Option<&'static str> {
         self.token_refusal.take()
     }
 }
 
-/// #### merge-mining v2: the own-root check on both coinbases a job's
+/// The own-root check on both coinbases a job's
 /// devices hash: the standard one, and the extended parts around this
 /// channel's prefix and zeroed rolled bytes.
 fn own_root(
@@ -1028,7 +1013,6 @@ fn own_root(
     check_own_root(&extended, &aux.commitment)
 }
 
-/// #### PR #42
 /// The share-target floor for a device whose vardiff target is `vardiff`:
 /// the easiest token target, but at most `TOKEN_FLOOR_CAP` times easier
 /// than `vardiff`.
@@ -1091,7 +1075,7 @@ mod tests {
             Arc::new(BchTemplate::from_rpc(&rpc_template()).unwrap()),
         )
     }
-    /// #### PR #42: the same on any template, one with tokens too.
+    /// The same on any template, one with tokens too.
     fn channel_on(id: u32, kind: ChannelKind, template: Arc<BchTemplate>) -> Channel {
         let mut channel = Channel::new(
             id,
@@ -1117,7 +1101,6 @@ mod tests {
         }
     }
 
-    // #### PR #48
     // What: a timestamp one minute past the server clock is valid on a
     // template whose curtime is already behind that clock, and one second
     // further, or anything before curtime, is not.
@@ -1145,7 +1128,7 @@ mod tests {
     #[test]
     fn retained_jobs_keep_exact_payouts_across_rate_and_work_rotations() {
         use crate::donation::bch::BchDonation;
-        // #### PR #42: merge-mined tokens in each job
+        // Merge-mined tokens in each job
         // With tokens, each retained job also keeps its own commitment (worth
         // 0, leading): a payout rotation changes what the leaves bind.
         let jobs = [false, true].into_iter().flat_map(|tokens| {
@@ -1216,7 +1199,7 @@ mod tests {
                     None => assert!(!tokens),
                 }
             }
-            // #### merge-mining v2: the donation's rate is in the leaf's
+            // The donation's rate is in the leaf's
             // split, and donation work changes the payout: three roots.
             roots.sort_unstable();
             roots.dedup();
@@ -1587,14 +1570,14 @@ mod tests {
         assert!(channel.check(share(2), 1700000010).is_err());
     }
 
-    /// #### PR #42: the test token's target in these tests, 2^248: about one
+    /// The test token's target in these tests, 2^248: about one
     /// share in 256 wins.
     const TOKEN_BITS: u32 = 0x2001_0000;
-    /// #### merge-mining v2: the test token's synthetic lock and state.
+    /// The test token's synthetic lock and state.
     const LOCK: Hash = [0x22; 32];
     const STATE: Hash = [0x33; 32];
 
-    /// #### PR #42: the test token at target `bits`.
+    /// The test token at target `bits`.
     fn token_set(bits: u32) -> Arc<TokenSet> {
         let state = TokenState::new(LOCK, STATE, bits).unwrap();
         Arc::new(
@@ -1607,7 +1590,7 @@ mod tests {
         )
     }
 
-    /// #### PR #42: a template with three transactions (a two-level
+    /// A template with three transactions (a two-level
     /// coinbase branch) and mainnet-like block difficulty (no test share is
     /// a block), merge-mining `set`.
     fn token_template(set: Arc<TokenSet>) -> Arc<BchTemplate> {
@@ -1621,13 +1604,13 @@ mod tests {
         Arc::new(template)
     }
 
-    /// #### PR #42: a Chipnet job's payout, donation and (with an
+    /// A Chipnet job's payout, donation and (with an
     /// operator) fee scripts.
     fn scripts(miner: &str, operator: Option<&str>) -> Vec<Vec<u8>> {
         super::super::payout::scripts(MiningNetwork::Chipnet, miner, operator).unwrap()
     }
 
-    /// #### PR #42: what the token's covenant sees in the claim of a miner
+    /// What the token's covenant sees in the claim of a miner
     /// job's win: the miner's output.
     fn claim_view(scripts: &[Vec<u8>]) -> ClaimView<'_> {
         ClaimView {
@@ -1636,13 +1619,13 @@ mod tests {
             state_hash: STATE,
             payout: &scripts[0],
             target_bits: TOKEN_BITS,
-            // #### merge-mining v2: 1% of each win to the donation.
+            // 1% of each win to the donation.
             ext: Split::donation(100, &scripts[1]).unwrap().ext(),
             max_aux_height: TEST_TOKEN.max_aux_height,
         }
     }
 
-    /// #### PR #42: submits nonces 0.. on job 1 until a share wins the
+    /// Submits nonces 0.. on job 1 until a share wins the
     /// token, checking that every share before it misses the token's target
     /// and carries no token work. Returns the win and its nonce.
     fn submit_until_win(
@@ -1675,7 +1658,7 @@ mod tests {
         panic!("no share won the token");
     }
 
-    /// #### PR #42: a device extranonce for `kind`'s shares.
+    /// A device extranonce for `kind`'s shares.
     fn device_extranonce(kind: ChannelKind) -> &'static [u8] {
         match kind {
             ChannelKind::Standard => &[],
@@ -1683,7 +1666,7 @@ mod tests {
         }
     }
 
-    // #### PR #42: token wins on the share path
+    // Token wins on the share path
     #[test]
     fn token_win_carries_the_exact_header_coinbase_and_branches() {
         let set = token_set(TOKEN_BITS);
@@ -1730,7 +1713,7 @@ mod tests {
         }
     }
 
-    // #### PR #42: token wins on the share path
+    // Token wins on the share path
     #[test]
     fn shares_without_tokens_have_no_token_work_and_carry_their_hash() {
         for kind in [ChannelKind::Standard, ChannelKind::Extended] {
@@ -1763,7 +1746,7 @@ mod tests {
         }
     }
 
-    // #### merge-mining v2: a block wins a token only by its target
+    // A block wins a token only by its target
     #[test]
     fn a_block_wins_a_token_only_when_it_meets_the_tokens_target() {
         // The easy test template: about half the shares are blocks; the
@@ -1795,7 +1778,7 @@ mod tests {
         assert!(blocks > wins && wins > 0, "{blocks} {wins}");
     }
 
-    // #### PR #42: token wins on the share path
+    // Token wins on the share path
     #[test]
     fn a_duplicate_share_never_yields_a_second_token_win() {
         let set = token_set(TOKEN_BITS);
@@ -1825,7 +1808,7 @@ mod tests {
         }
     }
 
-    // #### merge-mining v2: per-miner roots on a public pool
+    // Per-miner roots on a public pool
     // What: a public pool's channels commit a root of their miner's own: a
     // miner job's leaf pays the miner with the donation's reward share and
     // the coinbase-mode fee in its split; a donation-work job's pays the
@@ -1952,7 +1935,7 @@ mod tests {
         [255; 32]
     }
 
-    // #### merge-mining v2: solo leaves bind the miner or the donation
+    // Solo leaves bind the miner or the donation
     #[test]
     fn solo_donation_work_jobs_bind_the_donation_and_miner_jobs_the_miner() {
         let network = MiningNetwork::Chipnet;
@@ -1981,7 +1964,7 @@ mod tests {
             let entry = &job.aux.as_ref().unwrap().entries[0];
             let leaf = entry.leaf;
             assert_eq!(leaf.payout_hash, double_sha256(beneficiary));
-            // #### merge-mining v2: a miner job's leaf carries the donation's
+            // A miner job's leaf carries the donation's
             // block-reward share (1%) in its split; a donation-work job's,
             // none.
             let split = if policy.donation_work {
@@ -1998,7 +1981,7 @@ mod tests {
         }
     }
 
-    // #### merge-mining v2: a fresh extranonce per merge-mined job
+    // A fresh extranonce per merge-mined job
     // What: a standard channel's token jobs carry fresh random salt bytes
     // (the channel id stays), each job its own; without tokens, or on an
     // extended channel, the session salt stays.
@@ -2035,7 +2018,7 @@ mod tests {
         assert_eq!(extended.extranonce_prefix[..12], [9; 12]);
     }
 
-    // #### merge-mining v2: the own-root check
+    // The own-root check
     // What: a job's two coinbases (standard, and extended around the
     // channel's prefix) must carry its commitment as output 0; a tampered
     // one, a moved output 0 or a malformed head is refused, and such a job
@@ -2096,7 +2079,7 @@ mod tests {
         .is_err());
     }
 
-    // #### merge-mining v2: only the pool's shares go to the pool
+    // Only the pool's shares go to the pool
     // What: under Job Declaration with a token set, the local device target
     // is eased to the token's (locally only): a share that meets the token
     // target but not the pool's is accepted here and wins the token, but it
@@ -2182,7 +2165,7 @@ mod tests {
         assert!(local > pooled && pooled > 0, "{local} {pooled}");
     }
 
-    // #### PR #42: the share-target floor for merge-mined tokens
+    // The share-target floor for merge-mined tokens
     #[test]
     fn share_target_floors_at_the_easiest_token_target_within_15x() {
         let vardiff = compact_target(0x1d00ffff).unwrap();
@@ -2239,7 +2222,7 @@ mod tests {
         assert_eq!(times(&[0; 32], 15), [0; 32]);
     }
 
-    // #### PR #42: the share-target floor for merge-mined tokens
+    // The share-target floor for merge-mined tokens
     #[test]
     fn vardiff_ignores_shares_accepted_only_by_the_floor() {
         // Counting: vardiff aims at about one share in 256; the token's
@@ -2321,7 +2304,6 @@ mod tests {
         assert_eq!(channel.target, told);
     }
 
-    // #### PR #42
     // What: under a Job Declaration plan, a local channel's coinbase script
     // is the head, the pool's prefix, the job id, the pad, the lane and the
     // device's bytes; a share's forwarded bytes are exactly the rolled ones
@@ -2409,7 +2391,6 @@ mod tests {
         assert_eq!(share.coinbase.bytes, coinbase);
     }
 
-    // #### PR #56
     // What: under a compact plan a lane's coinbase script is the head, the
     // pool's prefix, the job id's low 2 bytes, the pad, a 2-byte lane and the
     // device's 4 bytes: the 8 a pool such as BCH P2Pool grants, which a share
@@ -2503,7 +2484,7 @@ mod tests {
         assert!(job.standard_coinbase.bytes.starts_with(&zeros));
     }
 
-    /// #### PR #42: a SAFA job on the test parent with version rule `mask`
+    /// A SAFA job on the test parent with version rule `mask`
     /// and full-precision `target`.
     fn safa_template(mask: u32, target: Hash) -> Arc<BchTemplate> {
         Arc::new(BchTemplate::token_only(
@@ -2528,7 +2509,6 @@ mod tests {
         ))
     }
 
-    // #### PR #42
     // What: no share on a SAFA job is a block; a share whose hash is at or
     // below the token's target is a win only when the hash is positive
     // (byte 31 below 0x80); below a hard target no share wins, but shares
@@ -2569,7 +2549,6 @@ mod tests {
         assert!(!result.block && !result.header_win);
     }
 
-    // #### PR #42
     // What: a token that fixes its version slot refuses rolled version
     // bits; a BIP320 token accepts them.
     // Look here if: the per-template version rule changes.
@@ -2601,7 +2580,6 @@ mod tests {
             .is_ok());
     }
 
-    // #### PR #42
     // What: a SAFA job's standard coinbase is the 65-byte forwarder to the
     // miner's script with the job id and the channel's prefix, and its root
     // is that script's HASH256; an extended channel's parts are the
@@ -2652,7 +2630,6 @@ mod tests {
         assert_eq!(result.header[36..68], double_sha256(&script));
     }
 
-    // #### PR #48
     // What: on a template that knows its parent's time (Chipnet's), a share
     // meeting the block target at the parent's time plus 20 minutes is a
     // block, and one second later only a share, still accepted. Without the
@@ -2697,7 +2674,6 @@ mod tests {
         assert!(!template.stale_bits(u32::MAX));
     }
 
-    // #### PR #48
     // What: on a Chipnet template on the limit's bits, a share meeting the
     // block target at or before the parent's time plus 1200 s is only a
     // share while ASERT gives the parent other bits, and one second later a

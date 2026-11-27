@@ -1,4 +1,4 @@
-//! #### PR #53: P2Pool's releases: the newest one for this platform, its
+//! P2Pool's releases: the newest one for this platform, its
 //! download checked against the SHA-256 published beside it, unpacked into
 //! its own version folder, with the previous version kept to roll back to.
 //! A release that also publishes a minisign-signed `SHA256SUMS` is held to

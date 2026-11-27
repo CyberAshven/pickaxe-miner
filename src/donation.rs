@@ -5,7 +5,6 @@ use std::{fmt, str::FromStr};
 
 pub mod bch;
 
-/// #### PR #32
 /// What: a token's donation, as a share of the mining work itself in
 /// hundredths of a percent. Each token has a default a miner can raise or
 /// lower, down to 0%, in Advanced settings: 4% for PHOTON and ELECTRIC, and
@@ -221,7 +220,7 @@ pub struct Schedule {
     position: u64,
 }
 impl Schedule {
-    /// #### PR #65: change future work without resetting the nonce allocation
+    /// Change future work without resetting the nonce allocation
     /// or changing the recipient of an already reserved GPU batch.
     pub fn set_scheme(&mut self, scheme: Scheme) -> Result<(), String> {
         let old_cycle = self.weights.iter().sum::<u64>() * self.unit;
@@ -298,7 +297,6 @@ pub(crate) fn require_direct_reward_policy(scheme: crate::donation::Scheme) -> R
 mod tests {
     use super::*;
 
-    // #### PR #32
     #[test]
     fn a_token_donation_moves_in_half_percent_steps_down_to_zero() {
         let photon = TokenDonation::from_bps(400);
@@ -314,7 +312,7 @@ mod tests {
         assert_eq!(TokenDonation::from_bps(475).adjusted(false).bps(), 450);
         assert_eq!(TokenDonation::from_bps(9_950).adjusted(true).bps(), 9_950);
         assert_eq!(NEW_TOKEN_DONATION.to_string(), "1.50%");
-        // #### 2026-10-24: down to 0%, and no lower.
+        // Down to 0%, and no lower.
         assert_eq!(TokenDonation::from_bps(50).adjusted(false).bps(), 0);
         assert_eq!(TokenDonation::from_bps(0).adjusted(false).bps(), 0);
         assert_eq!("0".parse::<TokenDonation>().unwrap().bps(), 0);

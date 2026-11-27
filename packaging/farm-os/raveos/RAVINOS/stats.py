@@ -1,4 +1,4 @@
-# #### PR #42: RaveOS reads the statistics this sets. The miner's status
+# RaveOS reads the statistics this sets. The miner's status
 # file gives each GPU's rate, temperature and shares, matched to RaveOS's
 # GPUs by PCI bus; on any error the shares are zero and the system's own
 # values stay. Python only because RaveOS requires it.

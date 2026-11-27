@@ -8,7 +8,7 @@ pub enum BackendKind {
     Cuda,
     Hip,
     Wgpu,
-    /// #### PR #32: GPUs the other engines cannot drive, through their
+    /// GPUs the other engines cannot drive, through their
     /// OpenCL driver: older integrated GPUs and cards, and ARM GPUs.
     OpenCl,
 }

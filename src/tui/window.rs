@@ -600,7 +600,7 @@ impl SetupDriver {
         self.flow.electric_in_use() && self.presses_start(input)
     }
 
-    /// #### Local sources first: whether `input` presses Start while this
+    /// Whether `input` presses Start while this
     /// computer's node and usual ports are still looked at: Start waits a
     /// moment for them, so the window does it away from its drawing.
     pub fn looks_here(&self, input: &SetupInput) -> bool {
@@ -1385,7 +1385,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    // #### Pool modes: the window chooses a pool's mode with < > and
+    // The window chooses a pool's mode with < > and
     // starts what the terminal's keys start, P2Pool's settings included.
     #[test]
     fn a_pool_mode_starts_from_the_window_as_from_the_keys() {
@@ -1488,7 +1488,6 @@ mod tests {
         }
     }
 
-    // #### Local sources first
     // What: Start pressed while this computer is still looked at goes to
     // another thread (it waits a moment for the look), as Start with
     // ELECTRIC does; once the look is in, Start runs at once.

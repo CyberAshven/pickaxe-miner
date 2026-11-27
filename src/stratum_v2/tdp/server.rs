@@ -1,8 +1,7 @@
-//! #### PR #42
 //! One Template Distribution client: SetupConnection, its coinbase output
 //! constraints, then this server's templates as the node worker publishes
 //! them, transaction data on request, and its solutions relayed to the node.
-//! #### BCH large templates: a client that negotiates 0x4C54 is pushed each
+//! A client that negotiates 0x4C54 is pushed each
 //! template's transactions (see `large`).
 
 use super::super::{
@@ -61,7 +60,7 @@ struct Active {
     reserve: u32,
     /// The node worker's template generation offered last, sent or withheld.
     generation: Option<u64>,
-    /// The parent of the client's latest SetNewPrevHash (#### PR #48: and
+    /// The parent of the client's latest SetNewPrevHash (and
     /// its bits).
     parent: Option<(Hash, u32)>,
     retained: VecDeque<Retained>,
@@ -69,7 +68,7 @@ struct Active {
     resend: Option<Instant>,
     last_constraints: Instant,
     requests: VecDeque<Instant>,
-    /// #### BCH large templates: the pushes, once the client negotiated
+    /// The pushes, once the client negotiated
     /// 0x4C54.
     large: Option<Pusher>,
 }
@@ -104,7 +103,7 @@ fn session_loop(
         return Ok(());
     };
     setup(&mut frame, sender)?;
-    // #### Template Distribution extensions: a negotiating client sends
+    // A negotiating client sends
     // RequestExtensions before its constraints. Extension frames are
     // answered or skipped, and the constraints keep one deadline.
     let deadline = Instant::now() + SETUP_DEADLINE;
@@ -134,7 +133,6 @@ fn session_loop(
             old.stale_since
                 .is_none_or(|since| now < since + STALE_GRACE)
         });
-        // #### BCH large templates
         // What: with 0x4C54 negotiated, transaction data goes out one frame
         // at a time as the socket takes it, never a whole template at once.
         // An answer the client asked for, with any push ahead of it, goes
@@ -254,7 +252,6 @@ fn constraints(frame: &mut SerializedFrame) -> Result<Option<u32>, String> {
     Ok(Some(message.coinbase_output_max_additional_size))
 }
 
-// #### Template Distribution extensions
 // What: a frame of a non-zero extension type (the channel bit aside) is an
 // extension's, not Template Distribution's. Template Distribution has no
 // channel messages, so a frame of extension 0 with the channel bit is an
@@ -321,7 +318,7 @@ impl Active {
         shared: &Shared,
         relay: &Relay,
     ) -> Result<(), String> {
-        // #### PR #42: the size budget
+        // The size budget
         // What: a template goes out only when the largest coinbase the
         // client may build (153 bytes and its reserved output bytes) fits
         // the block beside the template's transactions; otherwise it is
@@ -335,7 +332,7 @@ impl Active {
             return Ok(());
         }
         let id = relay.next_id();
-        // #### PR #48: new bits on the same parent
+        // New bits on the same parent
         // What: a template whose bits differ from the client's latest
         // SetNewPrevHash on the same parent goes out as a new parent does: a
         // future template and a SetNewPrevHash with the new bits, after which
@@ -365,7 +362,7 @@ impl Active {
         while self.retained.len() > MAX_RETAINED {
             self.retained.pop_front();
         }
-        // #### BCH large templates: its transactions follow, unasked.
+        // Its transactions follow, unasked.
         if let Some(pusher) = self.large.as_mut() {
             pusher.push(id, template);
         }
@@ -373,18 +370,18 @@ impl Active {
         Ok(())
     }
 
-    /// #### BCH large templates: an answer the client asked for is still
+    /// An answer the client asked for is still
     /// to be sent.
     fn answering(&self) -> bool {
         self.large.as_ref().is_some_and(Pusher::answering)
     }
 
-    /// #### BCH large templates: transaction data is still to be sent.
+    /// Transaction data is still to be sent.
     fn sending(&self) -> bool {
         self.large.as_ref().is_some_and(Pusher::sending)
     }
 
-    /// #### BCH large templates: sends the next frame of the transaction
+    /// Sends the next frame of the transaction
     /// data under way, built now from a template the client can still
     /// name.
     fn send_data(&mut self, sender: &mut Sender) -> Result<(), String> {
@@ -437,7 +434,7 @@ impl Active {
                 }
                 self.requests.push_back(now);
                 let id = request.template_id;
-                // #### BCH large templates: answered with the whole list in
+                // Answered with the whole list in
                 // pages after any push under way, never template-too-large.
                 if let Some(pusher) = self.large.as_mut() {
                     return pusher.request(id);
@@ -464,7 +461,7 @@ impl Active {
         Ok(())
     }
 
-    // #### PR #42: SubmitSolution → relay journal
+    // SubmitSolution → relay journal
     // What: a client's block on one of its templates is assembled, checked,
     // saved in the relay journal (fsync) and the node worker is woken to
     // submit it. One block per parent is kept, as for this server's own. A
@@ -493,7 +490,7 @@ impl Active {
             shared.template_stats(|stats| {
                 stats.refused_locally = stats.refused_locally.saturating_add(1)
             });
-            // #### PR #42: the bounded unchecked relay (D24)
+            // The bounded unchecked relay (D24)
             let due = relay.unchecked_at.lock().is_ok_and(|mut at| {
                 let due = at.is_none_or(|at| at.elapsed() >= UNCHECKED_INTERVAL);
                 if due {

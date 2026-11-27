@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# #### PR #42: the HiveOS agent sources this for $khs (kH/s) and $stats
+# The HiveOS agent sources this for $khs (kH/s) and $stats
 # (JSON); it must never exit. The miner's status file gives both.
 # shellcheck disable=SC2034 # khs and stats are read by the agent.
 pickaxe_dir=$(dirname "${BASH_SOURCE[0]}")

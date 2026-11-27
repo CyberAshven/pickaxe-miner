@@ -28,7 +28,7 @@ day each fact was checked.
   BCHN node, a durable block journal, per-device vardiff, a workers table with
   each device's own report, and an adjustable donation. Tested on Chipnet with
   an Avalon Nano 3.
-- GPU farms (PR #32): rigs on other machines mine as one with a coordinator,
+- GPU farms: rigs on other machines mine as one with a coordinator,
   with backup coordinators and `--rigs-only` for a coordinator without GPUs,
   in the default build; live on Chipnet with two rigs on one PC, 349 claims in
   10 minutes. A public GPU pool, where each rig mines for its own address and
@@ -36,7 +36,7 @@ day each fact was checked.
   settings; the OpenCL engine for GPUs the other engines cannot drive; the
   portable engine on older Intel Vulkan drivers (wgpu's upstream fix), its
   self-test on T2 engines, and throttled mining at full batch sizes.
-- Merged (PR #40): a read-only `watch` view for a server running as a
+- Merged: a read-only `watch` view for a server running as a
   service, calmer vardiff, a setup that starts with GPU mining, ASIC mining or
   Run a pool, device reports and confirmed controls for every make through
   asic-rs (with Pickaxe's own CGMiner and Bitaxe code as the extension), and:
@@ -53,7 +53,7 @@ day each fact was checked.
   - PHOTON jobs from the miner's own BCH node when one is configured (Fulcrum
     as the fallback), live on a pruned Chipnet BCHN with no transaction index;
     after a fall back to Fulcrum, mining goes back to the node by itself once
-    it answers again (#42), and the dashboard names the source;
+    it answers again, and the dashboard names the source;
   - Run a pool for GPUs (the public GPU pool, live with two rigs on Chipnet)
     and joining a GPU pool or farm from the setup;
   - workers named by their owners (never by an address), and a pool's name
@@ -213,8 +213,8 @@ to plug it in:
   BCH solo pool built on ASICseer pool.
 - Knuth is adding Stratum V2 Template Distribution inside the node: framing,
   primitives, the template messages and connection setup were merged in July
-  2026 (#534, #535, #537, #539, #540), on a mining job store moved out of the
-  RPC layer (#532) and a configurable coinbase reserve (#530). Its JSON-RPC
+  2026, on a mining job store moved out of the
+  RPC layer and a configurable coinbase reserve. Its JSON-RPC
   mining calls are `getblocktemplatelight`, `submitblocklight` and
   `getmininginfo`, backed by its C API. Interoperability with Pickaxe is not
   tested yet.
@@ -366,20 +366,20 @@ What this means for Pickaxe, and what step 1 did:
   connection, and show node name, version, network and sync height; warn when
   the node is behind or on the wrong network.
 - When the node stops answering, keep mining from the Fulcrum list, show it on
-  the dashboard, and switch back when the node returns (done in #42).
+  the dashboard, and switch back when the node returns.
 - The setup's BCH node list checks every saved node when it opens (and after
   a node is saved), each on its own thread, and says what it found: the
   client and sync height and whether it follows PHOTON, a refused login, no
   answer, another network or chain, or a node that answers but cannot follow
   PHOTON (no gettxout; Knuth has it since 1.7.0), whose BCH ASIC templates still work
-  (done in #42). A node without getnetworkinfo is "BCH node".
+. A node without getnetworkinfo is "BCH node".
 - The setup also searches this computer when a list opens: a node on
   another usual port (such as Knuth's 8332 on Chipnet), Fulcrum servers
   over TCP, WS or WSS (with their version and height) and ZMQ block notices,
   at most ten ports, each tried once with a short timeout. A node on this
   computer logs in with BCHN's bitcoin.conf (its rpcport and rpcuser and
   rpcpassword, or that network's cookie), read for each call and never kept
-  (done in #42).
+.
 - On a connection list, F searches another computer by name, `.local` name
   or address (a public address only after yes) and T one of the Tailscale
   network's online computers, on the same ports; Enter adds a node or
@@ -395,10 +395,10 @@ What this means for Pickaxe, and what step 1 did:
 - A node's chain is proven by its fork block (BCH's UAHF block 478,559 on
   mainnet, Chipnet's block 115,252), since a Bitcoin (BTC) node reports the
   same chain name and testnet4 shares Chipnet's genesis: the ASIC server and
-  GPU mining's return to the node refuse a BTC or testnet4 node (done in #42).
+  GPU mining's return to the node refuse a BTC or testnet4 node.
 - A home Fulcrum server (Umbrel, StartOS) is taken over plain TCP,
   `tcp://HOST:PORT` such as `tcp://umbrel.local:50001`, on this computer or
-  the home network only (done in #42); servers on the internet need `wss://`,
+  the home network only; servers on the internet need `wss://`,
   since plain TCP could be impersonated to feed a false baton.
 - ASIC BCH and merge mining need a node (or a pool), and setup says so only in
   that mode.
@@ -455,7 +455,7 @@ Answered (2026-10-10):
   tokens no longer need standard channels anyway (see
   [ASIC-exclusive token](#asic-exclusive-token-safa-style)).
 - Knuth: reached over its JSON-RPC from a separate process, like BCHN; the
-  setup finds it on its port and logs in with a saved cookie file (#43). Its
+  setup finds it on its port and logs in with a saved cookie file. Its
   C API in-process is not planned.
   Checked live on Knuth 1.7.0 (Chipnet, 2026-11-26): `stratum-v2 check-node`
   takes its templates; `gettxout`, `getblock` verbosity 2 (with `tokenData`),
@@ -469,7 +469,7 @@ Answered (2026-10-10):
 - Pools with Stratum V2 Job Declaration for BCH: none to list yet. CashStratum
   (behind SoloFury's BCH endpoint) has Job Declaration code, but its Noise
   certificate version keeps SV2 clients out (cashstratum/cashstratum#3); a
-  Pickaxe public pool accepts it with `--accept-job-declaration` (#42).
+  Pickaxe public pool accepts it with `--accept-job-declaration`.
 
 ## Sources and how they were checked
 

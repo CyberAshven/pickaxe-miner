@@ -1,5 +1,5 @@
-//! #### PR #58: terminal controls for the ELECTRIC GPU session.
-//! #### PR #65: its state, rates, fee pot and events, which the mining
+//! Terminal controls for the ELECTRIC GPU session.
+//! Its state, rates, fee pot and events, which the mining
 //! dashboard shows and steers (`tui::run_electric`).
 use std::{
     collections::VecDeque,
@@ -10,19 +10,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// #### PR #61: how many GPUs the hash split can hold one by one.
+/// How many GPUs the hash split can hold one by one.
 pub const MAX_HELD_GPUS: usize = 64;
 
 pub struct Monitor {
     pub(crate) withdrawal: Mutex<super::withdrawal::Control>,
     pub stop: Arc<AtomicBool>,
     pub paused: AtomicBool,
-    /// #### PR #53: the hash split holds the GPUs for another token.
+    /// The hash split holds the GPUs for another token.
     pub held: AtomicBool,
-    /// #### PR #61: or one GPU alone, by its place in the session's GPUs
+    /// Or one GPU alone, by its place in the session's GPUs
     /// (the first `MAX_HELD_GPUS`).
     held_gpus: Box<[AtomicBool]>,
-    /// #### PR #53: a search is running: the pot can pay and the baton is
+    /// A search is running: the pot can pay and the baton is
     /// minable, so ELECTRIC wants its share of the GPUs.
     pub searching: AtomicBool,
     pub intensity: AtomicU8,
@@ -35,18 +35,18 @@ pub struct Monitor {
     started: Instant,
 }
 
-/// #### PR #53: what the hash split's screen shows of the ELECTRIC session.
-/// #### PR #65: and the mining dashboard, for a split or ELECTRIC alone.
+/// What the hash split's screen shows of the ELECTRIC session.
+/// And the mining dashboard, for a split or ELECTRIC alone.
 #[derive(Debug, Clone, Default)]
 pub struct Summary {
     pub(crate) withdrawal: super::withdrawal::View,
     pub state: String,
     /// Hashes a second over the last two seconds.
     pub rate: f64,
-    /// #### PR #65: the GPUs' hashes a second while they mine (not while
+    /// The GPUs' hashes a second while they mine (not while
     /// paused or held for another token).
     pub active_rate: f64,
-    /// #### PR #65: every hash since the session started, and how long ago
+    /// Every hash since the session started, and how long ago
     /// that was.
     pub hashes: u64,
     pub uptime: Duration,
@@ -55,10 +55,10 @@ pub struct Summary {
     pub pot_qr: Vec<String>,
     /// Plain-BCH sats in the pot and the claims they pay, once read.
     pub pot: Option<(u64, u64)>,
-    /// #### PR #65: where the pot's recovery key is saved.
+    /// Where the pot's recovery key is saved.
     pub pot_key: Option<String>,
     pub events: Vec<String>,
-    /// #### PR #65: the GPUs, their intensity and whether mining is paused.
+    /// The GPUs, their intensity and whether mining is paused.
     pub devices: String,
     pub intensity: u8,
     pub paused: bool,
@@ -74,13 +74,13 @@ pub struct Summary {
     pub claim_fee_estimate: Option<u64>,
 }
 
-/// #### PR #65: events kept for the dashboard to take, at most.
+/// Events kept for the dashboard to take, at most.
 const FRESH_EVENTS: usize = 96;
 
 struct View {
     state: String,
     events: VecDeque<String>,
-    /// #### PR #65: events the dashboard has not taken yet.
+    /// Events the dashboard has not taken yet.
     fresh: VecDeque<String>,
     samples: VecDeque<(Instant, usize, u32, Duration)>,
     devices: String,
@@ -212,7 +212,7 @@ impl Monitor {
             .get_or_insert(crate::donation::TokenDonation::from_bps(total));
     }
 
-    /// #### PR #65: only future mining work changes; saved claims keep their
+    /// Only future mining work changes; saved claims keep their
     /// original recipient and signed transaction.
     pub fn request_donation(
         &self,
@@ -254,7 +254,7 @@ impl Monitor {
         Ok(())
     }
 
-    /// #### PR #65: connection and claim-cost details belong to ELECTRIC,
+    /// Connection and claim-cost details belong to ELECTRIC,
     /// including while it lends its GPU time to another token.
     pub(super) fn connected(&self, endpoint: &str) {
         let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
@@ -273,14 +273,14 @@ impl Monitor {
         self.view.lock().unwrap_or_else(|e| e.into_inner()).pending = pending;
     }
 
-    /// #### PR #61: holds or releases the GPU at `device` alone.
+    /// Holds or releases the GPU at `device` alone.
     pub fn hold_gpu(&self, device: usize, held: bool) {
         if let Some(gpu) = self.held_gpus.get(device) {
             gpu.store(held, std::sync::atomic::Ordering::Release);
         }
     }
 
-    /// #### PR #61: whether the GPU at `device` waits for its turn.
+    /// Whether the GPU at `device` waits for its turn.
     pub fn gpu_held(&self, device: usize) -> bool {
         self.held.load(std::sync::atomic::Ordering::Acquire)
             || self
@@ -289,7 +289,7 @@ impl Monitor {
                 .is_some_and(|gpu| gpu.load(std::sync::atomic::Ordering::Acquire))
     }
 
-    /// #### PR #61: each of the first `count` GPUs' hashes a second while
+    /// Each of the first `count` GPUs' hashes a second while
     /// it mines (not while held), over the last five seconds; 0 before it
     /// measured.
     pub fn gpu_rates(&self, count: usize) -> Vec<f64> {
@@ -350,7 +350,7 @@ impl Monitor {
             view.events.pop_front();
         }
     }
-    /// #### PR #65: the events since the dashboard last took them, oldest
+    /// The events since the dashboard last took them, oldest
     /// first.
     pub fn drain_events(&self) -> Vec<String> {
         self.view
@@ -392,7 +392,7 @@ impl Monitor {
             pot.claims = claims;
         }
     }
-    /// #### PR #53: the GPUs the session mines on, as its screen names them.
+    /// The GPUs the session mines on, as its screen names them.
     pub fn devices(&self) -> String {
         self.view
             .lock()
@@ -400,7 +400,7 @@ impl Monitor {
             .devices
             .clone()
     }
-    /// #### PR #53: the session as the hash split's screen shows it.
+    /// The session as the hash split's screen shows it.
     pub fn summary(&self) -> Summary {
         let view = self.view.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
@@ -472,7 +472,7 @@ impl Monitor {
     }
 }
 
-/// Mines with `mine` until it ends: on the mining dashboard (#### PR #65),
+/// Mines with `mine` until it ends: on the mining dashboard,
 /// or printing each state and event with `plain`. `gpus` are the GPUs it
 /// mines, for their telemetry.
 pub fn run(
@@ -560,7 +560,7 @@ mod tests {
         monitor.accepted();
         assert!(!monitor.summary().pending);
     }
-    // #### PR #65: what the dashboard reads of the session.
+    // What the dashboard reads of the session.
     #[test]
     fn the_summary_carries_the_pot_its_key_and_events_for_the_dashboard() {
         let monitor = Monitor::new(80, false, "RTX (cuda)".into());

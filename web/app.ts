@@ -136,7 +136,7 @@ async function run() {
       else log('Previous work is stale; using the current baton.');
     }
   }
-  // #### PR #22: show recent completed work per wall second. Active-only GPU
+  // Show recent completed work per wall second. Active-only GPU
   // speed hides intensity pauses; a lifetime average reacts too slowly.
   const render = (stopped = false) => {
     const now = performance.now();

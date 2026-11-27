@@ -1,4 +1,3 @@
-//! #### PR #48
 //! BCH's aserti3-2d difficulty: the bits a node requires of the next block,
 //! from the network's anchor and the parent's height and time. Integer-exact
 //! as `CalculateASERT` and `GetNextASERTWorkRequired` in Bitcoin Cash Node
@@ -41,7 +40,7 @@ fn pow_limit() -> BigUint {
     (BigUint::from(1u8) << 224u32) - 1u8
 }
 
-// #### PR #48: ASERT's next bits
+// ASERT's next bits
 // What: the bits ASERT gives the block after a parent at `parent_height`
 // and `parent_time` (before any testnet rule such as Chipnet's 20-minute
 // one). None where BCHN would assert instead: a parent below the anchor, or
@@ -134,7 +133,6 @@ fn compact(target: &BigUint) -> u32 {
 mod tests {
     use super::*;
 
-    // #### PR #48
     // What: real Chipnet blocks: the bits each carries are the ones ASERT
     // gives from Chipnet's anchor and its parent's height and time (both at
     // most 1200 s apart, so the 20-minute rule did not apply). From the
@@ -166,7 +164,6 @@ mod tests {
         assert_eq!(next_bits(&CHIPNET, 16_843, 1_605_451_779), None);
     }
 
-    // #### PR #48
     // What: lines of the aserti3-2d specification's test vectors (BCHN's
     // qa-assets repository, test_vectors/aserti3-2d, runs 1 to 6, 11 and
     // 12: the anchor at height 1, a two-day half-life and the limit

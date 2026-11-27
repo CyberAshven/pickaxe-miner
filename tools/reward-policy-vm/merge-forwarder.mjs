@@ -1,4 +1,4 @@
-// #### PR #65: execute the existing ASIC header-token payout forwarders in
+// Execute the existing ASIC header-token payout forwarders in
 // an independent VM. No token is registered or designed by this fixture.
 // AuxProof Case A/B and donation bindings are tested by the Rust merge suite;
 // this checks the executable payout bytecode, including composed inputs.

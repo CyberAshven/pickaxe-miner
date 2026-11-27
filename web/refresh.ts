@@ -1,4 +1,4 @@
-// #### PR #22: overlap server reads with GPU work, but deliver updates only
+// Overlap server reads with GPU work, but deliver updates only
 // between searches. Keep the one-second freshness boundary and fetch anew
 // after a winner; never mutate the borrowed WASM miner from a promise callback.
 type Outcome<T> = { ok: true; value: T; completedAt: number } | { ok: false; error: unknown };

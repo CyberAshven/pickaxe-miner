@@ -637,7 +637,7 @@ fn step(driver: &mut SetupDriver, label: &str) {
     });
 }
 
-/// #### Pool modes: Run a pool, Chipnet, ASIC pool, then P2Pool v2 (two
+/// Run a pool, Chipnet, ASIC pool, then P2Pool v2 (two
 /// steps past a Public Solo Endpoint) with the Advanced section open.
 fn p2pool_page() -> SetupDriver {
     let mut driver = SetupDriver::preview(preview_gpus(), MiningProfiles::default());
@@ -650,7 +650,7 @@ fn p2pool_page() -> SetupDriver {
     driver
 }
 
-/// #### Pool modes: the Run a pool page in P2Pool v2 names every control,
+/// The Run a pool page in P2Pool v2 names every control,
 /// with its two donations apart.
 #[test]
 fn the_pool_modes_page_names_every_control() {
@@ -796,7 +796,7 @@ fn setup_previews() {
     let mut driver = settings();
     click(&mut driver, "Fulcrum");
     shot("setup-connections.png", SIZE, driver);
-    // #### Pool modes: Run a pool with P2Pool v2 chosen.
+    // Run a pool with P2Pool v2 chosen.
     shot("setup-run-p2pool.png", TALL, p2pool_page());
     // The window's smallest size.
     let mut driver = settings();

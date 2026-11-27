@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# #### PR #42: the HiveOS, mmpOS and RaveOS packages, made from the Linux
+# The HiveOS, mmpOS and RaveOS packages, made from the Linux
 # x86_64 release archive (its pickaxe, cuda/, hip/, BACKENDS.txt, README.md
 # and licenses) and packaging/farm-os/.
 # Usage: tools/farm-os/build.sh <linux-x86_64.tar.gz> <out-dir>

@@ -1,4 +1,4 @@
-//! #### merge-mining v2: leaf disclosure
+//! Leaf disclosure
 //! What: the leaves behind a coinbase's output 0, in a small versioned
 //! format: what a Job Declaration client puts in DeclareMiningJob's
 //! `excess_data`, and what a pool shows a miner who asks for it.
@@ -147,7 +147,7 @@ impl Disclosure {
     }
 }
 
-// #### merge-mining v2: disclosure to miners
+// Disclosure to miners
 // What: a Pickaxe SV2 extension (type 0x4D4D, "MM"), negotiated with the
 // SV2 extensions negotiation (type 0x0001, RequestExtensions): a server
 // sends a client that asked for it, after each job, the job's leaves
@@ -348,7 +348,7 @@ pub fn extensions_payload(request: u16, extensions: &[u16]) -> Vec<u8> {
     bytes
 }
 
-// #### merge-mining v2: the public pool audit rule
+// The public pool audit rule
 // What: on a public pool, every leaf of a miner's job pays that miner's
 // registered payout script, except a work job's, which pays the donation or
 // the operator whole; a split pays only the donation and the operator.
@@ -407,7 +407,7 @@ mod tests {
         AuxJob::build(&test_set(), &terms)
     }
 
-    // #### merge-mining v2: the disclosure format
+    // The disclosure format
     #[test]
     fn a_disclosure_round_trips_and_rebuilds_its_root() {
         let job = job();
@@ -447,7 +447,7 @@ mod tests {
         assert!(Disclosure::decode(&changed).is_err());
     }
 
-    // #### merge-mining v2: disclosure to miners
+    // Disclosure to miners
     // What: JobLeaves and WinProof round-trip; JobLeaves refuses a branch
     // that misses output 0's root; the negotiation payloads read back.
     #[test]
@@ -509,7 +509,7 @@ mod tests {
         assert_eq!(requested_extensions(&[4, 0, 2, 0, 1]), None);
     }
 
-    // #### merge-mining v2: the public pool audit rule
+    // The public pool audit rule
     #[test]
     fn a_public_pool_leaf_pays_its_miner_or_a_work_job_s_recipient() {
         let (miner, donation, operator) = (vec![0x51], vec![0x52], vec![0x53]);
