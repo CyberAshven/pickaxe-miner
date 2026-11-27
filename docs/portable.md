@@ -94,6 +94,14 @@ Anyone can host its `web/` directory over HTTPS. No Pickaxe-operated website,
 pool, account service or backend server is required. Browsers still download
 the application and its approximately 64 MiB lookup table.
 
+A site that already has its own page does not fork the repository and does
+not use `index.html`. It hosts this same bundle and calls `runMiner` from
+`miner.js`, after `init()` and `browser_config()` from the generated
+WebAssembly bindings. The call takes the network, the visitor's payout
+address, and where to report status. The donation is compiled into that
+WebAssembly, not chosen by the page. Pin the release. A later engine arrives
+only when those files are replaced.
+
 To serve an extracted bundle locally with Python installed:
 
 ```sh
