@@ -200,7 +200,7 @@ wins and work, plus shared GPU utilization, temperature and power. Select a
 token for its own details. `G` shows charts (hidden initially), `A` opens
 Advanced settings, `F` opens ELECTRIC's pot details, and `B` safely returns to
 profiles after pending claims or sends are settled. See
-[dashboard controls](docs/hash-split.md#pr-65-the-shared-mining-dashboard).
+[dashboard controls](docs/hash-split.md#the-shared-mining-dashboard).
 
 ### Portable engine in the TUI
 

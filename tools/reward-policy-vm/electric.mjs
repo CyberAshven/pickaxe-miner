@@ -1,4 +1,4 @@
-// #### PR #51: run the ELECTRIC claims and pot refunds that Rust builds
+// Run the ELECTRIC claims and pot refunds that Rust builds
 // through the BCH 2026 VM, against the published contract body and the pot.
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';

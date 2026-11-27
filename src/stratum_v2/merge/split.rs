@@ -1,4 +1,4 @@
-//! #### merge-mining v2: the per-win split
+//! The per-win split
 //! What: a leaf's `ext` commits to how each win is shared: a donation slot,
 //! then a fee slot, each a rate in hundredths of a percent and the
 //! recipient's script hash.
@@ -227,7 +227,7 @@ impl Split {
         }
     }
 
-    // #### merge-mining v2: the minimum share
+    // The minimum share
     // What: after the raw shares, a donation or fee share worth less than
     // MIN_SHARE_SATS at the AMM price is 0 and goes to the miner. The fee is
     // still computed from what the raw donation left, so dropping a small
@@ -341,7 +341,7 @@ pub fn split_cost_sats(shares: &Shares, sats_per_byte: u64) -> u64 {
     split_outputs(shares) * (SPLIT_OUTPUT_SATS + SPLIT_OUTPUT_BYTES * sats_per_byte)
 }
 
-// #### merge-mining v2: 800 satoshis on every claim output
+// 800 satoshis on every claim output
 // What: the miner's output, like the donation's and the fee's, carries
 // exactly 800 satoshis.
 // Why: BCH P2Pool's SAFA covenant checks all three the same way; a miner
@@ -397,7 +397,7 @@ mod tests {
         (s.donation, s.fee, s.miner)
     }
 
-    // #### merge-mining v2: golden vectors (repeated in docs/merge-mining.md)
+    // Golden vectors (repeated in docs/merge-mining.md)
     // What: shares at the extremes: rewards 1, 99, 100 and 2^63-1 at rates
     // 10,000 and 9,999 in both slots.
     #[test]
@@ -437,7 +437,7 @@ mod tests {
         assert_eq!(shares(&Split::NONE, 77), (0, 0, 77));
     }
 
-    // #### merge-mining v2: the canonical slots and preimage
+    // The canonical slots and preimage
     #[test]
     fn slots_and_preimages_are_canonical() {
         assert_eq!(Slot::from_hash(10_001, [1; 32]), Err(SplitError::Rate));
@@ -482,7 +482,7 @@ mod tests {
         assert_eq!(Split::parse(&fee_only.preimage()), Ok(fee_only));
     }
 
-    // #### merge-mining v2: the minimum share at the AMM price
+    // The minimum share at the AMM price
     #[test]
     fn a_share_below_1000_sats_stays_with_the_miner() {
         // One satoshi per token: 1,000,000 sats (cash and virtual) for
@@ -529,7 +529,7 @@ mod tests {
         assert_eq!(rich.value(u64::MAX), Some(u64::MAX));
     }
 
-    // #### merge-mining v2: the claim's outputs
+    // The claim's outputs
     #[test]
     fn claim_outputs_follow_the_split_in_order() {
         let category = [0xca; 32];

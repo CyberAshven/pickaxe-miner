@@ -1,4 +1,3 @@
-//! #### PR #42
 //! A Full-Template declaration's coinbase, split as Job Declaration carries
 //! it, and the job a pool keeps once it has checked one: the block its node
 //! validates, and the block a PushSolution names.
@@ -27,7 +26,7 @@ pub struct CoinbaseShape {
 }
 
 impl CoinbaseShape {
-    /// Parses a declaration's prefix and suffix; #### PR #42: SRI's BIP141
+    /// Parses a declaration's prefix and suffix; SRI's BIP141
     /// bytes are left out (see `strip_bip141`).
     pub fn parse(prefix: &[u8], suffix: &[u8]) -> Result<Self, Refusal> {
         let invalid = |details: &str| Refusal::new("invalid-coinbase-tx", details);
@@ -112,7 +111,7 @@ impl CoinbaseShape {
     }
 }
 
-// #### PR #42: SRI's BIP141 bytes in a declaration (D20)
+// SRI's BIP141 bytes in a declaration (D20)
 // What: a declared coinbase whose bytes 4 and 5 are 00 01 (BIP141's marker
 // and flag) is taken without them and without its one witness item of 32
 // bytes, which sits before the locktime; any other witness (no item, two
@@ -214,7 +213,7 @@ impl DeclaredJob {
     /// The block `solution` names when it is one of this job's: its coinbase
     /// rebuilt with the pushed extranonce, on this job's parent and bits,
     /// with a hash that meets the bits' target. Returns the block's hash too.
-    /// #### PR #48: not a Chipnet block whose time needs other bits (see
+    /// Not a Chipnet block whose time needs other bits (see
     /// `BchTemplate::wrong_bits`: normal bits past the 20-minute point, or
     /// the limit's before it while ASERT gives other bits).
     pub fn solved(&self, solution: &Solution) -> Option<(Hash, Vec<u8>)> {
@@ -270,7 +269,6 @@ pub(in crate::stratum_v2) mod tests {
         BchTemplate::from_rpc(&raw).unwrap()
     }
 
-    // #### PR #42
     // What: a declared coinbase parses into its head, extranonce length and
     // outputs, and rebuilds with an extranonce of that length; a segwit
     // coinbase ("segwit coinbase"), a version other than 1 or 2, a non-null
@@ -290,7 +288,7 @@ pub(in crate::stratum_v2) mod tests {
         assert!(shape.coinbase(&[7; 31]).is_none());
         let refused =
             |prefix: &[u8], suffix: &[u8]| CoinbaseShape::parse(prefix, suffix).unwrap_err();
-        // #### PR #42: BIP141's marker with no witness item is refused.
+        // BIP141's marker with no witness item is refused.
         let mut segwit = prefix.clone();
         segwit.splice(4..4, [0, 1]);
         assert_eq!(
@@ -333,7 +331,6 @@ pub(in crate::stratum_v2) mod tests {
         );
     }
 
-    // #### PR #42
     // What: an SRI-shaped declaration (BIP141's marker and flag, one 32-byte
     // witness item before the locktime) parses to the coinbase without
     // them, whose bytes and outputs are the plain one's; no item, two
@@ -387,7 +384,6 @@ pub(in crate::stratum_v2) mod tests {
         );
     }
 
-    // #### PR #42
     // What: canonical order is ascending display order, as BCHN and
     // `from_rpc` compare; equal or descending neighbours are refused.
     // Look here if: ctor_ordered changes.
@@ -405,7 +401,6 @@ pub(in crate::stratum_v2) mod tests {
         assert!(!ctor_ordered(&reversed));
     }
 
-    // #### PR #42
     // What: for 0 to 17 transactions, a Job Declaration template's declared
     // prefix and suffix around any extranonce give the local channels'
     // coinbase, the declared template (the same transactions by id) has the
@@ -503,7 +498,7 @@ pub(in crate::stratum_v2) mod tests {
                 ..solution.clone()
             };
             assert!(job.solved(&elsewhere).is_none());
-            // #### PR #48: on Chipnet, not a block more than 20 minutes
+            // On Chipnet, not a block more than 20 minutes
             // after the parent on normal bits (see `BchTemplate::stale_bits`).
             for (gap, block) in [(1200, true), (1201, false)] {
                 let mut timed = (*job.template).clone();
@@ -514,7 +509,7 @@ pub(in crate::stratum_v2) mod tests {
                 };
                 assert_eq!(timed.solved(&solution).is_some(), block, "{gap}");
             }
-            // #### PR #48: nor, on the limit's bits, one at or before that
+            // Nor, on the limit's bits, one at or before that
             // point while ASERT gives the parent other bits (see
             // `BchTemplate::wrong_bits`; the test target stays easy).
             for (gap, block) in [(1200, false), (1201, true)] {

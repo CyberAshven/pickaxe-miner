@@ -1,4 +1,4 @@
-//! #### Pool modes: the SV2 door of a Non-custodial Pool
+//! The SV2 door of a Non-custodial Pool
 //! (`serve --own-p2pool --public`). SV2 devices and other Pickaxes connect
 //! to this server's own SV2 port and key, as at a Public Solo Endpoint;
 //! each connection is relayed to your own P2Pool node (on this computer
@@ -831,7 +831,7 @@ mod tests {
         (send, receive)
     }
 
-    // #### Pool modes: a standard-channel device through the door
+    // A standard-channel device through the door
     // What: an SV2 device on a standard channel, at a P2Pool that sends
     // standard channels their own jobs (the setup requires standard jobs)
     // or puts them in a group sent extended jobs: it gets standard jobs on
@@ -949,7 +949,7 @@ mod tests {
         }
     }
 
-    // #### Pool modes: one upstream channel per miner identity
+    // One upstream channel per miner identity
     // What: at a Non-custodial Pool, two SV1 miners and an SV2 miner with
     // different payouts each reach P2Pool under their own
     // `<payout>[.worker],p2p=<share address>`; the owner's identity and the
@@ -1009,7 +1009,7 @@ mod tests {
         drop((door, adapter));
     }
 
-    // #### Pool modes: your own P2Pool for your own devices
+    // Your own P2Pool for your own devices
     // What: without --public every device mines at P2Pool under the one
     // owner identity, whatever its username.
     // Look here if: owner-only --own-p2pool upstreams change.
@@ -1026,7 +1026,7 @@ mod tests {
         drop(adapter);
     }
 
-    // #### Pool modes: failover for your own P2Pool node
+    // Failover for your own P2Pool node
     // What: once P2Pool has served no work for the 3 s grace, a device's
     // session there ends and it reconnects to the fallback pool (P2Pool is
     // skipped while it is down); once P2Pool serves again for the return

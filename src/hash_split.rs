@@ -1,4 +1,4 @@
-//! #### PR #53: the token hash split. One session mines several GPU tokens
+//! The token hash split. One session mines several GPU tokens
 //! on the same GPUs, each for its share of the time in 5% steps, the shares
 //! together at most 100% (the rest idles). Only one token's kernels run at a
 //! time: on one GPU two tokens' kernels queue behind each other anyway, and
@@ -259,7 +259,6 @@ pub struct Slot {
 /// Parts of a whole closer than this count as equal.
 const EPSILON: f64 = 1e-9;
 
-/// #### PR #61
 /// What: one round of the split on the GPUs. Whole GPUs go to the tokens
 /// first: each GPU, the fastest first, to whoever needs the most of the
 /// rig's speed without the GPU being more than that (the idle rest of 100%
@@ -354,13 +353,13 @@ pub fn plan(shares: &[u8], wants: &[bool], weights: &[f64], period: Duration) ->
     Round { gpus, turns }
 }
 
-/// #### PR #61: how long every GPU takes turns at the start, so each token
+/// How long every GPU takes turns at the start, so each token
 /// mines every GPU and the GPUs' speeds can be measured; and how long the
 /// scheduler keeps trying before it weighs the GPUs as equal.
 const MEASURE_ROUNDS: u32 = 3;
 const MEASURE_LIMIT: Duration = Duration::from_secs(60);
 
-/// #### PR #61: each GPU's speed from the rates of the token with the
+/// Each GPU's speed from the rates of the token with the
 /// largest share that measured every GPU, the same for GPUs of the same
 /// model (`names`); `None` while no token has measured them all.
 fn weigh(slots: &[Slot], names: &[String]) -> Option<Vec<f64>> {
@@ -448,7 +447,7 @@ fn layout_text(round: &Round, slots: &[Slot]) -> String {
 /// `stop`; then releases every hold so each token can stop cleanly. The
 /// GPUs (`names`, in the order chosen) all take turns until their speeds
 /// are measured; `layout` says how the GPUs are shared now.
-/// #### PR #61: a round starts again as soon as a token starts or stops
+/// A round starts again as soon as a token starts or stops
 /// wanting the GPUs, so its GPUs and time go to the others at once.
 pub fn schedule(
     slots: &[Slot],
@@ -654,7 +653,7 @@ pub fn run_with_pot_mode(
         let shown = if plain {
             report(&stop, &mut runtimes, &monitor, &slots, &layout)
         } else {
-            // #### PR #65: the split uses the main dashboard. On exit the
+            // The split uses the main dashboard. On exit the
             // caller below joins ELECTRIC and stops the owned supervisors.
             let miners = crate::tui::Miners {
                 network: cfg.network,
@@ -695,7 +694,7 @@ pub fn run_with_pot_mode(
             .insert("ELECTRIC".into(), donation);
     }
     if crate::session_control::profiles_requested() {
-        // #### PR #65: a pot flag is an explicit choice; otherwise the
+        // A pot flag is an explicit choice; otherwise the
         // session's own choice (or the default) is kept.
         if owner_electric_pot {
             final_cfg.choose_electric_pot(Some(crate::config::ElectricPotMode::Owner));
@@ -742,7 +741,7 @@ pub fn runtime_state(snapshot: &crate::runtime::RuntimeSnapshot) -> String {
     }
 }
 
-/// #### PR #65: moves the share of `slots[index]` one step up or down while
+/// Moves the share of `slots[index]` one step up or down while
 /// mining, as `Shares::step` does; up is refused when the shares already add
 /// up to 100%. Returns the new share.
 pub fn step_share(slots: &[Slot], index: usize, up: bool) -> Result<u8, String> {
@@ -846,7 +845,7 @@ fn report(
     let mut shown_layout = String::new();
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(250));
-        // #### PR #61: how the GPUs are shared, when it changes.
+        // How the GPUs are shared, when it changes.
         let now = layout.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if now != shown_layout && !now.is_empty() {
             println!("GPUs: {now}");
@@ -1008,7 +1007,7 @@ mod tests {
         );
     }
 
-    // #### PR #61: whole GPUs first; turns only on the GPUs left over.
+    // Whole GPUs first; turns only on the GPUs left over.
     #[test]
     fn a_rig_gives_whole_gpus_first_and_turns_only_on_the_rest() {
         // Five GPUs at 80/20: four mine PHOTON, one ELECTRIC; no turns.
@@ -1133,7 +1132,7 @@ mod tests {
         ]
     }
 
-    // #### PR #65: the dashboard's settings move a running split's share.
+    // The dashboard's settings move a running split's share.
     #[test]
     fn a_running_share_steps_by_five_and_never_past_100() {
         let (photon, electric) = (Fake::new(true, 1), Fake::new(true, 1));
@@ -1153,7 +1152,6 @@ mod tests {
         assert_eq!(shares(&slots), (75, 25));
     }
 
-    /// #### PR #72
     /// What: stops the scheduler when dropped, a failed assertion included.
     /// Why: the scope waits for the scheduler, which only stops on `stop`;
     /// a failed assertion on a slow runner hung macOS CI for 27 minutes
@@ -1201,7 +1199,7 @@ mod tests {
         assert!(photon.released() && electric.released());
     }
 
-    // #### PR #61: once the GPUs are measured, a rig mines whole GPUs.
+    // Once the GPUs are measured, a rig mines whole GPUs.
     #[test]
     fn the_scheduler_measures_a_rig_then_gives_it_whole_gpus() {
         let (photon, electric) = (Fake::new(true, 5), Fake::new(true, 5));
@@ -1214,7 +1212,7 @@ mod tests {
         std::thread::scope(|scope| {
             scope.spawn(|| schedule(&slots, &names, &stop, period, &layout));
             let _stop = StopOnDrop(&stop);
-            // #### PR #72: each stage is waited for, not slept through.
+            // Each stage is waited for, not slept through.
             wait_until("the first round", || !layout.lock().unwrap().is_empty());
             assert!(layout.lock().unwrap().starts_with("measuring the GPUs"));
             wait_until("whole GPUs", || *layout.lock().unwrap() == whole);

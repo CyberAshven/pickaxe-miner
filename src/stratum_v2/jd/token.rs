@@ -1,4 +1,3 @@
-//! #### PR #42
 //! Pickaxe's Job Declaration tokens. The spec leaves `mining_job_token`
 //! opaque; a Pickaxe pool's tokens carry its rates (PX v1, 26 bytes), so a
 //! Pickaxe client can build a coinbase the pool accepts, and other clients
@@ -339,7 +338,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     // What: a PX v1 token is the design's 26 bytes; another pool's token
     // (SRI's 8-byte counter, another version or magic) is opaque.
     // Look here if: PxToken's layout changes.
@@ -384,7 +382,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     // What: a token redeems once, for the payout it was allocated to,
     // with its own secret, within 10 minutes; a closed connection's tokens
     // go; a full book evicts only the asking connection's oldest.
@@ -439,7 +436,6 @@ mod tests {
         );
     }
 
-    // #### PR #42
     // What: a Full-Template connection's token is spent by its own
     // connection's declaration and answers SetCustomMiningJob with
     // job-not-yet-validated until then; another connection, a declared or

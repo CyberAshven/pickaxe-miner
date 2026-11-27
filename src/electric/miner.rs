@@ -1,4 +1,3 @@
-//! #### PR #51
 //! What: `pickaxe electric`: the fee pot's address, the baton's state, the
 //! GPU miner that follows the baton through BCHN or Fulcrum and claims from the pot, and
 //! owner-authorized recovery (legacy pots remain explicitly selectable).
@@ -24,7 +23,7 @@ use std::time::{Duration, Instant};
 /// How often the miner reads the baton while it searches, on a node or a
 /// server without change notices.
 const BATON_POLL: Duration = Duration::from_secs(2);
-/// #### Live-state notices: with a Fulcrum server's notices, the baton is
+/// With a Fulcrum server's notices, the baton is
 /// read when the covenant or the tip changes, and otherwise once this often.
 const WATCHED_BATON_POLL: Duration = Duration::from_secs(30);
 /// The least time between two reads brought on by notices.
@@ -82,7 +81,7 @@ pub fn run(
             }
             print_deployment(cfg, &deployment, &addresses);
             println!("pot:        {}", pot.address());
-            // #### PR #53: the same QR code the setup shows, for a wallet to scan.
+            // The same QR code the setup shows, for a wallet to scan.
             for line in super::ui::qr_lines(&pot.address())? {
                 println!("{line}");
             }
@@ -105,7 +104,7 @@ pub fn run(
             };
             let pots = choice.as_ref().map(Choice::pots).unwrap_or_default();
             let mut session = connect_pots(cfg, Some(&deployment), &pots)?;
-            // #### PR #65: the pot mining would use.
+            // The pot mining would use.
             let read = choice
                 .as_ref()
                 .map(|choice| read_choice(&mut session, choice, false))
@@ -159,7 +158,7 @@ pub fn run(
                 .map(|path| RecoveryKey::load(path, false))
                 .transpose()?;
             let mut session = connect_pots(cfg, Some(&deployment), &choice.pots())?;
-            // #### PR #65: with no pot chosen, an empty signed-claim pot
+            // With no pot chosen, an empty signed-claim pot
             // refunds the previous funded pot instead.
             let read = read_choice(&mut session, &choice, true)?;
             let pot = choice.chosen(read.previous);
@@ -193,7 +192,7 @@ pub fn run(
                 key.as_ref(),
             )?;
             if sends.active() {
-                // #### PR #65: a send that propagated or can never confirm
+                // A send that propagated or can never confirm
                 // no longer holds the pot; this never broadcasts it.
                 let mut link = WithdrawalLink {
                     session: &mut session,
@@ -393,7 +392,7 @@ fn session(
     });
     if crate::session_control::profiles_requested() {
         let mut final_cfg = cfg.clone();
-        // #### PR #65: a pot flag is an explicit choice.
+        // A pot flag is an explicit choice.
         if args.owner_pot {
             final_cfg.choose_electric_pot(Some(crate::config::ElectricPotMode::Owner));
         } else if args.restricted_pot {
@@ -455,7 +454,7 @@ fn prepare(
     })
 }
 
-/// #### PR #65: what `pot_choice` mines while no pot was chosen: the
+/// What `pot_choice` mines while no pot was chosen: the
 /// previous restricted pot with the same recovery key while it alone can pay
 /// a claim, and after it can no longer pay one, the signed-claim pot.
 fn mine_choice(
@@ -572,7 +571,7 @@ fn claim_journal_path(
     }
 }
 
-/// #### PR #53: ELECTRIC as one token of a hash split: the setup's
+/// ELECTRIC as one token of a hash split: the setup's
 /// deployment and pot on `gpus`, reporting to `monitor`, whose `held` flag
 /// the split sets. The caller holds the GPU lock and the stop signal.
 pub fn run_in_split(
@@ -610,14 +609,14 @@ pub fn run_in_split_with_pot_mode(
     )
 }
 
-/// #### PR #53: what the setup's fee pot holds now, in plain-BCH sats, and
+/// What the setup's fee pot holds now, in plain-BCH sats, and
 /// the claims that pays at the current relay fee, read through BCHN or Fulcrum.
-/// #### PR #65: of the pot mining will use.
+/// Of the pot mining will use.
 pub fn pot_balance(cfg: &RuntimeConfig, config_path: &Path) -> Result<(u64, u64), String> {
     pot_reading(cfg, config_path).map(|(balance, _)| balance)
 }
 
-/// #### PR #65: the balance of the pot mining will use, and that pot's
+/// The balance of the pot mining will use, and that pot's
 /// address when it is the previous funded pot instead of the signed-claim pot.
 pub fn pot_reading(
     cfg: &RuntimeConfig,
@@ -637,7 +636,7 @@ pub fn pot_reading(
     ))
 }
 
-/// #### PR #65: whether the setup's pot could be an existing user's previous
+/// Whether the setup's pot could be an existing user's previous
 /// funded pot: no pot was chosen and the recovery key already exists.
 pub fn previous_pot_possible(cfg: &RuntimeConfig, config_path: &Path) -> bool {
     let args = ElectricDeploymentArgs::default();
@@ -711,7 +710,7 @@ fn pot_for(
         .map(|choice| (choice.pot, choice.addresses, choice.key_path))
 }
 
-/// #### PR #65: `pot_for`'s pot and, while no pot was chosen (no pot flag
+/// `pot_for`'s pot and, while no pot was chosen (no pot flag
 /// and no explicit saved choice), the previous restricted pot with the same
 /// recovery key, which an existing user may still have funded.
 struct Choice {
@@ -839,7 +838,7 @@ fn pot_choice(
     })
 }
 
-/// #### PR #65: what a choice's pots hold, and which one is used.
+/// What a choice's pots hold, and which one is used.
 struct PotRead {
     /// The previous funded pot is used instead of the signed-claim pot.
     previous: bool,
@@ -875,7 +874,7 @@ fn read_choice(
     })
 }
 
-/// #### PR #65: an implicit choice uses the previous pot while the
+/// An implicit choice uses the previous pot while the
 /// signed-claim pot cannot pay a claim and it can; a refund uses it while the
 /// signed-claim pot holds nothing and it holds BCH.
 fn uses_previous(signed: &[Coin], previous: &[Coin], relay_fee: u64, refund: bool) -> bool {
@@ -898,7 +897,7 @@ fn pays_claim(coins: &[Coin], relay_fee: u64) -> bool {
         .any(|coin| coin.value >= claim_minimum(relay_fee))
 }
 
-/// #### PR #65: ELECTRIC's own saved donation, else the session's, for
+/// ELECTRIC's own saved donation, else the session's, for
 /// ELECTRIC alone and its share of a split.
 fn electric_donation(cfg: &RuntimeConfig) -> Option<crate::donation::TokenDonation> {
     cfg.token_donations
@@ -971,7 +970,7 @@ fn connect(
     connect_pots(cfg, deployment, &pot.into_iter().collect::<Vec<_>>())
 }
 
-/// #### PR #65: one source session watching several pots.
+/// One source session watching several pots.
 fn connect_pots(
     cfg: &RuntimeConfig,
     deployment: Option<&Deployment>,
@@ -1053,7 +1052,7 @@ fn read_pot(session: &mut SourceSession, pot: &Pot) -> Result<Vec<Coin>, String>
         .collect())
 }
 
-/// #### PR #65: the pot's plain-BCH coins, largest first, and whether each
+/// The pot's plain-BCH coins, largest first, and whether each
 /// is confirmed (a positive height, as both sources report it).
 fn read_pot_coins(session: &mut SourceSession, pot: &Pot) -> Result<Vec<(Coin, bool)>, String> {
     let mut coins = Vec::new();
@@ -1167,7 +1166,7 @@ fn recipient_name(recipient: Recipient) -> &'static str {
 #[derive(Debug, PartialEq, Eq)]
 enum Ended {
     Done,
-    /// #### PR #65: the previous funded pot kept failing to pay a claim.
+    /// The previous funded pot kept failing to pay a claim.
     Drained,
 }
 
@@ -1175,8 +1174,8 @@ enum Ended {
 /// signed-claim pot takes over.
 const DRAINED_READS: u8 = 3;
 
-// #### PR #58: save completed proofs and exact claims before network submission.
-// #### PR #65: `previous` marks the previous funded pot, mined until it is migrated.
+// Save completed proofs and exact claims before network submission.
+// `previous` marks the previous funded pot, mined until it is migrated.
 #[allow(clippy::too_many_arguments)]
 fn mine(
     cfg: &RuntimeConfig,
@@ -1266,7 +1265,7 @@ fn mine(
                 }
                 Ok(false) => {}
                 Err(error) => {
-                    // #### PR #65: an expired or changed quote, or a send
+                    // An expired or changed quote, or a send
                     // still waiting, is not a source failure.
                     let reconnect = error.source && !link.retry_snapshot(&error.message);
                     monitor
@@ -1458,7 +1457,7 @@ fn mine(
         let started = Instant::now();
         let before = monitor.hashes.load(Ordering::Relaxed);
         let mut moved = false;
-        // #### PR #53: the hash split gives ELECTRIC GPU time only while this
+        // The hash split gives ELECTRIC GPU time only while this
         // search runs, so an empty pot or a wait leaves it to other tokens.
         struct Searching<'a>(&'a AtomicBool);
         impl Drop for Searching<'_> {
@@ -1656,7 +1655,6 @@ mod tests {
         );
     }
 
-    // #### PR #65
     #[test]
     fn electric_mines_its_own_saved_donation_alone_and_in_a_split() {
         use crate::donation::TokenDonation;

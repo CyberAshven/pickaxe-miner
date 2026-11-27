@@ -1,4 +1,4 @@
-// #### PR #71: future-token reference only; the live ELECTRIC miner stays v1.
+// Future-token reference only; the live ELECTRIC miner stays v1.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';

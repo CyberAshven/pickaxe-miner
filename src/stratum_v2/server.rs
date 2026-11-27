@@ -1,4 +1,3 @@
-//! #### PR #38
 //! Bounded native SV2 server. One worker owns the node/template and submissions;
 //! device connections only see immutable jobs and cannot select chain payouts.
 
@@ -36,7 +35,7 @@ use std::{
 use stratum_core::bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
 
 const MAX_CONNECTIONS: usize = 64;
-/// #### Pool modes: also how long your own P2Pool node may serve no work
+/// Also how long your own P2Pool node may serve no work
 /// before devices leave it for a fallback pool (`sv1::Preferred::down`).
 pub(super) const TEMPLATE_RECOVERY_GRACE: Duration = Duration::from_secs(3);
 
@@ -47,48 +46,48 @@ pub struct ServerConfig {
     pub authority_secret: [u8; 32],
     pub share_target: Hash,
     pub journal_path: PathBuf,
-    /// #### PR #40: the configured nodes' identities, so a journal written
+    /// The configured nodes' identities, so a journal written
     /// when journals were bound to one node still opens (and is rebound).
     pub legacy_sources: Vec<[u8; 32]>,
     pub donation: Arc<RwLock<BchDonation>>,
-    /// #### PR #40: a public pool, where each miner's blocks pay them.
+    /// A public pool, where each miner's blocks pay them.
     pub public: Option<super::payout::PublicPool>,
-    /// #### PR #40: the pool's name, written into every block's coinbase
+    /// The pool's name, written into every block's coinbase
     /// (empty for none).
     pub pool_tag: Vec<u8>,
-    /// #### PR #42: the merge-mined tokens jobs carry, and where their wins
+    /// The merge-mined tokens jobs carry, and where their wins
     /// are proven; none unless a token is merge-mined.
     pub tokens: Option<Arc<TokenHub>>,
-    /// #### PR #42: where blocks found on this server's templates by
+    /// Where blocks found on this server's templates by
     /// Template Distribution clients are saved until the node answers.
     pub relay_journal_path: Option<PathBuf>,
-    /// #### PR #42: a public pool's Job Declaration rules, when it accepts
+    /// A public pool's Job Declaration rules, when it accepts
     /// miners' own templates.
     pub declarator: Option<Arc<Declarator>>,
-    /// #### PR #42: where a pool that accepts Full-Template Job Declaration
+    /// Where a pool that accepts Full-Template Job Declaration
     /// saves the blocks found on miners' declared templates until its node
     /// answers.
     pub declared_journal_path: Option<PathBuf>,
-    /// #### PR #42: a Job Declaration client's uplink, when this server is
+    /// A Job Declaration client's uplink, when this server is
     /// the local server that mines its own templates at a pool.
     pub uplink: Option<UplinkHandle>,
-    /// #### PR #42: marked while this server has work to give, so devices
+    /// Marked while this server has work to give, so devices
     /// on a fallback pool come back to it.
     pub preferred: Option<Arc<super::sv1::Preferred>>,
-    /// #### PR #42: an ASIC-exclusive token mined instead of BCH: its wins
+    /// An ASIC-exclusive token mined instead of BCH: its wins
     /// go to the token worker, and its donation is a share of the work.
     pub header_work: Option<Arc<super::merge::source::HeaderWork>>,
     pub token_donation: Option<crate::donation::TokenDonation>,
-    /// #### PR #42: the node's ZMQ block notices (tcp://HOST:PORT).
+    /// The node's ZMQ block notices (tcp://HOST:PORT).
     pub node_zmq: Option<String>,
-    /// #### merge-mining v2: a public pool's leaf log for its standard
+    /// A public pool's leaf log for its standard
     /// channels (owner-only JSON lines, capped; see `LeafLog`).
     pub leaf_log_path: Option<PathBuf>,
     #[cfg(test)]
     pub allocation_phase: Option<u64>,
 }
 
-// #### merge-mining v2: the leaf log
+// The leaf log
 // What: a public pool's standard-channel jobs that commit a token root are
 // logged as JSON lines (time, channel, job, output 0 and the leaf
 // disclosure, never an address) to `<config>.sv2-leaves.jsonl`, readable by
@@ -167,45 +166,45 @@ pub struct ServerStats {
     pub template_ready: bool,
     pub template_failures: u64,
     pub last_template_error: Option<&'static str>,
-    /// #### PR #42: the node's ZMQ block notices, for the dashboard.
+    /// The node's ZMQ block notices, for the dashboard.
     pub block_notices: Option<String>,
     pub height: Option<u32>,
-    /// #### PR #40: the node templates come from (0 is the first in failover
+    /// The node templates come from (0 is the first in failover
     /// order), how many nodes there are, and how often the server moved on.
     pub active_node: usize,
     pub nodes: usize,
     pub node_switches: u64,
-    /// #### PR #40: the highest share difficulty since start, and its worker.
+    /// The highest share difficulty since start, and its worker.
     pub best_share: Option<(f64, String)>,
-    /// #### PR #40: the latest blocks found, newest last.
+    /// The latest blocks found, newest last.
     pub recent_blocks: VecDeque<FoundBlock>,
-    /// #### PR #42: merge-mined token wins handed to the claim worker, those
+    /// Merge-mined token wins handed to the claim worker, those
     /// dropped because its queue was full, the latest proven (newest last),
     /// and why token claims are off, if they are.
     pub token_wins: u64,
     pub token_wins_dropped: u64,
     pub recent_token_wins: VecDeque<FoundTokenWin>,
     pub tokens_off: Option<String>,
-    /// #### merge-mining v2: why the latest job refused token merge mining
+    /// Why the latest job refused token merge mining
     /// (its coinbase's output 0 is not this server's commitment).
     pub tokens_refused: Option<&'static str>,
-    /// #### merge-mining v2: what the tSAFA claimer did, when tSAFA is
+    /// What the tSAFA claimer did, when tSAFA is
     /// merge-mined.
     pub token_claims: Option<super::merge::hub::ClaimCounts>,
-    /// #### PR #42: the Template Distribution server's counts, when it
+    /// The Template Distribution server's counts, when it
     /// serves templates or still holds relayed blocks.
     pub template_server: Option<TemplateServerStats>,
-    /// #### PR #42: the Job Declaration server's counts, when the pool
+    /// The Job Declaration server's counts, when the pool
     /// accepts miners' own templates.
     pub jd_server: Option<JdServerStats>,
-    /// #### PR #42: the Job Declaration client's state and counts.
+    /// The Job Declaration client's state and counts.
     pub jd_client: Option<JdClientSummary>,
-    /// #### PR #42: what kind of source the active one is (`active_node` is
+    /// What kind of source the active one is (`active_node` is
     /// its place in failover order).
     pub template_source: Option<SourceKind>,
-    /// #### PR #42: an ASIC-exclusive token's wins, when one is mined.
+    /// An ASIC-exclusive token's wins, when one is mined.
     pub header_token: Option<super::merge::source::HeaderSummary>,
-    /// #### PR #48: validated BCH work by the payout of the job it was mined
+    /// Validated BCH work by the payout of the job it was mined
     /// on, for checking the donation and fee shares of work over a session:
     /// this server's own jobs (solo or a public pool, where the donation's
     /// work share applies), and apart from them the shares a remote pool
@@ -215,7 +214,6 @@ pub struct ServerStats {
     pub pool_work: WorkSplit,
 }
 
-/// #### PR #48
 /// Validated work in expected hashes (`2^256 / (target + 1)` per accepted
 /// share), split by its job's payout: the miner's own, the donation's or a
 /// public pool operator's fee. Counted where the work balance is credited,
@@ -260,7 +258,7 @@ impl WorkSplit {
     }
 }
 
-/// #### PR #42: what the Job Declaration server did. No count names a
+/// What the Job Declaration server did. No count names a
 /// client, an identity, a token or an address.
 #[derive(Default, Clone, Debug)]
 pub struct JdServerStats {
@@ -287,7 +285,7 @@ pub struct JdServerStats {
     pub declared_rejected: u64,
 }
 
-/// #### PR #42: what the Template Distribution server did. No count names a
+/// What the Template Distribution server did. No count names a
 /// client or an address.
 #[derive(Default, Clone, Debug)]
 pub struct TemplateServerStats {
@@ -315,7 +313,7 @@ pub struct TemplateServerStats {
     pub once_accepted: u64,
 }
 
-/// #### PR #42: a proven merge-mined token win.
+/// A proven merge-mined token win.
 #[derive(Clone, Debug)]
 pub struct FoundTokenWin {
     pub token: &'static str,
@@ -324,7 +322,6 @@ pub struct FoundTokenWin {
     pub found: Instant,
 }
 
-/// #### PR #40
 /// A block a device found: when, by which worker, and the node's answer once
 /// it has one.
 #[derive(Clone, Debug)]
@@ -342,7 +339,7 @@ const RECENT_BLOCKS: usize = 10;
 #[derive(Clone)]
 pub(super) struct PublishedJob {
     pub(super) generation: u64,
-    /// #### PR #42: the token set's serial; a change re-issues jobs on the
+    /// The token set's serial; a change re-issues jobs on the
     /// same parent.
     serial: u64,
     pub(super) template: Arc<BchTemplate>,
@@ -357,29 +354,29 @@ pub(super) struct Shared {
     fatal: Mutex<Option<&'static str>>,
     pub(super) stop: Arc<AtomicBool>,
     solved: Mutex<SolvedParents>,
-    /// #### PR #42: the claim worker's queue, bounded; device threads never
+    /// The claim worker's queue, bounded; device threads never
     /// wait on it.
     claims: Option<SyncSender<(TokenWin, String)>>,
-    /// #### merge-mining v2: the leaf log, on a public pool.
+    /// The leaf log, on a public pool.
     leaf_log: Option<LeafLog>,
-    /// #### PR #42: what Template Distribution sessions share with the node
+    /// What Template Distribution sessions share with the node
     /// worker, when templates are served or relayed blocks wait.
     pub(super) relay: Option<Relay>,
-    /// #### PR #42: the lanes a Job Declaration client's local channels take.
+    /// The lanes a Job Declaration client's local channels take.
     lanes: Arc<super::wire::Lanes>,
-    /// #### PR #42: blocks found on Full-Template declared jobs.
+    /// Blocks found on Full-Template declared jobs.
     declared: Option<DeclaredBlocks>,
-    /// #### PR #42: the latest published templates with different
+    /// The latest published templates with different
     /// transactions, newest first, whose transactions a declaration may name.
     recent: Option<Mutex<VecDeque<Arc<BchTemplate>>>>,
-    /// #### PR #42: see `ServerConfig::preferred`.
+    /// See `ServerConfig::preferred`.
     preferred: Option<Arc<super::sv1::Preferred>>,
-    /// #### PR #65: under P2Pool's own templates, until when devices
+    /// Under P2Pool's own templates, until when devices
     /// without work wait for a failing preparation, connected.
     hold: Mutex<Option<Instant>>,
 }
 
-/// #### PR #42: the JD journal and one block per parent.
+/// The JD journal and one block per parent.
 pub(super) struct DeclaredBlocks {
     journal: Mutex<Journal>,
     solved: Mutex<SolvedParents>,
@@ -389,14 +386,14 @@ pub(super) struct DeclaredBlocks {
 const RECENT_TEMPLATES: usize = 3;
 
 impl Shared {
-    /// #### PR #42: changes the Job Declaration counts.
+    /// Changes the Job Declaration counts.
     fn jd_stats(&self, change: impl FnOnce(&mut JdServerStats)) {
         if let Ok(mut stats) = self.stats.lock() {
             change(stats.jd_server.get_or_insert_with(Default::default));
         }
     }
 
-    /// #### PR #42: changes the Template Distribution counts.
+    /// Changes the Template Distribution counts.
     pub(super) fn template_stats(&self, change: impl FnOnce(&mut TemplateServerStats)) {
         if let Ok(mut stats) = self.stats.lock() {
             change(stats.template_server.get_or_insert_with(Default::default));
@@ -404,7 +401,7 @@ impl Shared {
     }
 }
 
-/// #### PR #42: the relay side of the Template Distribution server.
+/// The relay side of the Template Distribution server.
 pub(super) struct Relay {
     pub(super) journal: Mutex<Journal>,
     /// One relayed block per parent, as for this server's own blocks.
@@ -476,7 +473,7 @@ const CLAIM_QUEUE: usize = 64;
 /// How many proven token wins the dashboard keeps.
 const RECENT_TOKEN_WINS: usize = 10;
 
-/// #### PR #42: the template with the pool's name and the current token
+/// The template with the pool's name and the current token
 /// set, and that set's serial (0 without tokens).
 fn with_tokens(
     mut template: BchTemplate,
@@ -484,7 +481,7 @@ fn with_tokens(
     tokens: Option<&TokenHub>,
 ) -> (BchTemplate, u64) {
     template.tag(tag);
-    // #### merge-mining v2: tSAFA's thread depends on the job's height.
+    // TSAFA's thread depends on the job's height.
     match tokens.and_then(|hub| hub.current_for(template.height)) {
         Some(set) => {
             let serial = set.serial();
@@ -495,7 +492,6 @@ fn with_tokens(
     }
 }
 
-// #### PR #38
 // Only the first solved block on a parent can win; later solutions on the same
 // parent would only compete with it. Chipnet allows difficulty-1 blocks after
 // a 20-minute gap, and then every share is a solution: an Avalon Nano sends
@@ -521,7 +517,7 @@ impl SolvedParents {
     }
 }
 
-/// #### PR #42: the listeners a server serves: devices, and Template
+/// The listeners a server serves: devices, and Template
 /// Distribution clients when asked (`--tp-listen`).
 pub struct Listeners {
     pub devices: TcpListener,
@@ -551,7 +547,7 @@ pub fn run<R: NodeRpc + Send + 'static>(
     )
 }
 
-/// #### PR #42: nodes as template sources, in failover order.
+/// Nodes as template sources, in failover order.
 pub fn rpc_sources<R: NodeRpc + Send + 'static>(
     nodes: Vec<R>,
     network: MiningNetwork,
@@ -580,7 +576,7 @@ pub fn run_with(
     if total == 0 {
         return Err("no BCH node configured".into());
     }
-    // #### PR #42: each source keeps its place in failover order.
+    // Each source keeps its place in failover order.
     let mut sources: VecDeque<(usize, Box<dyn TemplateSource>)> =
         sources.into_iter().enumerate().collect();
     validate_payout_address(config.network, &config.payout)
@@ -592,7 +588,7 @@ pub fn run_with(
     listener
         .set_nonblocking(true)
         .map_err(|_| "cannot configure mining listener")?;
-    // #### PR #42: a Job Declaration client's blocks pay the pool's outputs.
+    // A Job Declaration client's blocks pay the pool's outputs.
     let journal = if config.uplink.is_some() {
         Journal::open_declared(&config.journal_path, config.network)?
     } else {
@@ -603,7 +599,7 @@ pub fn run_with(
             &config.legacy_sources,
         )?
     };
-    // #### PR #42: the relay journal opens with the template listener, and
+    // The relay journal opens with the template listener, and
     // also without it while its file exists, so blocks a pool found before a
     // restart without --tp-listen still reach the node.
     let relay = match (&templates, config.relay_journal_path.as_deref()) {
@@ -619,7 +615,7 @@ pub fn run_with(
             .set_nonblocking(true)
             .map_err(|_| "cannot configure template listener")?;
     }
-    // #### PR #42: the JD journal opens when the pool accepts Full-Template
+    // The JD journal opens when the pool accepts Full-Template
     // Job Declaration, and also without it while its file exists, so blocks
     // found before a restart still reach the node.
     let full_template = config
@@ -660,13 +656,13 @@ pub fn run_with(
         }
     }
     let (wake, receive_blocks) = mpsc::sync_channel::<()>(1);
-    // #### PR #42: the node's block notices wake the node worker (see
+    // The node's block notices wake the node worker (see
     // `zmq`).
     let notices = match config.node_zmq.as_deref() {
         Some(url) => Some(super::zmq::subscribe(url, wake.clone(), stop.clone())?),
         None => None,
     };
-    // #### PR #42: the claim worker
+    // The claim worker
     // What: proves each token win the device threads hand on (through a
     // bounded queue they never wait on), saves the proofs and lists them on
     // the dashboard.
@@ -708,7 +704,7 @@ pub fn run_with(
         }
         None => (None, None),
     };
-    // #### merge-mining v2: the tSAFA claimer
+    // The tSAFA claimer
     // What: every 20 seconds (60 after a failure), one round of
     // `TokenHub::safa_tick` through Fulcrum: the vaults jobs mine, then the
     // claims of proven wins; its counts reach the dashboard.
@@ -774,9 +770,9 @@ pub fn run_with(
     let node_notices = notices.clone();
     let node_donation = config.donation.clone();
     let node = thread::spawn(move || -> Result<(), String> {
-        // #### PR #42: what was last offered under Job Declaration.
+        // What was last offered under Job Declaration.
         let mut offered = Offered::default();
-        // #### PR #42: server-owned generations
+        // Server-owned generations
         // What: the server counts its own template generations: a new one
         // whenever the active source or its generation changes, the same one
         // when a template is published again (a token set or a plan change).
@@ -797,7 +793,6 @@ pub fn run_with(
                 Err(mpsc::RecvTimeoutError::Timeout) => (),
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            // #### PR #38
             // The journal is authoritative; a coalesced wake cannot lose work.
             // Release its lock before RPC so another device can persist a block
             // while a reply is delayed. Retry old blocks fairly with backoff.
@@ -808,7 +803,7 @@ pub fn run_with(
                     if retry {
                         stats.block_retries = stats.block_retries.saturating_add(1);
                     }
-                    // #### PR #40: the node's answer, on the dashboard's list.
+                    // The node's answer, on the dashboard's list.
                     let result = match outcome {
                         SubmissionOutcome::Accepted => Some("accepted"),
                         SubmissionOutcome::Rejected(_) => Some("rejected"),
@@ -835,7 +830,7 @@ pub fn run_with(
                 // survive tip changes; no response is treated as acceptance.
                 refreshed = Instant::now() - Duration::from_secs(60);
             }
-            // #### PR #42: relayed blocks
+            // Relayed blocks
             // What: blocks Template Distribution clients found go to the node
             // like this server's own: from the relay journal, retried with
             // backoff until the node answers exactly. A block the journal
@@ -862,7 +857,7 @@ pub fn run_with(
                     refreshed = Instant::now() - Duration::from_secs(60);
                 }
             }
-            // #### PR #42: a declared job's block is propagated by the pool
+            // A declared job's block is propagated by the pool
             // What: blocks found on Full-Template declared jobs (a client's
             // share on its custom job, or its PushSolution) go to the node
             // from the JD journal, retried with backoff until the node answers
@@ -895,8 +890,6 @@ pub fn run_with(
                     refreshed = Instant::now() - Duration::from_secs(60);
                 }
             }
-            // #### end PR #42 ####
-            // #### PR #42
             // What: when a merge-mined token's state changes, the current
             // template is published again with the new token set, without
             // asking the node; devices get new jobs on the same parent.
@@ -905,15 +898,15 @@ pub fn run_with(
             // revoke all work.
             // Look here if: jobs do not change after a token win, or a token
             // win revokes work.
-            // #### PR #42: a Job Declaration plan that came or went re-offers
+            // A Job Declaration plan that came or went re-offers
             // the current template (see `offer`).
-            // #### PR #42: the token worker's counts, for the dashboard.
+            // The token worker's counts, for the dashboard.
             if let Some(work) = node_header_work.as_ref() {
                 if let Ok(mut stats) = node_shared.stats.lock() {
                     stats.header_token = Some(work.summary());
                 }
             }
-            // #### PR #65: the donation setting can change while serving.
+            // The donation setting can change while serving.
             let donating = node_donation.read().is_ok_and(|rate| u16::from(*rate) != 0);
             let plan_changed = node_uplink.as_ref().is_some_and(|uplink| {
                 if let Ok(mut stats) = node_shared.stats.lock() {
@@ -923,7 +916,7 @@ pub fn run_with(
                     || donation_plan(uplink, donating).map(|plan| plan.serial)
                         != offered.donation_plan
             });
-            // #### PR #65: a finished P2Pool preparation is published, and a
+            // A finished P2Pool preparation is published, and a
             // failed one offered again when due (see `finish_preparations`).
             let retry = node_uplink.as_ref().is_some_and(|uplink| {
                 finish_preparations(&node_shared, uplink, &mut offered, Instant::now())
@@ -945,7 +938,7 @@ pub fn run_with(
                     );
                 }
             }
-            // #### PR #42: a block notice refreshes at once; while notices
+            // A block notice refreshes at once; while notices
             // flow, the node is asked for its tip every 2 s instead of at
             // every wake (the safety net).
             let notified = node_notices
@@ -964,7 +957,7 @@ pub fn run_with(
             } else {
                 true
             };
-            // #### PR #48: Chipnet's 20-minute point refreshes too (see
+            // Chipnet's 20-minute point refreshes too (see
             // `min_difficulty_due`).
             let wall = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -998,14 +991,13 @@ pub fn run_with(
                             stats.last_template_error = Some(template_reason(&error));
                         }
                         publish(&node_shared, None);
-                        // #### PR #65: a preparation still running was for a
+                        // A preparation still running was for a
                         // template this node no longer serves; it must not
                         // publish an old parent once it finishes.
                         offered.preparing = None;
                         offered.in_flight = None;
                         offered.waiting = None;
                         offered.last = None;
-                        // #### PR #40
                         // What: with more than one node, move to the next in
                         // failover order when this one gives no template, and
                         // try it at once; the failed node waits at the back.
@@ -1014,7 +1006,7 @@ pub fn run_with(
                         // blocks, so they go to the next node too.
                         // Look here if: the node number on the dashboard keeps
                         // changing, which means every node is failing.
-                        // #### PR #42: across nodes and template providers
+                        // Across nodes and template providers
                         // alike (see `TemplateSource`).
                         if total > 1 {
                             if let Some((slot, mut failed)) = sources.pop_front() {
@@ -1068,7 +1060,6 @@ pub fn run_with(
         match listener.accept() {
             Ok((stream, peer)) => {
                 idle = false;
-                // #### PR #40
                 // What: accepted sockets block again before the handshake.
                 // Why: on Windows an accepted socket inherits the listener's
                 // non-blocking mode, so the Noise handshake's first read
@@ -1116,7 +1107,7 @@ pub fn run_with(
                 break;
             }
         }
-        // #### PR #42: the template listener
+        // The template listener
         // What: Template Distribution clients (SV2 pools, Job Declaration
         // clients, P2Pool, another Pickaxe) connect here, at most 8 at once,
         // each on its own thread with the mining listener's key. The
@@ -1218,12 +1209,12 @@ impl RetrySchedule {
     }
 }
 
-/// #### PR #48: how often, and for how long past Chipnet's 20-minute point,
+/// How often, and for how long past Chipnet's 20-minute point,
 /// the node thread asks again while its template keeps normal bits.
 const MIN_DIFFICULTY_RETRY: Duration = Duration::from_secs(1);
 const MIN_DIFFICULTY_WINDOW: u64 = 15;
 
-// #### PR #48: the minimum-difficulty refresh
+// The minimum-difficulty refresh
 // What: on Chipnet, once the server's clock passes the current template's
 // parent time plus 1200 seconds while the template is on normal bits, the
 // node thread refreshes at once, and again each second while the template
@@ -1246,7 +1237,7 @@ fn min_difficulty_due(template: Option<&BchTemplate>, wall: u64, since_refresh: 
             .is_some_and(|past| past < MIN_DIFFICULTY_WINDOW)
 }
 
-/// #### PR #42: the server's own generation numbers (see the node thread).
+/// The server's own generation numbers (see the node thread).
 #[derive(Default)]
 struct Generations {
     count: u64,
@@ -1264,7 +1255,7 @@ impl Generations {
     }
 }
 
-// #### PR #42: the whole-block fallback
+// The whole-block fallback
 // What: a saved block goes to the active source; when that is a template
 // provider and its answer is not final, the first node among the other
 // sources gets the whole block too.
@@ -1298,7 +1289,7 @@ fn submit_saved(
     outcome
 }
 
-/// #### PR #38: one saved block from `journal` to the node: the oldest one
+/// One saved block from `journal` to the node: the oldest one
 /// due, retried with backoff until the node answers exactly. The journal's
 /// lock is released during the RPC. Returns the block, the node's answer and
 /// whether it was a retry.
@@ -1331,7 +1322,7 @@ fn submit_next(
     Ok(Some((pending, outcome, retry)))
 }
 
-/// #### PR #42: the relay journal's counts, for the dashboard.
+/// The relay journal's counts, for the dashboard.
 pub(super) fn update_relay_stats(shared: &Shared) -> Result<(), String> {
     let Some(relay) = shared.relay.as_ref() else {
         return Ok(());
@@ -1349,7 +1340,7 @@ pub(super) fn update_relay_stats(shared: &Shared) -> Result<(), String> {
     Ok(())
 }
 
-/// #### PR #42: the JD journal's counts, for the dashboard.
+/// The JD journal's counts, for the dashboard.
 fn update_declared_stats(shared: &Shared) -> Result<(), String> {
     let Some(declared) = shared.declared.as_ref() else {
         return Ok(());
@@ -1367,7 +1358,7 @@ fn update_declared_stats(shared: &Shared) -> Result<(), String> {
     Ok(())
 }
 
-/// #### PR #42: saves a block found on a declared job, the first on its
+/// Saves a block found on a declared job, the first on its
 /// parent, in the JD journal and lists it, then wakes the node worker. A
 /// journal that cannot save it stops the server, as for its own blocks.
 fn save_declared(
@@ -1461,14 +1452,14 @@ fn device_ended(shared: &Shared, id: u64, error: Option<&str>) {
     }
 }
 
-/// #### PR #42: the Job Declaration plan the uplink holds now.
-/// #### PR #65: the miner's own session's; the donation session's state
+/// The Job Declaration plan the uplink holds now.
+/// The miner's own session's; the donation session's state
 /// never gates it (see `donation_plan`).
 fn current_plan(uplink: &UplinkHandle) -> Option<Arc<super::jd::plan::JdPlan>> {
     uplink.status.plan.read().ok().and_then(|plan| plan.clone())
 }
 
-/// #### PR #65: the P2Pool donation session's plan, while the donation is
+/// The P2Pool donation session's plan, while the donation is
 /// above 0% (`donating`).
 fn donation_plan(uplink: &UplinkHandle, donating: bool) -> Option<Arc<super::jd::plan::JdPlan>> {
     if !donating {
@@ -1477,7 +1468,7 @@ fn donation_plan(uplink: &UplinkHandle, donating: bool) -> Option<Arc<super::jd:
     uplink.donation.as_ref()?.status.plan.read().ok()?.clone()
 }
 
-// #### PR #42: the JD plan gates local jobs
+// The JD plan gates local jobs
 // What: a Job Declaration client's local server publishes a template only
 // while the uplink holds a plan: the template carries the plan (the pool's
 // outputs, the nested extranonce) and goes to the uplink to declare. Without
@@ -1487,7 +1478,7 @@ fn donation_plan(uplink: &UplinkHandle, donating: bool) -> Option<Arc<super::jd:
 // Why: a custom job the pool has not accepted earns the miner nothing.
 // Look here if: devices get no work while Job Declaration is active, or keep
 // mining local jobs after a fallback.
-/// #### PR #42: what the node thread last offered under Job Declaration.
+/// What the node thread last offered under Job Declaration.
 #[derive(Default)]
 struct Offered {
     /// The plan serial jobs were last published with.
@@ -1498,14 +1489,14 @@ struct Offered {
     /// The parent, bits and plan of the last template sent to the uplink,
     /// and when.
     last: Option<(Hash, u32, u64, Instant)>,
-    /// #### PR #65: the P2Pool preparation running, and the newest offer
+    /// The P2Pool preparation running, and the newest offer
     /// waiting for it (see `start_preparation`).
     preparing: Option<mpsc::Receiver<Prepared>>,
     /// The running preparation's template, plan and lease, so a worker that
     /// never reports (a failed spawn or a panic) fails like any other.
     in_flight: Option<(BchTemplate, u64, Instant)>,
     waiting: Option<Preparation>,
-    /// #### PR #65: failed P2Pool preparations in a row, when the next try
+    /// Failed P2Pool preparations in a row, when the next try
     /// is due, and until when devices wait for one to succeed (the first
     /// failed offer's lease).
     failures: u32,
@@ -1560,7 +1551,7 @@ fn offer(
     let personal_serial = plan.as_ref().map(|plan| plan.serial);
     let donation = donation_plan(uplink, donating);
     let donation_serial = donation.as_ref().map(|plan| plan.serial);
-    // #### PR #65: only a new personal session starts a new cohort; a
+    // Only a new personal session starts a new cohort; a
     // donation session that comes or goes leaves the miner's accepted work
     // alone (its donation jobs pause, see `donation_readiness`), and its
     // next declaration goes at once.
@@ -1587,7 +1578,7 @@ fn offer(
         return;
     };
     let plan_serial = plan.serial;
-    // #### PR #42: coalescing
+    // Coalescing
     // What: under Job Declaration a template on the same parent and plan as
     // one offered less than 5 seconds ago is skipped; a new parent or plan
     // goes at once, and the next refresh catches up.
@@ -1596,7 +1587,7 @@ fn offer(
     // refreshes must not spend them.
     // Look here if: a pool refuses declarations for their rate, or devices
     // keep a template's job for over 15 seconds.
-    // #### PR #48: new bits on the same parent (Chipnet's limit at the
+    // New bits on the same parent (Chipnet's limit at the
     // 20-minute point) go at once too, as a new parent does.
     if offered.coalesce(&template, plan_serial, Instant::now()) {
         return;
@@ -1607,7 +1598,7 @@ fn offer(
         own
     });
     template.declare(plan);
-    // #### PR #65: P2Pool coinbases (and the pool's payout outputs, 0x5052)
+    // P2Pool coinbases (and the pool's payout outputs, 0x5052)
     // are prepared off this thread (see
     // `start_preparation`); the offer ends when they are.
     if template.needs_preparation() {
@@ -1641,12 +1632,11 @@ fn offer(
         }),
     );
 }
-// #### end PR #42 ####
 
 /// How long a published job may be issued to devices.
 const JOB_LEASE: Duration = Duration::from_secs(30);
 
-// #### PR #65: P2Pool preparation off the node thread
+// P2Pool preparation off the node thread
 // What: an offer under P2Pool's own templates hands its templates to a
 // preparation thread, which asks the helper for the personal and donation
 // coinbases at once (each request within its 2 s deadline) and wakes the
@@ -1894,7 +1884,7 @@ fn failed_preparation(
     set_hold(shared, Some(hold));
 }
 
-/// #### PR #65: until when devices without work wait for P2Pool
+/// Until when devices without work wait for P2Pool
 /// preparations, connected (see `JobAvailability::update`).
 fn set_hold(shared: &Shared, until: Option<Instant>) {
     if let Ok(mut hold) = shared.hold.lock() {
@@ -1902,7 +1892,7 @@ fn set_hold(shared: &Shared, until: Option<Instant>) {
     }
 }
 
-/// #### PR #65: a failed refresh cannot revoke still-fresh work on the same
+/// A failed refresh cannot revoke still-fresh work on the same
 /// parent and sessions. Its original lease and ACK checks remain authoritative.
 fn failed_offer(shared: &Shared, offered: &mut Offered, incoming: &BchTemplate, plan: u64) {
     offered.last = None; // Not a declaration: its retry must not be coalesced.
@@ -1928,12 +1918,12 @@ fn failed_offer(shared: &Shared, offered: &mut Offered, incoming: &BchTemplate, 
 }
 
 fn publish(shared: &Shared, job: Option<PublishedJob>) {
-    // #### PR #42: devices on a fallback pool come back while this server
+    // Devices on a fallback pool come back while this server
     // has work (see `sv1::Preferred`).
     if let Some(preferred) = shared.preferred.as_ref() {
         preferred.set(job.is_some(), Instant::now());
     }
-    // #### PR #42: the latest templates with other transactions, for
+    // The latest templates with other transactions, for
     // Full-Template declarations.
     if let (Some(job), Some(recent)) = (job.as_ref(), shared.recent.as_ref()) {
         if let Ok(mut recent) = recent.lock() {
@@ -1957,12 +1947,11 @@ fn publish(shared: &Shared, job: Option<PublishedJob>) {
     }
 }
 
-// #### PR #38
 // A brief template failure is not a failed device transport. Revoke all work
 // immediately, reject submissions while unavailable, then cleanly activate a
 // fresh job on the same channel. The grace is bounded; never extend a job's
 // original freshness lease just to keep a connection alive.
-/// #### PR #42: the donation a session's jobs rotate to: the BCH donation,
+/// The donation a session's jobs rotate to: the BCH donation,
 /// or on an ASIC-exclusive token that token's share of the work.
 #[derive(Clone, Copy, Debug)]
 enum JobDonation {
@@ -1971,7 +1960,7 @@ enum JobDonation {
     Token(crate::donation::TokenDonation),
 }
 
-/// #### PR #65: under Job Declaration, what the pools accepted so far.
+/// Under Job Declaration, what the pools accepted so far.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Acknowledged {
     /// The newest declaration the miner's own session's pool accepted.
@@ -1994,7 +1983,7 @@ impl Acknowledged {
     }
 }
 
-// #### PR #65: P2Pool donation work follows its own session
+// P2Pool donation work follows its own session
 // What: a P2Pool job's donation job is mined only once the donation
 // session accepted it. While that session still has to, donation work is
 // done on the miner's own job and stays owed (it is repaid once accepted);
@@ -2033,13 +2022,13 @@ const DONATION_ACK_WAIT: Duration = Duration::from_secs(5);
 
 struct JobAvailability {
     generation: Option<u64>,
-    /// #### PR #42: the token set's serial of the job issued last (and the
-    /// plan's, under Job Declaration), and its parent (#### PR #48: and
+    /// The token set's serial of the job issued last (and the
+    /// plan's, under Job Declaration), and its parent (and
     /// bits).
     serial: Option<u64>,
     parent: Option<(Hash, u32)>,
     unavailable_since: Option<Instant>,
-    /// #### PR #65: the published job issued last, until it is revoked.
+    /// The published job issued last, until it is revoked.
     held: Option<PublishedJob>,
     payout: Option<BchPayout>,
     next_id: u32,
@@ -2093,7 +2082,7 @@ impl JobAvailability {
                 .cloned();
             match held {
                 Some(held) => current = Some(held),
-                // #### PR #65: waiting for the pool's acceptance
+                // Waiting for the pool's acceptance
                 // What: a device whose work the new job replaces (a new
                 // block, or a new session) waits idle on its connection
                 // until the pool accepts the job or the job's lease ends.
@@ -2114,10 +2103,10 @@ impl JobAvailability {
             .filter(|job| now < job.valid_until && (!job.template.is_p2pool() || accepted(job)))
         {
             self.allocation.update(now, !mining.channels.is_empty());
-            // #### PR #42: a token's donation is all work (see
+            // A token's donation is all work (see
             // `WorkAllocation::token_donation_work`).
             let p2pool = matches!(donation, JobDonation::P2Pool(_));
-            // #### merge-mining v2: a job that merge-mines a root of its own
+            // A job that merge-mines a root of its own
             // (solo, or a public pool miner's; not under Job Declaration)
             // with a token without split support pays that token's donation,
             // and a public pool's fee, in work at the whole rate (see
@@ -2132,7 +2121,7 @@ impl JobAvailability {
                 && job.template.jd_plan().is_none();
             let (donation, donation_work) = match donation {
                 JobDonation::Bch(rate) => (rate, self.allocation.donation_work(rate)),
-                // #### PR #65: see `donation_readiness`.
+                // See `donation_readiness`.
                 JobDonation::P2Pool(rate) => match donation_readiness(&job, acknowledged, now) {
                     Some(true) => (rate, self.allocation.pool_donation_work(rate)),
                     Some(false) => (rate, false),
@@ -2146,7 +2135,7 @@ impl JobAvailability {
             let payout = BchPayout {
                 donation,
                 donation_work,
-                // #### PR #40: a public pool's fee, after the donation.
+                // A public pool's fee, after the donation.
                 fee,
                 fee_work: !donation_work
                     && fee.is_some_and(|fee| self.allocation.fee_work(donation, fee)),
@@ -2183,7 +2172,7 @@ impl JobAvailability {
             {
                 return Ok(Vec::new());
             }
-            // #### PR #42: same-parent gating (Job Declaration)
+            // Same-parent gating (Job Declaration)
             // What: under Job Declaration a new template on the parent and
             // plan of the job devices have reaches them only once the pool
             // accepted its custom job; a new parent or plan goes at once.
@@ -2192,7 +2181,7 @@ impl JobAvailability {
             // devices have stays valid on its parent.
             // Look here if: devices keep one job on a parent while the pool
             // accepts newer ones, or shares wait in the uplink's cache.
-            // #### PR #48: new bits on the parent (Chipnet's limit at the
+            // New bits on the parent (Chipnet's limit at the
             // 20-minute point) go at once too: the job devices have can no
             // longer make a block (see `BchTemplate::stale_bits`).
             if !job.template.is_p2pool()
@@ -2224,7 +2213,7 @@ impl JobAvailability {
         }
         self.allocation.update(now, false);
         self.revoke(mining);
-        // #### PR #65: under P2Pool's own templates a failing preparation
+        // Under P2Pool's own templates a failing preparation
         // is retried within moments; devices wait for it connected, until
         // the first failed offer's lease ends.
         if acknowledged
@@ -2252,7 +2241,6 @@ impl JobAvailability {
 }
 
 impl JobAvailability {
-    /// #### PR #38
     /// Vardiff runs only while a job is live. A new target reuses this
     /// session's job counter, so a re-issued job never repeats an ID.
     fn retarget(
@@ -2277,7 +2265,7 @@ pub(super) fn template_reason(error: &str) -> &'static str {
         }
         "invalid block template" => "invalid block template",
         "template generation exhausted" => "template generation exhausted",
-        // #### PR #42: template providers' reasons, as they are.
+        // Template providers' reasons, as they are.
         "template provider closed the connection" => "template provider closed the connection",
         "template provider broke the protocol" => "template provider broke the protocol",
         "template provider sent an invalid template" => {
@@ -2299,13 +2287,13 @@ pub(super) fn template_reason(error: &str) -> &'static str {
     }
 }
 
-/// #### PR #42: what a connection on the SV2 listener turned out to be.
+/// What a connection on the SV2 listener turned out to be.
 enum Served {
     Device,
     JobDeclaration,
 }
 
-/// #### PR #42: whether `frame` sets up a Job Declaration session.
+/// Whether `frame` sets up a Job Declaration session.
 fn job_declaration_setup(frame: &mut stratum_core::codec_sv2::SerializedFrame) -> bool {
     let header = frame.header();
     header.msg_type() == stratum_core::common_messages_sv2::MESSAGE_TYPE_SETUP_CONNECTION
@@ -2314,7 +2302,7 @@ fn job_declaration_setup(frame: &mut stratum_core::codec_sv2::SerializedFrame) -
             == Some(&(stratum_core::common_messages_sv2::Protocol::JobDeclarationProtocol as u8))
 }
 
-// #### PR #42: JD sessions on the SV2 listener
+// JD sessions on the SV2 listener
 // What: a connection whose first SetupConnection names Job Declaration is a
 // client's JD session when this pool accepts miners' own templates: it
 // leaves the device table (its row goes, and the rows it took over on its
@@ -2343,7 +2331,7 @@ fn serve_declarator(
             let now = Instant::now();
             let mut responses = match frame {
                 Some(mut frame) => {
-                    // #### PR #42: a declaration is checked against the
+                    // A declaration is checked against the
                     // pool's current template and its latest few.
                     let current = shared
                         .job
@@ -2370,7 +2358,7 @@ fn serve_declarator(
             // Requested Payout Outputs (0x5052): PayoutOutputsStale once
             // the pool's donation or fee changes (`DeclaratorSession::poll`).
             responses.frames.extend(session.poll(declarator)?.frames);
-            // #### PR #42: a Full-Template session's frames may take 16 MiB
+            // A Full-Template session's frames may take 16 MiB
             // (`Limits::JD`); a Coinbase-only one keeps a device's limits.
             if session.full_template() && !raised {
                 sender.set_limits(Limits::JD);
@@ -2437,7 +2425,7 @@ fn serve_device(
         )?;
         mining.set_public(config.public.clone());
         mining.set_declarator(config.declarator.clone());
-        // #### PR #42: a token that fixes its version slot (see
+        // A token that fixes its version slot (see
         // `MiningSession::set_fixed_version`).
         mining.set_fixed_version(config.header_work.as_ref().is_some_and(|work| {
             work.token().params.version == super::merge::safa::VersionRule::Fixed
@@ -2458,12 +2446,12 @@ fn serve_device(
                     .map(|job| job.clone())
                     .map_err(|_| "template state unavailable")
             };
-            // #### PR #42: under Job Declaration the custom job's coinbase
+            // Under Job Declaration the custom job's coinbase
             // pays the donation, so no local job is donation work; on an
             // ASIC-exclusive token the donation is that token's share of work.
-            // #### merge-mining v2: a public pool miner's own donation choice
+            // A public pool miner's own donation choice
             // sets this connection's rate (see `MiningSession::donation_choice`).
-            // #### one donation, the higher rate: the connection's rate is
+            // The connection's rate is
             // the higher of the pool's and the login's, less the miner's own
             // visible donation (see `MiningSession::public_donation`).
             let donation = |mining: &mut MiningSession| -> Result<JobDonation, String> {
@@ -2518,7 +2506,7 @@ fn serve_device(
             for frame in availability.retarget(&mut mining)? {
                 sender.send(frame)?;
             }
-            // #### merge-mining v2: the leaf log's lines (see `LeafLog`).
+            // The leaf log's lines (see `LeafLog`).
             if !mining.leaf_log.is_empty() {
                 let lines = std::mem::take(&mut mining.leaf_log);
                 if let Some(log) = shared.leaf_log.as_ref() {
@@ -2526,7 +2514,7 @@ fn serve_device(
                 }
             }
             if let Some(mut frame) = receiver.receive(Duration::from_millis(100))? {
-                // #### PR #42: JD sessions on the SV2 listener (see
+                // JD sessions on the SV2 listener (see
                 // `serve_declarator`).
                 if let Some(declarator) = config
                     .declarator
@@ -2560,7 +2548,7 @@ fn serve_device(
                     .as_secs();
                 let now = u32::try_from(now).map_err(|_| "system time exceeds header range")?;
                 let responses = mining.receive(frame, now)?;
-                // #### PR #48: validated BCH work repays the original job's quota.
+                // Validated BCH work repays the original job's quota.
                 if config.token_donation.is_none() {
                     if let Some((target, payout)) = responses.accepted_work {
                         if config
@@ -2584,7 +2572,7 @@ fn serve_device(
                             }
                         }
                     }
-                    // #### one donation, the higher rate: a donation
+                    // A donation
                     // channel's share is donation work in the work split,
                     // and repays no quota of the miner's own jobs.
                     if let Some(target) = mining.donation_share.take() {
@@ -2593,14 +2581,14 @@ fn serve_device(
                         }
                     }
                 }
-                // #### PR #42: shares for the pool, handed over without
+                // Shares for the pool, handed over without
                 // waiting (see `jd::client::forward`).
                 if let Some(uplink) = config.uplink.as_ref() {
                     for share in &responses.forward {
                         uplink.forward(share.clone());
                     }
                 }
-                // #### PR #42: header-token wins go to the token worker,
+                // Header-token wins go to the token worker,
                 // which checks and saves them on its own thread; a full
                 // queue drops (and counts) a win instead of waiting.
                 if let Some(work) = config.header_work.as_ref() {
@@ -2611,7 +2599,7 @@ fn serve_device(
                         });
                     }
                 }
-                // #### PR #42: a custom job's outcome on the dashboard.
+                // A custom job's outcome on the dashboard.
                 if let Some(outcome) = responses.custom_job {
                     shared.jd_stats(|stats| match outcome {
                         Ok(()) => stats.custom_jobs += 1,
@@ -2625,7 +2613,7 @@ fn serve_device(
                 // Storage failure stops the service rather than acknowledging
                 // work which would disappear on a restart.
                 for block in responses.blocks {
-                    // #### PR #42: a Coinbase-only custom job's block
+                    // A Coinbase-only custom job's block
                     // What: it is listed on the dashboard as submitted by
                     // the miner's node, never journaled, and does not mark
                     // its parent solved.
@@ -2635,7 +2623,7 @@ fn serve_device(
                     // still be saved in case the client's fails.
                     // Look here if: the server stops with "cannot persist
                     // solved block" while JD clients mine.
-                    // #### PR #42: a declared job's block (Full-Template) goes
+                    // A declared job's block (Full-Template) goes
                     // to the JD journal, then the pool's node.
                     if block.template.is_declared() {
                         let bytes = block.template.block(&block.coinbase, block.header)?;
@@ -2698,7 +2686,7 @@ fn serve_device(
                         shared.stop.store(true, Ordering::Relaxed);
                         return Err("cannot persist solved block; mining stopped".into());
                     }
-                    // #### PR #40: the dashboard lists the blocks found.
+                    // The dashboard lists the blocks found.
                     if saved == Ok(true) {
                         if let Ok(mut stats) = shared.stats.lock() {
                             let mut hash = super::template::double_sha256(&block.header);
@@ -2721,7 +2709,6 @@ fn serve_device(
                     // it also scans pending disk work on its bounded timeout.
                     let _ = shared.wake.try_send(());
                 }
-                // #### PR #42
                 // What: a share's token wins go to the claim worker, each
                 // token state once; a full queue drops the win (counted)
                 // instead of waiting.
@@ -2762,7 +2749,7 @@ fn serve_device(
                         .shares_rejected
                         .saturating_add(next_rejected.saturating_sub(rejected));
                     stats.device_stats.channels(device, mining.channels.len());
-                    // #### PR #40: best shares, the device's and the pool's.
+                    // Best shares, the device's and the pool's.
                     if let Some(difficulty) = mining.share_difficulty.take() {
                         if let Some(worker) = stats.device_stats.best_share(device, difficulty) {
                             if stats
@@ -2774,17 +2761,17 @@ fn serve_device(
                             }
                         }
                     }
-                    // #### PR #40: named by its channel's user identity.
+                    // Named by its channel's user identity.
                     if let Some(identity) = mining.identity.take() {
                         stats.device_stats.set_worker(device, &identity);
                     }
-                    // #### one donation, the higher rate: the miner's
+                    // The miner's
                     // effective rate and own Pickaxe credit, on a public
                     // pool.
                     stats
                         .device_stats
                         .set_donation(device, mining.donation_terms());
-                    // #### merge-mining v2: a job refused token merge
+                    // A job refused token merge
                     // mining (the own-root check) says so on the dashboard.
                     if let Some(reason) = mining.token_refusal.take() {
                         stats.tokens_refused = Some(reason);
@@ -2807,7 +2794,6 @@ fn serve_device(
                 }
                 accepted = next_accepted;
                 rejected = next_rejected;
-                // #### PR #38
                 // Publish validation counters before the peer can observe its
                 // acknowledgement. The node worker may already have accepted
                 // the block; delayed socket scheduling must not leave the
@@ -2928,7 +2914,7 @@ mod retry_tests {
         }
     }
 
-    // #### merge-mining v2: a token without split support donates in work
+    // A token without split support donates in work
     // What: on a solo template with such a token, a job pays its donation
     // in BCH's donation window, then on its own (BCH pays the miner, the
     // leaves the donation) until the whole 1.5% of the cycle, then neither;
@@ -3136,7 +3122,6 @@ mod retry_tests {
         );
     }
 
-    // #### PR #42
     // What: under Job Declaration a newer template on the same parent and
     // plan reaches the channel only once the pool accepted its generation's
     // custom job; a new parent goes at once, and without Job Declaration
@@ -3214,7 +3199,7 @@ mod retry_tests {
             3,
             "a new parent goes at once"
         );
-        // #### PR #48: new bits on the parent go at once too.
+        // New bits on the parent go at once too.
         next["bits"] = serde_json::json!("1d00ffff");
         next["target"] = serde_json::json!(format!("00000000ffff{}", "00".repeat(26)));
         let limit = Arc::new(BchTemplate::from_rpc(&next).unwrap());
@@ -3229,7 +3214,6 @@ mod retry_tests {
         assert_eq!(offer(&mut alone, &mut plain, job(2, &template), None), 2);
     }
 
-    // #### PR #48
     // What: the node thread refreshes for Chipnet's 20-minute point from the
     // parent's time plus 1201 s, once a second at most, for 15 seconds,
     // while the template is on normal bits; never for the limit's bits or a
@@ -3272,7 +3256,7 @@ mod retry_tests {
         assert_eq!(template.stale_from(), None);
     }
 
-    /// #### PR #65: the node thread's part of P2Pool preparations, until the
+    /// The node thread's part of P2Pool preparations, until the
     /// one running and the one waiting are done.
     fn settle(shared: &Shared, uplink: &UplinkHandle, offered: &mut Offered) {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -3286,7 +3270,6 @@ mod retry_tests {
         }
     }
 
-    // #### PR #48
     // What: under Job Declaration, a template on the parent, bits and plan
     // offered less than 5 s ago is skipped; new bits on the same parent go
     // at once, as a new parent or plan does.
@@ -3569,7 +3552,7 @@ mod retry_tests {
     }
 }
 
-// #### PR #65: P2Pool own templates: preparation, retries, the donation
+// P2Pool own templates: preparation, retries, the donation
 // session and acknowledgement waits.
 #[cfg(test)]
 mod p2pool_tests {
@@ -3742,7 +3725,6 @@ mod p2pool_tests {
         }
     }
 
-    // #### PR #65
     // What: an offer under P2Pool's own templates returns at once while the
     // helper hangs; the preparation ends at its deadline on its own thread
     // and wakes the node thread, which counts it as a failure to retry.
@@ -3778,7 +3760,6 @@ mod p2pool_tests {
         assert!(shared.job.read().unwrap().is_none());
     }
 
-    // #### PR #65
     // What: a preparation the helper refuses is offered again within a
     // second, as the node thread does, and that one is published and
     // queued for the pool; the waits are 0.5, 1, 2, then 5 s.
@@ -3840,7 +3821,6 @@ mod p2pool_tests {
         );
     }
 
-    // #### PR #65
     // What: with the donation session down the miner's own job is published
     // alone; at 0% nothing is prepared or declared for the donation even
     // with its session up; above 0% both coinbases are prepared, each for
@@ -3929,7 +3909,6 @@ mod p2pool_tests {
         assert_eq!(offered.failures, 0, "the miner's own job went out");
     }
 
-    // #### PR #65
     // What: on a P2Pool job with a donation job, a donation session that is
     // down (or replaced) leaves the device on the miner's own job with no
     // donation owed; one that has yet to accept leaves it there with the
@@ -4008,7 +3987,6 @@ mod p2pool_tests {
         assert_eq!(mined(&device), (false, 0, false), "never accepted");
     }
 
-    // #### PR #65
     // What: at a new block the device waits connected for the pool's
     // acceptance far past the 3 s grace, until the job's lease ends, then
     // mines the job at once; a job never accepted ends with its lease and
@@ -4055,7 +4033,6 @@ mod p2pool_tests {
         assert!(device.update(None, at(63), 0, hold).is_err());
     }
 
-    // #### merge-mining v2
     // What: with a token set registered, a P2Pool template still prepares
     // and its job reaches the device, mining BCH alone with no token
     // commitment, and the dashboard is told why.

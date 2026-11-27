@@ -1,4 +1,3 @@
-//! #### PR #38
 //! Persist complete solved blocks before acknowledging a device. Recovery is
 //! bound to the same node, network and payout, and retries never rebuild work.
 
@@ -31,7 +30,7 @@ pub struct PendingBlock {
     // bytes; it must never silently rebuild an already solved coinbase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payout: Option<BchPayout>,
-    /// #### PR #40: in a public pool, the miner this block pays when it is
+    /// In a public pool, the miner this block pays when it is
     /// not the configured payout, and the pool's fee address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub miner: Option<String>,
@@ -59,7 +58,7 @@ pub struct Journal {
     state: State,
 }
 
-// #### PR #53: release ownership even while a forked child retains the descriptor.
+// Release ownership even while a forked child retains the descriptor.
 struct JournalLock(File);
 
 impl Drop for JournalLock {
@@ -68,7 +67,7 @@ impl Drop for JournalLock {
     }
 }
 
-/// #### PR #42: what a journal's blocks are checked against.
+/// What a journal's blocks are checked against.
 pub enum JournalBinding {
     /// This server's own blocks: they pay its payout (with the donation and
     /// any pool fee).
@@ -79,12 +78,11 @@ pub enum JournalBinding {
     /// Blocks relayed for a Template Distribution client (a pool): they pay
     /// the client's coinbase, which this server neither builds nor knows.
     Relay,
-    /// #### PR #42: a Job Declaration client's blocks: they pay the pool's
+    /// A Job Declaration client's blocks: they pay the pool's
     /// outputs (the miner, the pool's fee and the donation).
     Declared,
 }
 
-/// #### PR #40
 /// What a journal belongs to: its network and payout script, and before
 /// PR #40 also the node it was written with (`source`).
 fn binding(source: Option<&[u8; 32]>, network: MiningNetwork, script: &[u8]) -> String {
@@ -111,7 +109,6 @@ impl Journal {
     ) -> Result<Self, String> {
         let payout = config::validate_coinbase_address(network, payout)?;
         let scripts = super::payout::scripts(network, &payout, None)?;
-        // #### PR #40
         // What: the journal belongs to its network and payout, no longer to
         // the one node it was first written with.
         // Why: with several nodes the server moves to the next when one stops
@@ -136,7 +133,7 @@ impl Journal {
         )
     }
 
-    /// #### PR #42: the relay journal
+    /// The relay journal
     /// What: `<config>.sv2-relay-blocks.json`, owner-only like the block
     /// journal, holds the blocks Template Distribution clients (pools) find
     /// on this server's templates, until the node answers. Its binding names
@@ -156,7 +153,7 @@ impl Journal {
         Self::open_bound(path, network, JournalBinding::Relay, context, &[])
     }
 
-    /// #### PR #42: the JD journal
+    /// The JD journal
     /// What: `<config>.sv2-jd-blocks.json`, owner-only, holds a Job
     /// Declaration client's own blocks until its node answers. They pay the
     /// pool's outputs, so the journal checks size, merkle root, proof of work
@@ -304,7 +301,7 @@ impl Journal {
         })
     }
 
-    /// #### PR #42: saves a block found on a Full-Template declared job
+    /// Saves a block found on a Full-Template declared job
     /// (a client's share, or its PushSolution); false when it is already
     /// saved. Only a JD journal takes them.
     pub fn enqueue_declared(&mut self, bytes: &[u8]) -> Result<bool, String> {
@@ -321,7 +318,7 @@ impl Journal {
         })
     }
 
-    /// #### PR #42: saves a block a Template Distribution client found;
+    /// Saves a block a Template Distribution client found;
     /// false when it is already saved. Only the relay journal takes them.
     pub fn enqueue_relayed(&mut self, bytes: &[u8]) -> Result<bool, String> {
         if !matches!(self.binding, JournalBinding::Relay) {
@@ -436,7 +433,6 @@ fn regular_if_present(path: &Path) -> Result<(), String> {
     }
 }
 
-/// #### PR #40
 /// The recipients a recorded block pays: the configured payout and the
 /// donation, or in a public pool the block's own miner, plus any fee address.
 fn block_scripts(
@@ -496,7 +492,7 @@ fn validate_state(
                 )?;
                 validate_block(&bytes, Some((scripts.as_slice(), pending.payout)))?
             }
-            // #### PR #42: a relayed or declared block names no payout.
+            // A relayed or declared block names no payout.
             JournalBinding::Relay | JournalBinding::Declared => {
                 if pending.payout.is_some() || pending.miner.is_some() || pending.operator.is_some()
                 {
@@ -528,7 +524,7 @@ fn validate_limits(state: &State) -> Result<(), String> {
 }
 
 /// The block's hash after its checks. `expected` holds the payout scripts
-/// and policy a block of this server must pay; a relayed block (#### PR #42)
+/// and policy a block of this server must pay; a relayed block
 /// has none, and its coinbase's outputs are the client's.
 fn validate_block(
     bytes: &[u8],
@@ -567,7 +563,7 @@ fn validate_block(
         Some(policy) => super::payout::outputs(total, scripts, policy),
         None => vec![(total, scripts[0].clone())],
     };
-    // #### PR #42: merge-mining output 0 in a journaled block
+    // Merge-mining output 0 in a journaled block
     // What: a zero-value commitment as output 0 is set aside before the
     // payouts are compared; anything else (a valued or malformed output 0,
     // any other output) still refuses the block. The coinbase total is

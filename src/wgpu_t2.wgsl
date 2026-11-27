@@ -1,5 +1,5 @@
 // T2 keeps one RFC6979 BCH Schnorr signature for each 65,536 conserved
-// #### PR #22: portable T2 uses the native amount coordinate and proof rules.
+// Portable T2 uses the native amount coordinate and proof rules.
 // Validate against complete CPU transactions across job/key and window boundaries.
 // token-amount pairs. Only the transaction HASH256 varies inside a window.
 // The shared Rust transaction code validates the complete window before use.

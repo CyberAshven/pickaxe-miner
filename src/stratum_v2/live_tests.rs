@@ -1,4 +1,3 @@
-//! #### PR #38
 //! Opt-in Chipnet proposal validation against a real BCHN node. This checks
 //! production coinbase/header/full-block assembly without mining or publishing
 //! a block. It must never be described as PoW or propagation evidence.

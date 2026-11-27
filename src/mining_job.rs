@@ -39,7 +39,7 @@ pub struct VerifiedWinner {
     pub public_key: [u8; 33],
     pub signature: [u8; 64],
     pub transaction: Vec<u8>,
-    /// #### PR #32: in a public GPU pool, the address the rig mined for (its
+    /// In a public GPU pool, the address the rig mined for (its
     /// own, or the operator's in a fee window); `None` is the coordinator's
     /// own payout.
     pub payout: Option<String>,
@@ -204,7 +204,6 @@ pub(crate) fn verify_gpu_winner(
     })
 }
 
-/// #### PR #32
 /// A winner from a rig must stand on its own before it reaches the claim
 /// path: it answers the job it names, carries a valid Schnorr signature, its
 /// digest matches its transaction, the digest meets the target under this

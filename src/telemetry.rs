@@ -233,7 +233,7 @@ pub enum TelemetrySource {
     Amd(String),
     #[cfg(windows)]
     Windows(crate::backend::PciAddress),
-    /// #### PR #48: a lone CUDA or HIP GPU's vendor tool, by ordinal, with
+    /// A lone CUDA or HIP GPU's vendor tool, by ordinal, with
     /// the PCI address that names it for the WDDM counters when the tool
     /// does not answer.
     #[cfg(windows)]
@@ -291,7 +291,7 @@ pub fn telemetry_sources(gpus: &[GpuDevice]) -> Vec<Option<TelemetrySource>> {
                 _ if gpu.backend == native => gpu.index.to_string(),
                 _ => return None,
             };
-            // #### PR #48: the ordinal names the GPU to its vendor tool, and
+            // The ordinal names the GPU to its vendor tool, and
             // its PCI address to the WDDM counters.
             #[cfg(windows)]
             if let Some(pci) = gpu.pci.filter(|_| lone_native) {
@@ -351,7 +351,7 @@ impl LiveTelemetrySampler {
             thread::Builder::new()
                 .name("pickaxe-telemetry".into())
                 .spawn(move || {
-                    // #### PR #48: WDDM counters fill missing portable metrics;
+                    // WDDM counters fill missing portable metrics;
                     // the query stays on this worker and never submits GPU work.
                     #[cfg(windows)]
                     let mut windows = sources

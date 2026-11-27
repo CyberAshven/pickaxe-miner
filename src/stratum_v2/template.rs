@@ -1,4 +1,3 @@
-//! #### PR #38
 //! Validated BCH full templates. Preserve the node's complete CTOR transaction
 //! list and target; do not inherit Bitcoin witness or fixed block-size rules.
 
@@ -22,9 +21,9 @@ use stratum_core::bitcoin::{consensus, Transaction};
 /// Hash bytes in serialized/internal order, not RPC display order.
 pub type Hash = [u8; 32];
 
-/// #### PR #48: Chipnet's proof-of-work limit (00000000ffff…) as bits.
+/// Chipnet's proof-of-work limit (00000000ffff…) as bits.
 pub const MIN_DIFFICULTY_BITS: u32 = 0x1d00ffff;
-/// #### PR #48: the gap after the parent's time from which a Chipnet block
+/// The gap after the parent's time from which a Chipnet block
 /// must carry `MIN_DIFFICULTY_BITS`: twice the 10-minute target spacing.
 pub const MIN_DIFFICULTY_GAP: u32 = 1200;
 
@@ -39,37 +38,37 @@ pub struct BchTemplate {
     pub height: u32,
     pub size_limit: u64,
     pub coinbase_value: u64,
-    /// #### PR #48: the parent block's time, on a network that allows
+    /// The parent block's time, on a network that allows
     /// minimum-difficulty blocks (Chipnet); see `stale_bits`.
     pub parent_time: Option<u32>,
     coinbase_flags: Vec<u8>,
-    /// #### PR #42: shared, so a template's copies (with tokens, a plan or a
+    /// Shared, so a template's copies (with tokens, a plan or a
     /// pool's name) and the jobs a pool checks for Job Declaration clients
     /// hold the same bytes.
     transactions: Arc<[Arc<[u8]>]>,
-    /// #### PR #42: the transactions' ids (internal byte order), and an
+    /// The transactions' ids (internal byte order), and an
     /// index of them built on first use.
     txids: Arc<[Hash]>,
     index: Arc<OnceLock<HashMap<Hash, u32>>>,
-    /// #### PR #42: the coinbase's merkle branch (index 0), computed once
+    /// The coinbase's merkle branch (index 0), computed once
     /// from the transactions' hashes, which nothing else needs.
     merkle_path: Arc<[Hash]>,
-    /// #### PR #42: the merge-mined tokens of jobs built from this template.
+    /// The merge-mined tokens of jobs built from this template.
     tokens: Option<Arc<TokenSet>>,
-    /// #### PR #42: where the template's jobs come from.
+    /// Where the template's jobs come from.
     origin: Origin,
-    /// #### PR #42: the Job Declaration plan of a client's local server:
+    /// The Job Declaration plan of a client's local server:
     /// jobs built from this template pay the pool's outputs and nest their
     /// extranonce inside the pool channel's.
     jd: Option<Arc<JdPlan>>,
     p2pool: Option<Arc<crate::p2pool::jd::Prepared>>,
     p2pool_donation: Option<Arc<BchTemplate>>,
     declaration_id: Option<u64>,
-    /// #### PR #42: a BCH block, or an ASIC-exclusive token's header.
+    /// A BCH block, or an ASIC-exclusive token's header.
     work: Work,
 }
 
-// #### PR #42: Work::Token
+// Work::Token
 // What: a template is BCH block work (the default; merge-mined tokens may
 // ride along) or an ASIC-exclusive token's job, mined instead of BCH: a
 // header-shaped token (SAFA layout v1) whose header is the token's
@@ -119,7 +118,7 @@ pub struct TokenJob {
     pub mtp: u32,
 }
 
-/// #### PR #42: where a template's jobs come from.
+/// Where a template's jobs come from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Origin {
     /// This server's own source: a node or a template provider.
@@ -260,7 +259,7 @@ impl BchTemplate {
         })
     }
 
-    /// #### PR #42: a Template Distribution provider's template
+    /// A Template Distribution provider's template
     /// What: built from what a provider announced, checked as a node's are:
     /// the prefix a minimal BIP34 height push (at most 8 bytes, its rest the
     /// node's flags), the value within the money supply, the provider's
@@ -301,7 +300,7 @@ impl BchTemplate {
         if !meets_target(&provided.target, &target) {
             return Err("template provider's target is easier than its bits".into());
         }
-        // #### BCH large templates: the core RequestTransactionData.Success
+        // The core RequestTransactionData.Success
         // carries at most 65,535 transactions; with 0x4C54 only the block
         // size limit bounds them.
         let mut hashes = Vec::with_capacity(provided.transactions.len());
@@ -354,7 +353,6 @@ impl BchTemplate {
         })
     }
 
-    /// #### PR #42
     /// A Coinbase-only custom job's template: the pool's parent, bits,
     /// target, height and limits, with the client's version, start time and
     /// merkle path. The pool never sees the client's transactions, so it can
@@ -391,7 +389,6 @@ impl BchTemplate {
         }
     }
 
-    /// #### PR #42
     /// A Full-Template declaration's template, once a pool holds every one
     /// of its transactions: the pool's parent, bits, target, height, size
     /// limit and times (`context`) with the client's version and
@@ -429,7 +426,6 @@ impl BchTemplate {
         }
     }
 
-    /// #### PR #42
     /// An ASIC-exclusive token's job: no transactions and no BCH value; the
     /// previous hash, bits and target (at full precision) are the token's,
     /// and devices start at `ntime_start`. `height` only shapes a Case A
@@ -470,7 +466,7 @@ impl BchTemplate {
         }
     }
 
-    /// #### PR #42: the token job, for token work.
+    /// The token job, for token work.
     pub fn token_job(&self) -> Option<&Arc<TokenJob>> {
         match &self.work {
             Work::Block => None,
@@ -478,12 +474,12 @@ impl BchTemplate {
         }
     }
 
-    /// #### PR #42: whether this is BCH block work.
+    /// Whether this is BCH block work.
     pub fn is_block(&self) -> bool {
         matches!(self.work, Work::Block)
     }
 
-    // #### PR #48: Chipnet's 20-minute rule
+    // Chipnet's 20-minute rule
     // What: a header more than 20 minutes after the parent's time needs the
     // proof-of-work limit's bits on Chipnet; one on any other bits is
     // refused by the node (bad-diffbits). Only a template that knows its
@@ -502,7 +498,7 @@ impl BchTemplate {
         self.stale_from().is_some_and(|from| time >= from)
     }
 
-    // #### PR #48: the limit's bits before the 20-minute point
+    // The limit's bits before the 20-minute point
     // What: on a template that knows its parent's time (Chipnet's), a header
     // at or before the parent's time plus 1200 s on the limit's bits is
     // refused unless ASERT itself gives the limit for this parent (from
@@ -530,7 +526,7 @@ impl BchTemplate {
                     .is_some_and(|bits| bits != MIN_DIFFICULTY_BITS))
     }
 
-    /// #### PR #48: the bits ASERT gives this template's block, from
+    /// The bits ASERT gives this template's block, from
     /// Chipnet's anchor: only Chipnet templates carry their parent's time
     /// (`MiningNetwork::allows_min_difficulty_blocks`).
     pub fn asert_bits(&self) -> Option<u32> {
@@ -541,7 +537,7 @@ impl BchTemplate {
         )
     }
 
-    /// #### PR #48: the first header time `stale_bits` refuses (the parent's
+    /// The first header time `stale_bits` refuses (the parent's
     /// time plus 1201 seconds), on a template that knows its parent's time
     /// and is not on the limit's bits; the node thread refreshes from then
     /// (see `min_difficulty_due` in the server).
@@ -552,7 +548,7 @@ impl BchTemplate {
         self.parent_time?.checked_add(MIN_DIFFICULTY_GAP + 1)
     }
 
-    // #### PR #42: the per-template version rule
+    // The per-template version rule
     // What: the version bits a device may roll: BIP320's for BCH blocks and
     // Case A token jobs, the token's own rule for a header-shaped token (none
     // when the token fixes its version slot).
@@ -572,7 +568,7 @@ impl BchTemplate {
             .is_some_and(|job| job.layout == Layout::Safa)
     }
 
-    /// #### PR #42: this template for a custom job set on it: the job's
+    /// This template for a custom job set on it: the job's
     /// version and start time, the same transactions.
     pub fn with_header(&self, version: u32, ntime_start: u32) -> Self {
         Self {
@@ -583,7 +579,7 @@ impl BchTemplate {
         }
     }
 
-    /// #### PR #42: builds this template's jobs for a pool through Job
+    /// Builds this template's jobs for a pool through Job
     /// Declaration: they pay `plan`'s outputs, nest their extranonce inside
     /// the pool channel's, and carry its token set's merge-mining (see
     /// `declared_aux`).
@@ -595,7 +591,7 @@ impl BchTemplate {
         self.jd.as_ref()
     }
 
-    /// #### PR #65: obtain P2Pool's exact PPLNS coinbase before publishing.
+    /// Obtain P2Pool's exact PPLNS coinbase before publishing.
     /// It cannot change the independently sourced transaction list or revenue.
     /// Requested Payout Outputs (0x5052): or the pool's outputs for this
     /// template (`payouts`), asked through the uplink.
@@ -694,7 +690,7 @@ impl BchTemplate {
         self.p2pool_donation.as_ref()
     }
 
-    /// #### PR #42: the coinbase script's head: the BIP34 height push, the
+    /// The coinbase script's head: the BIP34 height push, the
     /// node's flags and the pool's name; a custom job's `coinbase_prefix`.
     pub fn script_head(&self) -> Vec<u8> {
         let mut head = height_script(self.height);
@@ -702,29 +698,29 @@ impl BchTemplate {
         head
     }
 
-    /// #### PR #42: a custom job's template, without transactions.
+    /// A custom job's template, without transactions.
     pub fn is_header_only(&self) -> bool {
         self.origin == Origin::HeaderOnly
     }
 
-    /// #### PR #42: a Full-Template declaration's template.
+    /// A Full-Template declaration's template.
     pub fn is_declared(&self) -> bool {
         self.origin == Origin::Declared
     }
 
-    /// #### PR #42: the transactions' ids, in block order.
+    /// The transactions' ids, in block order.
     pub fn transaction_ids(&self) -> &[Hash] {
         &self.txids
     }
 
-    /// #### BCH large templates: the same ids, shared, so a Template
+    /// The same ids, shared, so a Template
     /// Distribution connection keeps them as the base of its next push
     /// without the transactions.
     pub fn shared_transaction_ids(&self) -> Arc<[Hash]> {
         self.txids.clone()
     }
 
-    /// #### PR #42: the transaction with id `txid`, from an index built on
+    /// The transaction with id `txid`, from an index built on
     /// the first call.
     pub fn transaction(&self, txid: &Hash) -> Option<&Arc<[u8]>> {
         let index = self.index.get_or_init(|| {
@@ -739,7 +735,7 @@ impl BchTemplate {
             .map(|position| &self.transactions[*position as usize])
     }
 
-    /// #### PR #42: a Job Declaration job's coinbase split around its whole
+    /// A Job Declaration job's coinbase split around its whole
     /// extranonce (the pool channel's prefix and the bytes the pool lets the
     /// client roll), as DeclareMiningJob carries it: the same bytes as the
     /// local channels' coinbases, merge-mining outputs included.
@@ -763,7 +759,7 @@ impl BchTemplate {
         Ok(self.split(coinbase, extranonce))
     }
 
-    // #### PR #42: merge-mined tokens under Job Declaration
+    // Merge-mined tokens under Job Declaration
     // What: a Job Declaration job with a token set carries the commitment as
     // output 0 before the pool's outputs, in every local coinbase, the
     // declared one and the custom job's outputs alike. Its leaves bind the
@@ -783,7 +779,7 @@ impl BchTemplate {
         let (Some(plan), Some(set)) = (self.jd.as_ref(), self.tokens.as_ref()) else {
             return Ok(None);
         };
-        // #### merge-mining v2: only Full-Template declarations carry the
+        // Only Full-Template declarations carry the
         // leaves the pool checks (`merge::disclosure`); the pool's exact
         // outputs (0x5052) carry no commitment.
         if self.is_p2pool() || self.payouts().is_some() || !plan.full_template {
@@ -792,7 +788,7 @@ impl BchTemplate {
         let miner = plan
             .token_payout()
             .ok_or("the pool's plan has no outputs")?;
-        // #### merge-mining v2: the pool's split
+        // The pool's split
         // What: a split leaf on a Job Declaration plan pays the miner and
         // puts the pool's donation (its whole rate to its donation output)
         // in the donation slot and the pool's fee (its rate to its fee
@@ -837,9 +833,7 @@ impl BchTemplate {
         }
         Ok(outputs)
     }
-    // #### end PR #42 ####
 
-    /// #### PR #40
     /// Writes the pool's name (`--pool-tag`) into the coinbase script of every
     /// block built from this template, after the node's flags and before the
     /// extranonce; the coinbase script stays within 100 bytes, which
@@ -848,7 +842,6 @@ impl BchTemplate {
         self.coinbase_flags.extend_from_slice(tag);
     }
 
-    /// #### PR #42
     /// Attaches the token set to merge-mine in jobs built from this template.
     /// It only feeds `aux_job`: a coinbase carries the commitment only when
     /// the caller passes that job's output 0 to `coinbase_with_aux` or
@@ -864,7 +857,7 @@ impl BchTemplate {
         self.tokens.as_ref()
     }
 
-    // #### merge-mining v2: P2Pool
+    // P2Pool
     // What: under P2Pool's own templates a token set is not merge-mined:
     // `aux_job` gives no commitment, the job mines BCH alone, and this
     // reason reaches the dashboard.
@@ -879,7 +872,7 @@ impl BchTemplate {
         if self.is_p2pool() {
             return Some("P2Pool's coinbase does not carry the token commitment yet");
         }
-        // #### merge-mining v2: a Coinbase-only declaration cannot show the
+        // A Coinbase-only declaration cannot show the
         // pool its leaves, so the pool refuses a token commitment there.
         if self.jd.as_ref().is_some_and(|plan| !plan.full_template) {
             return Some("Coinbase-only Job Declaration cannot show the pool its token leaves; use Full-Template");
@@ -890,7 +883,7 @@ impl BchTemplate {
         })
     }
 
-    // #### merge-mining v2: pool and role rules
+    // Pool and role rules
     // What: with a token set, a job for the operator's own devices (solo,
     // any channel) commits the operator's root, its leaves binding the
     // miner or, in donation-work jobs, the donation; a public pool's job
@@ -909,14 +902,14 @@ impl BchTemplate {
         operator: Option<&str>,
         policy: crate::donation::bch::BchPayout,
     ) -> Result<Option<AuxJob>, String> {
-        // #### PR #42: under Job Declaration, the declared coinbase's.
+        // Under Job Declaration, the declared coinbase's.
         if self.jd.is_some() {
             return self.declared_aux();
         }
         let Some(set) = self.tokens.as_ref() else {
             return Ok(None);
         };
-        // #### merge-mining v2: per-miner roots on a public pool
+        // Per-miner roots on a public pool
         // What: a public pool's job (it names an operator) commits a root
         // of its miner's own: each leaf binds the miner's payout, and its
         // split carries the miner's donation choice and the operator's fee;
@@ -926,7 +919,7 @@ impl BchTemplate {
         // Look here if: a public pool miner's leaf names another payout or
         // split than their BCH coinbase.
         let scripts = super::payout::scripts(network, payout, operator)?;
-        // #### merge-mining v2: the donation's split
+        // The donation's split
         // What: a miner job's split leaves pay the miner with the donation
         // setting's block-reward share (1% at the 1.5% default) in the
         // donation slot; a BCH donation-work job's leaves pay the donation
@@ -994,7 +987,7 @@ impl BchTemplate {
                 bytes,
             });
         }
-        // #### PR #42: the script coinbase
+        // The script coinbase
         // What: on a SAFA job the coinbase is the forwarder: a push of the
         // tag and the extranonce, OP_DROP, and the rule that forwards the
         // claim to the job's beneficiary (the miner, or the donation in its
@@ -1007,7 +1000,7 @@ impl BchTemplate {
             let scripts = super::payout::scripts(network, payout, operator)?;
             return forwarder_coinbase(extranonce, super::payout::beneficiary(&scripts, policy));
         }
-        // #### PR #42: Job Declaration jobs pay the pool's outputs.
+        // Job Declaration jobs pay the pool's outputs.
         let outputs = match &self.jd {
             Some(plan) => plan.outputs(self.coinbase_value),
             None => {
@@ -1018,7 +1011,7 @@ impl BchTemplate {
         self.coinbase_with_outputs(extranonce, outputs, aux)
     }
 
-    /// #### PR #42: the coinbase paying `outputs`, with a job's merge-mining
+    /// The coinbase paying `outputs`, with a job's merge-mining
     /// output 0, if any.
     fn coinbase_with_outputs(
         &self,
@@ -1045,7 +1038,7 @@ impl BchTemplate {
         compact_size(script.len(), &mut bytes);
         bytes.extend(script);
         bytes.extend_from_slice(&u32::MAX.to_le_bytes());
-        // #### PR #42: merge-mining commitment in output 0
+        // Merge-mining commitment in output 0
         // What: with tokens, output 0 is the 53-byte commitment (value 0)
         // before the payouts. Without tokens (`commitment` is `None`, the
         // default on both networks) the coinbase is byte for byte what it
@@ -1070,10 +1063,9 @@ impl BchTemplate {
             compact_size(script.len(), &mut bytes);
             bytes.extend(script);
         }
-        // #### end PR #42 ####
         bytes.extend_from_slice(&0u32.to_le_bytes());
         self.check_block_size(bytes.len())?;
-        // #### PR #42: the coinbase path is computed once per template
+        // The coinbase path is computed once per template
         // What: the merkle root folds the coinbase's hash up the branch
         // computed when the template arrived, instead of building the whole
         // tree for every coinbase.
@@ -1103,7 +1095,7 @@ impl BchTemplate {
         self.coinbase_parts_with_aux(network, payout, operator, extranonce_len, policy, None)
     }
 
-    /// #### PR #42: the parts with a job's merge-mining output 0, which sits
+    /// The parts with a job's merge-mining output 0, which sits
     /// in the suffix; the prefix and the merkle path are unchanged.
     pub fn coinbase_parts_with_aux(
         &self,
@@ -1131,7 +1123,7 @@ impl BchTemplate {
     /// The parts of `coinbase`, whose extranonce is `extranonce_len` bytes.
     fn split(&self, coinbase: Coinbase, extranonce_len: usize) -> CoinbaseParts {
         // The coinbase script is at most 100 bytes, so its CompactSize is one
-        // byte; #### PR #42: a forwarder's extranonce follows its push and
+        // byte; a forwarder's extranonce follows its push and
         // tag.
         let offset = if self.is_safa() {
             1 + TAG.len()
@@ -1170,7 +1162,7 @@ impl BchTemplate {
         if self.origin == Origin::HeaderOnly {
             return Err("a custom job's template has no transactions".into());
         }
-        // #### PR #42: block suppression: token work never becomes a block.
+        // Block suppression: token work never becomes a block.
         if !self.is_block() {
             return Err("token work is not a BCH block".into());
         }
@@ -1184,7 +1176,7 @@ impl BchTemplate {
         Ok(self.assemble(&coinbase.bytes, &header))
     }
 
-    /// #### PR #42: the block's bytes, unchecked: the header, the count,
+    /// The block's bytes, unchecked: the header, the count,
     /// the coinbase and the template's transactions. A Template
     /// Distribution client's solution is assembled with it before its
     /// checks, so even a refused one can still reach the node (D24).
@@ -1202,23 +1194,23 @@ impl BchTemplate {
         self.transactions.len() + 1
     }
 
-    /// #### PR #42: the BIP34 height push that begins every coinbase
+    /// The BIP34 height push that begins every coinbase
     /// script; a Template Distribution client's coinbase prefix.
     pub fn height_push(&self) -> Vec<u8> {
         height_script(self.height)
     }
 
-    /// #### PR #42: the coinbase's merkle branch, deepest sibling first.
+    /// The coinbase's merkle branch, deepest sibling first.
     pub fn merkle_path(&self) -> &[Hash] {
         &self.merkle_path
     }
 
-    /// #### PR #42: the block's other transactions, in block (CTOR) order.
+    /// The block's other transactions, in block (CTOR) order.
     pub fn transactions(&self) -> &[Arc<[u8]>] {
         &self.transactions
     }
 
-    /// #### PR #42: the bytes a coinbase may take in a block of this
+    /// The bytes a coinbase may take in a block of this
     /// template: the size limit less the header, the transaction count and
     /// every other transaction.
     pub fn coinbase_budget(&self) -> u64 {
@@ -1233,7 +1225,7 @@ impl BchTemplate {
             .saturating_sub(80 + count.len() as u64 + others)
     }
 
-    /// #### PR #42: the template with other transactions, unchecked (its
+    /// The template with other transactions, unchecked (its
     /// merkle path is not recomputed), for transaction-data size tests.
     #[cfg(test)]
     pub(super) fn with_transactions(mut self, transactions: Vec<Vec<u8>>) -> Self {
@@ -1251,7 +1243,7 @@ impl BchTemplate {
     }
 }
 
-/// #### PR #42: a SAFA job's coinbase: the forwarder to `destination`
+/// A SAFA job's coinbase: the forwarder to `destination`
 /// around `extranonce`, whose HASH256 is the merkle root.
 fn forwarder_coinbase(extranonce: &[u8], destination: &[u8]) -> Result<Coinbase, String> {
     let pushed = TAG.len() + extranonce.len();
@@ -1270,7 +1262,7 @@ fn forwarder_coinbase(extranonce: &[u8], destination: &[u8]) -> Result<Coinbase,
     Ok(Coinbase { bytes, merkle_root })
 }
 
-/// #### PR #42: what a Template Distribution provider announced for one
+/// What a Template Distribution provider announced for one
 /// template, with its transactions.
 pub struct Provided<'a> {
     pub previous_hash: Hash,
@@ -1282,7 +1274,7 @@ pub struct Provided<'a> {
     /// The coinbase prefix: the height push, then any flags.
     pub prefix: &'a [u8],
     pub value: u64,
-    /// #### BCH large templates: shared, so the transactions a provider
+    /// Shared, so the transactions a provider
     /// pushed stay the base of its next push without a copy.
     pub transactions: Vec<Arc<[u8]>>,
     pub merkle_path: &'a [Hash],
@@ -1294,7 +1286,7 @@ pub struct Provided<'a> {
 /// coinbase, has inputs and no witness encoding. Bitcoin's decoder treats
 /// CashTokens prefixes as opaque output script bytes; BCH txids commit to
 /// every byte. No Bitcoin consensus validation is used.
-/// #### PR #42: also a Job Declaration client's provided transactions.
+/// Also a Job Declaration client's provided transactions.
 pub fn checked_transaction(bytes: &[u8]) -> Result<Hash, String> {
     let tx: Transaction =
         consensus::deserialize(bytes).map_err(|_| "malformed template transaction")?;
@@ -1343,7 +1335,7 @@ pub fn meets_target(hash: &Hash, target: &Hash) -> bool {
     hash.iter().rev().cmp(target.iter().rev()).is_le()
 }
 
-/// #### PR #42: the merkle branch of the coinbase (index 0) over the
+/// The merkle branch of the coinbase (index 0) over the
 /// block's other transactions: one sibling per level.
 pub fn coinbase_path(txids: &[Hash]) -> Vec<Hash> {
     let mut hashes = vec![[0; 32]];
@@ -1369,7 +1361,7 @@ pub fn coinbase_path(txids: &[Hash]) -> Vec<Hash> {
     path
 }
 
-/// #### PR #42: folds the coinbase's hash up its branch at index 0 to the
+/// Folds the coinbase's hash up its branch at index 0 to the
 /// merkle root.
 pub fn fold(leaf: Hash, path: &[Hash]) -> Hash {
     path.iter().fold(leaf, |current, sibling| {

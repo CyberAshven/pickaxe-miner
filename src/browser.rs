@@ -44,7 +44,7 @@ pub fn browser_config(network: &str) -> Result<String, JsValue> {
     .to_string())
 }
 
-/// #### PR #22: development check of the portable engine in this browser.
+/// Development check of the portable engine in this browser.
 /// Signs and searches T2 windows with the chosen stages ("rust" or "wgsl")
 /// and reconstructs every candidate on the CPU. Mines and sends nothing.
 #[cfg(feature = "browser-check")]

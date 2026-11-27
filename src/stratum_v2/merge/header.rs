@@ -1,4 +1,3 @@
-//! #### PR #42
 //! Header-shaped token jobs (SAFA layout v1, draft): the payout script a
 //! grinder's commitment pays, which is also the "coinbase" devices hash, and
 //! the record of a win.
@@ -17,7 +16,7 @@ use super::OutPoint;
 /// Bare P2S locking bytecode may take at most this many bytes.
 pub const MAX_P2S: usize = 201;
 
-// #### PR #42: the BIP141-safe tag
+// The BIP141-safe tag
 // What: every forwarder's salt starts with the 4-byte tag "PXH1" right
 // after its push opcode, so byte 4 of a job's coinbase prefix is never 0x00.
 // Why: SRI's translator reads bytes 4 and 5 of a coinbase prefix as a
@@ -151,7 +150,6 @@ mod tests {
         destination
     }
 
-    // #### PR #42
     // What: the forwarder for a P2PKH destination is 73 bytes on extended
     // channels and SV1 (salt 0x22×28 hashes to 10243fae…) and 65 on standard
     // channels (salt 0x22×20 hashes to ea83f927…), a P2SH32 destination
@@ -188,7 +186,6 @@ mod tests {
         assert!(forwarder_body(&[]).is_err());
     }
 
-    // #### PR #42
     // What: byte 4 of the prefix is the tag's, never 0x00, so SRI's BIP141
     // check finds no marker for any job id (it fails on a prefix too short
     // to hold one).
@@ -211,7 +208,6 @@ mod tests {
         );
     }
 
-    // #### PR #42
     // What: a device's merkle root over the parts with an empty branch is
     // HASH256 of the whole script, which is the payout field SAFA checks.
     // Look here if: the parts or the job's merkle path change.
@@ -228,7 +224,6 @@ mod tests {
         );
     }
 
-    // #### PR #42
     // What: a win round-trips through its 125 + n bytes; another magic or
     // version, a script over 201 bytes and trailing bytes are refused.
     // Look here if: HeaderWin changes.
@@ -259,7 +254,7 @@ mod tests {
         assert!(HeaderWin::decode(&long).is_err());
     }
 
-    // #### PR #65: export the existing payout forwarders for an independent
+    // Export the existing payout forwarders for an independent
     // BCH VM check. This registers no token and introduces no claim contract.
     #[test]
     fn vm_forwarder_vectors() {

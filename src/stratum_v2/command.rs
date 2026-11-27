@@ -1,4 +1,3 @@
-//! #### PR #38
 //! Native node preflight and mining-server lifecycle. Reuse the terminal guard,
 //! keep authority secrets private, and never print node credentials or payouts.
 
@@ -40,7 +39,7 @@ use std::{
 };
 
 /// Runs a `stratum-v2` command. `profile` names the setup profile a server
-/// started from (#### PR #42: a donation changed on its Advanced page is
+/// started from (a donation changed on its Advanced page is
 /// saved there too). A server shows in the view `view::show_servers_in`
 /// set, when there is one, instead of the terminal.
 pub fn run(
@@ -79,7 +78,7 @@ fn serve(
     if let StratumV2Command::Watch = action {
         return watch(config_path);
     }
-    // #### Pool modes: the flags that go together, checked before P2Pool
+    // The flags that go together, checked before P2Pool
     // installs or starts.
     check_pool_flags(&action)?;
     // A view's Stop ends the server between its startup steps too, before
@@ -88,9 +87,9 @@ fn serve(
     if stop_asked() {
         return Ok(());
     }
-    // #### PR #61: your own P2Pool node, started here and mined at as this
+    // Your own P2Pool node, started here and mined at as this
     // server's pool under your share address.
-    // #### Pool modes: with the operator's settings in P2Pool's own
+    // With the operator's settings in P2Pool's own
     // configuration.
     let own_p2pool = match own_options(&action, config)? {
         Some(options) => Some(crate::p2pool::own::OwnNode::start(
@@ -100,7 +99,7 @@ fn serve(
         )?),
         None => None,
     };
-    // #### Pool modes: a Non-custodial Pool (or P2Pool v2): your own P2Pool
+    // A Non-custodial Pool (or P2Pool v2): your own P2Pool
     // with --public; each miner mines there under their own payout.
     let pool_mode =
         own_p2pool.is_some() && matches!(&action, StratumV2Command::Serve { public: true, .. });
@@ -113,7 +112,6 @@ fn serve(
     if stop_asked() {
         return Ok(());
     }
-    // #### PR #40
     // Pool mode: SV1 devices mine at a remote SV2 pool through the adapter,
     // and no local node or SV2 server runs.
     let pools = match (&action, &own_p2pool) {
@@ -142,8 +140,8 @@ fn serve(
         }
         _ => Vec::new(),
     };
-    // #### PR #42: solo mining's fallback pools.
-    // #### Pool modes: and your own P2Pool node's, where in a pool each
+    // Solo mining's fallback pools.
+    // And your own P2Pool node's, where in a pool each
     // miner mines under their own payout.
     let fallbacks = match &action {
         StratumV2Command::Serve { fallback_pool, .. } if !fallback_pool.is_empty() => {
@@ -157,7 +155,6 @@ fn serve(
         }
         _ => Vec::new(),
     };
-    // #### PR #40
     // A public pool: each miner is paid at the address they connect with,
     // and the operator's fee comes off what the donation leaves.
     let public = match &action {
@@ -184,7 +181,7 @@ fn serve(
         }),
         _ => None,
     };
-    // #### PR #42: Join a pool with JD runs a node and a local server
+    // Join a pool with JD runs a node and a local server
     // What: with --job-declaration the miner's own node and a local server
     // run as in solo mining; the local server's jobs pay the pool's outputs
     // and are declared to the first pool, and the SV1 adapter tries the local
@@ -203,7 +200,7 @@ fn serve(
         config::validate_payout_address(config.network, &config.payout_address)
             .map_err(|_| "a valid payout for the selected network is required")?;
     }
-    // #### PR #42: at a pool, merge-mined tokens need this node's own
+    // At a pool, merge-mined tokens need this node's own
     // templates (Job Declaration): without it the pool builds the blocks.
     if matches!(
         &action,
@@ -220,7 +217,7 @@ fn serve(
                 .into(),
         );
     }
-    // #### PR #42: template providers, tried before the nodes, told the
+    // Template providers, tried before the nodes, told the
     // coinbase bytes this server may add (with the test token's when asked
     // for; its registry row decides the network, so mainnet refuses it).
     let (providers, test_token, claim_delay, safa_deployment) = match &action {
@@ -245,7 +242,7 @@ fn serve(
         ),
         _ => (Vec::new(), None, Default::default(), None),
     };
-    // #### merge-mining v2: the tSAFA gate
+    // The tSAFA gate
     // What: tSAFA is merge-mined only from an explicit deployment file
     // (`--safa-deployment`), on Chipnet, with this server's own templates;
     // mainnet, a pool and the test token beside it are refused, and the
@@ -280,7 +277,7 @@ fn serve(
                         .into(),
                 );
             }
-            // #### merge-mining v2: every tSAFA claim output pays a script
+            // Every tSAFA claim output pays a script
             // of at most 35 bytes (P2PKH, P2SH20, P2SH32), as the covenant
             // checks: the payout, the donation and a public pool's fee
             // address must fit (an operator whose fee script did not could
@@ -310,7 +307,7 @@ fn serve(
         }
         (None, None) => None,
     };
-    // #### PR #42: an ASIC-exclusive token instead of BCH
+    // An ASIC-exclusive token instead of BCH
     // What: `--asic-test-token` mines the Chipnet ASIC test token's simulated
     // thread with no node; `--asic-token` is refused while no token is
     // registered. The server then serves the token's jobs alone.
@@ -351,7 +348,6 @@ fn serve(
         return Ok(());
     }
     let serving = node.is_some() || header_work.is_some();
-    // #### PR #40
     // The node's client and version, such as "Bitcoin Cash Node 29.1.0",
     // for check-node, the dashboard and the saved status.
     let node_client = node
@@ -359,7 +355,7 @@ fn serve(
         .and_then(|(nodes, _, _)| nodes.first())
         .and_then(|rpc| rpc.info().ok())
         .map(|info| info.client);
-    // #### PR #42: whether the pool knows this server by another name than
+    // Whether the pool knows this server by another name than
     // the payout address, for the Advanced page.
     let custom_user = pool_mode
         || matches!(
@@ -400,12 +396,12 @@ fn serve(
             return Err("P2Pool own templates need an upstream, Job Declaration and no pool-template fallback".into());
         }
     }
-    // #### PR #40: where each device's difficulty starts.
+    // Where each device's difficulty starts.
     let share_target = match start_difficulty {
         None => compact_target(0x1b0ffff0)?,
         Some(difficulty) => difficulty_target(difficulty)?,
     };
-    // #### PR #40: the pool's name, at most 20 printable characters.
+    // The pool's name, at most 20 printable characters.
     let pool_tag: Vec<u8> = match pool_tag.as_deref().map(str::trim) {
         None | Some("") => Vec::new(),
         Some(tag) if tag.len() <= 20 && tag.chars().all(|c| c.is_ascii_graphic() || c == ' ') => {
@@ -414,7 +410,7 @@ fn serve(
         Some(_) => return Err("--pool-tag must be 1 to 20 printable characters".into()),
     };
     let donation = Arc::new(RwLock::new(donation.unwrap_or(config.bch_donation)));
-    // #### PR #42: a public pool that accepts miners' own templates; with
+    // A public pool that accepts miners' own templates; with
     // Full-Template, its first node checks the declared ones
     // (validateblocktemplate).
     let declarator = match (accept_job_declaration, public.as_ref()) {
@@ -445,11 +441,10 @@ fn serve(
         }
         (None, _) => None,
     };
-    // #### PR #42: the source devices come back to from a pool: the node,
+    // The source devices come back to from a pool: the node,
     // or Job Declaration (see `sv1::Preferred`).
     let preferred =
         (declaring || !fallbacks.is_empty()).then(|| Arc::new(super::sv1::Preferred::default()));
-    // #### PR #40
     // At a pool the donation is the setting's share of mining work (#### PR
     // #48) under the donation address, on a second channel at the same pool.
     let at_pools = |pools: Vec<super::sv1::Upstream>| -> Vec<super::sv1::Upstream> {
@@ -466,7 +461,7 @@ fn serve(
             })
             .collect()
     };
-    // #### PR #65: the TUI supplies a bare payout. Both JD recipients need
+    // The TUI supplies a bare payout. Both JD recipients need
     // the explicit share-owner identity before connecting to BCH P2Pool.
     let pools = pools
         .into_iter()
@@ -479,7 +474,7 @@ fn serve(
         .collect::<Result<Vec<_>, String>>()?;
     let mut pools = at_pools(pools);
     let fallbacks = at_pools(fallbacks);
-    // #### Pool modes: failover for your own P2Pool node
+    // Failover for your own P2Pool node
     // What: with --fallback-pool, devices leave your own P2Pool node once it
     // has served no work (its light not green) for the solo fallback's 3 s
     // grace, take the first fallback pool that takes them, and come back
@@ -513,7 +508,7 @@ fn serve(
         .map(TcpListener::local_addr)
         .transpose()
         .map_err(|_| "cannot read SV1 listener")?;
-    // #### PR #42: the template listener, off unless asked for, and only
+    // The template listener, off unless asked for, and only
     // beside this server's own node.
     let tp_listener = tp_listen
         .filter(|_| node.is_some())
@@ -538,7 +533,7 @@ fn serve(
     // remains pinned.
     let public_pool = public.clone();
     let upstreams = match (bound, public_key) {
-        // #### Pool modes: your own P2Pool node, then its fallback pools.
+        // Your own P2Pool node, then its fallback pools.
         _ if own_p2pool.is_some() => pools.iter().chain(&fallbacks).cloned().collect(),
         _ if !pools.is_empty() && !declaring => pools.clone(),
         (Some(mut local), Some(public)) => {
@@ -549,18 +544,18 @@ fn serve(
                     std::net::Ipv6Addr::LOCALHOST.into()
                 });
             }
-            // #### PR #40: a public pool's devices open their channel
+            // A public pool's devices open their channel
             // under their own username.
             let mut list = vec![if public_pool.is_some() {
                 super::sv1::Upstream::local_public(local, public)
             } else {
                 super::sv1::Upstream::local(local, public)
             }
-            // #### PR #42: a token that fixes its version slot.
+            // A token that fixes its version slot.
             .with_fixed_version(header_work.as_ref().is_some_and(|work| {
                 work.token().params.version == super::merge::safa::VersionRule::Fixed
             }))];
-            // #### PR #42: under Job Declaration the pools' own jobs follow;
+            // Under Job Declaration the pools' own jobs follow;
             // in solo mining, the fallback pools.
             if declaring
                 && p2pool_prepare_api.is_none()
@@ -578,15 +573,15 @@ fn serve(
         _ => return Err("mining server unavailable".into()),
     };
     // The pools as the dashboard and status show them; never the identity.
-    // #### PR #40: a public pool says so on the dashboard, with its fee.
-    // #### Pool modes: by its mode's name.
+    // A public pool says so on the dashboard, with its fee.
+    // By its mode's name.
     let mode_name = match &own_p2pool {
         Some(own) if pool_mode && own.standalone => "Non-custodial Pool",
         Some(_) if pool_mode => "P2Pool v2",
         _ => "Public Solo Endpoint",
     };
     let pool_suffix = public_pool_suffix(public.as_ref(), mode_name);
-    // #### PR #61: your own P2Pool node by name, not its local address.
+    // Your own P2Pool node by name, not its local address.
     let pool_address = (!pools.is_empty()).then(|| match &own_p2pool {
         Some(own) if pool_mode => format!(
             "your P2Pool ({}; each miner under their own address)",
@@ -599,7 +594,7 @@ fn serve(
             .collect::<Vec<_>>()
             .join(" → "),
     });
-    // #### PR #42: what the server started with, for its Advanced page.
+    // What the server started with, for its Advanced page.
     let started = started_text(&Started {
         sv2: bound,
         sv1: sv1_bound,
@@ -646,7 +641,7 @@ fn serve(
         Some(TerminalSession::enter()?)
     };
     let stats = Arc::new(Mutex::new(ServerStats::default()));
-    // #### PR #42: the Job Declaration uplink, to the pools in order.
+    // The Job Declaration uplink, to the pools in order.
     let mode = match job_declaration {
         Some(
             crate::cli::JobDeclarationMode::Coinbase
@@ -666,7 +661,7 @@ fn serve(
                 p2pool_prepare_api: p2pool_prepare_api.clone(),
                 required: p2pool_prepare_api.is_some()
                     || job_declaration.is_some_and(|mode| mode.requires_own_templates()),
-                // #### merge-mining v2: the miner's donation at a Pickaxe
+                // The miner's donation at a Pickaxe
                 // pool, never at BCH P2Pool (see `JdTarget::login`).
                 pickaxe_donation: (p2pool_prepare_api.is_none()
                     && !super::sv1::names_donation(&pool.identity))
@@ -677,7 +672,7 @@ fn serve(
             let address = crate::donation::bch::address(config.network);
             let share = crate::tx::p2pool_share_address(address)
                 .expect("the configured donation address is a network-checked P2PKH");
-            // #### PR #65: the donation session runs only above 0% (see
+            // The donation session runs only above 0% (see
             // `spawn_p2pool`).
             super::jd::client::spawn_p2pool(
                 targets,
@@ -690,9 +685,9 @@ fn serve(
         }
     });
     let uplink_handle = uplink.as_ref().map(|(handle, _)| handle.clone());
-    // #### PR #42: the server's work: the nodes' (or providers') templates,
+    // The server's work: the nodes' (or providers') templates,
     // or an ASIC-exclusive token's thread.
-    // #### PR #42: the node's block notices: --node-zmq, or bitcoin.conf's
+    // The node's block notices: --node-zmq, or bitcoin.conf's
     // zmqpubhashblock for a node on this computer.
     let node_zmq = match (&config.node_zmq, node.is_some()) {
         (_, false) | (crate::config::NodeZmq::Off, _) => None,
@@ -719,7 +714,7 @@ fn serve(
         )),
         (None, None) => None,
     };
-    // #### Pool modes: the SV2 door takes the mining listener.
+    // The SV2 door takes the mining listener.
     let (listener, door_listener) = if pool_mode {
         (None, listener)
     } else {
@@ -755,7 +750,7 @@ fn serve(
                 donation: donation.clone(),
                 tokens: tokens.clone(),
                 relay_journal_path: Some(config_path.with_extension("sv2-relay-blocks.json")),
-                // #### PR #42: a pool's JD journal, for blocks found on
+                // A pool's JD journal, for blocks found on
                 // Full-Template declared jobs.
                 declared_journal_path: declarator
                     .as_ref()
@@ -763,7 +758,7 @@ fn serve(
                 declarator: declarator.clone(),
                 uplink: uplink_handle.clone(),
                 preferred: preferred.clone(),
-                // #### PR #42: the token's donation, or its default.
+                // The token's donation, or its default.
                 token_donation: header_work.as_ref().map(|work| {
                     config
                         .token_donation
@@ -771,7 +766,7 @@ fn serve(
                 }),
                 header_work: header_work.clone(),
                 node_zmq: node_zmq.clone(),
-                // #### merge-mining v2: a public pool's leaf log.
+                // A public pool's leaf log.
                 leaf_log_path: public
                     .as_ref()
                     .map(|_| config_path.with_extension("sv2-leaves.jsonl")),
@@ -801,11 +796,10 @@ fn serve(
         let upstreams = upstreams.clone();
         thread::spawn(move || super::sv1::run(listener, upstreams, stop, stats))
     });
-    // #### PR #40
     // Device reports every 15 seconds, outside the stats lock, from asic-rs
     // mixed with Pickaxe's own reader; all devices are asked in parallel.
     let fleet = Arc::new(Fleet::new());
-    // #### PR #42: the device logins the owner saved on the Device panel. A
+    // The device logins the owner saved on the Device panel. A
     // logins file that cannot be read leaves the devices on their default
     // logins; mining is not affected.
     if let Err(error) = fleet.load_logins(config_path) {
@@ -842,7 +836,6 @@ fn serve(
         encoded.extend(key);
         stratum_core::bitcoin::base58::encode_check(&encoded)
     });
-    // #### PR #40
     // Tell the user where to point devices: a wildcard listener shows this
     // computer's address on the local network instead, and the Connection
     // info page (`i`) every address, Tailscale's included, ready to copy.
@@ -863,13 +856,13 @@ fn serve(
     } else {
         ServeMode::Solo
     };
-    // #### PR #42: the overview's title names what devices mine.
+    // The overview's title names what devices mine.
     let dashboard_title = if header_work.is_some() {
         "Pickaxe · ASIC token mining"
     } else {
         "Pickaxe · BCH ASIC mining"
     };
-    // #### PR #42: for the Connection info page.
+    // For the Connection info page.
     let job_declaration_on = declaring || declarator.is_some();
     let result = (|| {
         if terminal.is_none() && view.is_none() {
@@ -888,12 +881,11 @@ fn serve(
         let mut overview = false;
         let status_file = status_path(config_path);
         let mut status_saved: Option<Instant> = None;
-        // #### PR #42: the owner-only devices file the watch view controls
+        // The owner-only devices file the watch view controls
         // devices from; written whole, and only when it changes.
         let devices_file = devices_path(config_path);
         let devices_server = connect_lines(bound, sv1_bound, authority.as_deref(), interfaces);
         let mut devices_saved: Option<Vec<u8>> = None;
-        // #### PR #42
         // What: the workers page highlights one row, moved with the arrow
         // keys, PgUp/PgDn, Home and End and kept by its label; Enter (or c)
         // opens the Device panel for that row, online or offline.
@@ -904,7 +896,6 @@ fn serve(
         // or the highlight jumps when rows re-sort.
         let mut selection = Selection::default();
         let mut panel: Option<DevicePanel> = None;
-        // #### end PR #42 ####
         let mut connect: Option<ConnectPage> = None;
         // A view's Connection info, read again when the view asks, as
         // opening the page (`i`) does.
@@ -925,7 +916,7 @@ fn serve(
             {
                 break;
             }
-            // #### Pool modes: devices leave your own P2Pool node for a
+            // Devices leave your own P2Pool node for a
             // fallback pool while it is not green, and come back after it
             // has been green for 30 s.
             if let (Some(own), Some(preferred)) = (own_p2pool.as_ref(), preferred.as_ref()) {
@@ -940,7 +931,6 @@ fn serve(
             let donation_value = *donation
                 .read()
                 .map_err(|_| "donation setting unavailable")?;
-            // #### PR #40
             // The status the JSON mode prints is also saved once a second
             // beside the config, so `stratum-v2 watch` can show the workers
             // table of a server running as a service. It never holds payouts
@@ -989,7 +979,7 @@ fn serve(
                     &devices,
                 );
                 let lines: Vec<WorkerLine> = devices.iter().map(WorkerLine::from).collect();
-                // #### PR #42: the highlight follows its device's label.
+                // The highlight follows its device's label.
                 let labels: Vec<&str> = lines.iter().map(|line| line.label.as_str()).collect();
                 selection.follow(&labels);
                 terminal
@@ -1031,7 +1021,7 @@ fn serve(
                 if event::poll(Duration::from_millis(500)).map_err(|_| "cannot read terminal")? {
                     if let Event::Key(key) = event::read().map_err(|_| "cannot read terminal")? {
                         if key.kind == KeyEventKind::Press {
-                            // #### PR #40: on Connection info, a number copies
+                            // On Connection info, a number copies
                             // that line.
                             if let Some(page) = connect.as_mut() {
                                 match key.code {
@@ -1063,7 +1053,6 @@ fn serve(
                                 }
                                 continue;
                             }
-                            // #### PR #42
                             // What: the Device panel takes every key, so q
                             // typed there never stops the server; Enter (or
                             // c) on the workers page opens it for the
@@ -1112,7 +1101,6 @@ fn serve(
                                         ));
                                     }
                                 }
-                                // #### end PR #42 ####
                                 KeyCode::Char('a') | KeyCode::Char('A') => advanced = !advanced,
                                 KeyCode::Char('i') | KeyCode::Char('I') if !advanced => {
                                     connect =
@@ -1159,7 +1147,7 @@ fn serve(
                                 KeyCode::PageDown if overview => {
                                     device_offset = device_offset.saturating_add(10)
                                 }
-                                // #### PR #42: on the workers page these keys
+                                // On the workers page these keys
                                 // move the highlight (the overview scrolls).
                                 KeyCode::Up
                                 | KeyCode::Down
@@ -1294,7 +1282,7 @@ fn serve(
         .and(door_result)
 }
 
-// #### Pool modes: flags that go together
+// Flags that go together
 // What: fallback pools with --public only for a pool that runs your own
 // P2Pool (a Public Solo Endpoint mines your node, whose templates do not
 // fail over); with your own P2Pool, the fee only from the coinbase (P2Pool
@@ -1343,7 +1331,7 @@ fn check_pool_flags(action: &StratumV2Command) -> Result<(), String> {
     Ok(())
 }
 
-/// #### Pool modes: what `--own-p2pool`'s flags set in P2Pool: with
+/// What `--own-p2pool`'s flags set in P2Pool: with
 /// --public the operator's fee (`--pool-fee`, `--pool-fee-address`, by
 /// default the payout address), in any mode the pool signature
 /// (`--pool-tag`), and from `config.p2pool` (a profile's, or
@@ -1404,7 +1392,6 @@ fn own_options(
     }))
 }
 
-// #### PR #61
 // What: when the device's identity names a share address (`,p2p=`, as a
 // BCH P2Pool node with no share address of its own requires), the donation
 // channel names the donation key's own share address the same way; refused
@@ -1458,7 +1445,6 @@ fn donation_route(
     }
 }
 
-/// #### PR #40
 /// The remote SV2 pools from `--upstream`, `--upstream-key` and
 /// `--upstream-user`, in failover order: one key per pool, in the same order.
 /// A key is the pool's authority public key as SV2 pools publish it:
@@ -1496,7 +1482,7 @@ fn pool_upstreams(
         .iter()
         .enumerate()
         .map(|(index, address)| {
-            // #### PR #40: the key may come in the address, as pools publish
+            // The key may come in the address, as pools publish
             // it; given in both places, the two must agree.
             let (address, embedded) = super::split_pool_address(address)
                 .map_err(|error| format!("--upstream: {error}"))?;
@@ -1541,7 +1527,7 @@ fn authority_key(key: &str) -> Result<[u8; 32], ()> {
     }
 }
 
-/// #### PR #42: solo mining's fallback pools, each with its key in its
+/// Solo mining's fallback pools, each with its key in its
 /// address; devices open their channels there with the payout address.
 fn fallback_upstreams(
     config: &RuntimeConfig,
@@ -1581,7 +1567,6 @@ fn save_donation(path: &Path, profile: Option<&str>, value: BchDonation) -> Resu
         .unwrap_or_default();
     saved.bch_donation_bps = Some(value);
     saved.save(path).map_err(|_| ())?;
-    // #### PR #42
     // What: a server started from a setup profile saves the donation into
     // that profile too.
     // Why: starting from a profile takes the profile's settings, so a change
@@ -1634,7 +1619,7 @@ fn step_donation(
 const VIEW_INTERVAL: Duration = Duration::from_millis(200);
 
 /// A Device panel opened from the workers page or a view: told where
-/// devices reach this server (#### PR #42: for its pool pages), and asking
+/// devices reach this server (for its pool pages), and asking
 /// the device what it is.
 fn ready_panel(
     mut panel: DevicePanel,
@@ -1653,11 +1638,11 @@ fn ready_panel(
     panel
 }
 
-/// #### PR #42: what the server started with.
+/// What the server started with.
 struct Started {
     sv2: Option<std::net::SocketAddr>,
     sv1: Option<std::net::SocketAddr>,
-    /// #### PR #42: where templates are served, if they are.
+    /// Where templates are served, if they are.
     templates: Option<std::net::SocketAddr>,
     start_difficulty: u64,
     pool_tag: String,
@@ -1667,14 +1652,14 @@ struct Started {
     custom_user: bool,
     /// A public pool's fee, and whether it goes to the payout address.
     fee: Option<(crate::donation::bch::PoolFee, bool)>,
-    /// #### PR #42: the Job Declaration modes the pool accepts, if any.
+    /// The Job Declaration modes the pool accepts, if any.
     job_declaration: Option<super::jd::AcceptJd>,
-    /// #### PR #42: solo mining's fallback pools, in order.
+    /// Solo mining's fallback pools, in order.
     fallbacks: Option<String>,
-    /// #### PR #42: how this server declares its node's templates to the
+    /// How this server declares its node's templates to the
     /// first pool, when it does.
     declaring: Option<crate::cli::JobDeclarationMode>,
-    /// #### PR #42: the ASIC-exclusive token mined instead of BCH, its
+    /// The ASIC-exclusive token mined instead of BCH, its
     /// donation and that donation's default.
     token: Option<(
         &'static str,
@@ -1683,7 +1668,6 @@ struct Started {
     )>,
 }
 
-/// #### PR #42
 /// What: the server's start values for its Advanced page: listening
 /// addresses, the start difficulty and the vardiff rule, the pool's name, a
 /// public pool's fee, and the pools joined. It never shows an address or key:
@@ -1803,7 +1787,7 @@ fn donation_summary(donation: BchDonation) -> String {
 /// What the Advanced page says the donation pays, and how it changes.
 fn advanced_text(donation: BchDonation, pool: bool) -> String {
     let (work, reward) = donation.shares();
-    // #### PR #40: at a pool the whole donation is mining work (#### PR #48:
+    // At a pool the whole donation is mining work (
     // accepted shares weighted by difficulty).
     let split = if pool {
         format!(
@@ -1848,7 +1832,6 @@ fn render_advanced(
     );
 }
 
-/// #### PR #61
 /// What: the colored lights over both dashboard pages, as on the P2Pool
 /// screen: P2Pool's and your BCH node's when the server runs your own
 /// P2Pool node, the pool's when it joins one, and the node's when it builds
@@ -1987,7 +1970,7 @@ impl PageText<'_> {
         let snapshot = self.snapshot;
         let sv1_bound = self.sv1;
         let bound = self.sv2;
-        // #### Pool modes: a Non-custodial Pool or P2Pool v2 names itself
+        // A Non-custodial Pool or P2Pool v2 names itself
         // first (the suffix is empty when joining someone's pool).
         if let Some(pool) = self.joined() {
             format!(
@@ -2193,7 +2176,6 @@ pub fn format_difficulty(difficulty: Option<f64>) -> String {
 }
 
 /// The workers table, laid out like a pool's worker list; the default page.
-/// #### PR #42
 /// What: the table scrolls itself to keep the highlighted row (`state`'s
 /// selection) in view and shows it reversed; with no selection (the
 /// read-only watch view) it scrolls from `state`'s offset.
@@ -2268,7 +2250,7 @@ fn render_workers(
     frame.render_widget(Paragraph::new(footer), areas[2]);
 }
 
-// #### PR #42: Enter opens the Device panel for the highlighted row.
+// Enter opens the Device panel for the highlighted row.
 /// The workers page's footer: its keys, then what U last said about
 /// Pickaxe's own update in place of the note under them.
 fn serve_footer(update_said: Option<&str>) -> String {
@@ -2306,7 +2288,7 @@ struct WorkerLine {
     model: Option<String>,
     firmware: Option<String>,
     power_w: Option<f64>,
-    /// #### one donation, the higher rate: a public pool miner's effective
+    /// A public pool miner's effective
     /// donation and their own Pickaxe's credit.
     donation_bps: Option<u16>,
     own_donation_bps: Option<u16>,
@@ -2393,7 +2375,7 @@ impl WorkerLine {
             },
             ago(self.last_share_seconds),
             format_difficulty(self.difficulty),
-            // #### one donation, the higher rate: the miner's effective
+            // The miner's effective
             // donation and their own Pickaxe's credit, never an address.
             super::telemetry::donation_text(self.donation_bps, self.own_donation_bps)
                 .unwrap_or_else(|| "—".into()),
@@ -2447,7 +2429,6 @@ fn device_addresses(
     }
 }
 
-/// #### PR #40
 /// What this server is, for what a device's username means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServeMode {
@@ -2457,14 +2438,13 @@ pub enum ServeMode {
     Public,
     /// Devices mine at a remote pool through this computer.
     JoinPool,
-    /// #### Pool modes: a Non-custodial Pool (`standalone`) or P2Pool v2:
+    /// A Non-custodial Pool (`standalone`) or P2Pool v2:
     /// each miner mines at your own P2Pool under their own payout.
     P2PoolPool { standalone: bool },
-    /// #### PR #42: devices mine this ASIC-exclusive token instead of BCH.
+    /// Devices mine this ASIC-exclusive token instead of BCH.
     Token(&'static str),
 }
 
-/// #### PR #40
 /// One address devices connect to: where it works from and the line to
 /// paste into a device (or, for SV2, into another Pickaxe's Join a pool).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2474,24 +2454,22 @@ pub struct ConnectLine {
     pub url: String,
 }
 
-/// #### PR #40
 /// The Connection info page (`i`), like ASICseer's: every address devices
 /// connect to, numbered for copying, and what to put as the username.
 struct ConnectPage {
     lines: Vec<ConnectLine>,
-    /// #### PR #42: where pools take this node's templates, numbered after
+    /// Where pools take this node's templates, numbered after
     /// `lines`, and the key they pin.
     templates: Vec<ConnectLine>,
     key: Option<String>,
     mode: ServeMode,
-    /// #### PR #42: Job Declaration is on: joining, this server declares its
+    /// Job Declaration is on: joining, this server declares its
     /// node's templates to the pool; a public pool accepts miners' own.
     job_declaration: bool,
     /// The last copy's result.
     note: Option<String>,
 }
 
-/// #### PR #40
 /// The addresses devices use: SV1 first, as most firmware speaks only SV1,
 /// then SV2 with the authority key in the address, the form ckpool and
 /// Braiins publish (stratum2+tcp://HOST:PORT/KEY). Each listener appears at
@@ -2519,7 +2497,7 @@ fn connect_lines(
     lines
 }
 
-/// #### PR #42: where Template Distribution clients (SV2 pools, P2Pool)
+/// Where Template Distribution clients (SV2 pools, P2Pool)
 /// reach this node's templates, at every address this computer is reached
 /// at, as `HOST:PORT`.
 fn template_lines(
@@ -2540,7 +2518,7 @@ fn template_lines(
         .unwrap_or_default()
 }
 
-/// #### PR #40: the addresses in the JSON start line; never a payout.
+/// The addresses in the JSON start line; never a payout.
 fn connect_json(lines: &[ConnectLine]) -> serde_json::Value {
     lines
         .iter()
@@ -2571,7 +2549,7 @@ pub const TEMPLATES_HEADING: &str =
 /// The Connection info page's line when no listener is open.
 pub const NO_LISTENER: &str = "No listener is open.";
 
-/// #### PR #40: the Connection info page's text.
+/// The Connection info page's text.
 fn connect_text(page: &ConnectPage) -> String {
     let mut text = String::from("How devices connect\n");
     let mut group = None;
@@ -2591,7 +2569,7 @@ fn connect_text(page: &ConnectPage) -> String {
         text.push_str(&format!("\n{NO_LISTENER}\n"));
     }
     text.push_str(&connect_notes(page));
-    // #### PR #42: where pools take this node's templates.
+    // Where pools take this node's templates.
     if !page.templates.is_empty() {
         text.push_str(&format!("\n{TEMPLATES_HEADING}:\n"));
         for (index, line) in page.templates.iter().enumerate() {
@@ -2622,7 +2600,7 @@ fn connect_text(page: &ConnectPage) -> String {
     text
 }
 
-/// #### PR #42: what an SRI pool or Job Declaration client puts in its
+/// What an SRI pool or Job Declaration client puts in its
 /// config to take this node's templates, once they are served.
 fn template_config(page: &ConnectPage) -> Option<String> {
     let (Some(first), Some(key)) = (page.templates.first(), page.key.as_deref()) else {
@@ -2639,7 +2617,7 @@ fn template_config(page: &ConnectPage) -> Option<String> {
 fn connect_notes(page: &ConnectPage) -> String {
     use crate::reach::Place;
     let mut text = String::new();
-    // #### PR #42: a token instead of BCH.
+    // A token instead of BCH.
     if let ServeMode::Token(token) = page.mode {
         text.push_str(&format!(
             "\nUsername: any name for the device; it names the device on the workers page. \
@@ -2663,7 +2641,7 @@ fn connect_notes(page: &ConnectPage) -> String {
              a root of their own; its token wins pay them, minus their donation and your fee \
              as each token allows.\n"
         }
-        // #### PR #42: with Job Declaration, this node builds the blocks.
+        // With Job Declaration, this node builds the blocks.
         ServeMode::JoinPool if page.job_declaration => {
             "\nUsername: any name for the device; it names the device on the workers page. \
              This computer mines at the pool for you with your node's templates (Job \
@@ -2678,7 +2656,6 @@ fn connect_notes(page: &ConnectPage) -> String {
              the pool builds the blocks, so this computer cannot add token commitments. Mine \
              solo, or at a pool with Job Declaration, to merge-mine.\n"
         }
-        // #### Pool modes
         ServeMode::P2PoolPool { .. } => {
             "\nUsername: the miner's own BCH address, a q (P2PKH) address because P2Pool \
              pays shares to a key (the prefix may be left out), optionally followed by \
@@ -2688,7 +2665,7 @@ fn connect_notes(page: &ConnectPage) -> String {
              donation above yours, never lowers it; it is mined as work.\n"
         }
     });
-    // #### PR #42: where miners' own templates go.
+    // Where miners' own templates go.
     if page.mode == ServeMode::Public && page.job_declaration {
         text.push_str(
             "Miners' own templates: a Job Declaration client (another Pickaxe's Join a pool \
@@ -2757,7 +2734,7 @@ fn status_path(config_path: &Path) -> PathBuf {
 
 /// The status published each second: printed in JSON mode and saved for
 /// `stratum-v2 watch`. It never contains payouts or credentials.
-/// #### PR #42: the Job Declaration client's part of the status file.
+/// The Job Declaration client's part of the status file.
 fn jd_client_json(jd: &super::jd::client::JdClientSummary) -> serde_json::Value {
     serde_json::json!({
         "state": jd.state,
@@ -2776,7 +2753,7 @@ fn jd_client_json(jd: &super::jd::client::JdClientSummary) -> serde_json::Value 
     })
 }
 
-/// #### PR #42: the Job Declaration server's part of the status file; its
+/// The Job Declaration server's part of the status file; its
 /// Full-Template counts while it accepts Full-Template.
 fn jd_server_json(jd: &server::JdServerStats) -> serde_json::Value {
     serde_json::json!({
@@ -2802,7 +2779,7 @@ fn jd_server_json(jd: &server::JdServerStats) -> serde_json::Value {
     })
 }
 
-/// #### PR #42: the template server's part of the status file, with no
+/// The template server's part of the status file, with no
 /// address.
 fn template_server_json(templates: &server::TemplateServerStats) -> serde_json::Value {
     serde_json::json!({
@@ -2837,7 +2814,7 @@ fn status_json(
 ) -> serde_json::Value {
     let mut status = serde_json::json!({
         "network": network,
-        // #### PR #42: what devices mine: BCH, or an ASIC-exclusive token.
+        // What devices mine: BCH, or an ASIC-exclusive token.
         "mode": if snapshot.header_token.is_some() { "asic-token" } else { "bch" },
         "upstream": upstream,
         "node": node,
@@ -2849,7 +2826,7 @@ fn status_json(
         "devices": snapshot.connections,
         "shares_accepted": snapshot.shares_accepted,
         "shares_rejected": snapshot.shares_rejected,
-        // #### PR #48: validated BCH work by its job's payout, in expected
+        // Validated BCH work by its job's payout, in expected
         // hashes, and the donation's and fee's fractions of all of it.
         "blocks_accepted": snapshot.blocks_accepted,
         "blocks_unconfirmed": snapshot.blocks_pending,
@@ -2862,7 +2839,7 @@ fn status_json(
         "template_failures": snapshot.template_failures,
         "last_template_error": snapshot.last_template_error,
         "node_active": snapshot.active_node + 1,
-        // #### PR #42: the kind of the active template source.
+        // The kind of the active template source.
         "template_source": snapshot.template_source.map(|kind| serde_json::json!({
             "kind": match kind {
                 super::provider::SourceKind::NodeRpc => "rpc",
@@ -2884,13 +2861,13 @@ fn status_json(
             "seconds_ago": found.found.elapsed().as_secs(),
             "result": found.result,
         })).collect::<Vec<_>>(),
-        // #### PR #42: merge-mined token wins, with no address or script.
+        // Merge-mined token wins, with no address or script.
         "tokens": serde_json::json!({
             "wins": snapshot.token_wins,
             "dropped": snapshot.token_wins_dropped,
             "off": snapshot.tokens_off,
             "refused": snapshot.tokens_refused,
-            // #### merge-mining v2: tSAFA's claims, as counts.
+            // TSAFA's claims, as counts.
             "claims": snapshot.token_claims.as_ref().map(token_claims_json),
             "recent": snapshot.recent_token_wins.iter().map(|win| serde_json::json!({
                 "token": win.token,
@@ -2899,11 +2876,11 @@ fn status_json(
                 "seconds_ago": win.found.elapsed().as_secs(),
             })).collect::<Vec<_>>(),
         }),
-        // #### PR #42: the Job Declaration client's state and counts, and the
+        // The Job Declaration client's state and counts, and the
         // server's, with no identity, token or address.
         "jd_client": snapshot.jd_client.as_ref().map(jd_client_json),
         "jd_server": snapshot.jd_server.as_ref().map(jd_server_json),
-        // #### PR #42: an ASIC-exclusive token's wins, never a script or an
+        // An ASIC-exclusive token's wins, never a script or an
         // address.
         "header_token": snapshot.header_token.as_ref().map(|token| serde_json::json!({
             "token": token.token,
@@ -2914,23 +2891,23 @@ fn status_json(
             "dropped": token.dropped,
             "off": token.off,
         })),
-        // #### PR #42: the template server's counts, with no address.
+        // The template server's counts, with no address.
         "template_server": snapshot.template_server.as_ref().map(template_server_json),
         "sv1_local_rejected": snapshot.sv1_local_rejected,
         "sessions_started": snapshot.sessions_started,
         "device_details": devices,
     });
-    // #### PR #48: validated BCH work by payout. Not measured for an
+    // Validated BCH work by payout. Not measured for an
     // ASIC-exclusive token or as a Job Declaration client; work at remote
     // pools is apart (see `ServerStats::work`).
     status["work"] = local_work(snapshot).map_or(serde_json::Value::Null, work_json);
     status["pool_work"] = work_json(&snapshot.pool_work);
-    // #### PR #42: the node's ZMQ block notices.
+    // The node's ZMQ block notices.
     status["block_notices"] = serde_json::json!(snapshot.block_notices);
     status
 }
 
-/// #### PR #42: the node's ZMQ block notices, on the dashboard.
+/// The node's ZMQ block notices, on the dashboard.
 fn notices_suffix(snapshot: &ServerStats) -> String {
     snapshot
         .block_notices
@@ -2939,7 +2916,7 @@ fn notices_suffix(snapshot: &ServerStats) -> String {
         .unwrap_or_default()
 }
 
-// #### PR #42: the devices file
+// The devices file
 // What: the server writes `<config>.sv2-devices.json`, readable by its owner
 // alone: where devices reach it, and each worker's label with its local
 // address (and whether that address is shared). `stratum-v2 watch` reads it
@@ -3047,7 +3024,7 @@ impl DevicesFile {
     }
 }
 
-/// #### PR #42: the Device panel for a row of the watch view, from the
+/// The Device panel for a row of the watch view, from the
 /// server's devices file; refused when the file cannot be read.
 fn watch_panel(devices_file: &Path, row: &WorkerLine) -> DevicePanel {
     let file = DevicesFile::read(devices_file);
@@ -3069,7 +3046,6 @@ fn watch_panel(devices_file: &Path, row: &WorkerLine) -> DevicePanel {
     view.set_donation(row.donation_bps, row.own_donation_bps);
     view
 }
-// #### end PR #42 ####
 
 /// Replaces the status file whole, so a reader never sees half of it.
 fn write_status(path: &Path, status: &serde_json::Value) -> std::io::Result<()> {
@@ -3082,7 +3058,7 @@ fn write_status(path: &Path, status: &serde_json::Value) -> std::io::Result<()> 
     })
 }
 
-/// #### PR #40: the saved best share.
+/// The saved best share.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct WatchBest {
@@ -3090,7 +3066,7 @@ struct WatchBest {
     worker: String,
 }
 
-/// #### PR #40: a saved found block.
+/// A saved found block.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct WatchBlock {
@@ -3109,10 +3085,10 @@ struct WatchStatus {
     upstream: Option<String>,
     /// The node's client and version in local mode.
     node: Option<String>,
-    /// #### PR #40: which node of several templates come from (1-based).
+    /// Which node of several templates come from (1-based).
     node_active: usize,
     nodes: usize,
-    /// #### PR #40: the best share since start and the latest blocks found.
+    /// The best share since start and the latest blocks found.
     best_share: Option<WatchBest>,
     recent_blocks: Vec<WatchBlock>,
     updated: u64,
@@ -3125,16 +3101,16 @@ struct WatchStatus {
     blocks_accepted: u64,
     blocks_pending: usize,
     device_details: Vec<WorkerLine>,
-    /// #### PR #42: Job Declaration, as the client and as a pool.
+    /// Job Declaration, as the client and as a pool.
     jd_client: Option<WatchJdClient>,
     jd_server: Option<WatchJdServer>,
-    /// #### PR #48: the validated work split, from servers that save it:
+    /// The validated work split, from servers that save it:
     /// this server's own jobs (absent when not measured), and remote pools'.
     work: Option<WatchWork>,
     pool_work: Option<WatchWork>,
 }
 
-/// #### PR #48: the donation's and fee's fractions of validated work.
+/// The donation's and fee's fractions of validated work.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct WatchWork {
@@ -3142,7 +3118,7 @@ struct WatchWork {
     fee_fraction: Option<f64>,
 }
 
-/// #### PR #42: the Job Declaration client's part of the saved status.
+/// The Job Declaration client's part of the saved status.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct WatchJdClient {
@@ -3153,7 +3129,7 @@ struct WatchJdClient {
     fallbacks: u64,
 }
 
-/// #### PR #42: the Job Declaration server's part of the saved status.
+/// The Job Declaration server's part of the saved status.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct WatchJdServer {
@@ -3164,7 +3140,7 @@ struct WatchJdServer {
 }
 
 impl WatchStatus {
-    /// #### PR #48: the donation's (and any fee's) measured share of the
+    /// The donation's (and any fee's) measured share of the
     /// validated work, beside the setting it should match over a session.
     fn measured(work: Option<&WatchWork>) -> String {
         let Some(work) = work else {
@@ -3181,7 +3157,7 @@ impl WatchStatus {
         }
     }
 
-    /// #### PR #42: Job Declaration's lines, when it is on.
+    /// Job Declaration's lines, when it is on.
     fn job_declaration(&self) -> String {
         let mut text = String::new();
         if let Some(jd) = &self.jd_client {
@@ -3257,7 +3233,6 @@ impl WatchStatus {
             + &self.job_declaration()
     }
 
-    /// #### PR #40
     /// The third header line: the best share and the latest blocks found,
     /// their ages counted to now.
     fn records(&self, age: u64) -> String {
@@ -3311,11 +3286,10 @@ impl WatchStatus {
     }
 }
 
-/// #### PR #40
 /// `stratum-v2 watch`: the workers table of a server running elsewhere on
 /// this machine, such as a service started with --no-tui. Read-only: it reads
 /// the status the server saves each second and never touches the server.
-// #### PR #42: the watch view controls devices
+// The watch view controls devices
 // What: `stratum-v2 watch` highlights a row like the server's workers page,
 // and Enter opens the same Device panel. It acts on the devices itself, with
 // the addresses from the server's owner-only devices file and the server's
@@ -3392,10 +3366,9 @@ fn watch(config_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// #### PR #40
 /// A public pool's note after the donation: each miner's blocks pay them,
 /// and the operator's fee comes off what the donation leaves.
-/// #### Pool modes: named by its mode: "Public Solo Endpoint, fee 2.00%
+/// Named by its mode: "Public Solo Endpoint, fee 2.00%
 /// from coinbase", or "Non-custodial Pool" or "P2Pool v2".
 fn public_pool_suffix(public: Option<&super::payout::PublicPool>, mode: &str) -> String {
     match public.map(|public| public.fee) {
@@ -3405,7 +3378,6 @@ fn public_pool_suffix(public: Option<&super::payout::PublicPool>, mode: &str) ->
     }
 }
 
-/// #### PR #40
 /// The share target of a pool difficulty: difficulty 1 is the target of
 /// compact bits 0x1d00ffff, so 4096 is the default start (0x1b0ffff0).
 fn difficulty_target(difficulty: u64) -> Result<super::template::Hash, String> {
@@ -3420,10 +3392,9 @@ fn difficulty_target(difficulty: u64) -> Result<super::template::Hash, String> {
         .map_err(|_| "--start-difficulty is out of range".into())
 }
 
-/// #### PR #40
 /// The overview's records: the best share since start and the latest blocks
 /// found, newest first, as "#327035 rig1 accepted 2m ago".
-/// #### PR #42: the Job Declaration client's line on the overview, when this
+/// The Job Declaration client's line on the overview, when this
 /// server declares its templates to a pool.
 fn jd_client_line(stats: &ServerStats, pool: Option<&str>) -> String {
     let Some(jd) = &stats.jd_client else {
@@ -3459,7 +3430,7 @@ fn jd_client_line(stats: &ServerStats, pool: Option<&str>) -> String {
     )
 }
 
-/// #### PR #42: the Job Declaration server's line on the overview, when the
+/// The Job Declaration server's line on the overview, when the
 /// pool accepts miners' own templates.
 fn jd_line(stats: &ServerStats) -> String {
     let Some(jd) = &stats.jd_server else {
@@ -3496,7 +3467,7 @@ fn jd_line(stats: &ServerStats) -> String {
     )
 }
 
-/// #### PR #42: the template server's line on the overview, while it serves
+/// The template server's line on the overview, while it serves
 /// templates or holds relayed blocks.
 fn templates_line(stats: &ServerStats) -> String {
     let Some(templates) = &stats.template_server else {
@@ -3520,7 +3491,7 @@ fn templates_line(stats: &ServerStats) -> String {
     )
 }
 
-/// #### PR #48: this server's own validated work, when its split is
+/// This server's own validated work, when its split is
 /// measured: not for an ASIC-exclusive token (a time-based donation) nor as a
 /// Job Declaration client (the pool's coinbase carries the donation).
 fn local_work(stats: &ServerStats) -> Option<&super::server::WorkSplit> {
@@ -3537,7 +3508,7 @@ fn work_json(work: &super::server::WorkSplit) -> serde_json::Value {
     })
 }
 
-/// #### PR #48: the donation's and fee's shares of the validated work so far
+/// The donation's and fee's shares of the validated work so far
 /// (see `WorkSplit`), to compare with the Donation setting over a session:
 /// this server's own jobs, or with `pool` the work remote pools acknowledged.
 fn work_line(stats: &ServerStats, pool: bool) -> String {
@@ -3557,7 +3528,7 @@ fn work_line(stats: &ServerStats, pool: bool) -> String {
     }
 }
 
-/// #### merge-mining v2: tSAFA's claim counts for the status file (never an
+/// TSAFA's claim counts for the status file (never an
 /// address or a script).
 fn token_claims_json(claims: &super::merge::hub::ClaimCounts) -> serde_json::Value {
     serde_json::json!({
@@ -3593,7 +3564,7 @@ fn records_line(stats: &ServerStats) -> String {
             )
         })
         .collect::<Vec<_>>();
-    // #### PR #42: merge-mined token wins, when a token is merge-mined.
+    // Merge-mined token wins, when a token is merge-mined.
     let tokens = match (&stats.tokens_off, stats.recent_token_wins.back()) {
         (Some(off), _) => format!(" · Tokens off: {off}"),
         (None, Some(last)) => format!(
@@ -3610,13 +3581,13 @@ fn records_line(stats: &ServerStats) -> String {
         ),
         (None, None) => String::new(),
     };
-    // #### merge-mining v2: a job whose coinbase failed the own-root check
+    // A job whose coinbase failed the own-root check
     // mines BCH alone; the dashboard says why.
     let tokens = match stats.tokens_refused {
         Some(reason) => format!("{tokens} · Token merge mining refused for a job: {reason}"),
         None => tokens,
     };
-    // #### merge-mining v2: tSAFA's claims.
+    // TSAFA's claims.
     let tokens = match &stats.token_claims {
         Some(claims) => format!(
             "{tokens} · {} claims: {} confirmed, {} sent, {} waiting, {} lost, {} failed ({} vaults){}",
@@ -3635,7 +3606,7 @@ fn records_line(stats: &ServerStats) -> String {
         ),
         None => tokens,
     };
-    // #### PR #42: an ASIC-exclusive token's wins.
+    // An ASIC-exclusive token's wins.
     let header = stats
         .header_token
         .as_ref()
@@ -3662,11 +3633,10 @@ fn records_line(stats: &ServerStats) -> String {
     )
 }
 
-/// #### PR #40
 /// After "Node Ready": the node's client while templates come from the node
 /// it was read from (the first in failover order), and which node of
 /// several, such as " (Bitcoin Cash Node 29.1.0) · node 1 of 2".
-/// #### PR #42: a token's difficulty from its compact target; below 1 (test
+/// A token's difficulty from its compact target; below 1 (test
 /// targets) in scientific notation.
 fn token_difficulty(bits: u32) -> String {
     let difficulty = super::merge::hub::difficulty_for_bits(bits);
@@ -3678,11 +3648,11 @@ fn token_difficulty(bits: u32) -> String {
 }
 
 fn node_label(client: Option<&str>, stats: &ServerStats) -> String {
-    // #### PR #42: an ASIC-exclusive token needs no node.
+    // An ASIC-exclusive token needs no node.
     if stats.template_source == Some(super::provider::SourceKind::Token) {
         return " · no node: an ASIC-exclusive token instead of BCH".into();
     }
-    // #### PR #42: templates from a template provider say so.
+    // Templates from a template provider say so.
     if stats.template_source == Some(super::provider::SourceKind::TemplateProvider) {
         return format!(
             " · templates from template provider {} of {}",
@@ -3701,7 +3671,6 @@ fn node_label(client: Option<&str>, stats: &ServerStats) -> String {
     label
 }
 
-/// #### PR #40
 /// The node's client after "Node Ready", such as " (Bitcoin Cash Node 29.1.0)".
 fn node_suffix(client: Option<&str>) -> String {
     client
@@ -3709,7 +3678,7 @@ fn node_suffix(client: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
-/// #### PR #42: what preflight found: the nodes (for their identity and
+/// What preflight found: the nodes (for their identity and
 /// client), every template source in failover order, and its first template.
 type Preflight = (
     Vec<NativeNodeRpc>,
@@ -3717,7 +3686,7 @@ type Preflight = (
     BchTemplate,
 );
 
-// #### PR #42: mixed failover
+// Mixed failover
 // What: the template providers (in their order), then the nodes (in theirs)
 // are tried, and the first that gives a verified template goes first; the
 // server then fails over across all of them. A provider's new parent is
@@ -3776,9 +3745,9 @@ fn preflight_sources(
     ))
 }
 
-/// #### PR #42: confirms a provider's parent on the selected network: by the
+/// Confirms a provider's parent on the selected network: by the
 /// first configured node, or by the network's Fulcrum servers.
-/// #### PR #48: gives the parent's time (from the same header) on a network
+/// Gives the parent's time (from the same header) on a network
 /// that allows minimum-difficulty blocks.
 fn chain_guard(config: &RuntimeConfig) -> super::tdp::client::Guard {
     let network = config.network;
@@ -3844,7 +3813,7 @@ fn preflight(config: &RuntimeConfig) -> Result<(Vec<NativeNodeRpc>, BchTemplate)
         let mut provider =
             TemplateProvider::new(NativeNodeRpc::new((*endpoint).to_owned()), config.network);
         match provider.refresh() {
-            // #### PR #40: the others follow in their order, as the server's
+            // The others follow in their order, as the server's
             // failover list.
             Ok((_, template)) => {
                 let nodes = endpoints[index..]
@@ -3854,7 +3823,6 @@ fn preflight(config: &RuntimeConfig) -> Result<(Vec<NativeNodeRpc>, BchTemplate)
                     .collect();
                 return Ok((nodes, template.clone()));
             }
-            // #### PR #40
             // The last node's reason, such as a refused login or a node on
             // another network, instead of a bare failure.
             Err(error) => reason = server::template_reason(&error),
@@ -3926,7 +3894,7 @@ mod tests {
         assert_eq!(lines[1], "Downloading Pickaxe v0.0.5…");
     }
 
-    /// #### Pool modes: a `stratum-v2 serve` command line.
+    /// A `stratum-v2 serve` command line.
     fn serve(extra: &[&str]) -> StratumV2Command {
         let mut args = vec![
             "pickaxe",
@@ -3945,7 +3913,7 @@ mod tests {
         }
     }
 
-    // #### Pool modes: the operator's settings and what P2Pool cannot do
+    // The operator's settings and what P2Pool cannot do
     // What: --pool-fee and --pool-fee-address (with --public), --pool-tag
     // and P2Pool's own settings become P2Pool's fee in basis points, fee
     // address, signature and donation; fee modes work and both, a
@@ -4057,7 +4025,7 @@ mod tests {
         assert!(own_options(&serve(&[]), &config).unwrap().is_none());
     }
 
-    /// #### PR #65: the CLI has the same source requirement as setup;
+    /// The CLI has the same source requirement as setup;
     /// Electrum headers/UTXOs never stand in for a BCH block template.
     #[test]
     fn fulcrum_cannot_replace_a_bch_node_or_template_provider_at_preflight() {
@@ -4079,7 +4047,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     // What: merge-mined token wins show on the dashboard's records line and
     // in the status file (token, case, height, worker; never an address),
     // and a journal failure says token claims are off.
@@ -4108,7 +4075,7 @@ mod tests {
         assert_eq!(status["tokens"]["dropped"], 1);
         assert_eq!(status["tokens"]["recent"][0]["height"], 325_909);
         assert!(status["tokens"]["refused"].is_null());
-        // #### merge-mining v2: a job refused by the own-root check.
+        // A job refused by the own-root check.
         stats.tokens_refused = Some("output 0 is not this server's token commitment");
         assert!(records_line(&stats).contains(
             "Token merge mining refused for a job: output 0 is not this server's token commitment"
@@ -4118,7 +4085,7 @@ mod tests {
             status["tokens"]["refused"],
             "output 0 is not this server's token commitment"
         );
-        // #### merge-mining v2: tSAFA's claims.
+        // TSAFA's claims.
         stats.token_claims = Some(crate::stratum_v2::merge::hub::ClaimCounts {
             token: "tSAFA",
             vaults: 4,
@@ -4138,12 +4105,10 @@ mod tests {
         assert!(super::super::status_report().contains("merge mining: common format v2"));
     }
 
-    // #### PR #42
     // What: an ASIC-exclusive token's counts show on the overview and in the
     // status file (kind "token"), with no script or address, and the
     // overview says no node is needed.
     // Look here if: the token's dashboard or status lines change.
-    // #### PR #48
     // What: validated work is split by the job's payout, and the status JSON
     // and the overview report the donation's and fee's fractions of it.
     // Look here if: `WorkSplit`, the `work` JSON or the work line change.
@@ -4239,7 +4204,6 @@ mod tests {
             .contains("Pickaxe ASIC test token off: a token win failed its own check"));
     }
 
-    // #### PR #42
     // What: the template server's counts show on the overview and in the
     // status file, which never holds an address; Connection info lists where
     // pools take the templates, numbered after the device lines, with SRI's
@@ -4253,7 +4217,7 @@ mod tests {
         assert_eq!(templates_line(&stats), "");
         let status = status_json("chipnet", None, None, &stats, BchDonation::default(), &[]);
         assert!(status["template_server"].is_null());
-        // #### PR #42: BCH unless an ASIC-exclusive token is mined.
+        // BCH unless an ASIC-exclusive token is mined.
         assert_eq!(status["mode"], "bch");
         assert!(status["jd_server"].is_null());
         assert_eq!(jd_line(&stats), "");
@@ -4274,7 +4238,7 @@ mod tests {
         assert_eq!(status["jd_server"]["custom_jobs"], 2);
         assert_eq!(status["jd_server"]["last_refusal"], "stale-chain-tip");
         assert!(status["jd_server"]["full_template"].is_null());
-        // #### PR #42: a pool that accepts Full-Template shows its
+        // A pool that accepts Full-Template shows its
         // declarations, its node check and its node's answers.
         if let Some(jd) = stats.jd_server.as_mut() {
             jd.validator = Some("validateblocktemplate");
@@ -4361,7 +4325,6 @@ mod tests {
         assert!(text.contains(&format!("1-{number}  Copy a line")), "{text}");
     }
 
-    // #### PR #42
     // What: the devices file carries this server's addresses and each
     // worker's local address; the watch view takes a worker's address from
     // it only when it is local and not shared, refuses an edited public one,
@@ -4475,7 +4438,7 @@ mod tests {
             );
         }
         devices.share(first, ShareEvent::Rejected("stale job"), true, start);
-        // #### PR #42: a second worker, highlighted with the arrow keys.
+        // A second worker, highlighted with the arrow keys.
         devices.connect("127.0.0.1:1001".parse().unwrap(), true, start);
         let rows: Vec<WorkerLine> = devices
             .snapshots(start + Duration::from_secs(45))
@@ -4540,7 +4503,6 @@ mod tests {
         assert_eq!(ago(Some(250)), "4m ago");
     }
 
-    // #### PR #40
     #[test]
     fn a_start_difficulty_is_the_matching_share_target() {
         assert_eq!(
@@ -4557,7 +4519,6 @@ mod tests {
         assert!(difficulty_target(u64::MAX).is_err());
     }
 
-    // #### PR #40
     #[test]
     fn the_overview_records_the_best_share_and_recent_blocks() {
         let mut stats = ServerStats::default();
@@ -4621,7 +4582,6 @@ mod tests {
         );
     }
 
-    // #### PR #40
     #[test]
     fn connection_info_lists_sv1_and_sv2_lines_and_what_to_type() {
         use crate::reach::{Interfaces, Place};
@@ -4668,7 +4628,7 @@ mod tests {
         };
         let text = connect_text(&public);
         assert!(!text.contains("Miners' own templates"), "{text}");
-        // #### PR #42: a pool accepting Job Declaration says where it goes.
+        // A pool accepting Job Declaration says where it goes.
         let accepting = connect_text(&ConnectPage {
             job_declaration: true,
             lines: connect_lines(
@@ -4736,7 +4696,7 @@ mod tests {
         let text = connect_text(&join);
         assert!(text.contains("mines at the pool for you"), "{text}");
         assert!(!text.contains("with Join a"), "{text}");
-        // #### PR #42: with Job Declaration this node builds the blocks.
+        // With Job Declaration this node builds the blocks.
         let declaring = connect_text(&ConnectPage {
             job_declaration: true,
             note: None,
@@ -4754,7 +4714,7 @@ mod tests {
             !declaring.contains("the pool builds the blocks"),
             "{declaring}"
         );
-        // #### PR #42: a token instead of BCH.
+        // A token instead of BCH.
         let token = connect_text(&ConnectPage {
             lines: Vec::new(),
             templates: Vec::new(),
@@ -4790,7 +4750,6 @@ mod tests {
         assert!(text.contains("Only programs on this computer"), "{text}");
     }
 
-    // #### PR #42
     // What: at a pool, --merge-test-token is refused without
     // --job-declaration (the pool builds the blocks there), before anything
     // is opened.
@@ -4901,7 +4860,7 @@ mod tests {
         wrong_version.extend([7u8; 32]);
         let wrong = stratum_core::bitcoin::base58::encode_check(&wrong_version);
         assert!(one("pool.example:3336", &wrong, None).is_err());
-        // #### PR #40: the key may come in the address, as pools publish it.
+        // The key may come in the address, as pools publish it.
         let embedded = pool_upstreams(
             &config,
             &[format!("stratum2+tcp://pool.example:3336/{key}")],
@@ -4977,7 +4936,7 @@ mod tests {
         stats.template_ready = true;
         stats.height = Some(326930);
         stats.shares_accepted = 1;
-        // #### PR #40: the records a service's watch view shows too.
+        // The records a service's watch view shows too.
         stats.best_share = Some((5000.0, "rig1 #1".into()));
         stats
             .recent_blocks
@@ -5026,7 +4985,7 @@ mod tests {
         }
         assert!(saved.header(updated + 60).contains("Server not updating"));
         assert!(!header.contains("Job Declaration"), "{header}");
-        // #### PR #48: the measured donation share, beside the setting.
+        // The measured donation share, beside the setting.
         assert!(header.contains("· no validated work yet ·"), "{header}");
         stats.work = super::super::server::WorkSplit {
             personal: 199.0,
@@ -5068,7 +5027,7 @@ mod tests {
             header.contains("rejected · Donation 1.50% · 1.50% of work so far"),
             "{header}"
         );
-        // #### PR #42: Job Declaration's lines, as the client and as a pool.
+        // Job Declaration's lines, as the client and as a pool.
         stats.jd_client = Some(super::super::jd::client::JdClientSummary {
             state: "active",
             mode: "full-template",
@@ -5192,7 +5151,7 @@ mod tests {
         assert!(text.contains("0.50% of mining work and 1.00% of each block reward"));
         assert!(text.contains("from 0% to 100%"));
         assert!(text.contains("Could not save donation"));
-        // #### PR #42: the start values, read-only, never an address.
+        // The start values, read-only, never an address.
         for expected in [
             "apply after a restart",
             "SV1 0.0.0.0:3338",
@@ -5222,11 +5181,11 @@ mod tests {
         assert!(joined.contains("pool.example:3336 → b1.example:3336 (in failover order)"));
         assert!(joined.contains("username: your own"));
         assert!(!joined.contains("Start difficulty"));
-        // #### PR #42: Join a pool with the node's own templates says so.
+        // Join a pool with the node's own templates says so.
         assert!(joined.contains(
             "Your templates  Coinbase-only Job Declaration at the first pool, from your node"
         ));
-        // #### PR #42: solo mining names its fallback pools.
+        // Solo mining names its fallback pools.
         let solo = started_text(&Started {
             sv2: Some("0.0.0.0:3336".parse().unwrap()),
             sv1: Some("0.0.0.0:3333".parse().unwrap()),
@@ -5245,7 +5204,7 @@ mod tests {
                 crate::donation::TokenDonation::from_bps(150),
             )),
         });
-        // #### PR #42: a token's donation, apart from the BCH donation.
+        // A token's donation, apart from the BCH donation.
         assert!(
             solo.contains(
                 "Token  Pickaxe ASIC test token instead of BCH; its donation is 2.00% of the \
@@ -5259,7 +5218,6 @@ mod tests {
         ));
     }
 
-    // #### PR #42
     // What: a donation changed on the server's Advanced page is saved into
     // the profile the server started from, and fails closed when that
     // profile is gone.
@@ -5297,7 +5255,7 @@ mod tests {
         assert!(save_donation(&path, Some("Gone"), rate).is_err());
     }
 
-    // #### PR #61: the dashboard's lights: the pool's when joining one, the
+    // The dashboard's lights: the pool's when joining one, the
     // node's when building templates, drawn as one colored line.
     #[test]
     fn the_dashboard_lights_show_the_pool_and_the_node() {
@@ -5637,7 +5595,7 @@ mod tests {
         assert!(!status_path(&path).exists(), "it never served");
     }
 
-    // #### Pool modes: the dashboard header names the server's mode and its
+    // The dashboard header names the server's mode and its
     // fee, in the terminal and in the window (the same `PageText`); joining
     // someone's pool names none.
     #[test]

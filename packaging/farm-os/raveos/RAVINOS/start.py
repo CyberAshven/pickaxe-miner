@@ -1,4 +1,4 @@
-# #### PR #42: RaveOS starts the miner with the command line this builds
+# RaveOS starts the miner with the command line this builds
 # (raveos-foundation/custom_mining). Each pool becomes --pool and
 # --password, the first pool's user (or the wallet) --user, and the extra
 # arguments follow `--`; `pickaxe farm-os mine` maps them (src/farm_os.rs).

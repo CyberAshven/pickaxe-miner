@@ -1,4 +1,3 @@
-//! #### PR #40
 //! A read-only view of a miner running without a screen (a GPU farm's or
 //! pool's coordinator as a service, or any `--no-tui` miner): it saves its
 //! status once a second beside its config, and `pickaxe watch` shows it, as
@@ -75,7 +74,7 @@ fn view(status: &Value, now: u64) -> (String, Vec<[String; 5]>, [&'static str; 5
         .and_then(|rigs| rigs.get("rate"))
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
-    // #### PR #42: a rig's own status: its coordinator and its GPUs.
+    // A rig's own status: its coordinator and its GPUs.
     if status.get("role").and_then(Value::as_str) == Some("rig") {
         let header = format!(
             "Rig of {}{} · {} · {} · winners sent {} · {freshness}",
@@ -144,7 +143,7 @@ fn view(status: &Value, now: u64) -> (String, Vec<[String; 5]>, [&'static str; 5
         crate::telemetry::format_hash_rate(own + farm),
         number(status, "verified_winners"),
         number(status, "rejected_winners"),
-        // #### PR #42: the job source's label (your node, Fulcrum, or
+        // The job source's label (your node, Fulcrum, or
         // Fulcrum while the node is down); older status files name the
         // endpoint.
         status
@@ -199,7 +198,7 @@ fn view(status: &Value, now: u64) -> (String, Vec<[String; 5]>, [&'static str; 5
         number(rigs, "rejected"),
         rigs.get("listen").and_then(Value::as_str).unwrap_or("—"),
     ));
-    // #### PR #42: each rig, then its GPUs: status, rate, winners and
+    // Each rig, then its GPUs: status, rate, winners and
     // health (or the error).
     let rows = rigs
         .get("rigs")
@@ -376,7 +375,7 @@ mod tests {
         assert_eq!(rows[0][0], "pool-test-nvidia");
         assert_eq!(rows[0][3], "94");
         assert_eq!(rows[0][4], "10m");
-        // #### PR #42: the rig's GPU under it, with its health.
+        // The rig's GPU under it, with its health.
         assert_eq!(rows[1][0], "  RTX 3080");
         assert_eq!(rows[1][1], "mining");
         assert_eq!(rows[1][4], "61°C · fan 40%");
@@ -394,7 +393,7 @@ mod tests {
             (titles[0], rows[0][0].as_str(), rows[0][3].as_str()),
             ("GPU", "RTX", "3")
         );
-        // #### PR #42: a rig's own status names its coordinator and lists
+        // A rig's own status names its coordinator and lists
         // its GPUs.
         let rig = crate::rigs::rig_status_json(
             Some(("192.0.2.1:3340", false)),
@@ -421,7 +420,7 @@ mod tests {
         assert_eq!(titles[0], "GPU");
         assert_eq!(rows[0][0], "RTX 3080");
         assert_eq!(rows[0][4], "61°C");
-        // #### PR #42: the job source's label, rather than its endpoint.
+        // The job source's label, rather than its endpoint.
         let (header, _, _) = view(
             &json!({"state": "mining", "updated": now, "endpoint": "wss://f.example",
                 "job_source": {"kind": "fulcrum-node-down",

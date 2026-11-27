@@ -1,4 +1,3 @@
-//! #### PR #42
 //! What a Job Declaration client's local server builds its jobs from while
 //! the pool accepts its templates: the pool channel's extranonce prefix, the
 //! pool's outputs and rates (from its token), and the pool's share target.
@@ -17,7 +16,7 @@ pub struct JdPlan {
     /// Zero bytes after the job id when the pool lets the client roll more
     /// than the layout needs.
     pub pad: Vec<u8>,
-    /// #### PR #56: the pool granted fewer than 16 bytes, so the compact
+    /// The pool granted fewer than 16 bytes, so the compact
     /// layout (2-byte job id and lane, 4 bytes per device) is used.
     pub compact: bool,
     /// The pool's outputs, in its order: the miner's own script first.
@@ -30,7 +29,7 @@ pub struct JdPlan {
     /// The pool granted Requested Payout Outputs (0x5052): templates ask it
     /// for their coinbase outputs before they are published.
     pub payouts: Option<std::sync::Arc<super::payouts::Payouts>>,
-    /// #### merge-mining v2: the client declares each template's
+    /// The client declares each template's
     /// transactions (Full-Template), so DeclareMiningJob can carry its token
     /// leaves for the pool to check; a Coinbase-only plan merge-mines no
     /// token.
@@ -68,7 +67,7 @@ impl JdPlan {
             .collect()
     }
 
-    /// #### merge-mining v2: the payout merge-mined token leaves bind under
+    /// The payout merge-mined token leaves bind under
     /// this plan: the miner's own script, the pool's first output (no
     /// donation work runs under Job Declaration, and a split is
     /// token-defined); `None` without outputs.
@@ -83,7 +82,7 @@ impl JdPlan {
         id + self.pad.len() + lane + device
     }
 
-    /// #### PR #56: the bytes of the job id, the lane and each device: 4, 4
+    /// The bytes of the job id, the lane and each device: 4, 4
     /// and 8, or 2, 2 and 4 in the compact layout.
     pub fn layout(&self) -> (usize, usize, usize) {
         if self.compact {
@@ -94,7 +93,7 @@ impl JdPlan {
     }
 
     /// Whether the pool's outputs name valid indexes: the miner first, the
-    /// donation and fee within the list; #### PR #42: and its rates are at
+    /// donation and fee within the list; and its rates are at
     /// most 100%, so the payout never underflows and a token split fits.
     pub fn is_valid(&self) -> bool {
         if self.p2pool.is_some() {
@@ -124,7 +123,6 @@ impl JdPlan {
 mod tests {
     use super::*;
 
-    // #### PR #42
     // What: a plan pays the pool's rule exactly: at 1.5% and 1%, 312,500,000
     // satoshis go 304,734,375 to the miner, 3,078,125 to the fee and
     // 4,687,500 to the donation, in the pool's order, and the pool's rule
@@ -151,7 +149,7 @@ mod tests {
         };
         assert!(plan.is_valid());
         assert_eq!(plan.rollable(), 16);
-        // #### PR #56: the compact layout fits a pool's 8 bytes, its pad
+        // The compact layout fits a pool's 8 bytes, its pad
         // taking any it grants beyond them.
         let compact = JdPlan {
             compact: true,
@@ -197,7 +195,7 @@ mod tests {
             ..plan.clone()
         };
         assert!(!broken.is_valid());
-        // #### PR #42: rates over 100% are refused.
+        // Rates over 100% are refused.
         for rates in [
             PoolRates {
                 donation_bps: 10_001,

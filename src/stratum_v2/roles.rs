@@ -11,13 +11,13 @@ pub enum Role {
     MiningServer,
     /// Translate SV1 firmware onto the same mining server.
     Sv1Translator,
-    /// #### PR #42: serve this node's templates to SV2 pools, Job
+    /// Serve this node's templates to SV2 pools, Job
     /// Declaration clients and P2Pool (Template Distribution).
     TemplateProviderServer,
-    /// #### PR #42: accept miners' own templates in a public pool (Job
+    /// Accept miners' own templates in a public pool (Job
     /// Declaration, Coinbase-only).
     JobDeclaratorServer,
-    /// #### PR #42: mine at a pool with this node's own templates (Job
+    /// Mine at a pool with this node's own templates (Job
     /// Declaration, Coinbase-only).
     JobDeclaratorClient,
 }

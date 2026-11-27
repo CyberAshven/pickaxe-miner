@@ -1,6 +1,5 @@
 # Job Declaration (miners' own templates)
 
-#### PR #42
 
 SV2 Job Declaration lets a miner choose the transactions in the blocks they
 mine while still mining at a pool: the miner's own node builds the template,
@@ -350,7 +349,6 @@ counts as the overview line below.
 
 ## Merge-mined tokens under Job Declaration
 
-#### PR #42
 
 While tokens are merge-mined with Full-Template, every local job on the
 pool's plan, the declared coinbase and the custom job's outputs carry the
@@ -458,7 +456,6 @@ The client (`--job-declaration`):
 
 ## Public BCH P2Pool with your own BCH node
 
-#### PR #65
 
 The optional **Your templates** setting now has three P2Pool choices: public
 node jobs, a managed local P2Pool node, and a public P2Pool connection with your

@@ -22,7 +22,6 @@ pub enum MiningNetwork {
 }
 
 impl MiningNetwork {
-    /// #### PR #42
     /// What: the curated node RPCs of this network, tried after the miner's
     /// own (none yet on either network).
     /// Why: Chipnet and mainnet are one code path; the network chooses data,
@@ -35,7 +34,7 @@ impl MiningNetwork {
         }
     }
 
-    /// #### PR #42: the SV2 Template Distribution port a server listens on
+    /// The SV2 Template Distribution port a server listens on
     /// by default on this network.
     pub fn template_port(self) -> u16 {
         match self {
@@ -44,7 +43,7 @@ impl MiningNetwork {
         }
     }
 
-    // #### PR #42: the fork block proves the chain
+    // The fork block proves the chain
     // What: a node's block at this height must be this one: BCH's UAHF block
     // on mainnet, Chipnet's fork block on Chipnet.
     // Why: a Bitcoin (BTC) node reports the same chain name ("main") as a
@@ -73,7 +72,7 @@ impl MiningNetwork {
         }
     }
 
-    /// #### PR #48: Chipnet's 20-minute rule
+    /// Chipnet's 20-minute rule
     /// What: on Chipnet a block more than 20 minutes after its parent must
     /// carry the proof-of-work limit's bits (BCHN `fPowAllowMinDifficultyBlocks`);
     /// mainnet has no such rule.
@@ -126,7 +125,6 @@ pub enum MiningToken {
 impl MiningToken {
     pub const GPU_SUPPORTED: &[Self] = &[Self::Photon];
 
-    /// #### PR #32
     /// The donation a miner gives to mine this token unless they change it:
     /// PHOTON's 4% work share. A miner can lower it to 0% or raise it. Every
     /// token added later uses `donation::NEW_TOKEN_DONATION` (1.5%).
@@ -195,7 +193,7 @@ impl MiningToken {
         {
             Ok(Self::Photon)
         } else if query.eq_ignore_ascii_case("electric") {
-            // #### PR #51: a token with its own command; since PR #58 it mines
+            // A token with its own command; since PR #58 it mines
             // on GPUs and iGPUs, as PHOTON does.
             Err("ELECTRIC mines with `pickaxe electric mine` or from the setup screen".into())
         } else {
@@ -264,13 +262,13 @@ pub struct RuntimeConfig {
     /// Per-token start values kept in the compatible profile-choices sidecar.
     pub token_donations: std::collections::BTreeMap<String, crate::donation::TokenDonation>,
     pub electric_pot_mode: ElectricPotMode,
-    /// #### PR #65: `electric_pot_mode` was chosen by a flag or saved as an
+    /// `electric_pot_mode` was chosen by a flag or saved as an
     /// explicit choice. `Signed` without it is only the default, which keeps
     /// mining an existing user's previous funded pot until it is migrated.
     pub electric_pot_chosen: bool,
     /// BCH ASIC policy only. Token policies are selected separately.
     pub bch_donation: crate::donation::bch::BchDonation,
-    /// #### PR #32: the token donation a miner chose in Advanced settings;
+    /// The token donation a miner chose in Advanced settings;
     /// `None` mines at the token's minimum.
     pub token_donation: Option<crate::donation::TokenDonation>,
     /// Mining chain; mainnet is the safe default.
@@ -289,11 +287,11 @@ pub struct RuntimeConfig {
     /// `PICKAXE_NODE_RPC_USER` + `PICKAXE_NODE_RPC_PASSWORD` so secrets never
     /// need to appear in command history or runtime endpoint identity.
     pub node_url: Option<String>,
-    /// #### PR #42: the node's ZMQ block notices, for the ASIC server.
+    /// The node's ZMQ block notices, for the ASIC server.
     pub node_zmq: NodeZmq,
     /// Preferred network transport for submission/diagnostics.
     pub source: JobSource,
-    /// #### Pool modes: your own P2Pool's donation, standalone choice and
+    /// Your own P2Pool's donation, standalone choice and
     /// node P2P port, for `stratum-v2 serve --own-p2pool`.
     pub p2pool: SavedP2Pool,
     /// When true, the GPU mining loop is running.
@@ -326,7 +324,7 @@ impl Default for RuntimeConfig {
     }
 }
 
-// #### PR #42: ZMQ block notices
+// ZMQ block notices
 // What: where the ASIC server hears of new blocks from its node: bitcoin.conf's
 // zmqpubhashblock for a node on this computer (the default), a tcp:// endpoint
 // on this computer or the home network, or off.
@@ -342,7 +340,7 @@ pub enum NodeZmq {
     At(String),
 }
 
-/// #### PR #42: `auto` (or empty), `off`, or tcp://HOST:PORT on this
+/// `auto` (or empty), `off`, or tcp://HOST:PORT on this
 /// computer or the home network.
 pub fn parse_node_zmq(value: &str) -> Result<NodeZmq, String> {
     let value = value.trim();
@@ -373,20 +371,20 @@ pub fn parse_node_zmq(value: &str) -> Result<NodeZmq, String> {
 }
 
 impl RuntimeConfig {
-    /// #### PR #65: the explicitly chosen ELECTRIC pot mode, or `None` for the
+    /// The explicitly chosen ELECTRIC pot mode, or `None` for the
     /// default. Restricted and owner pots are only ever chosen explicitly.
     pub fn electric_pot_choice(&self) -> Option<ElectricPotMode> {
         (self.electric_pot_chosen || self.electric_pot_mode != ElectricPotMode::Signed)
             .then_some(self.electric_pot_mode)
     }
 
-    /// #### PR #65: records an explicit ELECTRIC pot choice, or the default.
+    /// Records an explicit ELECTRIC pot choice, or the default.
     pub fn choose_electric_pot(&mut self, mode: Option<ElectricPotMode>) {
         self.electric_pot_mode = mode.unwrap_or_default();
         self.electric_pot_chosen = mode.is_some();
     }
 
-    /// #### PR #32: the token donation in effect: the miner's, or the
+    /// The token donation in effect: the miner's, or the
     /// token's default.
     pub fn token_donation(&self) -> crate::donation::TokenDonation {
         self.token_donation
@@ -460,7 +458,7 @@ impl RuntimeConfig {
             self.clear_fulcrum_url();
             return Ok(());
         };
-        // #### PR #42: plain-TCP Fulcrum servers (tcp://HOST:PORT), such as
+        // Plain-TCP Fulcrum servers (tcp://HOST:PORT), such as
         // Umbrel's or StartOS's, only on this computer or the home network.
         for endpoint in endpoints.split(',').map(str::trim) {
             if endpoint.len() > 6 && endpoint[..6].eq_ignore_ascii_case("tcp://") {
@@ -533,7 +531,7 @@ impl RuntimeConfig {
         Ok(())
     }
 
-    /// #### PR #42: `auto`, `off`, or tcp://HOST:PORT on this computer or
+    /// `auto`, `off`, or tcp://HOST:PORT on this computer or
     /// the home network.
     pub fn set_node_zmq(&mut self, value: &str) -> Result<(), String> {
         self.node_zmq = parse_node_zmq(value)?;
@@ -579,7 +577,7 @@ impl RuntimeConfig {
         for url in self.custom_node_endpoints() {
             out.push(url.to_string());
         }
-        // #### PR #42: the curated list is the network's own data.
+        // The curated list is the network's own data.
         for u in self.network.node_rpc_bootstrap().iter().copied() {
             if !out.iter().any(|x| x.as_str() == u) {
                 out.push((*u).to_string());
@@ -604,7 +602,6 @@ impl RuntimeConfig {
 
 /// Validates a payout for the selected chain and returns its canonical CashAddr.
 /// An omitted prefix uses the selected chain's checksum, never another network's.
-/// #### PR #40
 /// A BCH coinbase payout for `network`: P2PKH (q) or P2SH (p), such as a pool
 /// operator's multisig, in its canonical lower-case CashAddr form.
 pub fn validate_coinbase_address(network: MiningNetwork, address: &str) -> Result<String, String> {
@@ -687,7 +684,7 @@ pub(crate) fn reprefix_p2pkh_payout(
     }
 }
 
-// #### PR #42: plain TCP only at home
+// Plain TCP only at home
 // What: a Fulcrum server over plain TCP (tcp://HOST:PORT, as Umbrel and
 // StartOS publish theirs) is taken only on this computer or the home
 // network: loopback, private, link-local and Tailscale's shared range, IPv6
@@ -741,7 +738,6 @@ fn private_host(host: &str) -> bool {
         Err(_) => false,
     }
 }
-// #### end PR #42 ####
 
 fn normalize_endpoint_list(
     input: &str,
@@ -815,7 +811,7 @@ impl SavedDevices {
 pub struct SavedConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bch_donation_bps: Option<crate::donation::bch::BchDonation>,
-    /// #### PR #32: a token donation other than its default.
+    /// A token donation other than its default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_donation_bps: Option<crate::donation::TokenDonation>,
     pub network: Option<String>,
@@ -830,11 +826,11 @@ pub struct SavedConfig {
     pub fulcrum: Option<String>,
     pub node_rpc: Option<String>,
     pub source: Option<String>,
-    /// #### PR #42: what the profile starts besides plain GPU mining. Plain
+    /// What the profile starts besides plain GPU mining. Plain
     /// GPU profiles leave it out, so their saved bytes do not change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server: Option<SavedServer>,
-    /// #### Pool modes: the server runs its own P2Pool with these settings:
+    /// The server runs its own P2Pool with these settings:
     /// with an ASIC pool server it is a Non-custodial Pool (or P2Pool v2),
     /// with an ASIC join server it mines at it for its own devices. Left
     /// out, none are saved. A build from before Pool modes refuses a file
@@ -843,7 +839,7 @@ pub struct SavedConfig {
     pub p2pool: Option<SavedP2Pool>,
 }
 
-// #### PR #42: profiles keep their mode
+// Profiles keep their mode
 // What: a profile saves the setup's mode (a rig joining a GPU pool or farm,
 // ASIC solo, ASIC at a pool, an ASIC pool or a GPU pool) and its pool values,
 // and reopens in that mode.
@@ -865,7 +861,7 @@ pub enum SavedMode {
     AsicPool,
     /// A public GPU pool for other miners' rigs.
     GpuPool,
-    /// #### PR #42: this computer's GPUs coordinate the operator's own rigs
+    /// This computer's GPUs coordinate the operator's own rigs
     /// (a farm), and may mine too.
     GpuFarm,
 }
@@ -882,7 +878,7 @@ impl SavedMode {
     }
 }
 
-/// #### PR #42: how a profile that joins a pool declares its node's
+/// How a profile that joins a pool declares its node's
 /// templates there (SV2 Job Declaration).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -897,7 +893,7 @@ pub enum SavedDeclaration {
     CoinbaseRequired,
 }
 
-/// #### PR #42: the Job Declaration modes a profile's ASIC pool accepts.
+/// The Job Declaration modes a profile's ASIC pool accepts.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum SavedAccept {
@@ -929,7 +925,7 @@ pub struct SavedServer {
     /// An ASIC pool's name in its blocks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_tag: Option<String>,
-    /// #### PR #42: an ASIC server's Advanced values; left out at their
+    /// An ASIC server's Advanced values; left out at their
     /// defaults (3333, 3336, the server's start difficulty, no backup pools,
     /// the payout address at the pool).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -942,29 +938,29 @@ pub struct SavedServer {
     pub backups: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_user: Option<String>,
-    /// #### PR #42: the port an ASIC server with its own node serves its
+    /// The port an ASIC server with its own node serves its
     /// templates on (SV2 Template Distribution); left out, it serves none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tp_port: Option<u16>,
-    /// #### PR #42: Join a pool declares this node's templates to the pool
+    /// Join a pool declares this node's templates to the pool
     /// (SV2 Job Declaration); left out, devices mine the pool's own jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_declaration: Option<SavedDeclaration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p2pool_prepare_api: Option<String>,
-    /// #### PR #42: the Job Declaration modes an ASIC pool accepts from its
+    /// The Job Declaration modes an ASIC pool accepts from its
     /// miners; left out, it accepts none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accept_job_declaration: Option<SavedAccept>,
-    /// #### PR #42: the pools ASIC solo mining falls back on while its node
+    /// The pools ASIC solo mining falls back on while its node
     /// gives no work, each a one-line SV2 address with its key, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_pools: Vec<String>,
-    /// #### PR #42: ASIC solo mines this ASIC-exclusive token instead of BCH,
+    /// ASIC solo mines this ASIC-exclusive token instead of BCH,
     /// by its registry name; left out, BCH.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asic_token: Option<String>,
-    /// #### PR #42: a GPU rig's name on its coordinator's dashboard; left
+    /// A GPU rig's name on its coordinator's dashboard; left
     /// out, the computer's name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rig_name: Option<String>,
@@ -975,13 +971,13 @@ pub struct SavedServer {
     /// A GPU farm's coordinator mines with its rigs only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rigs_only: bool,
-    /// #### PR #42: an ASIC server's ZMQ block notices: `off` or
+    /// An ASIC server's ZMQ block notices: `off` or
     /// tcp://HOST:PORT; left out, bitcoin.conf's for a node on this computer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_zmq: Option<String>,
 }
 
-/// #### Pool modes: your own P2Pool's settings, as a profile saves them
+/// Your own P2Pool's settings, as a profile saves them
 /// (`SavedConfig::p2pool`, beside its server) and as the server runs with
 /// them (`RuntimeConfig::p2pool`, from the profile or --p2pool-donation,
 /// --p2pool-standalone and --node-p2p). The pool's fee, fee address and
@@ -1005,7 +1001,7 @@ pub struct SavedP2Pool {
     pub node_p2p: Option<String>,
 }
 
-/// #### Pool modes: a node's P2P address, `HOST:PORT` with an IPv6 host in
+/// A node's P2P address, `HOST:PORT` with an IPv6 host in
 /// brackets, as `--node-p2p` takes it.
 pub fn validate_node_p2p(address: &str) -> Result<String, String> {
     let invalid = || "--node-p2p takes HOST:PORT, such as 192.168.1.5:8333".to_owned();
@@ -1090,7 +1086,7 @@ impl SavedServer {
         self.validate_with(network, None)
     }
 
-    /// #### Pool modes: the same, for a server that runs its own P2Pool
+    /// The same, for a server that runs its own P2Pool
     /// with `p2pool`'s settings when there are any.
     pub fn validate_with(
         &self,
@@ -1105,7 +1101,7 @@ impl SavedServer {
             }
             validate_p2pool_preparation_url(api)?;
         }
-        // #### PR #42: block notices only where the server has a node.
+        // Block notices only where the server has a node.
         if let Some(value) = &self.node_zmq {
             parse_node_zmq(value)?;
             if !matches!(
@@ -1117,7 +1113,7 @@ impl SavedServer {
         }
         let join = self.join.as_deref().map(str::trim).unwrap_or("");
         if self.mode.joins() {
-            // #### Pool modes: your own P2Pool, which ASICs join here, has
+            // Your own P2Pool, which ASICs join here, has
             // no address to save.
             if join.is_empty() && !(self.mode == SavedMode::AsicJoin && p2pool.is_some()) {
                 return Err("a profile that joins a pool needs the pool's address".into());
@@ -1147,7 +1143,7 @@ impl SavedServer {
             }
             .map_err(|error| format!("pool fee address: {error}"))?;
         }
-        // #### PR #42: the Advanced values, checked as the setup checks them.
+        // The Advanced values, checked as the setup checks them.
         let asic = matches!(
             self.mode,
             SavedMode::AsicSolo | SavedMode::AsicJoin | SavedMode::AsicPool
@@ -1158,7 +1154,7 @@ impl SavedServer {
             || !self.backups.is_empty()
             || self.pool_user.is_some()
             || self.tp_port.is_some();
-        // #### PR #42: a GPU rig keeps backup coordinators.
+        // A GPU rig keeps backup coordinators.
         let rig_backups = self.mode == SavedMode::GpuRig
             && self.sv1_port.is_none()
             && self.sv2_port.is_none()
@@ -1176,7 +1172,7 @@ impl SavedServer {
         if self.sv1_port.unwrap_or(3333) == self.sv2_port.unwrap_or(3336) {
             return Err("the SV1 and SV2 ports must differ".into());
         }
-        // #### PR #42: templates come from this server's own node.
+        // Templates come from this server's own node.
         if let Some(port) = self.tp_port {
             if !matches!(self.mode, SavedMode::AsicSolo | SavedMode::AsicPool) {
                 return Err("only an ASIC server with its own node serves templates".into());
@@ -1206,7 +1202,7 @@ impl SavedServer {
                 "only a profile that joins a pool saves backup pools or a pool username".into(),
             );
         }
-        // #### PR #42: the GPU farm's, rig's and GPU pool's own values.
+        // The GPU farm's, rig's and GPU pool's own values.
         if self.rig_name.is_some() && self.mode != SavedMode::GpuRig {
             return Err("only a GPU rig saves a rig name".into());
         }
@@ -1237,18 +1233,18 @@ impl SavedServer {
         {
             return Err("at most 8 backup pools, each without spaces".into());
         }
-        // #### PR #42: Job Declaration and fallback pools, each in its mode.
+        // Job Declaration and fallback pools, each in its mode.
         if self.job_declaration.is_some() && self.mode != SavedMode::AsicJoin {
             return Err("only ASICs joining a pool declare their node's templates".into());
         }
         if self.accept_job_declaration.is_some() && self.mode != SavedMode::AsicPool {
             return Err("only an ASIC pool accepts miners' own templates".into());
         }
-        // #### Pool modes: and a server running its own P2Pool.
+        // And a server running its own P2Pool.
         if !self.fallback_pools.is_empty() && self.mode != SavedMode::AsicSolo && p2pool.is_none() {
             return Err("only ASIC solo mining or your own P2Pool saves fallback pools".into());
         }
-        // #### Pool modes: P2Pool's own limits.
+        // P2Pool's own limits.
         if let Some(p2pool) = p2pool {
             if !matches!(self.mode, SavedMode::AsicJoin | SavedMode::AsicPool) {
                 return Err("only an ASIC pool or ASIC join profile runs its own P2Pool".into());
@@ -1292,7 +1288,7 @@ impl SavedServer {
         {
             return Err("at most 8 fallback pools, each without spaces".into());
         }
-        // #### PR #42: an ASIC-exclusive token instead of BCH, mined solo
+        // An ASIC-exclusive token instead of BCH, mined solo
         // with no templates to serve and no fallback pools.
         if let Some(name) = &self.asic_token {
             if self.mode != SavedMode::AsicSolo {
@@ -1326,7 +1322,6 @@ impl SavedServer {
         Ok(())
     }
 }
-// #### end PR #42 ####
 
 impl SavedConfig {
     /// Applies saved configuration values to a running miner.
@@ -1358,7 +1353,7 @@ impl SavedConfig {
         if let Some(value) = &self.source {
             cfg.set_source(value)?;
         }
-        // #### Pool modes: your own P2Pool's settings.
+        // Your own P2Pool's settings.
         if let Some(p2pool) = &self.p2pool {
             cfg.p2pool = p2pool.clone();
         }
@@ -1384,9 +1379,9 @@ impl SavedConfig {
         }
         let mut runtime = RuntimeConfig::default();
         self.apply_to_runtime(&mut runtime)?;
-        // #### PR #42: a saved mode's pool values are checked as the setup
+        // A saved mode's pool values are checked as the setup
         // checks them.
-        // #### Pool modes: your own P2Pool's settings go with its server.
+        // Your own P2Pool's settings go with its server.
         if self.p2pool.is_some() && self.server.is_none() {
             return Err("P2Pool settings need an ASIC pool or ASIC join profile".into());
         }
@@ -1493,7 +1488,7 @@ pub fn sources_path(config_path: &Path) -> PathBuf {
     config_path.with_extension("sources.json")
 }
 
-// #### PR #42: saved cookie files
+// Saved cookie files
 // What: a node whose cookie file Pickaxe does not find by itself (Knuth, a
 // custom data folder, another computer's shared folder) can be given its
 // cookie file for its host and port; the list is kept owner-only beside the
@@ -1971,7 +1966,6 @@ impl MiningProfiles {
     }
 }
 
-/// #### PR #42
 /// What: a private file written whole: a temporary file beside it is made
 /// owner-only before anything is written, synced, then renamed over the old
 /// one, so a crash leaves the old file or the new one, never half of one.
@@ -2113,7 +2107,6 @@ mod tests {
 
     const PAYOUT: &str = "bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh";
 
-    // #### PR #32
     #[test]
     fn a_photon_donation_moves_from_its_default_down_to_zero() {
         use crate::donation::TokenDonation;
@@ -2561,7 +2554,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     #[cfg(feature = "stratum-v2")]
     #[test]
     fn private_atomic_write_replaces_whole_and_leaves_no_temporary_file() {
@@ -2586,7 +2578,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    // #### PR #42
     #[test]
     fn a_plain_gpu_profile_saves_no_server_and_bad_pool_values_are_refused() {
         let plain = SavedConfig {
@@ -2653,7 +2644,7 @@ mod tests {
             node_zmq: None,
         };
         with(joining.clone()).validate().unwrap();
-        // #### PR #42: Job Declaration and fallback pools round trip.
+        // Job Declaration and fallback pools round trip.
         let text = serde_json::to_string(&with(joining.clone())).unwrap();
         assert!(text.contains("\"job_declaration\":\"full\""), "{text}");
         let back: SavedConfig = serde_json::from_str(&text).unwrap();
@@ -2671,7 +2662,7 @@ mod tests {
         let text = serde_json::to_string(&with(solo.clone())).unwrap();
         let back: SavedConfig = serde_json::from_str(&text).unwrap();
         assert_eq!(back.server, Some(solo.clone()));
-        // #### PR #42: an ASIC-exclusive token round trips too.
+        // An ASIC-exclusive token round trips too.
         let token = SavedServer {
             fallback_pools: Vec::new(),
             asic_token: Some("Pickaxe ASIC test token".into()),
@@ -2756,7 +2747,6 @@ mod tests {
                 },
                 "a pool username on an ASIC pool",
             ),
-            // #### PR #42
             (
                 SavedServer {
                     tp_port: Some(48442),
@@ -2885,7 +2875,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     // What: a plain-TCP Fulcrum server is taken on this computer, the home
     // network, Tailscale or a .local name, with its port; a public host or a
     // missing port is refused, in the runtime and in the shared sources.
@@ -2994,7 +2983,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // #### Pool modes
     // What: a profile keeps your own P2Pool's settings beside its ASIC pool
     // or ASIC join server (P2Pool's own donation, standalone, the node's
     // P2P port), with fallback pools; they reach the runtime config, and
@@ -3154,7 +3142,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     // What: --node-zmq takes auto, off, or a tcp:// endpoint with its port
     // on this computer or the home network; a public one is refused.
     // Look here if: set_node_zmq changes.
@@ -3184,7 +3171,6 @@ mod tests {
         assert!(server.validate(MiningNetwork::Chipnet).is_err());
     }
 
-    // #### PR #42
     // What: the saved cookie files are kept owner-only, at most 16, without
     // unknown fields, and only regular files are taken: a folder or a link
     // is refused.

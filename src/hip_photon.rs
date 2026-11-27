@@ -31,7 +31,7 @@ const HIP_CODE_OBJECT_NAMES: [&str; 5] = [
 /// The shared Rust GPU engine built for AMD: the same source as photon_rust.ptx.
 const HIP_RUST_CODE_OBJECT: &str = "photon_rust.hsaco";
 
-// #### PR #22: swappable HIP kernel builds
+// Swappable HIP kernel builds
 // What: PICKAXE_HIP_KERNELS=rust loads photon_rust.hsaco, built from the shared
 // Rust engine; the default loads the CUDA C++ kernels compiled for HIP.
 // Why: one Rust source for NVIDIA and AMD, while the proven C++ build stays
@@ -949,7 +949,7 @@ impl HipPhotonEngine {
         )?;
         let architecture = device_architecture(&api, device_ordinal)?;
         let directory = resolve_code_object_dir(&architecture, kernel_source)?;
-        // #### PR #22: native HIP stays off integrated GPUs under Windows
+        // Native HIP stays off integrated GPUs under Windows
         // What: refuse integrated (APU) targets on Windows after the
         // code-object check, before any module load or launch.
         // Why: on a gfx1036 APU the HIP 5.7 runtime in AMD's Windows driver
@@ -1286,7 +1286,7 @@ impl HipPhotonEngine {
         )
     }
 
-    // #### PR #22: native HIP T2 window search for AMD GPUs
+    // Native HIP T2 window search for AMD GPUs
     // What: one batch signs each 65,536-amount window (Stage A nonces, Stage B
     // points, dual C1 signatures and negated s), prepares the windows, then
     // filters every amount with the CUDA C++ T2 kernels compiled for HIP.

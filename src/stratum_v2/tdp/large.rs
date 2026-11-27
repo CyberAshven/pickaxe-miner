@@ -1,4 +1,3 @@
-//! #### BCH large templates on Template Distribution (0x4C54)
 //! The Knuth node's extension (k-nuth/kth PR #879; its docs/sv2.md,
 //! "Template flow"). Once a client negotiates it, the provider pushes each
 //! template's transactions after its NewTemplate and SetNewPrevHash, unasked.

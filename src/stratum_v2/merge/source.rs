@@ -1,4 +1,4 @@
-//! #### PR #42: the token worker
+//! The token worker
 //! What: an ASIC-exclusive token's job source and its wins. It builds each
 //! job from the token's thread (the header-shaped commitment the next win
 //! must follow), takes the wins devices find through a bounded queue the
@@ -95,7 +95,7 @@ impl std::fmt::Debug for HeaderWork {
 }
 
 impl HeaderWork {
-    // #### PR #42: the ASIC test token
+    // The ASIC test token
     // What: the Chipnet test token's simulated thread at a compact target:
     // its first commitment names no predecessor, its age stays 71 so the
     // target stays put, and each proven win becomes the next commitment.
@@ -338,7 +338,7 @@ impl HeaderWork {
     }
 }
 
-/// #### PR #42: an ASIC-exclusive token's work as the server's template
+/// An ASIC-exclusive token's work as the server's template
 /// source: a new job whenever the thread moves.
 pub struct TokenSource {
     work: Arc<HeaderWork>,
@@ -443,7 +443,6 @@ mod tests {
         .unwrap()
     }
 
-    // #### PR #42
     // What: a proven win moves the simulated thread: the next job's
     // previous hash is the win's HASH256 and the source gives a new
     // generation; the win is saved once (mode H, a HeaderWin), a second win
@@ -488,7 +487,6 @@ mod tests {
         .is_err());
     }
 
-    // #### PR #42
     // What: a win that pays another script than this server's forwarders,
     // or fails the covenant's check, turns proofs off (a Pickaxe bug) and is
     // never saved; a full queue drops and counts wins.

@@ -1,4 +1,4 @@
-//! #### PR #65: one app process can leave mining, choose a profile, and
+//! One app process can leave mining, choose a profile, and
 //! start another session after its workers and journal locks have closed.
 use std::sync::{
     atomic::{AtomicBool, Ordering},

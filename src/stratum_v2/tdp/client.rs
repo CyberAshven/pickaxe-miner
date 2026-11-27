@@ -1,8 +1,7 @@
-//! #### PR #42
 //! Templates from an SV2 Template Provider (another Pickaxe's template
 //! server, a node bridge, or a node with one built in), as a
 //! `TemplateSource` the server fails over with, like a node over JSON-RPC.
-//! #### BCH large templates: a provider that grants 0x4C54 pushes each
+//! A provider that grants 0x4C54 pushes each
 //! template's transactions (see `large`).
 
 use super::super::{
@@ -48,10 +47,10 @@ const FIRST_TEMPLATE_WAIT: Duration = Duration::from_secs(10);
 const MAX_FUTURES: usize = 8;
 /// Parents remembered to recognise this server's own blocks.
 const CONFIRMED: usize = 64;
-/// #### BCH large templates: the request id of this client's
+/// The request id of this client's
 /// RequestExtensions.
 const EXTENSIONS_REQUEST: u16 = 1;
-/// #### BCH large templates: the longest a refresh waits for a push that
+/// The longest a refresh waits for a push that
 /// keeps coming; each of its frames gives `TX_DATA_WAIT` more.
 const PUSH_WAIT: Duration = Duration::from_secs(60);
 
@@ -110,7 +109,7 @@ impl TdpAddress {
 }
 
 /// Confirms a provider's new parent is on this server's network, given its
-/// hash and the template's height. #### PR #48: gives the parent's time on a
+/// hash and the template's height. Gives the parent's time on a
 /// network that allows minimum-difficulty blocks (see
 /// `BchTemplate::stale_bits`).
 pub type Guard = Box<dyn FnMut(&Hash, u32) -> Result<Option<u32>, String> + Send>;
@@ -150,7 +149,7 @@ type Transactions = (Vec<Arc<[u8]>>, Vec<u8>);
 /// Transaction data a provider sent, or its error code.
 type Data = Result<Transactions, String>;
 
-/// #### BCH large templates: 0x4C54 on a provider's link.
+/// 0x4C54 on a provider's link.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Negotiation {
     /// Not asked for: the provider closed the last link on the request.
@@ -179,7 +178,7 @@ pub struct TdpSource {
     confirmed: VecDeque<Hash>,
     /// The parent `guard` confirmed last, and its time when given.
     guarded: Option<(Hash, Option<u32>)>,
-    /// #### BCH large templates: what the provider answered on this link,
+    /// What the provider answered on this link,
     /// and its pushes once it granted 0x4C54.
     negotiation: Negotiation,
     received: Received,
@@ -209,7 +208,7 @@ impl TdpSource {
         }
     }
 
-    /// #### BCH large templates: whether this link's provider granted
+    /// Whether this link's provider granted
     /// 0x4C54.
     #[cfg(test)]
     pub(super) fn large_templates(&self) -> bool {
@@ -260,7 +259,7 @@ impl TdpSource {
         )?)?;
         let deadline = Instant::now() + FIRST_TEMPLATE_WAIT;
         let reply = loop {
-            // #### Template Distribution extensions: an extension's frame is
+            // An extension's frame is
             // not the answer, and is discarded (see `handle`).
             if let Some(frame) = receiver.receive(Duration::from_millis(100))? {
                 if frame.header().ext_type_without_channel_msg() == 0 {
@@ -274,7 +273,6 @@ impl TdpSource {
         if reply.header().msg_type() != common::MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS {
             return Err("template provider refused the setup".into());
         }
-        // #### BCH large templates
         // What: right after the setup the client asks for 0x4C54 (request
         // 1), then sends its constraints without waiting: a provider that
         // negotiates answers before it reads them, and one that does not
@@ -349,7 +347,7 @@ impl TdpSource {
         result
     }
 
-    // #### PR #42: a provider's protocol
+    // A provider's protocol
     // What: template ids only rise; a future template waits for the
     // SetNewPrevHash naming it (at most 8 wait); a current template needs
     // an earlier SetNewPrevHash; anything else or the channel bit closes the
@@ -358,7 +356,6 @@ impl TdpSource {
     // work of every device.
     // Look here if: a provider's link keeps closing with "broke the
     // protocol".
-    // #### Template Distribution extensions
     // What: a frame of a non-zero extension type (the channel bit aside) is
     // an extension's (see `extension`). Template Distribution has no
     // channel messages, so the channel bit on extension 0 still breaks the
@@ -455,7 +452,7 @@ impl TdpSource {
                     Ok((transactions, message.excess_data.as_ref().to_vec())),
                 );
             }
-            // #### BCH large templates: with 0x4C54 this client asks for
+            // With 0x4C54 this client asks for
             // nothing, so no answer comes.
             MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_ERROR if granted => {
                 return Err(BROKE_PROTOCOL.into())
@@ -473,7 +470,6 @@ impl TdpSource {
         Ok(())
     }
 
-    // #### BCH large templates
     // What: an extension's frame. While RequestExtensions is unanswered,
     // its Success (request 1) grants 0x4C54 when it lists it; its Error
     // grants nothing, unless it requires an extension this client does not
@@ -514,7 +510,7 @@ impl TdpSource {
         Ok(())
     }
 
-    /// #### BCH large templates: the core Success that ends a push, checked
+    /// The core Success that ends a push, checked
     /// against its template's merkle path.
     fn finish_push(&mut self, message: &RequestTransactionDataSuccess<'_>) -> Result<(), String> {
         if !message.excess_data.as_ref().is_empty() {
@@ -539,7 +535,7 @@ impl TdpSource {
             .map_err(|_| BROKE_PROTOCOL.into())
     }
 
-    /// #### BCH large templates: waits for the newest template's push,
+    /// Waits for the newest template's push,
     /// while it keeps coming; a newer template's push replaces it.
     fn await_push(&mut self) -> Result<(), String> {
         let started = Instant::now();
@@ -618,7 +614,7 @@ impl TemplateSource for TdpSource {
 
     fn refresh(&mut self) -> Result<(u64, &BchTemplate), String> {
         if self.link.is_none() {
-            // #### BCH large templates: a provider that closes the link on
+            // A provider that closes the link on
             // RequestExtensions (a Pickaxe before it took extension frames)
             // is asked nothing on a second one, here or below.
             match self.connect(true) {
@@ -686,7 +682,7 @@ impl TemplateSource for TdpSource {
             reserve: self.reserve,
         })
         .map_err(|_| "template provider sent an invalid template")?;
-        // #### PR #42: the network guard
+        // The network guard
         // What: a provider's new parent is confirmed on this server's
         // network (by the miner's node, or the network's Fulcrum servers)
         // before its template is mined.
@@ -725,7 +721,7 @@ impl TemplateSource for TdpSource {
         Ok((self.generation, &ready.template))
     }
 
-    // #### PR #42: solutions to a provider
+    // Solutions to a provider
     // What: a saved block goes back as SubmitSolution on the template it was
     // built from; it counts as accepted once the provider names it as a
     // later parent. Until then the journal retries it, and the server's
@@ -789,7 +785,7 @@ impl TemplateSource for TdpSource {
     }
 }
 
-/// #### BCH large templates: whether a provider's answer to
+/// Whether a provider's answer to
 /// RequestExtensions (`kind`, `payload`) grants 0x4C54, as the Job
 /// Declaration client reads its pool's.
 fn grants_large_templates(kind: u8, payload: &[u8]) -> Result<bool, String> {
@@ -839,7 +835,6 @@ mod tests {
         MESSAGE_TYPE_NEW_TEMPLATE, MESSAGE_TYPE_SET_NEW_PREV_HASH,
     };
 
-    // #### PR #42
     // What: a provider's address is sv2tp://HOST:PORT/KEY; without a key
     // only on this computer; a malformed key or address is refused.
     // Look here if: TdpAddress::parse changes.
@@ -958,7 +953,6 @@ mod tests {
         {}
     }
 
-    // #### PR #42
     // What: a SetNewPrevHash naming a template never announced breaks the
     // protocol; the refresh fails with that reason and the link closes.
     // Look here if: TdpSource::handle changes.
@@ -974,7 +968,6 @@ mod tests {
         provider.join().unwrap();
     }
 
-    // #### Template Distribution extensions
     // What: a provider's frames of an extension this client never
     // negotiated, before its setup answer and between templates, with and
     // without the channel bit, are discarded: the link stays up and the
@@ -1025,10 +1018,9 @@ mod tests {
         provider.join().unwrap();
     }
 
-    // #### PR #42
     // What: a template whose parent the guard does not confirm is refused
     // with "network is not confirmed"; the same template passes once the
-    // guard confirms it. #### PR #48: and carries the parent's time the
+    // guard confirms it. And carries the parent's time the
     // guard gave.
     // Look here if: the network guard changes.
     #[test]
@@ -1070,7 +1062,6 @@ mod tests {
         provider.join().unwrap();
     }
 
-    // #### PR #48
     // What: a second SetNewPrevHash on the same parent with new bits (a
     // provider at Chipnet's 20-minute point) gives a new template on those
     // bits and their target, keeping the parent's time the guard gave
@@ -1115,7 +1106,6 @@ mod tests {
         provider.join().unwrap();
     }
 
-    // #### PR #42
     // What: the reserve is 122 bytes for the payouts alone, and 175 with
     // the Chipnet test token (the 53-byte commitment).
     // Look here if: tdp::reserve changes.
@@ -1133,7 +1123,7 @@ mod tests {
         assert_eq!(super::super::reserve(hub.current().as_deref()), 175);
     }
 
-    /// #### BCH large templates: a provider that answers the client's
+    /// A provider that answers the client's
     /// RequestExtensions (checked: request 1 for 0x4C54 alone) with
     /// `answer`, or ignores it, reads up to the constraints, then sends each
     /// batch it is given, and stays until the batches end.
@@ -1222,7 +1212,6 @@ mod tests {
         }
     }
 
-    // #### BCH large templates
     // What: a provider that grants 0x4C54 pushes each template; the client
     // rebuilds and mines it: 65,537 transactions in pages (more than the
     // core Success carries), then a refresh on the same parent as a delta,
@@ -1286,7 +1275,6 @@ mod tests {
         provider.join().unwrap();
     }
 
-    // #### BCH large templates
     // What: a provider that refuses 0x4C54 (RequestExtensions.Error), or
     // ignores the request and goes on to its templates, is asked for a
     // template's transactions as before; one that requires an extension
@@ -1356,7 +1344,6 @@ mod tests {
         provider.join().unwrap();
     }
 
-    // #### BCH large templates
     // What: a provider that closes the link on RequestExtensions (as a
     // Pickaxe template server did before it took extension frames) gets a
     // second link at once, whose first frame after the setup is the

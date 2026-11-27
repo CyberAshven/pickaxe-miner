@@ -1,4 +1,3 @@
-//! #### PR #42, merge-mining v2
 //! A token's leaf: a 169-byte preimage, hashed as `SHA256(0x00 ‖ preimage)`.
 //! A covenant builds it from introspection, so a proof never carries leaf
 //! data it could forge.
@@ -71,7 +70,7 @@ impl Leaf {
         bytes
     }
 
-    /// #### merge-mining v2: reads a 169-byte preimage with this tag and
+    /// Reads a 169-byte preimage with this tag and
     /// version; anything else is not a leaf.
     pub fn parse(bytes: &[u8]) -> Option<Self> {
         let bytes: &[u8; LEN] = bytes.try_into().ok()?;
@@ -119,7 +118,6 @@ mod tests {
         )
     }
 
-    // #### merge-mining v2
     #[test]
     fn preimage_layout_and_every_field_changes_the_hash() {
         let leaf = sample();

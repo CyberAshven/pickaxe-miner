@@ -1,4 +1,3 @@
-//! #### PR #38
 //! Mining-protocol session using reference message parsers/serializers. The
 //! server supplies templates and channel IDs; devices only submit header work.
 
@@ -36,12 +35,12 @@ use stratum_core::{
 };
 
 const MAX_CHANNELS: usize = 32;
-/// #### PR #42: channels on a connection whose extended channels are
+/// Channels on a connection whose extended channels are
 /// grouped: a proxy such as SRI's translator opens one per miner behind it.
 const MAX_GROUPED_CHANNELS: usize = 256;
 
-/// #### PR #42: the lanes a Job Declaration client's local channels take,
-/// from one server-wide counter. #### PR #56: and the layout of the last
+/// The lanes a Job Declaration client's local channels take,
+/// from one server-wide counter. And the layout of the last
 /// plan a job carried, for channels opened while no plan is current.
 #[derive(Default)]
 pub struct Lanes {
@@ -49,7 +48,7 @@ pub struct Lanes {
     compact: AtomicBool,
 }
 
-/// #### PR #42: a group channel: the extended channels of one payout
+/// A group channel: the extended channels of one payout
 /// identity on a connection, which share each template's job frame.
 struct Group {
     payout: String,
@@ -67,54 +66,54 @@ pub struct MiningSession {
     maximum_targets: BTreeMap<u32, Hash>,
     current: Option<(u32, u64, Arc<BchTemplate>)>,
     payout_policy: BchPayout,
-    /// #### PR #40: a public pool, where each channel pays its user.
+    /// A public pool, where each channel pays its user.
     public: Option<super::payout::PublicPool>,
-    /// #### PR #40: the latest channel's user identity, taken by the server
+    /// The latest channel's user identity, taken by the server
     /// to name the device on the workers page.
     pub identity: Option<String>,
-    /// #### PR #40: the difficulty the latest accepted share's hash reached,
+    /// The difficulty the latest accepted share's hash reached,
     /// taken by the server for best-share records.
     pub share_difficulty: Option<f64>,
     pub accepted: u64,
     pub rejected: u64,
-    /// #### PR #42: a public pool's Job Declaration rules, when it accepts
+    /// A public pool's Job Declaration rules, when it accepts
     /// miners' own templates; this connection negotiated work selection;
     /// the custom jobs it set so far.
     declarator: Option<Arc<Declarator>>,
     work_selection: bool,
     custom_jobs: u32,
-    /// #### PR #42: a Job Declaration client's local server: each channel
+    /// A Job Declaration client's local server: each channel
     /// takes a lane from this server-wide counter as its extranonce prefix.
     lanes: Option<Arc<Lanes>>,
-    /// #### PR #42: whether this connection's extended channels are grouped,
+    /// Whether this connection's extended channels are grouped,
     /// and its groups by id.
     grouping: bool,
     groups: BTreeMap<u32, Group>,
-    /// #### PR #42: the server mines a token that fixes the version slot.
+    /// The server mines a token that fixes the version slot.
     fixed_version: bool,
-    /// #### merge-mining v2: why token merge mining was refused for a job
+    /// Why token merge mining was refused for a job
     /// (the own-root check), taken by the server for the dashboard.
     pub token_refusal: Option<&'static str>,
-    /// #### merge-mining v2: on a public pool, the donation choice of this
+    /// On a public pool, the donation choice of this
     /// connection's logins (`None` inside: the pool's setting), fixed by its
     /// first channel.
     donation_choice: Option<Option<crate::donation::bch::BchDonation>>,
-    /// #### one donation, the higher rate: on a public pool, the server's
+    /// On a public pool, the server's
     /// donation rate as last given (`public_donation`), and the donation
     /// this connection's own Pickaxe visibly mines on its donation channels.
     server_donation: Option<crate::donation::bch::BchDonation>,
     own_donation: super::own_donation::OwnDonation,
-    /// #### one donation, the higher rate: the target of the latest share
+    /// The target of the latest share
     /// accepted on a donation channel, taken by the server for the work
     /// split (such shares repay no quota of the connection's own jobs).
     pub donation_share: Option<Hash>,
-    /// #### merge-mining v2: the client asked for the merge-mining
+    /// The client asked for the merge-mining
     /// disclosure extension (`merge::disclosure`).
     merge_disclosure: bool,
     /// The client was granted Worker-Specific Hashrate Tracking (0x0002):
     /// its extended shares may name their worker.
     worker_hashrate: bool,
-    /// #### merge-mining v2: leaf log lines (JSON) for jobs on a public
+    /// Leaf log lines (JSON) for jobs on a public
     /// pool's standard channels, taken by the server for its leaf log.
     pub leaf_log: Vec<String>,
 }
@@ -123,17 +122,17 @@ pub struct MiningSession {
 pub struct Responses {
     pub frames: Vec<SerializedFrame>,
     pub blocks: Vec<ValidatedShare>,
-    /// #### PR #42: accepted shares that win merge-mined tokens, whether or
+    /// Accepted shares that win merge-mined tokens, whether or
     /// not they are also blocks.
     pub token_wins: Vec<TokenWin>,
     pub share_event: Option<ShareEvent>,
     pub accepted_work: Option<(Hash, BchPayout)>,
-    /// #### PR #42: a SetCustomMiningJob's outcome, its error code when
+    /// A SetCustomMiningJob's outcome, its error code when
     /// refused.
     pub custom_job: Option<Result<(), &'static str>>,
-    /// #### PR #42: accepted shares on Job Declaration jobs, for the pool.
+    /// Accepted shares on Job Declaration jobs, for the pool.
     pub forward: Vec<ForwardShare>,
-    /// #### PR #42: accepted shares that win a header-shaped token (never
+    /// Accepted shares that win a header-shaped token (never
     /// blocks).
     pub header_wins: Vec<ValidatedShare>,
     /// The worker the share named (extension 0x0002), for the workers
@@ -187,7 +186,7 @@ impl MiningSession {
         })
     }
 
-    // #### merge-mining v2: disclosure to miners
+    // Disclosure to miners
     // What: after a job reaches a channel whose job commits a non-empty
     // root, a client that negotiated the extension gets its JobLeaves frame;
     // a public pool's standard channel (whose device cannot take the frame)
@@ -231,7 +230,7 @@ impl MiningSession {
         extension_frame(EXTENSION, JOB_LEAVES, true, &leaves.encode()).map(Some)
     }
 
-    // #### merge-mining v2: one donation choice per connection
+    // One donation choice per connection
     // What: a public pool connection's first channel fixes its donation
     // choice (its login's `,donation=`, or none for the pool's setting); a
     // later channel whose login chooses otherwise is refused with
@@ -247,7 +246,6 @@ impl MiningSession {
         self.donation_choice.flatten()
     }
 
-    // #### one donation, the higher rate
     // What: on a public pool, the rate this connection's miner channels'
     // jobs carry: the effective rate (the higher of the server's and the
     // login's, `payout::effective_donation`), less what the connection's own
@@ -289,7 +287,7 @@ impl MiningSession {
         super::own_donation::charged(effective, self.own_donation.credit(effective))
     }
 
-    /// #### one donation, the higher rate: on a public pool with a miner
+    /// On a public pool with a miner
     /// channel open, the effective rate and the own Pickaxe's credit, for
     /// the workers page; never an address.
     pub fn donation_terms(
@@ -308,25 +306,25 @@ impl MiningSession {
             })
     }
 
-    /// #### PR #42: the server mines a token that fixes the version slot:
+    /// The server mines a token that fixes the version slot:
     /// clients that require version rolling are refused, others are told
     /// the version is fixed.
     pub fn set_fixed_version(&mut self, fixed: bool) {
         self.fixed_version = fixed;
     }
 
-    /// #### PR #42: a Job Declaration client's local server, whose channels
+    /// A Job Declaration client's local server, whose channels
     /// take lanes from `lanes`.
     pub fn set_lanes(&mut self, lanes: Option<Arc<Lanes>>) {
         self.lanes = lanes;
     }
 
-    /// #### PR #42: a public pool that accepts miners' own templates.
+    /// A public pool that accepts miners' own templates.
     pub fn set_declarator(&mut self, declarator: Option<Arc<Declarator>>) {
         self.declarator = declarator;
     }
 
-    /// #### PR #42: whether the connection's SetupConnection was accepted.
+    /// Whether the connection's SetupConnection was accepted.
     pub fn is_set_up(&self) -> bool {
         self.setup_flags.is_some()
     }
@@ -369,7 +367,7 @@ impl MiningSession {
             lanes.compact.store(plan.compact, Ordering::Relaxed);
         }
         let mut frames = Vec::new();
-        // #### PR #42: the group broadcast
+        // The group broadcast
         // What: on each template, a group of two or more extended channels
         // (one payout identity on a connection) gets one job frame addressed
         // to the group instead of one per channel; each member still gets
@@ -402,7 +400,7 @@ impl MiningSession {
             if !meets_target(&template.target, maximum) {
                 return Err("device maximum target would discard valid block work".into());
             }
-            // #### PR #42: custom-only channels
+            // Custom-only channels
             // What: a Job Declaration client's channel never gets the pool's
             // jobs; a new parent (or bits) revokes its custom jobs, and its
             // target follows the block target as a device's does.
@@ -422,12 +420,10 @@ impl MiningSession {
                 }
                 continue;
             }
-            // #### end PR #42 ####
-            // #### PR #38
             // Follow an easier block target down and, on the next normal
             // template, back up to the share difficulty. SetTarget precedes
             // the job so the job carries the new target.
-            // #### PR #42: and floor it at the easiest merge-mined token
+            // And floor it at the easiest merge-mined token
             // target, within 15 times vardiff's (see `Channel::settle`), on
             // this server's own devices only (`Channel::floor_for`).
             let tokens = channel.floor_for(&template);
@@ -468,7 +464,7 @@ impl MiningSession {
                 &immediates,
             )?);
         }
-        // #### merge-mining v2: each channel's leaves after its job.
+        // Each channel's leaves after its job.
         let ids: Vec<u32> = self.channels.keys().copied().collect();
         for id in ids {
             frames.extend(self.disclose(id)?);
@@ -476,7 +472,6 @@ impl MiningSession {
         Ok(frames)
     }
 
-    /// #### PR #38
     /// Vardiff for every channel. A changed target goes out as SetTarget and
     /// at once as a fresh job on the same template, because SetTarget only
     /// applies to jobs sent after it. Job IDs come from the session's
@@ -492,7 +487,7 @@ impl MiningSession {
             let Some(target) = channel.retarget(maximum) else {
                 continue;
             };
-            // #### PR #42: a custom-only channel's client re-issues its own
+            // A custom-only channel's client re-issues its own
             // jobs; it gets the target alone.
             if channel.custom_only {
                 frames.push(mining(Mining::SetTarget(SetTarget {
@@ -517,7 +512,7 @@ impl MiningSession {
             frames.extend(job_frames(channel, true)?);
             retargeted.push(channel.id);
         }
-        // #### merge-mining v2: each new job's leaves.
+        // Each new job's leaves.
         for id in retargeted {
             frames.extend(self.disclose(id)?);
         }
@@ -526,7 +521,7 @@ impl MiningSession {
 
     pub fn receive(&mut self, mut frame: SerializedFrame, now: u32) -> Result<Responses, String> {
         let header = frame.header();
-        // #### merge-mining v2: the extensions negotiation (type 0x0001).
+        // The extensions negotiation (type 0x0001).
         // What: RequestExtensions after setup grants the merge-mining
         // disclosure (0x4D4D) and Worker-Specific Hashrate Tracking (0x0002)
         // when asked, in the order asked; a request for neither gets
@@ -578,7 +573,7 @@ impl MiningSession {
             let setup: SetupConnection =
                 binary_sv2::from_bytes(frame.payload()).map_err(|_| "malformed setup message")?;
             // 0: header-only channels; 2: version rolling.
-            // #### PR #42: work selection accepted with a Declarator
+            // Work selection accepted with a Declarator
             // What: bit 1 (REQUIRES_WORK_SELECTION) is accepted when this
             // public pool accepts miners' own templates; such a connection's
             // extended channels are custom-only.
@@ -591,7 +586,7 @@ impl MiningSession {
             } else {
                 0b101
             };
-            // #### PR #42: the Fixed-version setup
+            // The Fixed-version setup
             // What: when the server mines a token that fixes the version
             // slot, a client that requires version rolling (bit 2, as every
             // Bitaxe sets) is refused with that bit, and any other client is
@@ -622,7 +617,7 @@ impl MiningSession {
                 )?);
             } else {
                 self.setup_flags = Some(setup.flags);
-                // #### PR #42: group channels
+                // Group channels
                 // What: extended channels are grouped unless the connection
                 // asked for standard jobs, or it is a Pickaxe SV1 adapter from
                 // before group support (its firmware field was empty).
@@ -633,7 +628,7 @@ impl MiningSession {
                         && setup.firmware.as_utf8_or_hex().is_empty());
                 // Upstream flag bit 0 means REQUIRES_FIXED_VERSION. Leave it
                 // clear: ASIC hardware, including Bitaxe, needs version rolling.
-                // #### PR #42: set only for a token that fixes the version.
+                // Set only for a token that fixes the version.
                 frames.push(encoded(
                     SetupConnectionSuccess {
                         used_version: 2,
@@ -821,7 +816,7 @@ impl MiningSession {
                 });
             }
             Mining::CloseChannel(request) => {
-                // #### PR #42: closing a group closes its members.
+                // Closing a group closes its members.
                 let closed: Vec<u32> = match self.groups.remove(&request.channel_id) {
                     Some(group) => group.members.into_iter().collect(),
                     None => vec![request.channel_id],
@@ -835,7 +830,7 @@ impl MiningSession {
                 }
                 self.groups.retain(|_, group| !group.members.is_empty());
             }
-            // #### PR #42: SetCustomMiningJob (Coinbase-only)
+            // SetCustomMiningJob (Coinbase-only)
             // What: a Job Declaration client sets its own job on its
             // custom-only channel with a token the pool allocated; the pool
             // checks the parent, bits, version, start time, prefix and
@@ -883,7 +878,7 @@ impl MiningSession {
         })
     }
 
-    /// #### PR #42: the checks of a Coinbase-only custom job, in the order of
+    /// The checks of a Coinbase-only custom job, in the order of
     /// their error codes, and the job id of one that passes.
     fn custom_job(&mut self, request: &SetCustomMiningJob, now: u32) -> Result<u32, &'static str> {
         let declarator = self
@@ -924,7 +919,7 @@ impl MiningSession {
         if request.ntime_start < context.min_time || request.ntime_start > now.saturating_add(600) {
             return Err("invalid-ntime-start");
         }
-        // #### PR #48: on Chipnet, the bits its start time needs: not normal
+        // On Chipnet, the bits its start time needs: not normal
         // bits past the parent's time plus 1200 s, nor the limit's at or
         // before it while ASERT gives other bits (`BchTemplate::wrong_bits`).
         if context.wrong_bits(request.ntime_start) {
@@ -932,7 +927,7 @@ impl MiningSession {
         }
         let prefix = request.coinbase_prefix.as_ref();
         // The script: the client's prefix, this channel's 16-byte prefix and
-        // the client's rollable bytes (16, #### PR #56: or what this channel
+        // the client's rollable bytes (16, or what this channel
         // was granted), at most 100 bytes.
         let script = prefix.len() + extranonce;
         if !prefix.starts_with(&context.height_push()) || script > 100 {
@@ -968,7 +963,7 @@ impl MiningSession {
         let outputs = parse_outputs(outputs).map_err(|_| "invalid-coinbase-tx-outputs")?;
         rule.check(&outputs)
             .map_err(|_| "invalid-coinbase-tx-outputs")?;
-        // #### merge-mining v2: no token root without its declared leaves.
+        // No token root without its declared leaves.
         super::jd::policy::check_no_root(&outputs).map_err(|_| "invalid-coinbase-tx-outputs")?;
         let id = self.next_custom_id()?;
         let template = Arc::new(BchTemplate::custom(
@@ -993,7 +988,7 @@ impl MiningSession {
         Ok(id)
     }
 
-    /// #### PR #42: the next custom job id, which carries 0x8000_0000.
+    /// The next custom job id, which carries 0x8000_0000.
     fn next_custom_id(&mut self) -> Result<u32, &'static str> {
         let count = self
             .custom_jobs
@@ -1003,7 +998,7 @@ impl MiningSession {
         Ok(CUSTOM_JOB_BIT | self.custom_jobs)
     }
 
-    // #### PR #42: SetCustomMiningJob on a declared job (Full-Template)
+    // SetCustomMiningJob on a declared job (Full-Template)
     // What: a declared token sets exactly the job the pool checked: its
     // parent (still the pool's), its bits, its version within the rolling
     // bits, a start time from the pool's mintime to 10 minutes ahead, and
@@ -1043,7 +1038,7 @@ impl MiningSession {
         if request.ntime_start < context.min_time || request.ntime_start > now.saturating_add(600) {
             return Err("invalid-ntime-start");
         }
-        // #### PR #48: the bits its start time needs, as above.
+        // The bits its start time needs, as above.
         if template.wrong_bits(request.ntime_start) {
             return Err("invalid-nbits");
         }
@@ -1097,10 +1092,9 @@ impl MiningSession {
         Ok(id)
     }
 
-    /// #### PR #40
     /// Makes this connection a public pool's: each channel pays the address
     /// its user connects with, and the operator's fee address is added.
-    /// #### merge-mining v2: a public pool's session, whose channels carry
+    /// A public pool's session, whose channels carry
     /// the empty commitment.
     pub fn is_public(&self) -> bool {
         self.public.is_some()
@@ -1120,11 +1114,11 @@ impl MiningSession {
         extra: u16,
         identity: &str,
     ) -> Result<Vec<SerializedFrame>, String> {
-        // #### PR #42: a work-selection connection's extended channels are
+        // A work-selection connection's extended channels are
         // custom-only, with 16 rollable bytes; its standard channels are
         // refused, as the spec names.
         let custom_only = self.work_selection && kind == ChannelKind::Extended;
-        // #### PR #56: a Job Declaration lane takes the current plan's
+        // A Job Declaration lane takes the current plan's
         // layout, or the last plan's while none is current; a compact lane's
         // device rolls 4 bytes.
         let compact = self.lanes.as_ref().is_some_and(|lanes| {
@@ -1161,7 +1155,7 @@ impl MiningSession {
             }
             || self.next_channel >= u32::MAX - 1
         {
-            // #### PR #42: a grouped connection carries up to 256 channels.
+            // A grouped connection carries up to 256 channels.
             Some("channel-capacity-exhausted")
         } else if self.current.is_none() {
             Some("no-template-available")
@@ -1175,13 +1169,13 @@ impl MiningSession {
         if !meets_target(&template.target, &maximum) {
             return Ok(vec![open_error(request, "max-target-out-of-range")?]);
         }
-        // #### PR #40: in a public pool, the user's own address; ####
+        // In a public pool, the user's own address; ####
         // merge-mining v2: and their donation choice.
         let login = self
             .public
             .as_ref()
             .map(|_| super::payout::identity_login(self.network, identity));
-        // #### one donation, the higher rate: the donation's channel
+        // The donation's channel
         // What: on a public pool, a channel whose login pays the Pickaxe
         // donation's own address (the SV1 adapter's donation channel at a
         // remote pool, on the device's own connection) mines donation work
@@ -1229,7 +1223,7 @@ impl MiningSession {
         )?;
         if let Some(public) = &self.public {
             channel.set_operator(Some(&public.address))?;
-            // #### one donation, the higher rate: a miner channel's first
+            // A miner channel's first
             // job carries the connection's rate with this login's choice
             // (see `public_donation`); a donation channel's is donation work.
             if pays_donation {
@@ -1260,7 +1254,7 @@ impl MiningSession {
             return Ok(vec![frame]);
         }
         let (id, generation, template) = self.current.as_ref().unwrap();
-        // #### PR #42: a new channel starts with the token floor too (see
+        // A new channel starts with the token floor too (see
         // `Channel::settle`).
         let tokens = channel.floor_for(template);
         channel.settle(&template.target, tokens.as_ref(), &maximum);
@@ -1271,7 +1265,7 @@ impl MiningSession {
             channel.drop_token_floor(&maximum);
         }
         let target = channel.target;
-        // #### PR #42: an extended channel joins its payout's group, made
+        // An extended channel joins its payout's group, made
         // with the next id when it is the first; the group is announced here
         // and never moved (no SetGroupChannel).
         let group = if self.grouping && kind == ChannelKind::Extended {
@@ -1359,12 +1353,12 @@ impl MiningSession {
         match result {
             Ok(share) => {
                 let event = ShareEvent::Accepted(share.share_target);
-                // #### PR #48: only this server's own jobs carry its BCH
+                // Only this server's own jobs carry its BCH
                 // payout policy. A Job Declaration job's coinbase is the
                 // client's (its payout here is a placeholder), so its work
                 // repays no quota and is not counted as anyone's here.
                 if !share.template.is_header_only() && !share.template.is_declared() {
-                    // #### one donation, the higher rate: on a public pool,
+                    // On a public pool,
                     // each share on the server's own jobs counts toward the
                     // connection's own donation measure: a donation
                     // channel's as verified donation work, a miner
@@ -1389,7 +1383,7 @@ impl MiningSession {
                         *accepted_work = Some((share.share_target, share.payout));
                     }
                 }
-                // #### PR #42: best share from the carried hash
+                // Best share from the carried hash
                 // What: the best-share difficulty uses the hash the channel's
                 // check computed, instead of hashing the header again.
                 // Why: one double SHA-256 fewer per share, more than the
@@ -1397,7 +1391,6 @@ impl MiningSession {
                 // Look here if: best-share difficulties disagree with the
                 // shares' headers.
                 self.share_difficulty = Some(super::telemetry::share_difficulty(&share.hash));
-                // #### end PR #42 ####
                 let work = share_work(&share.share_target);
                 self.accepted = self.accepted.saturating_add(1);
                 frames.push(mining(Mining::SubmitSharesSuccess(SubmitSharesSuccess {
@@ -1406,7 +1399,7 @@ impl MiningSession {
                     new_submits_accepted_count: 1,
                     new_shares_sum: work,
                 }))?);
-                // #### PR #42: token wins leave with the responses
+                // Token wins leave with the responses
                 // What: every accepted share that wins merge-mined tokens is
                 // handed on as a `TokenWin`, whether or not it is also a
                 // block (a block also goes to `blocks`, as before).
@@ -1415,14 +1408,13 @@ impl MiningSession {
                 // Look here if: a winning share is acknowledged but its
                 // token win never reaches the server.
                 if let Some(win) = share.token_win() {
-                    // #### merge-mining v2: the miner gets each won entry's
+                    // The miner gets each won entry's
                     // proof, when it asked for the disclosure.
                     if self.merge_disclosure {
                         frames.extend(win_proofs(id, job_id, &win)?);
                     }
                     token_wins.push(win);
                 }
-                // #### end PR #42 ####
                 if let Some(share) = share.forward.clone() {
                     forward.push(share);
                 }
@@ -1451,7 +1443,7 @@ fn job_frames(channel: &Channel, immediate: bool) -> Result<Vec<SerializedFrame>
     frames_for(channel.id, channel.kind, job, immediate)
 }
 
-/// #### PR #42: one job frame for a group's members when they hold the same
+/// One job frame for a group's members when they hold the same
 /// job (its id, coinbase parts, merkle path, version and parent), activated
 /// at once only when every member's would be; otherwise each member's own.
 fn group_frames(
@@ -1511,7 +1503,7 @@ fn frames_for(
             job_id: job.id,
             ntime_start: Sv2Option::new(immediate.then_some(job.template.current_time)),
             version: job.template.version,
-            // #### PR #42: none for a token that fixes the version.
+            // None for a token that fixes the version.
             version_rolling_allowed: job.template.version_mask() != 0,
             merkle_path: job
                 .parts
@@ -1555,7 +1547,7 @@ fn open_error(id: u32, code: &'static str) -> Result<SerializedFrame, String> {
     }))
 }
 
-/// #### merge-mining v2: a frame of extension `extension` (with the
+/// A frame of extension `extension` (with the
 /// channel bit when `channel`) and message `kind` around `payload`, as the
 /// SV2 framing writes it: the type (u16 LE), the message type, the length
 /// (u24 LE) and the payload.
@@ -1578,7 +1570,7 @@ pub fn extension_frame(
     SerializedFrame::from_bytes(bytes).map_err(|_| "SV2 frame encoding failed".into())
 }
 
-/// #### merge-mining v2: a WinProof frame for each entry `win` won.
+/// A WinProof frame for each entry `win` won.
 fn win_proofs(channel: u32, job: u32, win: &TokenWin) -> Result<Vec<SerializedFrame>, String> {
     use super::merge::disclosure::{WinProof, EXTENSION, WIN_PROOF};
     let mut frames = Vec::new();
@@ -1867,10 +1859,10 @@ mod tests {
     }
 
     const NOW: u32 = 1700000010;
-    /// #### PR #42: the extranonce test devices roll on extended channels.
+    /// The extranonce test devices roll on extended channels.
     const DEVICE_EXTRANONCE: [u8; DEVICE_EXTRANONCE_SIZE] = [0x23; DEVICE_EXTRANONCE_SIZE];
 
-    /// #### PR #42: the test template merge-mining the test token (its
+    /// The test template merge-mining the test token (its
     /// target `bits`), with block difficulty no test share reaches when
     /// `hard`.
     fn token_template(bits: u32, hard: bool) -> BchTemplate {
@@ -1890,7 +1882,7 @@ mod tests {
         template
     }
 
-    /// #### PR #42: what a device hashes for its first job: the header
+    /// What a device hashes for its first job: the header
     /// (nonce still open) and, on an extended channel, the coinbase it
     /// assembled from the job's prefix and suffix.
     struct DeviceJob {
@@ -1901,13 +1893,13 @@ mod tests {
         coinbase: Vec<u8>,
     }
 
-    /// #### PR #42: opens a channel of `kind` and builds its first job as a
+    /// Opens a channel of `kind` and builds its first job as a
     /// device does, from the frames alone.
     fn open_device(server: &mut MiningSession, kind: ChannelKind) -> DeviceJob {
         open_device_as(server, kind, "device")
     }
 
-    /// #### one donation, the higher rate: `open_device` under `identity`
+    /// `open_device` under `identity`
     /// (an extended channel's; a standard channel's is always "device").
     fn open_device_as(server: &mut MiningSession, kind: ChannelKind, identity: &str) -> DeviceJob {
         let request = match kind {
@@ -1979,7 +1971,7 @@ mod tests {
         }
     }
 
-    /// #### PR #42: the device's share of `nonce` on its first job.
+    /// The device's share of `nonce` on its first job.
     fn submit_share(
         device: &DeviceJob,
         kind: ChannelKind,
@@ -2043,7 +2035,7 @@ mod tests {
         }
     }
 
-    // #### PR #42: token wins leave with the responses
+    // Token wins leave with the responses
     #[test]
     fn responses_carry_token_wins_for_standard_and_extended_submits() {
         // A target of 2^248: about one share in 256 wins; no share is a
@@ -2117,7 +2109,7 @@ mod tests {
         }
     }
 
-    // #### PR #42: best share from the carried hash
+    // Best share from the carried hash
     #[test]
     fn best_share_uses_the_carried_hash() {
         let mut server = session();
@@ -2142,7 +2134,7 @@ mod tests {
         assert_eq!(server.share_difficulty.take(), None);
     }
 
-    // #### PR #42: the share-target floor for merge-mined tokens
+    // The share-target floor for merge-mined tokens
     #[test]
     fn new_channels_and_jobs_carry_the_token_floor() {
         // Vardiff's target: one share in 4,096 (2^244); the token's, eight
@@ -2176,7 +2168,7 @@ mod tests {
         assert_eq!(channel.job().unwrap().target, floor);
     }
 
-    /// #### PR #42: a public pool's session that accepts Job Declaration,
+    /// A public pool's session that accepts Job Declaration,
     /// set up with `flags`, its declarator, and the miner's channel when
     /// `open` (its id and extranonce prefix).
     fn jd_session(flags: u32) -> (MiningSession, Arc<Declarator>, u32, Vec<u8>) {
@@ -2344,7 +2336,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     // What: every Coinbase-only rule has its own error code, one case each,
     // and a job that meets them all gets id 0x8000_0001, a second
     // 0x8000_0002; a token works once and only for its identity.
@@ -2420,7 +2411,6 @@ mod tests {
         );
     }
 
-    // #### PR #48
     // What: on Chipnet a Coinbase-only custom job's bits must be those its
     // start time needs: normal bits past the parent's time plus 1200 s, or
     // the limit's at or before it while ASERT gives the parent other bits,
@@ -2476,7 +2466,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     // What: a work-selection connection's extended channel is custom-only
     // with 16 rollable bytes and no job of the pool's; its standard channel
     // is refused; a share on a custom job rebuilds the client's coinbase,
@@ -2542,21 +2531,20 @@ mod tests {
         assert_eq!(error.error_code.as_ref(), b"stale-share");
     }
 
-    // #### PR #42
     // What: a declared token sets exactly its declared job: a parent, bits,
     // version, start time, coinbase version, prefix, outputs or merkle path
     // other than declared each has its own error code (and spends the
     // token); an allocated token whose declared flag was forged is refused;
     // the job's shares rebuild the declared coinbase, and a block share
     // comes back on the declared template, whole, with its 3 transactions.
-    // #### PR #48: on Chipnet, a start time past the parent's time plus
+    // On Chipnet, a start time past the parent's time plus
     // 1200 s on normal bits is invalid-nbits.
     // Look here if: MiningSession::declared_job changes.
     #[test]
     fn set_custom_mining_job_on_a_declared_job_must_match_the_declaration() {
         use super::super::jd::declared::{tests::context, CoinbaseShape, DeclaredJob};
         let (mut server, declarator, channel, prefix) = jd_session(0b110);
-        // #### PR #48: on Chipnet's normal bits, the parent 1100 s back.
+        // On Chipnet's normal bits, the parent 1100 s back.
         let mut pool = context(3);
         pool.parent_time = Some(NOW - 1100);
         let pool = Arc::new(pool);
@@ -2606,7 +2594,7 @@ mod tests {
                 ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_NTIME_START,
                 Box::new(|job| job.ntime_start = 1_699_999_999),
             ),
-            // #### PR #48: a start past the parent's time plus 1200 s needs
+            // A start past the parent's time plus 1200 s needs
             // the limit's bits (see `BchTemplate::wrong_bits`).
             ("invalid-nbits", Box::new(|job| job.ntime_start = NOW + 101)),
             (
@@ -2682,7 +2670,7 @@ mod tests {
         assert!(decoded.check_merkle_root());
     }
 
-    /// #### PR #42: a session set up with `flags` by `vendor` running
+    /// A session set up with `flags` by `vendor` running
     /// `firmware`.
     fn session_by(flags: u32, vendor: &str, firmware: &str) -> MiningSession {
         let mut server = session();
@@ -2712,7 +2700,7 @@ mod tests {
         server
     }
 
-    /// #### PR #42: opens an extended channel for `identity`: its id, its
+    /// Opens an extended channel for `identity`: its id, its
     /// group's id and its extranonce prefix, or the refusal's code.
     fn open_extended(
         server: &mut MiningSession,
@@ -2748,14 +2736,14 @@ mod tests {
         ))
     }
 
-    /// #### PR #42: a template on another parent.
+    /// A template on another parent.
     fn next_parent() -> Arc<BchTemplate> {
         let mut next = rpc_template();
         next["previousblockhash"] = serde_json::json!("cd".repeat(32));
         Arc::new(BchTemplate::from_rpc(&next).unwrap())
     }
 
-    /// #### PR #42: the channel ids the job frames among `frames` address.
+    /// The channel ids the job frames among `frames` address.
     fn job_targets(frames: &mut [SerializedFrame]) -> Vec<(u8, u32)> {
         frames
             .iter_mut()
@@ -2778,7 +2766,6 @@ mod tests {
             .collect()
     }
 
-    // #### PR #42
     // What: two extended channels of one payout on a connection share a
     // group, announced when each opens; a new template sends one job and one
     // SetNewPrevHash to the group, not one per channel; a Pickaxe SV1 adapter
@@ -2814,7 +2801,6 @@ mod tests {
         assert_eq!(targets, vec![a, b]);
     }
 
-    // #### PR #42
     // What: each member rebuilds its coinbase from the group's job, its own
     // prefix and its extranonce, and its share on the group's job id is
     // accepted on its own channel; a share or an UpdateChannel naming the
@@ -2923,7 +2909,6 @@ mod tests {
         assert!(server.groups.is_empty());
     }
 
-    // #### PR #42
     // What: a connection that requires standard jobs gets no groups: its
     // standard channels announce group 0 and get their own job frames, as
     // before group support; one member alone gets its own frames too; a
@@ -2972,7 +2957,6 @@ mod tests {
             .all(|frame| frame.header().msg_type() != MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB));
     }
 
-    // #### PR #42
     // What: at a public pool each payout identity has its own group; the
     // two channels of one miner share a job frame and the other miner gets
     // its own.
@@ -3000,7 +2984,7 @@ mod tests {
         assert_eq!(targets.len(), 4);
     }
 
-    // #### merge-mining v2: disclosure to miners
+    // Disclosure to miners
     // What: a client that negotiates the disclosure extension gets the
     // granted type back, then a JobLeaves frame after each job that commits
     // a root (rebuilding output 0) and a WinProof after a share that wins
@@ -3109,7 +3093,7 @@ mod tests {
         assert!(!public.leaf_log[0].contains("bchtest"));
     }
 
-    // #### merge-mining v2: one donation choice per connection
+    // One donation choice per connection
     // What: on a public pool a login's `,donation=` is fixed per
     // connection: a later channel choosing otherwise is refused
     // (donation-mismatch), and a malformed choice is refused
@@ -3176,7 +3160,6 @@ mod tests {
         );
     }
 
-    // #### one donation, the higher rate
     // What: on a public pool the higher of the pool's rate and the login's
     // applies from a channel's first job (host 0 and miner 1.5% is 1.5%,
     // host 1.5% and miner 3% is 3%, in the token leaves' donation slot as
@@ -3313,7 +3296,6 @@ mod tests {
         );
     }
 
-    // #### PR #42
     // What: vardiff stays per channel inside a group: a member's new target
     // comes with its own SetTarget and its own job frame.
     // Look here if: retarget changes for grouped channels.
@@ -3336,7 +3318,6 @@ mod tests {
         );
     }
 
-    // #### PR #42
     // What: a grouped connection carries 256 channels and refuses the
     // 257th; an ungrouped one stops at 32.
     // Look here if: MAX_GROUPED_CHANNELS or the capacity check changes.
@@ -3360,7 +3341,6 @@ mod tests {
         );
     }
 
-    // #### PR #42
     // What: for a token that fixes the version slot, a client requiring
     // version rolling (Bitaxe's 0b101) is refused with bit 2; another is
     // told the version is fixed (Success bit 0), and its extended jobs

@@ -1,4 +1,4 @@
-//! #### PR #42: TLS through rustls
+//! TLS through rustls
 //! What: wss:// Fulcrum servers and https:// nodes connect through rustls
 //! (the aws-lc-rs provider, already in the build for the ASIC device
 //! library), checked by the operating system's verifier: the system's
@@ -33,7 +33,7 @@ pub fn client_config() -> Result<Arc<rustls::ClientConfig>, String> {
 }
 
 /// A TLS stream to `host` over `stream`, with its handshake done.
-/// #### PR #65: over any stream, so a P2Pool preparation's handshake keeps
+/// Over any stream, so a P2Pool preparation's handshake keeps
 /// its request's deadline.
 pub fn connect<S: std::io::Read + std::io::Write>(
     host: &str,
@@ -86,7 +86,6 @@ pub fn websocket(url: &str) -> Result<(WebSocket<MaybeTlsStream<TcpStream>>, Res
 mod tests {
     use super::*;
 
-    // #### PR #42
     // What: the TLS configuration builds (the provider and the system's
     // verifier), once, and a name that is not a server name is refused
     // before any connection.
@@ -102,7 +101,6 @@ mod tests {
         assert!(error.contains("is not a server name"), "{error}");
     }
 
-    // #### PR #42
     // What: the built-in Fulcrum servers of each network answer over rustls
     // with the system's verifier (their certificates are accepted).
     // Look here if: wss:// servers stop connecting after a TLS change.

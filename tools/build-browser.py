@@ -20,7 +20,7 @@ def main():
         raise SystemExit(f"Install the matching CLI: cargo install --locked wasm-bindgen-cli --version {version}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir", type=Path, default=ROOT / "dist" / "web")
-    # #### PR #22: development build exporting verify_portable_engine.
+    # Development build exporting verify_portable_engine.
     parser.add_argument("--check", action="store_true", help="include the portable engine check")
     arguments = parser.parse_args()
     output = arguments.out_dir.resolve()

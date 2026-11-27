@@ -1,4 +1,3 @@
-//! #### PR #32
 //! OpenCL engine for GPUs the other engines cannot drive: older integrated
 //! GPUs without Vulkan or DirectX 12, older discrete cards, and ARM GPUs
 //! (Mali, Adreno) with an OpenCL driver. The OpenCL library is loaded at

@@ -11,9 +11,9 @@ shares the same code path with a network switch.
 | **Template Provider client** | Pull full block templates from the miner's own node (BCHN over JSON-RPC) or, from PR #42, from an SV2 Template Provider (`--template-provider`), and keep them fresh. |
 | **Mining server** | Serve SV2 mining channels to devices (Bitaxe native SV2 and SV1 via translator). Check shares, submit blocks. |
 | **SV1 translator** | Accept Stratum V1 firmware (Avalon Nano and most home ASICs) and translate to the SV2 mining server. Required in this implementation scope. |
-| **Job Declaration client** (PR #42) | Mine at a Pickaxe pool with your own node's templates (`--job-declaration`: Full-Template, or `coinbase`); devices fall back to the pool's own jobs when the pool refuses them. See [job-declaration.md](job-declaration.md). |
-| **Job Declaration server** (PR #42) | Accept miners' own templates at a public pool (`--accept-job-declaration`: both modes, or `full` or `coinbase`), checking each custom job's coinbase pays the pool's fee and the donation; Full-Template templates are checked by the pool's node, which gets their blocks too. See [job-declaration.md](job-declaration.md). |
-| **Template Provider server** (PR #42) | Serve this node's templates to SV2 pools, Job Declaration clients and P2Pool over SV2 Template Distribution (`--tp-listen`), and relay the blocks they find. See [Serving templates to a pool](#serving-templates-to-a-pool-template-distribution). |
+| **Job Declaration client** | Mine at a Pickaxe pool with your own node's templates (`--job-declaration`: Full-Template, or `coinbase`); devices fall back to the pool's own jobs when the pool refuses them. See [job-declaration.md](job-declaration.md). |
+| **Job Declaration server** | Accept miners' own templates at a public pool (`--accept-job-declaration`: both modes, or `full` or `coinbase`), checking each custom job's coinbase pays the pool's fee and the donation; Full-Template templates are checked by the pool's node, which gets their blocks too. See [job-declaration.md](job-declaration.md). |
+| **Template Provider server** | Serve this node's templates to SV2 pools, Job Declaration clients and P2Pool over SV2 Template Distribution (`--tp-listen`), and relay the blocks they find. See [Serving templates to a pool](#serving-templates-to-a-pool-template-distribution). |
 
 GPU CashToken mining stays on its existing path. This work adds an ASIC-facing
 SV2 surface; it does not replace the portable GPU product bar.
@@ -55,7 +55,7 @@ assumptions baked into some SV2 examples:
 
 ## Template sources
 
-#### PR #65: when a node is required
+#### When a node is required
 
 | Mining mode | Source of BCH block templates | Own BCH node required in setup |
 | --- | --- | --- |
@@ -96,8 +96,8 @@ and [Electrum indexed-UTXO methods](https://electrum-cash-protocol.readthedocs.i
 | **bchn-sv2-bridge** | External AGPL TP for unmodified BCHN over JSON-RPC; tested on mainnet; keeps JD off because unordered JD breaks CTOR. |
 | **Own JSON-RPC template client** | Current implementation feeds the mining server from BCHN full `getblocktemplate` / `submitblock`. GBT-light remains pending. |
 | **Knuth native TP (future integration)** | Upstream has merged SV2 framing and message building blocks. Those changes do not establish a complete, interoperable template provider. |
-| **SV2 Template Providers** (PR #42) | `--template-provider sv2tp://HOST:PORT/KEY` takes templates from another Pickaxe's template server, a node bridge with a Noise shim, or a node with a provider built in (Knuth has the codecs but no listener yet); see [Templates from a provider](#templates-from-a-provider-template-distribution-client). |
-| **Pickaxe's own template server** (PR #42) | `serve --tp-listen` hands this node's full templates to SV2 pools and P2Pool, the other direction; see [Serving templates to a pool](#serving-templates-to-a-pool-template-distribution). |
+| **SV2 Template Providers** | `--template-provider sv2tp://HOST:PORT/KEY` takes templates from another Pickaxe's template server, a node bridge with a Noise shim, or a node with a provider built in (Knuth has the codecs but no listener yet); see [Templates from a provider](#templates-from-a-provider-template-distribution-client). |
+| **Pickaxe's own template server** | `serve --tp-listen` hands this node's full templates to SV2 pools and P2Pool, the other direction; see [Serving templates to a pool](#serving-templates-to-a-pool-template-distribution). |
 
 **New blocks over ZMQ** (PR #42 follow-up): the server subscribes to the node's `zmqpubhashblock` and refreshes its template as soon as a block is announced, instead of at its next 250 ms tip check; while notices flow it asks the node's tip every 2 s as a safety net. For a node on this computer the endpoint comes from bitcoin.conf (`zmqpubhashblock=tcp://127.0.0.1:28332`, the network's section first); `--node-zmq tcp://HOST:PORT` names one on this computer or the home network, and `--node-zmq off` turns it off; the setup's Advanced section has the same choice as its "Block notices" row. The dashboard shows `ZMQ connected · N blocks`, or why it is not connected while the server keeps polling.
 
@@ -178,7 +178,6 @@ estimates, so compare the 1-hour rate with the device's own figure. Up to 64
 closed sessions remain visible. JSON `device_details` contains the same rows,
 including last-share age and SV1-local reject counts.
 
-#### PR #42
 
 A device on the local network keeps one row and one label through
 reconnects. When it connects again from the same local address, it takes over
@@ -258,7 +257,6 @@ journal belongs to the network and payout, not to one node, so the server
 also starts when its first node is down; a journal written by an older
 build opens while its node is still configured.
 
-#### PR #42
 
 On the workers page, the arrow keys, PgUp/PgDn, Home and End move a
 highlighted row. Enter (or `c`) opens the Device panel for it, online or
@@ -430,7 +428,7 @@ is the configured payout address. The identity is never printed or saved in
 the status file. The channel declares 1 TH/s, and pools set their first
 difficulty from that.
 
-#### PR #67: at a BCH P2Pool node, the login decides who owns the shares. A
+#### At a BCH P2Pool node, the login decides who owns the shares. A
 node with no share address of its own refuses a bare payout login
 (`share-address-required`); the adapter then asks once more under
 `<payout>[.<worker>],p2p=<share address>`, the share address of that payout.
@@ -464,11 +462,11 @@ the second channel, for example one whose usernames are accounts rather than
 addresses, keeps the device mining on its own channel, and the workers page
 shows why. So does a pool that opens the second channel but refuses its
 shares, or never answers them within two minutes: after eight such donation
-shares in a row (#### PR #48), since only accepted donation shares repay the
+shares in a row, since only accepted donation shares repay the
 donation's work. Native SV2 devices such as Bitaxe can connect to SV2 pools
 themselves.
 
-#### PR #61: `--own-p2pool` (with `--sv1-listen`, instead of `--upstream`)
+#### `--own-p2pool` (with `--sv1-listen`, instead of `--upstream`)
 mines at your own BCH P2Pool node: the server installs, updates and starts
 P2Pool with the configuration's node, ZMQ block notices and payout, mines at
 it as at any SV2 pool under `<payout>,p2p=<share address>`, shows P2Pool's
@@ -491,7 +489,6 @@ its BCH interoperability can be retested; Pickaxe never relaxes the check.
 
 ### Fallback pools and coming back
 
-#### PR #42
 
 Solo mining can name pools to fall back on while the node gives no work:
 
@@ -522,7 +519,6 @@ pickaxe_miner stratum-v2 serve --config mainnet.json --sv1-listen 0.0.0.0:3333 \
 
 ### Group channels (proxies such as SRI's translator)
 
-#### PR #42
 
 A proxy carries many miners on one SV2 connection, one extended channel
 each. Pickaxe's server groups them:
@@ -649,7 +645,6 @@ the replaced tip.
 
 ### Templates from a provider (Template Distribution client)
 
-#### PR #42
 
 A server can take its templates from SV2 Template Providers before (or
 instead of) its nodes:
@@ -694,7 +689,6 @@ provider 1 of 2"), and the status file's `template_source` gives its kind
 
 ### Serving templates to a pool (Template Distribution)
 
-#### PR #42
 
 A server with its own node can also hand that node's block templates to SV2
 pools, Job Declaration clients and P2Pool over SV2 Template Distribution, so
@@ -784,7 +778,6 @@ work on an unavailable source. A block is counted accepted only when the
 source node returns success or its matching header has positive confirmations;
 a share acknowledgement does not establish that.
 
-#### PR #38
 
 A temporary template loss revokes jobs immediately but keeps the device
 connection for up to three seconds. Recovery cleanly replaces work on the same
@@ -794,7 +787,6 @@ failure counts and a sanitized last-error category, separately from actual
 device connection errors. A brief outage can still waste firmware work; it
 does not count as accepted work merely because the connection stays open.
 
-#### PR #38
 
 Solved full blocks are saved beside the config in `chipnet.sv2-blocks.json`
 before the device receives its share acknowledgement. The journal is private,
@@ -875,7 +867,7 @@ The BCH policy is attached to each job; changing the setting never changes an
 in-flight job's coinbase. Saved solved blocks retain that policy across restart,
 and pre-donation journal entries replay their original bytes.
 
-#### PR #48: work-weighted BCH allocation
+#### Work-weighted BCH allocation
 
 After the first accepted share, the work adapter accumulates the requested
 quota in expected hashes (`2^256 / (target + 1)`) and subtracts work credited

@@ -1,4 +1,3 @@
-//! #### PR #51
 //! What: ELECTRIC (`PoWMineStateful`), a CashToken whose `mine` claim needs a
 //! SHA-256d proof over 32 bytes, searched on CUDA or portable GPUs. The relay fee comes from
 //! a pot covenant with owner-authorized claims and refunds. Pickaxe
@@ -488,7 +487,7 @@ impl Pot {
         })
     }
 
-    /// #### PR #65: authorize every spend with the pot-only key. A public
+    /// Authorize every spend with the pot-only key. A public
     /// ELECTRIC proof alone cannot spend this pot, so fresh same-height work
     /// needs no height restriction. Existing pots keep their original script.
     pub fn with_authorized_claims(
@@ -510,7 +509,7 @@ impl Pot {
         Ok(pot)
     }
 
-    /// #### PR #65: a new pot whose saved owner key authorizes the refund
+    /// A new pot whose saved owner key authorizes the refund
     /// destination too. Previous constructors retain their funded scripts.
     pub fn with_owner_destination(
         deployment: &Deployment,
@@ -1409,7 +1408,7 @@ mod tests {
         assert_eq!(push_number(-129), vec![0x02, 0x81, 0x80]);
     }
 
-    /// #### PR #51: transactions for `tools/reward-policy-vm/electric.mjs`,
+    /// Transactions for `tools/reward-policy-vm/electric.mjs`,
     /// written when PICKAXE_ELECTRIC_PROOF names a file. A test deployment at
     /// 1-2 bytes keeps the search short; the VM runs the real contract body.
     #[test]

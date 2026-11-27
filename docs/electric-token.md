@@ -6,7 +6,7 @@ and refunds, allowing fresh same-height proofs without the former keyless
 pot's height gate. Since PR #58 it searches on GPUs (CUDA, and the portable engine
 for integrated and other GPUs), is a token choice in the setup, and has
 Pickaxe's own Chipnet deployment, where it has claimed live (below). No
-payout-wallet key is needed. The design note of 2026-10-13 (PR #50) is
+payout-wallet key is needed. The design note of 2026-10-13 is
 revised below where the implementation or the chain changed it.
 
 Sources, read 2026-10-13 and 2026-10-15:
@@ -28,7 +28,6 @@ deployment as data so a fixed contract is one new `Contract` variant.
 
 ## Author's v2 is a reference for new tokens
 
-#### PR #71
 
 The author added `PoWMineStatefulV2` for future deployments and explicitly says
 that existing ELECTRIC stays on its original v1 covenant and category. Pickaxe
@@ -49,7 +48,6 @@ the application safeguards for v1.
 
 ## Node or Fulcrum source
 
-#### PR #65
 
 ELECTRIC and hash-split setup show **BCH node** and **Fulcrum** connection
 controls. Their saved endpoints remain specific to Mainnet or Chipnet. A saved
@@ -166,7 +164,7 @@ without changing PHOTON: see [photon-electric-auxpow.md](photon-electric-auxpow.
 
 ## Signed fee-pot claims
 
-#### PR #65: funding cost
+#### Funding cost
 
 The pot pays **1,000 sats attached to each token reward, plus that claim's
 network fee**. The 1,000 sats remain in the recipient's token output; they
@@ -184,7 +182,6 @@ The actual fee comes from the serialized claim and the server's relay fee.
 
 ### Pickaxe-controlled receiving wallet and owner pot
 
-#### PR #65
 
 `pickaxe electric wallet` creates or reopens a dedicated payout key beside
 the configuration, separately for each network. It prints the public receiving
@@ -260,7 +257,6 @@ Keep the original key and journal backups until all transfers are settled.
 The receiving-wallet key and pot key are separate. A newly created empty pot
 must be funded before mining can use it; creating keys moves no existing BCH.
 
-#### PR #65
 
 New pots require the dedicated pot key to sign each claim and refund.
 Fresh proofs can be mined repeatedly at the same block height, up to the
@@ -298,14 +294,13 @@ amounts, duplicate pots, and all permitted recipients.
 
 ## Previous owner-recoverable pots
 
-#### PR #51
 
 Pickaxe creates a dedicated recovery key for the fee pot. It does not import
 or store the payout wallet's key. Claims remain keyless; only refunds need
 the recovery signature. PHOTON and its runtime keys are unchanged.
 
 `pickaxe electric pot --address <payout>` creates the key before displaying
-the funding address, or reuses the existing key. #### PR #53: it prints the
+the funding address, or reuses the existing key. it prints the
 address's QR code too, the same one the setup shows. Fund that P2SH32 address
 with plain BCH from any wallet. The default key file is beside the selected
 `--config`, named for the network and the pot's contract/payout parameters.
@@ -377,7 +372,7 @@ away. The work share needs neither.
 
 ## Racing
 
-The proof is cheap: 2^24 hashes at difficulty 3, 2^32 at 4. #### PR #58:
+The proof is cheap: 2^24 hashes at difficulty 3, 2^32 at 4. 
 Pickaxe searches on the selected GPUs: CUDA through its own module
 (`cuda/build/electric_rust.ptx`) and every other GPU through the portable
 engine (`reference/shared-electric`), both generated from the shared Rust
@@ -394,7 +389,7 @@ without a funded pot and sends nothing, to show a computer's rate first.
 
 ## Mining from the setup
 
-#### PR #58: in the setup, Token lists ELECTRIC after the GPU tokens. Its
+#### In the setup, Token lists ELECTRIC after the GPU tokens. Its
 settings are the GPUs, the payout address, intensity and, under Advanced,
 the donation. As soon as the payout address is in, the setup makes the fee
 pot and its recovery key (beside the configuration, owner-only) and shows
@@ -405,7 +400,7 @@ claims it pays, and the QR code again whenever the pot cannot pay a claim
 (`f` shows or hides it). `--no-tui` prints the same address, QR code and
 key path once, then each state and event as a line.
 
-#### PR #53: Start first reads the pot's balance. A pot that cannot pay a
+#### Start first reads the pot's balance. A pot that cannot pay a
 claim yet (or cannot be read) is reported, and the next Start press starts
 anyway. To mine ELECTRIC beside PHOTON on the same GPUs, each for a share of
 the time, choose Hash split instead ([hash-split.md](hash-split.md)).
@@ -416,7 +411,7 @@ the setup each time.
 
 ## Chipnet
 
-There is no published Chipnet deployment, so Pickaxe made one (PR #58),
+There is no published Chipnet deployment, so Pickaxe made one,
 and `--chipnet` mines it with no other flag: category
 `39629630f3f5ba91c6e656e7b79c2c8de2fc6f776bfe085e1b7eaf70aa8a5e76`
 (genesis `6ba9682c719248f473ec6b3eb5efe3650b55439b751463ea1dec65c906163ee1`,
@@ -473,7 +468,7 @@ the old pot to the payout first.
   the pot's input.
 - `pickaxe electric status` read the live baton through Fulcrum on
   2026-10-15 (claim 1412, difficulty 4, height 972908).
-- #### PR #58: `cargo test --lib electric` also checks the genesis builder
+- `cargo test --lib electric` also checks the genesis builder
   (output 0 only, the baton's state and supply, the fee for the signed
   size), the Chipnet deployment's covenant, the fee pot's QR code module
   for module, and the ELECTRIC screen showing an unfunded pot's QR code;

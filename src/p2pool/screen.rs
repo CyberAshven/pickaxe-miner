@@ -1,4 +1,4 @@
-//! #### PR #53: `pickaxe p2pool`: install, update, roll back and run
+//! `pickaxe p2pool`: install, update, roll back and run
 //! P2Pool, with a screen of lights as Gupaxx shows its processes: P2Pool
 //! green when it runs and miners can connect, the BCH node green when it
 //! answers on its chain and is synced.

@@ -150,7 +150,7 @@ impl SourceEntry {
     /// Creates a user-configured endpoint entry.
     pub(crate) fn user(kind: SourceKind, endpoint: &str, label: String) -> Self {
         let transport = match kind {
-            // #### PR #42: a home server over plain TCP.
+            // A home server over plain TCP.
             SourceKind::Fulcrum
                 if endpoint.len() > 6 && endpoint[..6].eq_ignore_ascii_case("tcp://") =>
             {
@@ -256,7 +256,7 @@ impl SourceEntry {
             (SourceKind::Fulcrum, SourceTransport::Wss)
                 | (SourceKind::NativeNode, SourceTransport::NodeHttp)
         ) || (
-            // #### PR #42: plain TCP only to a server the miner entered,
+            // Plain TCP only to a server the miner entered,
             // which the configuration takes only at home; the published
             // public TCP servers stay unused.
             self.kind == SourceKind::Fulcrum
@@ -1126,7 +1126,6 @@ mod tests {
         assert_eq!(tcp.transport, SourceTransport::ElectrumTcp);
     }
 
-    // #### PR #42
     // What: a plain-TCP Fulcrum server the miner entered (the configuration
     // takes it only at home) is a probe candidate; the published public TCP
     // servers still are not.

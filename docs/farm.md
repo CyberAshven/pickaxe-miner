@@ -35,7 +35,7 @@ same across restarts. Keep that file private: it is the coordinator's identity.
 Without `--no-tui`, the dashboard shows a Rigs row (rigs connected, their GPUs,
 the farm's rate, winners and rejected winners, the listen address) and one row
 per rig (name, GPUs, rate, winners, minutes connected, seconds since it was
-last heard). Under each rig, one row per GPU (#42): its name, status, rate,
+last heard). Under each rig, one row per GPU: its name, status, rate,
 temperature, fan and power, winners, rejected winners and last error. A GPU
 that is not mining, is at 85°C or above, has rejected winners or reports an
 error keeps its row when the screen is short. Its Hashrate row adds the rigs'
@@ -60,7 +60,7 @@ as a `rigs join` line.
 pickaxe mine --coordinator <coordinator address>:3340 --coordinator-key <key> --rig-name rack1-07 --no-tui
 ```
 
-The coordinator's one-line address carries its key, so this works too (#42):
+The coordinator's one-line address carries its key, so this works too:
 `pickaxe mine --coordinator stratum2+tcp://HOST:3340/KEY --no-tui`. A rig
 writes its status file beside its configuration every two seconds (its
 coordinator, state, rate, winners sent and each GPU, never a key or a payout),
@@ -102,7 +102,6 @@ published.
 
 ## In the setup
 
-#### PR #42
 
 GPU mining keeps its farm values under **Advanced** on the settings page:
 - **GPU mining alone**: **Rig port** turns this computer into your farm's
@@ -124,7 +123,6 @@ only coordinates.
 
 ## Farm operating systems (HiveOS, mmpOS, RaveOS)
 
-#### PR #42
 
 Farm systems run a miner through small scripts that pass the flight sheet's
 fields and read statistics back. Pickaxe has one command for each side:
