@@ -50,8 +50,7 @@ mining OSes, and a Docker image ([README](README.md), [guide](docs/guide.md)).
     (the legacy build CI also runs);
   - the tests of the code you touched;
   - the supply-chain scan below.
-- **Commits and PRs** describe the change and how it was checked. No
-  attribution lines, no AI or tool mentions, no personal names. Docs change
+- **Commits and PRs** describe the change and how it was checked. Docs change
   with the behaviour they describe.
 - **Merging and releases are the owner's.** PRs need the owner's review.
   Promotions to `master` and version changes happen only when the owner asks.
