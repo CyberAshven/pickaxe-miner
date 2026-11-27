@@ -4,6 +4,21 @@ A step-by-step walk through the desktop window, from download to mining. The
 screenshots show example data; the red numbers match the steps under each one.
 The terminal (`pickaxe`) has the same setup and the same steps.
 
+## Start here: pick what fits you
+
+| You want to… | Use | Go to |
+|---|---|---|
+| Mine GPU tokens on your desktop computer | the window (`pickaxe-gui`) | steps 1–5 |
+| Mine on a rig with no screen, or over SSH | the terminal (`pickaxe`) | [Terminal](#the-terminal-tui), then steps 2–5 (same setup) |
+| Mine PHOTON in a web browser, nothing to install | the browser miner | [Browser](#the-browser-miner) |
+| Point your BCH ASICs at your own node | the ASIC server | step 6 |
+| Run a pool other people mine on | Running a pool | step 7 |
+| Run several GPU rigs as one farm | a coordinator and rigs | step 8 |
+| Use HiveOS, mmpOS or RaveOS | the mining OS packages | [Mining OS](#mining-os-hiveos-mmpos-raveos) |
+| Run it in Docker | the container image | [Docker](#docker) |
+| Use your own BCHN or Knuth node | the BCH node row in step 4 | [Your own node](#your-own-node) |
+| Try everything without real money first | Chipnet | [Chipnet](#chipnet-try-it-first) |
+
 ## 1. Download and start
 
 1. Download your system's archive from the
@@ -127,6 +142,68 @@ coordinator). Its dashboard then lists the rigs:
 2. **Auto-update** installs new releases by themselves, once releases are
    signed with Pickaxe's key; until then each update asks you first.
 3. **Update P2Pool** (with **Roll back**) does the same for P2Pool v2.
+
+## Other ways to run Pickaxe
+
+### The terminal (TUI)
+
+Run `pickaxe` (`.\pickaxe.exe` in PowerShell) from the unpacked download, or
+double-click it. It opens the same setup as the window: profiles, hardware,
+network, token, settings and **Start mining**, with the arrow keys, Enter and
+Esc. On the mining dashboard, `G` shows charts, `A` opens Advanced settings,
+`F` opens ELECTRIC's fee pot and `B` goes back to the profiles once pending
+claims are settled. To start PHOTON straight away:
+
+```sh
+pickaxe mine --address "bitcoincash:YOUR_ADDRESS"
+```
+
+Add `--no-tui` for a plain log with no screen, as a service would run it
+([farms and services](farm.md#running-rigs-as-a-service)).
+
+### The browser miner
+
+PHOTON only, in a browser with WebGPU. Unpack the `browser` download, run
+`python -m http.server 8080 --bind 127.0.0.1 --directory web` in it, open
+`http://127.0.0.1:8080`, choose Mainnet or Chipnet, enter your address and
+press **Start mining**. Keep the tab open, and pause native GPU mining while it
+runs ([browser miner](../README.md#browser-miner)).
+
+### Mining OS (HiveOS, mmpOS, RaveOS)
+
+Install the release's `pickaxe-hiveos`, `pickaxe-mmpos` or `pickaxe-raveos`
+package as a custom miner. The flight sheet's pool, wallet and password
+fields become Pickaxe's options: solo PHOTON, or a rig joining your
+coordinator. What to put in each field: [farm OS packages](farm-os.md) and
+[farms](farm.md#farm-operating-systems-hiveos-mmpos-raveos).
+
+### Docker
+
+The headless image runs `pickaxe mine --no-tui` and keeps its settings in a
+volume:
+
+```sh
+docker run --rm -it --gpus all -v pickaxe-data:/data \
+  ghcr.io/cyberashven/pickaxe-miner:latest \
+  --config /data/pickaxe.json mine --no-tui --address 'bitcoincash:YOUR_ADDRESS'
+```
+
+NVIDIA needs the host driver and the NVIDIA Container Toolkit; AMD and Intel
+need their device files passed in ([container guide](container.md)).
+
+### Your own node
+
+Pickaxe works with servers on the internet by default. To use your own node,
+add it in step 4's **BCH node** row: one on this computer is found by itself,
+one on another computer is added with **Other PC** or **Tailscale**, and a
+Fulcrum server the same way in the **Fulcrum** row. BCHN and Knuth both work;
+what each one supports is in [what Pickaxe needs from a node](node-requirements.md).
+
+### Chipnet: try it first
+
+Choose **Chipnet** in the network step to try any of the above with test
+coins that have no value: GPU tokens, ASICs, pools and farms all run there the
+same way ([Mainnet and Chipnet](../README.md#mainnet-and-chipnet)).
 
 More detail: [desktop window](desktop-window.md),
 [updates](updates.md), [ASIC mining](stratum-v2.md), [P2Pool](p2pool.md),

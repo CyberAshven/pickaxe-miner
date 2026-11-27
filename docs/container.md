@@ -11,10 +11,10 @@ starts `pickaxe mine --no-tui`. Persist configuration in `/data` and pass
 normal Pickaxe CLI options after the image name:
 
 ```sh
-docker run --rm -it \\
-  --gpus all \\
-  -v pickaxe-data:/data \\
-  ghcr.io/cyberashven/pickaxe-miner:latest \\
+docker run --rm -it \
+  --gpus all \
+  -v pickaxe-data:/data \
+  ghcr.io/cyberashven/pickaxe-miner:latest \
   --config /data/pickaxe.json mine --no-tui --address 'bitcoincash:YOUR_ADDRESS'
 ```
 
