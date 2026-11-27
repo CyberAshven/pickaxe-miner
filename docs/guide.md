@@ -24,9 +24,23 @@ without a desktop.
    running a pool), network (Mainnet or Chipnet), then the token or mode.
 2. **Open** a saved profile to go straight to its settings, with Start ready.
    **Rename** and **Delete** are beside it.
-3. **Updates** shows whether a newer Pickaxe or P2Pool is out (see step 6).
+3. **Updates** shows whether a newer Pickaxe or P2Pool is out (see step 9).
 
-## 3. Settings and Start
+## 3. Choose what to mine
+
+For GPU mining, the token step lists:
+
+![Choose a token](images/guide/setup-token.png)
+
+1. **PHOTON**: GPU mining with direct token rewards; no fee pot needed.
+2. **ELECTRIC**: GPU mining with a fee pot you fund with plain BCH (its address
+   and QR code show beside the settings and on the dashboard).
+3. **Hash split**: both at once, each with a share of the GPUs that you set on
+   the dashboard ([hash split](hash-split.md)).
+
+ASIC mining and running a pool have their own steps below (6 and 7).
+
+## 4. Settings and Start
 
 ![Settings](images/guide/setup-settings.png)
 
@@ -41,24 +55,27 @@ rows open their lists, where a node or Fulcrum server on this or another
 computer is added with a click. See
 [what Pickaxe needs from a node](node-requirements.md) for BCHN and Knuth.
 
-## 4. The mining dashboard
+## 5. The mining dashboard
+
+This one is a **hash split** session (PHOTON and ELECTRIC). With one token the
+share column is not shown, and the fee pot shows only for ELECTRIC.
 
 ![Mining dashboard](images/guide/dashboard.png)
 
 1. **Pause** stops the GPUs and keeps the session; **Stop** ends it.
 2. **Intensity** sets how hard the GPUs work.
-3. With two tokens, each token's **share** of the GPUs: **−** and **+**.
+3. In a hash split, each token's **share** of the GPUs: **−** and **+**.
 4. ELECTRIC's **fee pot**: send plain BCH to this address (scan the QR code) to
    pay its claims' fees. PHOTON needs no fee pot.
 
 The graphs show the last 10 minutes; **Details** opens more; the events log is
 at the bottom.
 
-## 5. BCH ASICs: the Stratum server
+## 6. BCH ASICs: the Stratum server
 
 Choose **ASIC mining** in step 2, then **Solo** on your own node, or **Join a
-pool**; choose **Running a pool** for a Public Solo Endpoint, a Non-custodial
-Pool or P2Pool v2 ([pool modes](pool.md)).
+pool**. Pickaxe is the Stratum V1 and V2 server your ASICs connect to; it does
+not hash BCH itself.
 
 ![ASIC server](images/guide/asic-workers.png)
 
@@ -68,7 +85,39 @@ Pool or P2Pool v2 ([pool modes](pool.md)).
    allows.
 3. **Stop** stops the server.
 
-## 6. Updates
+## 7. Run a pool for other miners
+
+Choose **Running a pool** in step 2. The settings then start with its **Mode**:
+
+![Run a pool](images/guide/setup-run-p2pool.png)
+
+1. **Mode**, with **<** **>**:
+   - **Public Solo Endpoint**: each miner mines solo, and whoever finds a block
+     takes it.
+   - **Non-custodial Pool**: miners share every block by their work, paid
+     straight from the block, through your own P2Pool that stays separate.
+   - **P2Pool v2**: the same, linked with other P2Pool servers.
+2. **Pool fee**: your operator fee, taken in the block's coinbase.
+3. **Peers**: other P2Pool servers to link with (P2Pool v2).
+4. Under **Advanced**: the **Pickaxe donation** and **P2Pool donation**, the
+   SV1 and SV2 ports, block notices and fallback pools.
+5. **Start** starts the node connection, P2Pool and the server. Miners then
+   connect as in step 6.
+
+More: [pool modes](pool.md), [P2Pool](p2pool.md).
+
+## 8. A GPU farm of several rigs
+
+Turn on **Rig port** under **Advanced** in step 4 on the computer that leads (the
+coordinator). Its dashboard then lists the rigs:
+
+![GPU farm](images/guide/coordinator.png)
+
+1. Each connected rig, with its GPUs, rate and winners.
+2. **Copy** the command a rig runs to join, on the local network or over
+   Tailscale; every rig mines with all its GPUs, and the coordinator claims.
+
+## 9. Updates
 
 ![Updates](images/guide/updates-available.png)
 
@@ -81,4 +130,5 @@ Pool or P2Pool v2 ([pool modes](pool.md)).
 
 More detail: [desktop window](desktop-window.md),
 [updates](updates.md), [ASIC mining](stratum-v2.md), [P2Pool](p2pool.md),
+[GPU farms](farm.md),
 [all guides](README.md).
