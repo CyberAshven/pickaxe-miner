@@ -129,7 +129,7 @@ and, with [Tailscale](https://tailscale.com), from anywhere.
 
 ## How to start
 
-Run `pickaxe` for the setup, or use the command line.
+Double-click `pickaxe-gui` for the window or run `pickaxe` in a terminal: both open the same setup. Or use the command line. A [step-by-step guide with screenshots](docs/guide.md) walks through each.
 
 | To | In the setup (`pickaxe`) | On the command line | Guide |
 |---|---|---|---|
@@ -157,9 +157,9 @@ described under [Chain connections](#chain-connections).
 
 ## Supported platforms
 
-Windows x86_64, Linux x86_64 and Apple Silicon macOS, plus a browser miner (WebAssembly on browser WebGPU).
+Releases are built for Windows (x86_64 and ARM64), Linux (x86_64 and ARM64, also as `.deb` packages for Debian and Ubuntu) and Apple Silicon macOS, each with the desktop window (`pickaxe-gui`) beside the terminal program (`pickaxe`). There is also a browser miner (WebAssembly on browser WebGPU), packages for HiveOS, mmpOS and RaveOS, and a headless Linux x86_64 Docker image ([container guide](docs/container.md)).
 
-Linux and Windows ARM64 (for example Raspberry Pi 5, Ampere servers and Snapdragon laptops) build and pass the tests on GitHub's ARM64 runners; each CI run uploads the ARM64 binaries. They mine through the portable engine (Vulkan, or DirectX 12 on Windows).
+The ARM64 builds (for example Raspberry Pi 5, Ampere servers and Snapdragon laptops) mine through the portable engine (Vulkan, or DirectX 12 on Windows).
 
 | GPU | Engine |
 | --- | --- |
