@@ -1,4 +1,3 @@
-//! #### PR #42, merge-mining v2
 //! A token set (what the server merge-mines now) and an `AuxJob` (one job's
 //! leaves, tree and commitment).
 //!
@@ -67,11 +66,11 @@ pub struct TokenSet {
     easiest: Hash,
     serial: u64,
     dropped: Vec<SetEntry>,
-    /// #### merge-mining v2: tokens with threads (tSAFA), by category.
+    /// Tokens with threads (tSAFA), by category.
     threads: Vec<(Hash, Arc<ThreadChoice>)>,
 }
 
-// #### merge-mining v2: a token with threads
+// A token with threads
 // What: for a token whose vaults are threads (tSAFA), the state each
 // minable thread's leaf binds at the set's height; each job's leaf mines
 // the thread `safa_auxpow::thread_start` gives for its payout hash, or the
@@ -160,7 +159,7 @@ impl TokenSet {
                 .unwrap_or(MAX_HEIGHT);
             Layout::search(&categories, max_height).ok()
         };
-        // #### PR #42: which entries leave a set that does not fit
+        // Which entries leave a set that does not fit
         // What: when the whole set has no layout, entries join highest
         // priority first, and one that does not fit beside those kept so far
         // is left out; the others still join.
@@ -205,7 +204,6 @@ impl TokenSet {
                 (kept, layout, dropped)
             }
         };
-        // #### end PR #42 ####
         let easiest = entries
             .iter()
             .map(|e| e.state.target)
@@ -221,7 +219,7 @@ impl TokenSet {
         })
     }
 
-    /// #### merge-mining v2: the token `category` mines one of `choice`'s
+    /// The token `category` mines one of `choice`'s
     /// threads per job (see `ThreadChoice`); the easiest target covers them
     /// all.
     pub fn with_threads(mut self, category: Hash, choice: ThreadChoice) -> Self {
@@ -278,7 +276,7 @@ pub struct AuxEntry {
     pub target: Hash,
 }
 
-// #### merge-mining v2: what a job's leaves bind
+// What a job's leaves bind
 // What: a token whose covenant verifies splits binds `payout` with `split`
 // in its ext; one without split support binds `plain_payout` with ext 0,
 // its donation (and a fee) taken as work instead. In a BCH donation-work
@@ -334,7 +332,7 @@ impl AuxJob {
                 } else {
                     (terms.plain_payout, Split::NONE)
                 };
-                // #### merge-mining v2: a token with threads mines the
+                // A token with threads mines the
                 // thread its payout hash picks.
                 let state = set
                     .threads(&entry.token.category)
@@ -379,7 +377,7 @@ impl AuxJob {
         }
     }
 
-    /// #### merge-mining v2: the empty commitment, which jobs for other
+    /// The empty commitment, which jobs for other
     /// people's devices carry: no leaf, no win, no token target.
     pub fn empty() -> Self {
         let layout = Layout {
@@ -430,7 +428,7 @@ pub(crate) mod tests {
         TokenState::new([0x22; 32], [0x33; 32], 0x1f10_0000).unwrap()
     }
 
-    /// #### merge-mining v2: the test token as if its covenant verified no
+    /// The test token as if its covenant verified no
     /// split.
     pub(crate) fn plain_test_set() -> TokenSet {
         let token = Box::leak(Box::new(MergeToken {
@@ -463,7 +461,6 @@ pub(crate) mod tests {
         }))
     }
 
-    // #### merge-mining v2
     #[test]
     fn a_set_checks_its_entries_and_a_job_binds_its_payout() {
         // The test token exists only on Chipnet.
@@ -511,7 +508,7 @@ pub(crate) mod tests {
             );
         }
         assert_eq!(job.branch(2), None);
-        // #### merge-mining v2: a token without split support binds the
+        // A token without split support binds the
         // plain payout with ext 0.
         let plain = SetEntry::new(
             Box::leak(Box::new(MergeToken {
@@ -540,7 +537,7 @@ pub(crate) mod tests {
         assert!(empty.wins(&[0; 32]).is_empty());
     }
 
-    // #### PR #42: which entries leave a set that does not fit
+    // Which entries leave a set that does not fit
     #[test]
     fn entries_join_a_set_highest_priority_first_and_sets_are_capped() {
         // A token whose covenant takes no aux branch (h = 0) leaves room
@@ -574,7 +571,7 @@ pub(crate) mod tests {
             .contains("at most 16"));
     }
 
-    // #### PR #42: token wins on the share path
+    // Token wins on the share path
     #[test]
     fn a_share_wins_each_token_whose_target_it_meets() {
         let easy = TokenState::new([0x22; 32], [0x33; 32], 0x2001_0000).unwrap();

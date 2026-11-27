@@ -1,4 +1,4 @@
-//! #### PR #48: PCI-matched WDDM telemetry when a vendor utility is unavailable.
+//! PCI-matched WDDM telemetry when a vendor utility is unavailable.
 //! Only utilization and dedicated memory are reported; power/heat stay unknown.
 
 use super::GpuTelemetry;

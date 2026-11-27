@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { buildFile, buildModule } from './test-build.mjs';
-const { default: init, browser_config, BrowserMiner, BrowserControls, validate_payout_address } = await buildModule('pkg/pickaxe_miner.js');
+const { default: init, browser_config, BrowserMiner, BrowserControls, validate_payout_address, require_browser_token, describe_browser_work } = await buildModule('pkg/pickaxe_miner.js');
 
 await init({ module_or_path: await readFile(buildFile('pkg/pickaxe_miner_bg.wasm')) });
 const main = JSON.parse(browser_config('mainnet'));
@@ -14,7 +14,14 @@ assert.match(main.scriptHash, /^[0-9a-f]{64}$/);
 assert.notDeepEqual(main.endpoints, chip.endpoints);
 assert.ok(main.endpoints.length && chip.endpoints.length);
 assert.throws(() => browser_config('invalid'));
-await assert.rejects(BrowserMiner.create('mainnet', 'invalid', new Uint8Array()));
+require_browser_token('');
+require_browser_token('photon');
+assert.throws(() => require_browser_token('electric'), /pickaxe electric/);
+assert.throws(() => require_browser_token('all'), /hash-split/);
+assert.match(describe_browser_work('mainnet', 0, 0), /donation 4% \(2% \+ 2%\), miner 96%/);
+assert.throws(() => describe_browser_work('mainnet', 2, 0), /cannot lower/);
+assert.throws(() => describe_browser_work('mainnet', 0, 11), /at most 10%/);
+await assert.rejects(BrowserMiner.create('mainnet', 'invalid', new Uint8Array(), '', 0, 0));
 
 // Independently encoded with libauth: P2PKH and token-aware P2PKH, hash [0x42; 20].
 const addresses = {
@@ -40,10 +47,14 @@ for (const [network, valid] of Object.entries(addresses)) {
     const matches = error => String(error).includes(message);
     assert.throws(() => validate_payout_address(network, address), matches);
     // Exercise actual startup too; rejection must happen before GPU initialization.
-    await assert.rejects(BrowserMiner.create(network, address, new Uint8Array()), matches);
+    await assert.rejects(BrowserMiner.create(network, address, new Uint8Array(), '', 0, 0), matches);
     invalidCases++;
   }
 }
+await assert.rejects(
+  BrowserMiner.create('mainnet', addresses.mainnet[0], new Uint8Array(), '', 10, 0),
+  /needs an address/,
+);
 console.log(`Generated WASM configuration, 16 valid address forms and ${invalidCases} invalid startup cases passed.`);
 
 // Exercise the actual shared Rust pacing through WASM with coarse browser timers.

@@ -1,4 +1,3 @@
-//! #### PR #42
 //! The tokens Pickaxe can merge-mine, compiled in per network like PHOTON's
 //! deployments. Both networks' lists are empty: no merge-minable token
 //! exists yet. The Chipnet test token is for tests and the hidden Chipnet
@@ -51,7 +50,7 @@ impl CovenantDeployment {
     }
 }
 
-/// #### merge-mining v2: a merge-mined token's registry row. A token wins
+/// A merge-mined token's registry row. A token wins
 /// on any share whose hash meets its own target; v2 has no block-required
 /// mode (version 03 is reserved for one).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,7 +68,7 @@ pub struct MergeToken {
     pub max_aux_height: u8,
     /// Which token stays when the tree cannot hold them all: higher stays.
     pub priority: u8,
-    /// #### merge-mining v2: whether the covenant verifies the per-win split
+    /// Whether the covenant verifies the per-win split
     /// (`split::Split`). Without it the leaf's ext is 0 and the donation
     /// (and a fee) are taken as work instead.
     pub split: bool,
@@ -104,7 +103,7 @@ pub fn tokens(network: MiningNetwork) -> &'static [MergeToken] {
     }
 }
 
-/// #### merge-mining v2: the token a pool knows by `category` on
+/// The token a pool knows by `category` on
 /// `network`: a registered one, or on Chipnet the test token (which exists
 /// for tests only and is never in a list).
 pub fn known(network: MiningNetwork, category: &Hash) -> Option<&'static MergeToken> {
@@ -138,7 +137,7 @@ pub const TEST_TOKEN: MergeToken = MergeToken {
     split: true,
 };
 
-/// #### PR #42: a token mined by its own 80-byte header instead of BCH
+/// A token mined by its own 80-byte header instead of BCH
 /// (ASIC-exclusive), such as SAFA.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeaderToken {
@@ -189,7 +188,6 @@ pub const HEADER_TEST_TOKEN: HeaderToken = HeaderToken {
 mod tests {
     use super::*;
 
-    // #### PR #42
     // What: no header token is registered on either network; the ASIC test
     // token is Chipnet-only, SAFA's canonical layout with BIP320 rolling,
     // a 1.5% default donation and no covenant.
@@ -209,7 +207,6 @@ mod tests {
         assert!(HEADER_TEST_TOKEN.deployment.is_none());
     }
 
-    // #### merge-mining v2
     #[test]
     fn registries_are_empty_and_the_test_token_is_chipnet_only() {
         assert!(tokens(MiningNetwork::Mainnet).is_empty());
@@ -220,7 +217,7 @@ mod tests {
             super::super::sha256(b"pickaxe merge-mining test token v1")
         );
         TEST_TOKEN.verify().unwrap();
-        // #### merge-mining v2: the test token exercises the split.
+        // The test token exercises the split.
         const { assert!(TEST_TOKEN.split) };
         // Rows that could not be mined or claimed as written are refused.
         let refused: [fn(&mut MergeToken); 3] = [
@@ -235,7 +232,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     #[test]
     fn a_deployment_must_match_its_lock_and_script_hash() {
         use crate::protocol::{

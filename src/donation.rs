@@ -5,7 +5,6 @@ use std::{fmt, str::FromStr};
 
 pub mod bch;
 
-/// #### PR #32
 /// What: a token's donation, as a share of the mining work itself in
 /// hundredths of a percent. Each token has a default a miner can raise or
 /// lower, down to 0%, in Advanced settings: 4% for PHOTON and ELECTRIC, and
@@ -21,6 +20,8 @@ pub struct TokenDonation(u16);
 
 /// The default of every token added after PHOTON and ELECTRIC.
 pub const NEW_TOKEN_DONATION: TokenDonation = TokenDonation(150);
+/// The most a hosting site may take, out of the miner's remaining work.
+pub const MAX_HOST_FEE_BPS: u16 = 1_000;
 /// The most a miner can donate: the miner keeps a share of the work.
 const MAX_TOKEN_DONATION_BPS: u16 = 9_950;
 /// Steps of the Advanced setting: 0.5%.
@@ -157,6 +158,10 @@ impl Scheme {
     /// Integer conservation without intermediate overflow, including u128::MAX.
     pub fn split_reward(self, amount: u128, recipient: Recipient) -> Result<[u128; 3], String> {
         self.validate()?;
+        // A host is paid by mining its own work, never by dividing a reward.
+        if recipient == Recipient::Host {
+            return Err("a host fee is a share of work, not a cut of a reward".into());
+        }
         if recipient != Recipient::Miner {
             let mut amounts = [0; 3];
             amounts[recipient as usize] = amount;
@@ -209,6 +214,8 @@ pub enum Recipient {
     Miner,
     Project,
     Collaborator,
+    /// A site that hosts the miner. Paid from the miner's remaining work.
+    Host,
 }
 impl Recipient {
     pub const ALL: [Self; 3] = [Self::Miner, Self::Project, Self::Collaborator];
@@ -217,15 +224,17 @@ impl Recipient {
 /// Counts completed hashes, retaining allocation across pauses, jobs and keys.
 pub struct Schedule {
     unit: u64,
-    weights: [u64; 3],
+    weights: [u64; 4],
     position: u64,
+    /// Zero unless a hosting site set a fee. Desktop sessions stay at zero.
+    host_bps: u16,
 }
 impl Schedule {
-    /// #### PR #65: change future work without resetting the nonce allocation
+    /// Change future work without resetting the nonce allocation
     /// or changing the recipient of an already reserved GPU batch.
     pub fn set_scheme(&mut self, scheme: Scheme) -> Result<(), String> {
         let old_cycle = self.weights.iter().sum::<u64>() * self.unit;
-        let mut next = Self::new(scheme, self.unit, 0)?;
+        let mut next = Self::with_host(scheme, self.unit, 0, self.host_bps)?;
         let new_cycle = next.weights.iter().sum::<u64>() * next.unit;
         // Preserve progress through the cycle when a different GCD changes
         // its length; toggling rates must not restart the personal-work part.
@@ -236,16 +245,34 @@ impl Schedule {
     }
 
     pub fn new(scheme: Scheme, unit: u64, random: u64) -> Result<Self, String> {
+        Self::with_host(scheme, unit, random, 0)
+    }
+
+    /// `host_bps` comes out of the miner's share. Zero keeps the donation split.
+    pub fn with_host(
+        scheme: Scheme,
+        unit: u64,
+        random: u64,
+        host_bps: u16,
+    ) -> Result<Self, String> {
         scheme.validate()?;
-        let [a, b] = scheme.work().map(u64::from);
-        let weights = [10_000 - a - b, a, b];
+        if host_bps > MAX_HOST_FEE_BPS {
+            return Err("a host fee must be at most 10%".into());
+        }
+        let [project, collaborator] = scheme.work().map(u64::from);
+        let host = u64::from(host_bps);
+        let miner = 10_000 - project - collaborator;
+        if host >= miner {
+            return Err("a host fee must leave the miner a share of the work".into());
+        }
+        let weights = [miner - host, project, collaborator, host];
         let gcd = |mut a: u64, mut b: u64| {
             while b != 0 {
                 (a, b) = (b, a % b);
             }
             a
         };
-        let divisor = gcd(gcd(weights[0], a), b);
+        let divisor = gcd(gcd(gcd(weights[0], project), collaborator), host);
         let weights = weights.map(|weight| weight / divisor);
         let cycle = weights
             .iter()
@@ -257,17 +284,24 @@ impl Schedule {
             unit,
             weights,
             position: random % cycle,
+            host_bps,
         })
     }
     pub fn recipient(&self) -> Recipient {
         let slot = self.position / self.unit;
-        if slot < self.weights[0] {
-            Recipient::Miner
-        } else if slot < self.weights[0] + self.weights[1] {
-            Recipient::Project
-        } else {
-            Recipient::Collaborator
+        let mut covered = 0u64;
+        for (weight, recipient) in self.weights.into_iter().zip([
+            Recipient::Miner,
+            Recipient::Project,
+            Recipient::Collaborator,
+            Recipient::Host,
+        ]) {
+            covered += weight;
+            if slot < covered {
+                return recipient;
+            }
         }
+        Recipient::Miner
     }
     pub fn limit_batch(&self, requested: u32) -> u32 {
         u64::from(requested).min(self.unit - self.position % self.unit) as u32
@@ -294,11 +328,89 @@ pub(crate) fn require_direct_reward_policy(scheme: crate::donation::Scheme) -> R
     Ok(())
 }
 
+fn percent_bps(percent: f64, label: &str) -> Result<u16, String> {
+    if !percent.is_finite() || percent < 0.0 {
+        return Err(format!("{label} must be a percentage"));
+    }
+    let scaled = percent * 100.0;
+    let bps = scaled.round();
+    if (scaled - bps).abs() > 1e-6 || !(0.0..=10_000.0).contains(&bps) {
+        return Err(format!(
+            "{label} must be a percentage with at most two decimal places"
+        ));
+    }
+    Ok(bps as u16)
+}
+
+fn percent_label(bps: u16) -> String {
+    if bps.is_multiple_of(100) {
+        format!("{}%", bps / 100)
+    } else {
+        format!("{}.{:02}%", bps / 100, bps % 100)
+    }
+}
+
+/// Browser work split. A donation of 0 means the token default. Lower is
+/// rejected. Higher adds to the project share. The host percent, at most
+/// 10%, comes out of the miner's remaining share.
+pub fn host_work(
+    scheme: Scheme,
+    default: TokenDonation,
+    donation_percent: f64,
+    host_percent: f64,
+) -> Result<(Scheme, u16), String> {
+    require_direct_reward_policy(scheme)?;
+    let Scheme::Work(shares) = scheme else {
+        return Err("a host fee needs a work donation".into());
+    };
+    let donation = if donation_percent == 0.0 {
+        default
+    } else {
+        let bps = percent_bps(donation_percent, "donation")?;
+        if bps < default.bps() {
+            return Err("a host cannot lower the donation".into());
+        }
+        TokenDonation::try_from(bps)?
+    };
+    let host_bps = percent_bps(host_percent, "host fee")?;
+    if host_bps > MAX_HOST_FEE_BPS {
+        return Err("a host fee must be at most 10%".into());
+    }
+    let scheme = Scheme::Work(donation.work_shares(default, shares));
+    Schedule::with_host(scheme, 1, 0, host_bps)?;
+    Ok((scheme, host_bps))
+}
+
+/// One line a page can show. The percentages are shares of the work.
+pub fn describe_host_work(scheme: Scheme, host_bps: u16) -> String {
+    let [project, collaborator] = scheme.work();
+    let donation = u32::from(project) + u32::from(collaborator);
+    let miner = 10_000u32 - donation - u32::from(host_bps);
+    let donation = if collaborator == 0 {
+        format!("donation {}", percent_label(donation as u16))
+    } else {
+        format!(
+            "donation {} ({} + {})",
+            percent_label(donation as u16),
+            percent_label(project),
+            percent_label(collaborator)
+        )
+    };
+    if host_bps == 0 {
+        format!("Work: {donation}, miner {}.", percent_label(miner as u16))
+    } else {
+        format!(
+            "Work: {donation}, host {}, miner {}.",
+            percent_label(host_bps),
+            percent_label(miner as u16)
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // #### PR #32
     #[test]
     fn a_token_donation_moves_in_half_percent_steps_down_to_zero() {
         let photon = TokenDonation::from_bps(400);
@@ -314,7 +426,7 @@ mod tests {
         assert_eq!(TokenDonation::from_bps(475).adjusted(false).bps(), 450);
         assert_eq!(TokenDonation::from_bps(9_950).adjusted(true).bps(), 9_950);
         assert_eq!(NEW_TOKEN_DONATION.to_string(), "1.50%");
-        // #### 2026-10-24: down to 0%, and no lower.
+        // Down to 0%, and no lower.
         assert_eq!(TokenDonation::from_bps(50).adjusted(false).bps(), 0);
         assert_eq!(TokenDonation::from_bps(0).adjusted(false).bps(), 0);
         assert_eq!("0".parse::<TokenDonation>().unwrap().bps(), 0);
@@ -385,7 +497,7 @@ mod tests {
                 let mut schedule = Schedule::new(scheme, 101, start).unwrap();
                 let period = schedule.weights.iter().sum::<u64>() * schedule.unit;
                 let mut remaining = period;
-                let mut counts = [0u64; 3];
+                let mut counts = [0u64; 4];
                 while remaining > 0 {
                     let count = schedule.limit_batch(37.min(remaining as u32));
                     counts[schedule.recipient() as usize] += u64::from(count);
@@ -408,5 +520,54 @@ mod tests {
         assert!(schedule.record(2).is_err());
         schedule.record(0).unwrap();
         assert_eq!(schedule.position, 4799);
+    }
+
+    #[test]
+    fn a_host_fee_comes_out_of_the_miners_share() {
+        let default = TokenDonation::from_bps(400);
+        let (scheme, host) = host_work(Scheme::Work([200, 200]), default, 0.0, 10.0).unwrap();
+        assert_eq!(scheme, Scheme::Work([200, 200]));
+        assert_eq!(host, 1_000);
+        assert_eq!(
+            describe_host_work(scheme, host),
+            "Work: donation 4% (2% + 2%), host 10%, miner 86%."
+        );
+        let mut schedule = Schedule::with_host(scheme, 100, 0, host).unwrap();
+        let period = schedule.weights.iter().sum::<u64>() * schedule.unit;
+        let mut counts = [0u64; 4];
+        let mut remaining = period;
+        while remaining > 0 {
+            let count = schedule.limit_batch(remaining as u32);
+            counts[schedule.recipient() as usize] += u64::from(count);
+            schedule.record(count).unwrap();
+            remaining -= u64::from(count);
+        }
+        let total = counts.iter().sum::<u64>();
+        assert_eq!(counts[0] * 100 / total, 86);
+        assert_eq!(counts[1] * 100 / total, 2);
+        assert_eq!(counts[2] * 100 / total, 2);
+        assert_eq!(counts[3] * 100 / total, 10);
+        let plain = Schedule::new(Scheme::Work([200, 200]), 100, 0).unwrap();
+        assert_eq!(plain.weights[3], 0);
+        assert_eq!(
+            &plain.weights[..3],
+            &Schedule::with_host(Scheme::Work([200, 200]), 100, 0, 0)
+                .unwrap()
+                .weights[..3]
+        );
+        let (raised, _) = host_work(Scheme::Work([200, 200]), default, 6.0, 0.0).unwrap();
+        assert_eq!(raised, Scheme::Work([400, 200]));
+        assert_eq!(
+            describe_host_work(raised, 0),
+            "Work: donation 6% (4% + 2%), miner 94%."
+        );
+        let (chipnet, _) = host_work(Scheme::Work([400, 0]), default, 0.0, 0.0).unwrap();
+        assert_eq!(
+            describe_host_work(chipnet, 0),
+            "Work: donation 4%, miner 96%."
+        );
+        assert!(host_work(Scheme::Work([200, 200]), default, 2.0, 0.0).is_err());
+        assert!(host_work(Scheme::Work([200, 200]), default, 0.0, 10.5).is_err());
+        assert!(Schedule::with_host(Scheme::Work([200, 200]), 1, 0, 1_001).is_err());
     }
 }

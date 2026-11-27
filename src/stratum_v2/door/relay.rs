@@ -1,4 +1,4 @@
-//! #### Pool modes: one SV2 connection at the door, with the Pickaxe
+//! One SV2 connection at the door, with the Pickaxe
 //! donation mined as work.
 //!
 //! Each device channel opens at P2Pool under its miner's own identity (its
@@ -191,7 +191,7 @@ impl Lane {
         self.channel == channel || (self.group != 0 && self.group == channel)
     }
 
-    // #### Pool modes: a standard channel in a P2Pool group
+    // A standard channel in a P2Pool group
     // What: a pool may put standard channels in a group channel and send
     // the group extended jobs (SV2 does, for a connection that does not
     // require standard jobs). Each standard lane takes its own standard job
@@ -388,7 +388,7 @@ impl Relay {
         }))?))
     }
 
-    // #### Pool modes: a donation lane closes with its device channel
+    // A donation lane closes with its device channel
     // What: when the device closes its channel, the pool closes the
     // device's lane, or the connection ends, the donation lane closes at the
     // pool too (CloseChannel); a donation lane the pool opens after its
@@ -412,7 +412,6 @@ impl Relay {
         Ok(out)
     }
 
-    // #### one donation, the higher rate, at the door
     // What: the miner pays the higher of the server's rate and the rate
     // their login names (`payout::effective_donation`), once; a joining
     // Pickaxe's visible donation channel on the same connection is
@@ -1517,7 +1516,7 @@ mod tests {
         relay.channels[&pool_channel].next_job
     }
 
-    // #### Pool modes: the Pickaxe donation at the door
+    // The Pickaxe donation at the door
     // What: an SV2 device's channel opens at P2Pool under its own identity
     // and, once it has work, a donation lane opens beside it under the
     // donation key's share address. At 100% the device is moved to the
@@ -1790,7 +1789,7 @@ mod tests {
             .collect()
     }
 
-    // #### Pool modes: the Pickaxe donation for a standard channel
+    // The Pickaxe donation for a standard channel
     // What: an SV2 device on a standard channel (some Bitaxe firmware)
     // mines the donation for its share as an extended one does, whether
     // P2Pool sends each standard channel its own jobs or puts both lanes in
@@ -1933,7 +1932,7 @@ mod tests {
         device_standard_job(down[0].clone()).1
     }
 
-    // #### Pool modes: one donation, the higher rate, for standard channels
+    // One donation, the higher rate, for standard channels
     // What: as for extended channels, a standard-channel miner's typed
     // `,pickaxe-donation=0` leaves the server's 2%; a joining Pickaxe's
     // donation channel opened as a standard channel gets no lane and its
@@ -2025,7 +2024,7 @@ mod tests {
         job_id
     }
 
-    // #### Pool modes: a donation lane closes with its device channel
+    // A donation lane closes with its device channel
     // What: the device closes its channel while mining the donation: both
     // its channel and its donation lane close at P2Pool, and nothing more
     // goes on either (P2Pool's late jobs, parents, targets and verdicts
@@ -2111,7 +2110,7 @@ mod tests {
         assert!(relay.pool_frame(job(14, 5, &[1; 8]), T).unwrap().is_empty());
     }
 
-    // #### Pool modes: one donation, the higher rate, at the door
+    // One donation, the higher rate, at the door
     // What: a typed `,pickaxe-donation=0` leaves the server's 2%; a joining
     // Pickaxe's donation channel (its login the donation's address) opens
     // under the donation key's share address and gets no lane of its own;

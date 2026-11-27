@@ -44,14 +44,14 @@ pub struct Cli {
     #[arg(long = "node-rpc", alias = "node", global = true)]
     pub node_rpc: Option<String>,
 
-    /// #### PR #42: the node's ZMQ block notices for the ASIC server:
+    /// The node's ZMQ block notices for the ASIC server:
     /// tcp://HOST:PORT (its zmqpubhashblock) on this computer or the home
     /// network, `auto` (bitcoin.conf's, for a node on this computer; the
     /// default) or `off`. A new block then reaches devices at once.
     #[arg(long = "node-zmq", global = true, value_name = "URL")]
     pub node_zmq: Option<String>,
 
-    /// #### Pool modes: the node's P2P port, HOST:PORT, where your own
+    /// The node's P2P port, HOST:PORT, where your own
     /// P2Pool hears of new blocks from a node without ZMQ notices (Knuth,
     /// BCHD). Default: the node's host with port 8333 (mainnet) or 48333
     /// (Chipnet), used when the node gives no ZMQ notices. With
@@ -59,13 +59,13 @@ pub struct Cli {
     #[arg(long = "node-p2p", global = true, value_name = "HOST:PORT")]
     pub node_p2p: Option<String>,
 
-    /// #### Pool modes: P2Pool's own donation, separate from the Pickaxe
+    /// P2Pool's own donation, separate from the Pickaxe
     /// donation (--donation): 0 to 10 percent in 0.5 steps (default 1,
     /// P2Pool's own default). With `stratum-v2 serve --own-p2pool`.
     #[arg(long, global = true, value_name = "PERCENT")]
     pub p2pool_donation: Option<crate::donation::bch::BchDonation>,
 
-    /// #### Pool modes: run your own P2Pool alone on its own share chain
+    /// Run your own P2Pool alone on its own share chain
     /// (the Non-custodial Pool), its P2P port on this computer only and no
     /// peers. Without it, P2Pool links with other P2Pool nodes (P2Pool
     /// v2). With `stratum-v2 serve --own-p2pool`.
@@ -73,7 +73,7 @@ pub struct Cli {
     pub p2pool_standalone: bool,
 
     /// Fulcrum servers for PHOTON jobs, comma-separated: wss:// or ws://,
-    /// or #### PR #42: a home server over plain TCP (tcp://HOST:PORT, such
+    /// or a home server over plain TCP (tcp://HOST:PORT, such
     /// as tcp://umbrel.local:50001), taken only on this computer or the home
     /// network.
     #[arg(long, global = true)]
@@ -102,7 +102,7 @@ pub struct Cli {
     pub rigs_listen: Option<std::net::SocketAddr>,
 
     /// Mine as a rig of the coordinator at this address; it claims every win.
-    /// Repeat for backup coordinators, tried in order. #### PR #42: the
+    /// Repeat for backup coordinators, tried in order. The
     /// coordinator's one-line address, stratum2+tcp://HOST:PORT/KEY, carries
     /// its key; a bare HOST:PORT takes the next --coordinator-key.
     #[arg(
@@ -130,7 +130,6 @@ pub struct Cli {
     #[arg(long, global = true, requires_all = ["rigs_listen", "address"])]
     pub rigs_only: bool,
 
-    /// #### PR #32
     /// With --rigs-listen: run a public GPU pool, where each rig mines for
     /// the --address it gives and is claimed to it; your fee is a share of
     /// each rig's mining time.
@@ -155,12 +154,11 @@ pub struct Cli {
     pub command: Option<Commands>,
 }
 
-// #### PR #40: parsed once at start, so the server options' size is no cost.
+// Parsed once at start, so the server options' size is no cost.
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum Commands {
     Mine,
-    /// #### PR #40
     /// Show the status of a miner running without a screen, such as a GPU
     /// farm's or pool's coordinator as a service (read-only; same --config).
     Watch,
@@ -181,7 +179,6 @@ pub enum Commands {
         #[command(subcommand)]
         command: StratumV2Command,
     },
-    /// #### PR #42
     /// For farm operating systems (HiveOS, mmpOS, RaveOS): their scripts run
     /// `farm-os mine` with the flight sheet's fields and read
     /// `farm-os stats` (see docs/farm.md).
@@ -189,7 +186,6 @@ pub enum Commands {
         #[command(subcommand)]
         command: FarmOsCommand,
     },
-    /// #### PR #51, #58
     /// ELECTRIC on your GPUs, beside BCH or PHOTON, with the relay fee paid
     /// from a pot you fund, with a dedicated recovery key (see
     /// docs/electric-token.md).
@@ -197,7 +193,6 @@ pub enum Commands {
         #[command(subcommand)]
         command: ElectricCommand,
     },
-    /// #### PR #53
     /// Mine several GPU tokens on the selected GPUs, each for its share of
     /// the time in 5% steps, for example `--share photon=80 --share
     /// electric=20` (see docs/hash-split.md).
@@ -212,12 +207,11 @@ pub enum Commands {
         /// New owner-controlled pot with Max/send; old funded pots remain separate.
         #[arg(long, conflicts_with = "restricted_electric_pot")]
         owner_electric_pot: bool,
-        /// #### PR #65: the signed-claim ELECTRIC pot even while a previous
+        /// The signed-claim ELECTRIC pot even while a previous
         /// funded pot with the same key could still be mined.
         #[arg(long, conflicts_with_all = ["restricted_electric_pot", "owner_electric_pot"])]
         signed_electric_pot: bool,
     },
-    /// #### PR #53
     /// BCH P2Pool as a dependency Pickaxe installs from P2Pool's releases,
     /// keeps updated and runs with your node and payout (see docs/p2pool.md).
     P2pool {
@@ -253,7 +247,6 @@ pub enum Commands {
     Repl,
 }
 
-/// #### PR #53
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum P2poolCommand {
     /// Run P2Pool with --node-rpc, --node-zmq and --address on --network,
@@ -329,7 +322,6 @@ pub enum UpdateCommand {
     },
 }
 
-/// #### PR #51
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum ElectricCommand {
     /// Create/reopen a separate owner-only payout wallet beside the config.
@@ -399,7 +391,7 @@ pub enum ElectricCommand {
     },
 }
 
-/// #### PR #51: another deployment of the same contract, such as your own
+/// Another deployment of the same contract, such as your own
 /// Chipnet deploy (required there) or a redeploy; mainnet defaults to the
 /// published one.
 #[derive(clap::Args, Debug, Clone, Default, PartialEq, Eq)]
@@ -418,7 +410,7 @@ pub struct ElectricDeploymentArgs {
     /// valid BCH address. This does not migrate funds from previous pots.
     #[arg(long, conflicts_with_all = ["legacy_pot", "restricted_pot"])]
     pub owner_pot: bool,
-    /// #### PR #65: the signed-claim pot even while the previous funded pot
+    /// The signed-claim pot even while the previous funded pot
     /// with the same key could still be mined (the default mines that one
     /// until it is migrated).
     #[arg(long, conflicts_with_all = ["legacy_pot", "restricted_pot", "owner_pot"])]
@@ -454,7 +446,7 @@ pub enum StratumV2Command {
     /// Show a running server's workers table, read-only (for example a
     /// service started with --no-tui). Use the same --config as the server.
     Watch,
-    /// #### PR #61: Print the BCH P2Pool share address of a P2PKH address
+    /// Print the BCH P2Pool share address of a P2PKH address
     /// (default: the configured payout address). A P2Pool node with no share
     /// address of its own needs one in --upstream-user, after ",p2p=".
     ShareAddress {
@@ -472,12 +464,11 @@ pub enum StratumV2Command {
         /// BCH donation percentage, 0 to 100 (default 1.5). Defaults to the saved setting.
         #[arg(long)]
         donation: Option<crate::donation::bch::BchDonation>,
-        /// #### PR #40
         /// Mine at a remote SV2 pool instead of your own node: HOST:PORT of
         /// the pool (another Pickaxe server, or a BCH SV2 pool). SV1 devices
         /// connect to --sv1-listen; no node is needed. Repeat for backup
         /// pools, tried in order.
-        /// #### PR #40: HOST:PORT, or the pool's one-line SV2 address with
+        /// HOST:PORT, or the pool's one-line SV2 address with
         /// its key, stratum2+tcp://HOST:PORT/KEY.
         #[arg(long, requires = "sv1_listen")]
         upstream: Vec<String>,
@@ -491,18 +482,16 @@ pub enum StratumV2Command {
         /// payout address.
         #[arg(long, requires = "upstream")]
         upstream_user: Option<String>,
-        /// #### PR #61
         /// Mine at your own BCH P2Pool node, which Pickaxe installs, keeps
         /// updated and runs with --node-rpc, --node-zmq and --address (see
         /// docs/p2pool.md). SV1 devices connect to --sv1-listen. With
         /// --public it is a pool for other people: see --public.
         #[arg(long, requires = "sv1_listen", conflicts_with = "upstream")]
         own_p2pool: bool,
-        /// #### PR #40
         /// Run a public pool: each miner's username is their own payout
         /// address (q or p, optionally with .worker) and the blocks they find
         /// pay them; the Pickaxe donation comes off first, then your fee.
-        /// #### Pool modes: with --own-p2pool, a Non-custodial Pool: miners
+        /// With --own-p2pool, a Non-custodial Pool: miners
         /// share every block by their work through your P2Pool, each under
         /// their own P2PKH (q) address; P2Pool pays your fee.
         #[arg(long, conflicts_with = "upstream")]
@@ -519,26 +508,22 @@ pub enum StratumV2Command {
         /// configured payout address.
         #[arg(long, requires = "public")]
         pool_fee_address: Option<String>,
-        /// #### PR #40
         /// The pool's name, written into the coinbase of every block this
         /// server builds (at most 20 printable characters), such as /MyPool/.
         /// Not with --upstream: the pool there builds the blocks. With
         /// --own-p2pool, P2Pool's pool signature: at most 16 characters.
         #[arg(long, value_name = "TEXT", conflicts_with = "upstream")]
         pool_tag: Option<String>,
-        /// #### PR #40
         /// The share difficulty every device starts at (default 4096), for
         /// farms of fast ASICs; vardiff moves each device from there.
         #[arg(long, value_name = "DIFFICULTY", conflicts_with = "upstream")]
         start_difficulty: Option<u64>,
-        /// #### PR #42
         /// Merge-mines the Chipnet test token at this share difficulty, to
         /// try merge mining with real devices before any token exists;
         /// refused on mainnet. With --upstream it needs --job-declaration
         /// (the pool builds the blocks otherwise). Hidden: it is for tests.
         #[arg(long, value_name = "DIFFICULTY", hide = true)]
         merge_test_token: Option<u64>,
-        /// #### merge-mining v2
         /// Merge-mines tSAFA, the Chipnet test deployment of BCH P2Pool's
         /// SAFA AuxPoW covenant, from this deployment file (JSON), and
         /// claims its wins through Fulcrum. Chipnet only, with this
@@ -551,14 +536,12 @@ pub enum StratumV2Command {
             conflicts_with_all = ["upstream", "merge_test_token", "asic_token", "asic_test_token"]
         )]
         safa_deployment: Option<std::path::PathBuf>,
-        /// #### merge-mining v2
         /// How long after a merge-mined token win its claim may be
         /// broadcast: SECONDS, or MIN-MAX seconds drawn at random for each
         /// claim (default 5-60). Each claim is its own transaction. To hide
         /// where claims come from, route this computer through Tor yourself.
         #[arg(long, value_name = "SECONDS")]
         claim_delay: Option<String>,
-        /// #### PR #42
         /// Serve this node's block templates to SV2 pools, Job Declaration
         /// clients and P2Pool (SV2 Template Distribution) at this address,
         /// such as 0.0.0.0:8442 (mainnet) or 0.0.0.0:48442 (Chipnet), with
@@ -566,7 +549,6 @@ pub enum StratumV2Command {
         /// pool's templates come from its own node.
         #[arg(long, value_name = "ADDRESS", conflicts_with = "upstream")]
         tp_listen: Option<std::net::SocketAddr>,
-        /// #### PR #42
         /// Accept miners' own templates at this public pool (SV2 Job
         /// Declaration) on the SV2 port: `full` checks each declared
         /// template with your node and sends its blocks to your node too,
@@ -582,7 +564,6 @@ pub enum StratumV2Command {
             requires = "public"
         )]
         accept_job_declaration: Option<AcceptJobDeclaration>,
-        /// #### PR #42
         /// Mine at the first --upstream pool with your own node's templates
         /// (SV2 Job Declaration), at a Pickaxe pool that accepts it: `full`
         /// (the flag alone) declares each template with its transactions,
@@ -602,14 +583,12 @@ pub enum StratumV2Command {
         /// commitments are prepared there, using the allocated pool token.
         #[arg(long, value_name = "URL", requires = "job_declaration")]
         p2pool_prepare_api: Option<String>,
-        /// #### PR #42
         /// Take templates from an SV2 Template Provider, tried before your
         /// node: sv2tp://HOST:PORT/KEY, such as another Pickaxe's
         /// --tp-listen. Repeat for more, tried in order. The key may be left
         /// out only for a provider on this computer.
         #[arg(long, value_name = "URL")]
         template_provider: Vec<String>,
-        /// #### PR #42
         /// Solo mining with a pool to fall back on: SV1 devices mine at this
         /// pool (stratum2+tcp://HOST:PORT/KEY) while your node gives no work,
         /// and come back once it has served for 30 seconds. Repeat for more,
@@ -624,7 +603,6 @@ pub enum StratumV2Command {
             conflicts_with = "upstream"
         )]
         fallback_pool: Vec<String>,
-        /// #### PR #42
         /// Mine an ASIC-exclusive token instead of BCH: devices mine its
         /// header-shaped jobs, and no node is needed. Refused until a token
         /// is registered on the network (none is yet).
@@ -644,7 +622,6 @@ pub enum StratumV2Command {
             ]
         )]
         asic_token: Option<String>,
-        /// #### PR #42
         /// Mines the Chipnet ASIC test token (SAFA layout, a simulated
         /// thread) at this share difficulty instead of BCH, to try
         /// ASIC-exclusive mining before any such token exists; refused on
@@ -668,7 +645,7 @@ pub enum StratumV2Command {
     },
 }
 
-/// #### PR #42: how a miner declares its templates to a pool.
+/// How a miner declares its templates to a pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum JobDeclarationMode {
     /// Full-Template: each template with its transactions; the pool checks
@@ -689,7 +666,7 @@ impl JobDeclarationMode {
     }
 }
 
-/// #### PR #42: the Job Declaration modes a public pool accepts.
+/// The Job Declaration modes a public pool accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum AcceptJobDeclaration {
     /// Full-Template: a miner declares each template with its
@@ -703,7 +680,7 @@ pub enum AcceptJobDeclaration {
     Both,
 }
 
-/// #### PR #42: what a farm operating system's scripts run.
+/// What a farm operating system's scripts run.
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum FarmOsCommand {
     /// Print the running miner's statistics in the system's format (from
@@ -722,7 +699,7 @@ pub enum FarmOsCommand {
 }
 
 impl Cli {
-    /// #### Pool modes: --node-p2p, --p2pool-donation and
+    /// --node-p2p, --p2pool-donation and
     /// --p2pool-standalone are your own P2Pool's settings, taken only by
     /// `stratum-v2 serve --own-p2pool`.
     pub fn check_p2pool_flags(&self) -> Result<(), String> {
@@ -749,7 +726,7 @@ impl Cli {
 }
 
 /// Parses command-line arguments into the supported miner commands;
-/// #### PR #42: `farm-os mine ...` becomes Pickaxe's own `mine` first (see
+/// `farm-os mine ...` becomes Pickaxe's own `mine` first (see
 /// `farm_os::mine_argv`).
 pub fn parse() -> Cli {
     let raw: Vec<std::ffi::OsString> = std::env::args_os().collect();
@@ -1019,7 +996,6 @@ mod tests {
         assert_eq!(save.config, Some(PathBuf::from("pickaxe.json")));
     }
 
-    // #### PR #42
     // What: the argv `farm-os mine` rewrites to parses as `mine`, headless,
     // with the rig's coordinator and name; `farm-os stats --os` parses.
     // Look here if: farm_os::mine_argv or the farm-os subcommand changes.
@@ -1188,7 +1164,6 @@ mod tests {
         .unwrap();
         assert_eq!(cli.coordinator, ["192.0.2.1:3340", "192.0.2.2:3340"]);
         assert_eq!(cli.coordinator_key, ["main", "backup"]);
-        // #### PR #32
         // A rig may be named; a coordinator may mine with its rigs only, given
         // where it pays.
         let named = Cli::try_parse_from([
@@ -1226,7 +1201,7 @@ mod tests {
         assert!(
             Cli::try_parse_from(["pickaxe", "mine", "--rigs-only", "--address", "payout"]).is_err()
         );
-        // #### PR #42: a bare address parses; the pairing with its key is
+        // A bare address parses; the pairing with its key is
         // checked when the rig starts (`coordinators` in main.rs).
         assert!(
             Cli::try_parse_from(["pickaxe", "mine", "--coordinator", "192.0.2.1:3340"]).is_ok()
@@ -1294,7 +1269,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     // What: --template-provider repeats, in order.
     // Look here if: the Serve flags change.
     #[test]
@@ -1323,7 +1297,6 @@ mod tests {
         );
     }
 
-    // #### PR #42
     // What: --tp-listen takes an address and cannot be used with --upstream,
     // where the pool's templates come from its own node.
     // Look here if: the Serve flags change.
@@ -1358,7 +1331,6 @@ mod tests {
         .is_err());
     }
 
-    // #### PR #42
     // What: --accept-job-declaration needs --public and alone means both;
     // --job-declaration needs --upstream and alone means full.
     // Look here if: the Serve flags change.
@@ -1456,7 +1428,6 @@ mod tests {
         );
     }
 
-    // #### PR #42
     // What: --asic-test-token and --asic-token mine a token instead of BCH,
     // so they conflict with joining or running a pool, serving templates,
     // Job Declaration, the merge-mining test token, template providers and
@@ -1486,7 +1457,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     // What: --merge-test-token parses with --upstream (the server refuses it
     // there without --job-declaration) and with --upstream and
     // --job-declaration together.
@@ -1523,7 +1493,7 @@ mod tests {
                 }
             })
         ));
-        // #### merge-mining v2: tSAFA from a deployment file, never at a
+        // TSAFA from a deployment file, never at a
         // pool and never with the test token.
         let cli = parse(&["--safa-deployment", "tsafa.json"]).unwrap();
         assert!(matches!(
@@ -1539,7 +1509,7 @@ mod tests {
         args.extend(["--safa-deployment", "tsafa.json"]);
         assert!(parse(&args).is_err());
         assert!(parse(&["--safa-deployment", "a.json", "--merge-test-token", "1"]).is_err());
-        // #### merge-mining v2: the claim broadcast delay.
+        // The claim broadcast delay.
         let cli = parse(&["--claim-delay", "10-20"]).unwrap();
         assert!(matches!(
             cli.command,
@@ -1552,7 +1522,6 @@ mod tests {
         ));
     }
 
-    // #### PR #42
     // What: --fallback-pool needs --sv1-listen, repeats in order, and
     // conflicts with --upstream. #### Pool modes: with --public it parses;
     // the server refuses it unless --own-p2pool (`command::check_pool_flags`).
@@ -1603,7 +1572,6 @@ mod tests {
         .is_ok());
     }
 
-    // #### Pool modes
     // What: --own-p2pool takes --public and --fallback-pool; P2Pool's own
     // settings (--p2pool-donation, --p2pool-standalone, --node-p2p) parse
     // anywhere on the line but go only with serve --own-p2pool.
@@ -1666,7 +1634,6 @@ mod tests {
             .contains("--own-p2pool"));
     }
 
-    // #### PR #40
     #[test]
     fn a_public_pool_takes_a_fee_from_a_chosen_source_and_cannot_also_join_a_pool() {
         let cli = Cli::try_parse_from([
@@ -1728,7 +1695,6 @@ mod tests {
         .is_err());
     }
 
-    // #### PR #40
     #[test]
     fn a_server_names_its_blocks_but_a_pool_member_cannot() {
         let parse = |extra: &[&str]| {
@@ -1821,7 +1787,7 @@ mod tests {
         // its address, so a missing key is found when the server starts.
         assert!(with(&["--sv1-listen", "0.0.0.0:3333"]).is_ok());
         assert!(with(&["--upstream-key", "key"]).is_err());
-        // #### PR #40: at a pool the donation is mining work (#### PR #48),
+        // At a pool the donation is mining work,
         // set as anywhere.
         assert!(with(&[
             "--upstream-key",
@@ -1868,7 +1834,6 @@ mod tests {
         assert!(Cli::try_parse_from(["pickaxe", "stratum-v2", "check-node", "--chipnet"]).is_ok());
     }
 
-    // #### PR #65
     #[test]
     fn the_signed_pot_can_be_chosen_explicitly_but_not_with_another_pot() {
         assert!(Cli::try_parse_from(["pickaxe", "electric", "mine", "--signed-pot"]).is_ok());

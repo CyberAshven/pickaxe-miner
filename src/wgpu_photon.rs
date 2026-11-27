@@ -24,7 +24,7 @@ use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
-// #### PR #22: shared Rust stages for portable GPUs
+// Shared Rust stages for portable GPUs
 // What: stages A, B and C1 (signing), T2 preparation, and the non-T2 C2 and C3
 // come from the shared Rust engine (reference/shared-stages) by default, like
 // the T2 filter (reference/shared-t2). PICKAXE_WGPU_STAGES=wgsl selects the
@@ -106,7 +106,7 @@ const SHARED_STAGES_WGSL: &str =
 const SHARED_STAGES_LOOP_COPIES_WGSL: &str =
     include_str!("../reference/shared-stages/pickaxe_shared_stages_dx12_metal.wgsl");
 
-// #### PR #22: shared stages per shader translator
+// Shared stages per shader translator
 // What: Vulkan (naga's SPIR-V writer) and Chromium browsers (Tint) run the
 // generated shared stages unchanged. DirectX 12 and Metal (naga's HLSL and MSL
 // writers) and other browsers run the copy whose loop values survive naga's
@@ -162,7 +162,7 @@ const WINNER_RECORD_WORDS: usize = 9;
 const WINNER_RECORD_BYTES: usize = WINNER_RECORD_WORDS * 4;
 const WGPU_MIN_LADDER_BATCH: u32 = 1_024;
 pub(crate) const WGPU_REFERENCE_MAX_BATCH: u32 = 524_288;
-// #### PR #22: amortize the portable queue/readback handoff on fast devices.
+// Amortize the portable queue/readback handoff on fast devices.
 // The existing elapsed-time ladder still limits slower GPUs to shorter work.
 // CUDA geometry and the conserved 65,536-candidate signature window are unchanged.
 pub(crate) const WGPU_T2_MAX_BATCH: u32 = crate::gpu_types::PORTABLE_MAX_BATCH_CANDIDATES;
@@ -396,7 +396,6 @@ fn reference_shader_source_for_wgpu() -> Result<String, String> {
 /// Rejects non-hardware WGPU adapters for mining.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn is_hardware_adapter(info: &wgpu::AdapterInfo) -> bool {
-    // #### PR #22
     // CI executes the real kernels on lavapipe. This opt-in exists only in a
     // test binary, requires a software device, and is never a mining fallback.
     #[cfg(test)]
@@ -589,7 +588,7 @@ fn create_bind_group(
     })
 }
 
-// #### PR #22: import the native Rust hash/layout through the pinned compiler.
+// Import the native Rust hash/layout through the pinned compiler.
 // The provenance check and regeneration CI reject separately edited WGSL.
 #[cfg(feature = "shared-rust-t2")]
 fn create_shared_t2_filter(
@@ -743,7 +742,7 @@ impl WgpuPhotonEngine {
             let mut hardware = adapters
                 .into_iter()
                 .filter(|adapter| is_hardware_adapter(&adapter.get_info()));
-            // #### PR #22: GPU tests may name their adapter, because the Vulkan
+            // GPU tests may name their adapter, because the Vulkan
             // order can differ between processes; a named test never runs elsewhere.
             #[cfg(test)]
             let named = std::env::var("PICKAXE_TEST_WGPU_ADAPTER").ok();
@@ -826,7 +825,7 @@ impl WgpuPhotonEngine {
             .await
             .map_err(|error| format!("request WGPU device {}: {error}", adapter_info.name))?;
 
-        // #### PR #22: the shared stages never touch the 34k-line original
+        // The shared stages never touch the 34k-line original
         // module, so it is parsed only for PICKAXE_WGPU_STAGES=wgsl (or the
         // legacy non-shared filter build); startup is seconds shorter.
         let shader = if stages == PortableStages::Wgsl || cfg!(not(feature = "shared-rust-t2")) {
@@ -1358,7 +1357,7 @@ impl WgpuPhotonEngine {
         nonce_base
             .checked_add(candidate_count - 1)
             .ok_or("PHOTON WGPU candidate range crosses the key-rotation boundary")?;
-        // #### PR #32: throttled batches grow the batch ladder too
+        // Throttled batches grow the batch ladder too
         // What: below 100% intensity the search runs a quarter of the
         // recommended batch; that batch's time, scaled to the full batch, now
         // adapts the ladder as a full batch's time does.
@@ -1652,7 +1651,7 @@ pub fn production_wgpu_backends() -> Result<wgpu::Backends, String> {
     )
 }
 
-// #### PR #22: optional DirectX 12 on Windows
+// Optional DirectX 12 on Windows
 // What: PICKAXE_WGPU_API=dx12 runs the portable engine on DirectX 12 instead
 // of Vulkan, compiling shaders with Microsoft's DXC (dxcompiler.dll and
 // dxil.dll beside the executable or on PATH). Vulkan stays the default, and
@@ -1723,7 +1722,7 @@ fn dxc_compiler_path() -> Result<String, String> {
     Ok(path)
 }
 
-/// #### PR #22: an independent CPU check of the portable T2 search
+/// An independent CPU check of the portable T2 search
 /// What: serializer -> GPU signatures and search -> CPU signature, complete
 /// transaction and digest for every deployment, layout, carry and window edge.
 /// Why: native GPU tests and the browser check run this one implementation.
@@ -1981,7 +1980,7 @@ mod tests {
             .set_job(&template_for_key(key), &target, &key)
             .unwrap();
         assert!(engine.t2_active);
-        // #### PR #22: compare the actual shared Rust filter against the current
+        // Compare the actual shared Rust filter against the current
         // 64-lane WGSL filter; keep the historical geometry probe without it.
         let alternate_group_size = if cfg!(feature = "shared-rust-t2") {
             64
@@ -2082,7 +2081,7 @@ mod tests {
         }
     }
 
-    // #### PR #22: pipeline compilation time; clear the driver cache to see
+    // Pipeline compilation time; clear the driver cache to see
     // the cost of a first launch.
     #[test]
     #[ignore = "requires exclusive access to a physical GPU"]
@@ -2126,7 +2125,7 @@ mod tests {
         }
     }
 
-    // #### PR #22: per-stage GPU time of both stage sets on the same GPU and job.
+    // Per-stage GPU time of both stage sets on the same GPU and job.
     // Run with PICKAXE_WGPU_TIMESTAMPS=1; prints mean milliseconds per stage.
     #[test]
     #[ignore = "requires exclusive access to a physical GPU"]
@@ -2322,7 +2321,7 @@ mod tests {
         (key, target, template)
     }
 
-    // #### PR #22: checks each signing stage separately, for either signer.
+    // Checks each signing stage separately, for either signer.
     #[test]
     #[ignore = "requires exclusive access to a physical GPU"]
     fn signing_stages_match_cpu_per_window() {
@@ -2396,7 +2395,7 @@ mod tests {
         );
     }
 
-    // #### PR #22: development check of the shared stages' arithmetic on GPU.
+    // Development check of the shared stages' arithmetic on GPU.
     // Needs `PICKAXE_BUILD_SHARED_STAGES=debug` output; skipped without it.
     #[test]
     #[ignore = "requires exclusive access to a physical GPU"]
@@ -2595,7 +2594,7 @@ mod tests {
         }
     }
 
-    // #### PR #22: optional DirectX 12 on Windows
+    // Optional DirectX 12 on Windows
     #[test]
     fn graphics_api_defaults_to_vulkan_and_offers_dx12_on_windows() {
         use wgpu::Backends;
@@ -2627,7 +2626,7 @@ mod tests {
         assert!(native_wgpu_backends(Some("vulkan"), false, true).is_err());
     }
 
-    // #### PR #22: shared stages per shader translator
+    // Shared stages per shader translator
     #[test]
     fn shared_stages_follow_the_shader_translator() {
         use wgpu::Backends;

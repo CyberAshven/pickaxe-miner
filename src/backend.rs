@@ -139,7 +139,7 @@ pub fn resolve_mining_devices(
     }
 }
 
-// #### PR #58: ELECTRIC uses CUDA or the portable engine, never a CPU fallback.
+// ELECTRIC uses CUDA or the portable engine, never a CPU fallback.
 pub fn resolve_electric_devices(
     prefer: BackendKind,
     selection: &DeviceSelection,
@@ -184,7 +184,7 @@ pub fn mining_gpus() -> Vec<GpuDevice> {
     if !gpus.is_empty() {
         return gpus;
     }
-    // #### PR #32: OpenCL is loaded only when no other engine found a GPU,
+    // OpenCL is loaded only when no other engine found a GPU,
     // such as an older integrated GPU without Vulkan or DirectX 12, or an
     // ARM GPU without Vulkan. A machine whose GPUs another engine drives
     // never loads an OpenCL driver, so a broken one cannot affect it;
@@ -251,7 +251,7 @@ fn select_gpus(
     Ok(selected)
 }
 
-// #### PR #22: every GPU mines once, on its best engine
+// Every GPU mines once, on its best engine
 // What: CUDA, HIP and wgpu each list the GPUs they can drive, so one card can
 // appear in several lists. Entries with the same PCI address are one GPU;
 // when a driver reports no address, the same vendor and name from another
@@ -265,7 +265,7 @@ fn select_gpus(
 // never compete for the same reward, and no card may mine twice.
 // Check: `pickaxe devices` lists each physical GPU once with its engine.
 //
-// #### PR #32: OpenCL comes last for every GPU, so a GPU another engine can
+// OpenCL comes last for every GPU, so a GPU another engine can
 // drive keeps that engine, and one only OpenCL sees (an older integrated GPU
 // without Vulkan or DirectX 12, an ARM GPU) still mines. Two integrated GPUs
 // of one vendor are one GPU when no PCI address tells them apart, because
@@ -476,7 +476,7 @@ fn list_cuda_devices() -> Result<Vec<GpuDevice>, String> {
     if cfg!(target_os = "macos") {
         return Err("CUDA is unavailable on macOS; use the wgpu Metal backend".into());
     }
-    // #### PR #22: a missing NVIDIA driver is an error, not a crash
+    // A missing NVIDIA driver is an error, not a crash
     // What: check that the driver library loads before the first CUDA call.
     // Why: cudarc panics when it cannot load nvcuda.dll or libcuda.so, and
     // auto discovery (the dashboard at startup, `devices`) probes CUDA first,
@@ -506,7 +506,7 @@ fn list_cuda_devices() -> Result<Vec<GpuDevice>, String> {
             backend: BackendKind::Cuda,
             detail: info.detail,
             integrated: false,
-            // #### PR #22: the shipped CUDA kernels are PTX for sm_120, which
+            // The shipped CUDA kernels are PTX for sm_120, which
             // the driver compiles for compute capability 12.0 and newer only.
             // Other NVIDIA GPUs mine on the portable engine instead.
             ready: info.compute >= (12, 0),
@@ -824,7 +824,7 @@ mod tests {
         assert_eq!(BackendKind::parse("wgpu").unwrap(), BackendKind::Wgpu);
     }
 
-    // #### PR #22: a missing NVIDIA driver is an error, not a crash
+    // A missing NVIDIA driver is an error, not a crash
     #[test]
     fn cuda_discovery_without_a_driver_reports_an_error() {
         // Runs where no NVIDIA driver is installed, such as the CI runners.
@@ -1114,7 +1114,7 @@ mod tests {
         assert!(selected.integrated);
     }
 
-    // #### PR #22: every GPU mines once, on its best engine
+    // Every GPU mines once, on its best engine
     #[test]
     fn pci_addresses_parse_in_every_engine_format() {
         let expected = PciAddress {

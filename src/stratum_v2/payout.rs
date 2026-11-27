@@ -1,4 +1,3 @@
-//! #### PR #38
 //! Bind BCH donation amounts to exact coinbase outputs, without changing the
 //! GBT subsidy/fee budget. The setting and recipient are immutable per job.
 
@@ -8,7 +7,6 @@ use crate::{
     tx::{cashaddr_to_coinbase_locking, cashaddr_to_p2pkh_locking},
 };
 
-/// #### PR #40
 /// A public pool: each miner's blocks pay the address they connect with, and
 /// the operator's fee comes off what the Pickaxe donation leaves.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,7 +17,7 @@ pub struct PublicPool {
     pub address: String,
 }
 
-// #### merge-mining v2: login options
+// Login options
 // What: a public pool's username is `ADDRESS[.worker][,key=value]...`. The
 // options come after the first comma: `donation=<percent>` names this
 // miner's Pickaxe donation (0 to 100 in 0.5% steps), as does
@@ -27,7 +25,7 @@ pub struct PublicPool {
 // adapter names it, see `sv1::open`); `p2p=` is BCH P2Pool's share address
 // and is ignored here, and other keys are ignored too. A malformed
 // donation, or two of them, refuses the login.
-// #### one donation, the higher rate: the named rate can raise the
+// The named rate can raise the
 // server's, never lower it (see `effective_donation`).
 // Why: a miner may pay the donation on someone else's server even when its
 // owner set 0; without the option the server's own setting applies.
@@ -41,7 +39,6 @@ pub struct Login {
     pub donation: Option<BchDonation>,
 }
 
-// #### one donation, the higher rate
 // What: a Public Solo Endpoint's (or a pool's) miner pays the higher of the
 // server's Pickaxe donation rate and the rate their login names, once: host
 // 1.5% and a login's 3% is 3%, host 1.5% and a login's 0 is 1.5%, host 0
@@ -61,7 +58,7 @@ pub fn effective_donation(server: BchDonation, login: Option<BchDonation>) -> Bc
     login.map_or(server, |login| login.max(server))
 }
 
-/// #### one donation, the higher rate: whether a login's payout is the
+/// Whether a login's payout is the
 /// Pickaxe donation's own address, as the SV1 adapter's donation channel
 /// opens at a remote pool: that channel's work is the donation.
 pub fn is_donation(network: MiningNetwork, payout: &str) -> bool {
@@ -125,7 +122,7 @@ fn user_payout(network: MiningNetwork, user: &str) -> Result<String, String> {
 }
 
 /// The coinbase's recipients: the miner, the donation and, in a public pool,
-/// its operator (#### PR #40).
+/// its operator.
 pub fn scripts(
     network: MiningNetwork,
     miner: &str,
@@ -165,7 +162,6 @@ pub fn outputs(value: u64, scripts: &[Vec<u8>], policy: BchPayout) -> Vec<(u64, 
     outputs
 }
 
-/// #### PR #42
 /// Who a job pays as a whole: the donation in its work jobs, a public
 /// pool's operator in its fee-work jobs, the miner otherwise; the same
 /// rule as `BchPayout::amounts`. A SAFA forwarder pays this script.
@@ -179,7 +175,7 @@ pub fn beneficiary(scripts: &[Vec<u8>], policy: BchPayout) -> &[u8] {
     }
 }
 
-// #### merge-mining v2: what a job's token leaves bind
+// What a job's token leaves bind
 // What: a split token's leaf pays the miner with the donation's reward share
 // (two thirds of the miner's donation setting) in the donation slot and, on
 // a public pool, the operator's coinbase-mode fee share in the fee slot; a
@@ -236,7 +232,6 @@ pub fn leaf_terms(
 mod tests {
     use super::*;
 
-    // #### PR #40
     #[test]
     fn a_public_pool_username_is_its_payout_address() {
         let network = MiningNetwork::Chipnet;
@@ -258,7 +253,7 @@ mod tests {
         assert!(identity_payout(MiningNetwork::Mainnet, &payout).is_err());
     }
 
-    // #### merge-mining v2: login options
+    // Login options
     #[test]
     fn a_login_may_choose_its_donation() {
         let network = MiningNetwork::Chipnet;
@@ -313,7 +308,6 @@ mod tests {
         assert!(login(",donation=1").is_err());
     }
 
-    // #### one donation, the higher rate
     // What: the higher of the server's rate and the login's applies, once:
     // host 0 and miner 1.5% is 1.5%, host 1.5% and a typed 0 is 1.5%, host
     // 1.5% and miner 3% is 3% (not 4.5%); no option leaves the server's.
@@ -353,7 +347,6 @@ mod tests {
         assert!(!is_donation(MiningNetwork::Mainnet, donation));
     }
 
-    // #### PR #40
     #[test]
     fn a_coinbase_pays_p2pkh_and_p2sh_including_multisig_and_p2sh32() {
         let network = MiningNetwork::Chipnet;
@@ -382,7 +375,7 @@ mod tests {
         assert!(cashaddr_to_coinbase_locking("bchtest:qqqq").is_err());
     }
 
-    // #### merge-mining v2: what a job's token leaves bind
+    // What a job's token leaves bind
     // What: a miner job's split leaf pays the miner with the donation's
     // reward share and the operator's coinbase share in its split; work jobs
     // pay their recipient whole with no split; a token without split

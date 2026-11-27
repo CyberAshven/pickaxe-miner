@@ -36,14 +36,12 @@ use self::source_pool::{
     SourceCapability, SourceCatalog, SourceKind, AUTO_PROBE_LIMIT, DEFAULT_CAPABILITY_TTL_MS,
 };
 
-/// #### PR #32
 /// The backend name a coordinator with no GPU of its own shows: its rigs mine.
 pub const RIGS_ONLY: &str = "rigs only";
 
 const COMMAND_CAP: usize = 16;
 const EVENT_CAP: usize = 32;
 const SUPERVISOR_POLL: Duration = Duration::from_millis(10);
-// #### Baton check cadence
 // What: a Fulcrum session subscribed to the PHOTON covenant reads the live
 // state (tip, baton, tip) as soon as the server reports a change (a claim or
 // a new block), looking for its notices every 100 ms, and otherwise once
@@ -387,7 +385,6 @@ fn broadcast_reports_known(error: &str) -> bool {
     .any(|known| lower.contains(known))
 }
 
-// #### Claims that wait for a block
 // What: a node that refuses a claim's parent because it is not final yet
 // answers with one of these reasons: `non-BIP68-final` (the baton it spends
 // needs a confirmation first), `bad-txns-nonfinal` or `non-final` (a lock
@@ -806,7 +803,7 @@ impl PendingSubmission {
         Self::persist_marker(&Self::parent_accepted_path(journal_path), &self.parent_txid)
     }
 
-    // #### Claims that wait for a block: the journal record
+    // The journal record
     // What: `<journal>.parent-not-final` says the latest send (or node
     // mempool check) of the journaled parent was refused as not final yet,
     // so no server holds it. It is one line, `<parent txid> <tip height>`,
@@ -968,6 +965,7 @@ impl PendingSubmission {
                     crate::donation::Recipient::Miner => "direct_miner",
                     crate::donation::Recipient::Project => "direct_project",
                     crate::donation::Recipient::Collaborator => "direct_collaborator",
+                    crate::donation::Recipient::Host => "direct_host",
                 }
                 .into(),
             ),
@@ -992,10 +990,13 @@ impl PendingSubmission {
             } else {
                 0
             },
-            donation_token_amount: if recipient == crate::donation::Recipient::Miner {
-                0
-            } else {
+            donation_token_amount: if matches!(
+                recipient,
+                crate::donation::Recipient::Project | crate::donation::Recipient::Collaborator
+            ) {
                 amount
+            } else {
+                0
             },
         };
         pending.validate()?;
@@ -1978,7 +1979,6 @@ fn broadcast_classified(
     cfg: &RuntimeConfig,
     raw_tx_hex: &str,
 ) -> Result<String, BroadcastFailure> {
-    // #### PR #42
     // What: a Chipnet claim is broadcast as a mainnet one: Fulcrum or the
     // miner's node by the source preference, falling back to the other.
     // Why: the Chipnet-only shortcut was left from the retired Chipnet
@@ -2047,7 +2047,6 @@ fn preflight_not_final(
     expected_txid: &str,
     raw_tx_hex: &str,
 ) -> Result<Option<String>, String> {
-    // #### PR #42
     // What: a Chipnet claim takes the same node mempool gate as a mainnet
     // one when the miner saved a node.
     // Why: the Chipnet-only skip was left from the retired Chipnet
@@ -2421,7 +2420,7 @@ fn prepare_submission_for_network(
     settlement.ensure_current(cfg.generation_id, live)?;
     let policy = cfg.fee_policy();
     require_direct_reward_policy(policy.scheme)?;
-    // #### PR #32: a public GPU pool's winner pays the rig it came from (or
+    // A public GPU pool's winner pays the rig it came from (or
     // the operator in a fee window); the coordinator checked that address.
     let miner = winner.payout.as_deref().unwrap_or(&cfg.payout_address);
     let payouts = policy.payouts(cfg.network, miner)?;
@@ -2494,7 +2493,7 @@ impl BlockWait {
     }
 }
 
-// #### Claims that wait for a block: on a node
+// On a node
 // What: a node session has no pushed notices, so a claim waiting there reads
 // only the tip height (one `getblockcount`) every 2 s; the transaction lookup,
 // the state read and the resend run once the tip is past the refusal height.
@@ -2568,7 +2567,7 @@ fn resolve_pending_before_search(
     )
 }
 
-// #### Claims that wait for a block: at startup
+// At startup
 // What: a journaled claim refused as not final waits for the next block on
 // the start's own connection and is sent again, as in a running session;
 // waiting for an accepted claim's baton keeps its 2 s cadence. Both waits
@@ -2985,7 +2984,7 @@ pub struct RuntimeGpu {
     pub device: u32,
     pub name: String,
     pub telemetry: GpuTelemetry,
-    /// #### PR #42: the GPU's PCI location, which farm systems match by.
+    /// The GPU's PCI location, which farm systems match by.
     pub pci: Option<crate::backend::PciAddress>,
 }
 
@@ -2994,7 +2993,7 @@ pub struct RuntimeSnapshot {
     pub state: SupervisorState,
     pub network: MiningNetwork,
     pub fee_scheme: crate::donation::Scheme,
-    /// #### PR #32: the token donation in effect and its default, for
+    /// The token donation in effect and its default, for
     /// Advanced settings.
     pub token_donation: crate::donation::TokenDonation,
     pub donation_default: crate::donation::TokenDonation,
@@ -3028,10 +3027,10 @@ pub struct RuntimeSnapshot {
     pub gpu_telemetry: GpuTelemetry,
     /// The rigs this miner coordinates, when it runs with --rigs-listen.
     pub rigs: Option<RigSummary>,
-    /// #### PR #42: where jobs come from now: the miner's node, Fulcrum,
+    /// Where jobs come from now: the miner's node, Fulcrum,
     /// or Fulcrum while the node is down.
     pub job_source: crate::job_source::JobSourceStatus,
-    /// #### PR #42: when mining started, in unix seconds.
+    /// When mining started, in unix seconds.
     pub started_at: u64,
 }
 
@@ -3074,7 +3073,7 @@ pub enum RuntimeEvent {
         height: u32,
     },
     Error(String),
-    /// #### PR #42: the job source fell back to Fulcrum while a node is
+    /// The job source fell back to Fulcrum while a node is
     /// configured, and why.
     NodeDown {
         reason: String,
@@ -3127,7 +3126,7 @@ impl ShutdownSignal {
     }
 }
 
-/// #### PR #61: a runtime's GPUs' hashes a second while each mines (not
+/// A runtime's GPUs' hashes a second while each mines (not
 /// while held), in the order the GPUs were chosen; 0 before one measured.
 #[derive(Clone)]
 pub struct GpuRates(Arc<Mutex<RuntimeSnapshot>>);
@@ -3152,7 +3151,7 @@ pub struct RuntimeSupervisor {
     shutdown: ShutdownSignal,
     worker: Option<JoinHandle<()>>,
     telemetry: LiveTelemetrySampler,
-    /// #### PR #53: the hash split's hold on this miner's GPU search.
+    /// The hash split's hold on this miner's GPU search.
     hold: crate::search::SearchHold,
 }
 
@@ -3164,7 +3163,6 @@ impl RuntimeSupervisor {
         Self::start_on_gpus_with_rigs(cfg, gpus, None)
     }
 
-    /// #### PR #32
     /// As `start_on_gpus`, also coordinating GPU rigs: every job this miner
     /// mines is shared with them, and their checked winners join its own at
     /// the claim path. With no GPUs, the rigs do all the mining.
@@ -3174,7 +3172,6 @@ impl RuntimeSupervisor {
         rigs: Option<RigHub>,
     ) -> Result<Self, String> {
         cfg.ensure_mining_supported()?;
-        // #### PR #32
         // With no GPU here, a coordinator mines through its rigs only
         // (`--rigs-only`); without rigs there is nothing to mine with.
         if gpus.is_empty() && rigs.is_none() {
@@ -3340,12 +3337,12 @@ impl RuntimeSupervisor {
         })
     }
 
-    /// #### PR #53: the hash split's hold on this miner's GPU search.
+    /// The hash split's hold on this miner's GPU search.
     pub fn hold_handle(&self) -> crate::search::SearchHold {
         self.hold.clone()
     }
 
-    /// #### PR #61: each GPU's rate, readable from the hash split's
+    /// Each GPU's rate, readable from the hash split's
     /// scheduler.
     pub fn gpu_rates(&self) -> GpuRates {
         GpuRates(Arc::clone(&self.snapshot))
@@ -3377,7 +3374,6 @@ impl RuntimeSupervisor {
         self.request(|reply| SupervisorCommand::SetIntensity(value, reply))
     }
 
-    /// #### PR #32
     /// Changes the token donation from Advanced settings; it is never lower
     /// than the token's minimum and reaches every GPU and rig at once.
     pub fn set_donation(&self, value: crate::donation::TokenDonation) -> Result<(), String> {
@@ -3481,7 +3477,7 @@ fn run_supervisor(
     rigs: Option<RigHub>,
 ) {
     let mut active_fulcrum_endpoint = initial_session.url.clone();
-    // #### PR #42: back to the miner's own node
+    // Back to the miner's own node
     // What: when the job source falls back to Fulcrum while a node is
     // configured, a watch asks the node again on its own thread (15 s, then
     // doubling to 300 s; a syncing node 2 min, a setting to fix 30 min) and,
@@ -3717,7 +3713,6 @@ fn run_supervisor(
                 Err(TryRecvError::Empty) => break,
             }
         }
-        // #### PR #32
         // A checked winner from a rig starts the same claim as a local one.
         let rig_winner = rigs.as_ref().is_some_and(RigHub::has_winner);
         if should_begin_winner_refresh(
@@ -3776,7 +3771,7 @@ fn run_supervisor(
             // immediately rather than waiting for the next scheduled check.
             next_state_refresh = Instant::now();
         }
-        // #### PR #42: a ready node takes over through the reconnect path.
+        // A ready node takes over through the reconnect path.
         let safe = session.is_some()
             && pending_winners == 0
             && pending_winner.is_none()
@@ -3838,7 +3833,7 @@ fn run_supervisor(
                 };
                 match reconnect_result {
                     Ok((next_session, next_job)) => {
-                        // #### PR #42: the watch follows the installed source.
+                        // The watch follows the installed source.
                         if next_session.is_node() {
                             if node_watch.is_down() {
                                 emit(
@@ -4058,7 +4053,7 @@ fn run_supervisor(
                 let reported_block_wait = claim_block_wait.take().map(|(height, _)| height);
                 match attempt {
                     Ok(SubmissionAttempt::AwaitingBlock(refused_at)) => {
-                        // #### Claims that wait for a block: in a session
+                        // In a session
                         // What: a refusal by node policy is an answer, not a
                         // transport failure, so this session stays: the next
                         // try follows a pushed notice (a block, or another
@@ -4488,7 +4483,6 @@ fn run_supervisor(
             }
         }
 
-        // #### PR #32
         // Rigs mine whatever this miner mines: share each new generation.
         if let Some(rigs) = rigs.as_ref() {
             if rigs.published_generation() != Some(cfg.generation_id) {
@@ -4697,7 +4691,6 @@ fn refresh_native_with_current_proof(
     }
 }
 
-/// #### PR #40
 /// What: the PHOTON job source. With a BCH node configured, the miner's own
 /// node comes first: it finds the baton in its UTXO set, follows it through
 /// its mempool and blocks, and sends the claims. The Fulcrum servers are used
@@ -4762,14 +4755,14 @@ fn connect_job_source(
     }
 }
 
-/// #### PR #42: the job source connected, and why the node was skipped
+/// The job source connected, and why the node was skipped
 /// when a node is configured and the source is Fulcrum.
 struct JobSourceConnection {
     session: ElectrumSession,
     node_error: Option<String>,
 }
 
-/// Refreshes the PHOTON job on the periodic source cadence; #### PR #42:
+/// Refreshes the PHOTON job on the periodic source cadence;
 /// with `skip_native` (the node is down) no node call runs.
 fn refresh_photon_job_on_cadence(
     cfg: &RuntimeConfig,
@@ -4779,7 +4772,7 @@ fn refresh_photon_job_on_cadence(
     epoch: Instant,
     skip_native: bool,
 ) -> Result<PhotonBoundaryRefresh, String> {
-    // #### PR #40: on the miner's own node, its state is the job.
+    // On the miner's own node, its state is the job.
     if canonical.is_node() {
         *native_session = None;
         return canonical
@@ -4789,7 +4782,7 @@ fn refresh_photon_job_on_cadence(
                 route_warning: None,
             });
     }
-    // #### PR #42: skip_native
+    // Skip_native
     // What: while the node is down, the refresh asks Fulcrum alone: no node
     // connect, scan or proof runs on the loop thread; the node watch asks
     // the node on its own thread.
@@ -5074,7 +5067,7 @@ fn winner_matches_live(winner: &VerifiedWinner, generation_id: u64, live: &LiveJ
         && winner.baton_vout == live.baton_vout
 }
 
-// #### PR #35: claim a winner without waiting for other GPUs ####
+// Claim a winner without waiting for other GPUs ####
 // What: once a GPU queues a host-verified winner, the claim starts at once.
 // It no longer waits until every GPU has finished its current batch, and a
 // drain acknowledges exactly the winners it took from the queue.
@@ -5096,7 +5089,6 @@ fn winner_refresh_ready(winner_refresh_pending: bool, session_connected: bool) -
 fn acknowledge_drained(observed: u64, drained: usize) -> u64 {
     observed.saturating_add(drained as u64)
 }
-// #### end PR #35 ####
 
 /// Checks whether winner recovery needs an immediate job refresh.
 fn should_begin_winner_refresh(
@@ -5845,7 +5837,7 @@ mod tests {
                     let winner = sign_winner(&job, cfg.generation_id);
                     let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
                     production_preflight_local(&cfg, &job, &journal, 1_000).unwrap();
-                    // #### PR #32: a public GPU pool's winner for a rig's own
+                    // A public GPU pool's winner for a rig's own
                     // payout is claimed only when the hub vouches for it.
                     if recipient == Recipient::Miner {
                         let mut rig_cfg = cfg.clone();
@@ -6089,7 +6081,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     // What: while the node is down (`skip_native`), a cadence refresh on
     // Fulcrum asks Fulcrum alone: the configured node, a listener that never
     // accepts, sees no connection, and the refresh returns Fulcrum's job.
@@ -7352,7 +7343,7 @@ mod tests {
         assert!(winner_refresh_ready(true, true));
     }
 
-    // #### PR #35 test: a claim does not wait for other GPUs ####
+    // Test: a claim does not wait for other GPUs ####
     #[test]
     fn a_winner_another_gpu_queues_during_a_claim_gets_its_own_check() {
         // Five winners handled so far; the claim drains one, while a second
@@ -7379,7 +7370,6 @@ mod tests {
             0
         ));
     }
-    // #### end PR #35 test ####
 
     #[test]
     /// Checks that submission retry never rebroadcasts parent after it is known.
@@ -8419,7 +8409,6 @@ mod tests {
         assert!(submission_journal_path(MiningNetwork::Mainnet).ends_with("pending-reward.json"));
     }
 
-    // #### PR #42
     // What: the node mempool gate runs the same way on Chipnet and mainnet:
     // skipped without a saved node, and a node's rejection stops the claim
     // on both.
@@ -8605,7 +8594,7 @@ mod tests {
         }
     }
 
-    // #### Claims that wait for a block: tests
+    // Tests
     // What: a claim refused as not final waits for the next block on the same
     // connection and is sent again with the same bytes; another claim taking
     // the baton resolves it as stale; a lost reply keeps the attempted and

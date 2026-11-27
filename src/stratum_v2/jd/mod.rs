@@ -1,4 +1,3 @@
-//! #### PR #42
 //! SV2 Job Declaration for BCH. A Pickaxe public pool accepts miners' own
 //! templates: a miner's Job Declaration client allocates tokens on the
 //! pool's SV2 port, declares each template with its transactions
@@ -21,7 +20,7 @@ use std::time::Duration;
 
 /// Rollable extranonce bytes a work-selection channel gets.
 pub const JD_ROLLABLE: usize = 16;
-/// #### PR #56: the compact layout for pools that grant only 8 rollable
+/// The compact layout for pools that grant only 8 rollable
 /// bytes, as BCH P2Pool does (its share chain stores the extranonce as 4
 /// prefix and 8 rolled bytes): a 2-byte job id, a 2-byte lane and 4 bytes
 /// for each device.

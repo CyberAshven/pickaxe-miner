@@ -1,5 +1,4 @@
 //! Shared intensity pacing and measured active throughput for native and browser miners.
-//! #### PR #22
 //! Keep timer accounting shared while each interface selects its display window.
 //! Check candidate-weighted rates, live intensity changes and oversleep repayment.
 use std::collections::VecDeque;
@@ -10,7 +9,7 @@ const DUTY_WINDOW: Duration = Duration::from_secs(2);
 /// Throttled work runs as one burst then one rest per period of this length.
 const DUTY_PERIOD: Duration = Duration::from_millis(100);
 
-// #### PR #22: share allocation capacity across both launchers. The portable
+// Share allocation capacity across both launchers. The portable
 // engine starts with a tiny adaptive batch; using it as the allocation unit
 // prevents later full batches. Preserve existing CUDA/HIP allocation cadence.
 pub(crate) const fn work_allocation_quantum(
@@ -21,7 +20,7 @@ pub(crate) const fn work_allocation_quantum(
         crate::backend_kind::BackendKind::Wgpu => {
             crate::gpu_types::PORTABLE_MAX_BATCH_CANDIDATES as u64
         }
-        // #### PR #32: the OpenCL engine also adapts its batch size.
+        // The OpenCL engine also adapts its batch size.
         crate::backend_kind::BackendKind::OpenCl => {
             crate::gpu_types::OPENCL_MAX_BATCH_CANDIDATES as u64
         }
@@ -120,7 +119,7 @@ pub(crate) fn duty_rest(compute_time: Duration, intensity: u8) -> Duration {
 }
 
 /// Recent completed throughput, including throttling and network waits.
-// #### PR #22: the browser's primary rate must include intensity pauses and
+// The browser's primary rate must include intensity pauses and
 // network waits. Retain bounded recent completion samples, counted only once,
 // so moving the slider changes the displayed rate and an idle miner reaches zero.
 #[cfg(any(target_arch = "wasm32", test))]

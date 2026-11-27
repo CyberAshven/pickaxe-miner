@@ -1,4 +1,3 @@
-//! #### PR #42
 //! Farm operating systems (HiveOS, mmpOS, RaveOS) run a miner through small
 //! scripts: they start it with the flight sheet's pool, user and password,
 //! and read its statistics for their dashboards. `pickaxe farm-os mine`
@@ -185,7 +184,7 @@ pub fn stats(os: FarmOs, status: Option<&Value>, now: u64) -> String {
     }
 }
 
-/// #### PR #42: `pickaxe farm-os mine` with a flight sheet's fields
+/// `pickaxe farm-os mine` with a flight sheet's fields
 /// What: the farm systems start the miner with `--pool`, `--user`,
 /// `--password`, `--coin`, `--api-port` and `--pool-protocol` (any of them,
 /// in any order); they become `pickaxe mine --no-tui --config P` with the
@@ -242,7 +241,7 @@ pub fn mine_argv(raw: &[String]) -> Result<Vec<String>, String> {
     let mut rig = false;
     for pool in &pools {
         let lower = pool.to_ascii_lowercase();
-        // #### PR #42: mmpOS sends "solo:1" for a coin without a pool.
+        // MmpOS sends "solo:1" for a coin without a pool.
         let host = match lower.split_once(':') {
             Some((host, _)) if !lower.contains("://") => host,
             _ => lower.as_str(),
@@ -321,7 +320,6 @@ mod tests {
         stratum_core::bitcoin::base58::encode_check(&encoded)
     }
 
-    // #### PR #42
     // What: every pool form a flight sheet may hold maps to Pickaxe's flags,
     // failover pools in order; the user's worker names a rig; mmpOS's
     // HOST:PORT takes the key from the password; farm extras pass through.
@@ -438,7 +436,6 @@ mod tests {
         );
     }
 
-    // #### PR #42
     #[test]
     fn mine_argv_refuses_sv1_pools_and_keyless_host_port() {
         let error =
@@ -472,7 +469,6 @@ mod tests {
         })
     }
 
-    // #### PR #42
     // What: the same status reads as HiveOS's two lines, mmpOS's line and
     // RaveOS's line, for a miner, a coordinator and a rig alike.
     // Look here if: a farm system's format changes.
@@ -503,7 +499,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     // What: a stale status reports no rate and no uptime, and a missing one
     // nothing at all.
     #[test]
@@ -521,7 +516,6 @@ mod tests {
         );
     }
 
-    // #### PR #42
     // What: a GPU without a PCI bus is null for HiveOS, its position for
     // mmpOS and left out for RaveOS; it never takes another GPU's bus.
     #[test]

@@ -1,4 +1,4 @@
-//! #### PR #65: a dedicated receiving wallet for ELECTRIC rewards. This
+//! A dedicated receiving wallet for ELECTRIC rewards. This
 //! owner-only key is separate from the fee-pot and GPU search keys.
 use super::recovery::RecoveryKey;
 use crate::config::MiningNetwork;

@@ -1,4 +1,3 @@
-//! #### PR #40
 //! Device reports and controls for the workers, mixed from two sources.
 //! asic-rs (256 Foundation, Apache-2.0) is the dependency: it identifies most
 //! SHA-256 makes and firmwares (Antminer, Whatsminer, Avalon, Bitaxe, NerdAxe,
@@ -81,7 +80,6 @@ pub struct Fleet {
 struct Shared {
     factory: MinerFactory,
     known: Mutex<HashMap<IpAddr, Known>>,
-    /// #### PR #42
     /// What: the address of the device the Device panel opened last; the
     /// poller's passes keep what is known about it.
     /// Why: each pass forgets every device that is not connected, and the
@@ -91,11 +89,11 @@ struct Shared {
     /// Look here if: an action on an offline row fails or takes another path
     /// than the panel listed, or a farm's churn grows the cache.
     held: Mutex<Option<IpAddr>>,
-    /// #### PR #42: what each Avalon listed in its `ascset 0,help` reply,
+    /// What each Avalon listed in its `ascset 0,help` reply,
     /// read when its Device panel identifies it; `None` when it listed
     /// nothing readable.
     avalon_help: Mutex<HashMap<IpAddr, Option<Vec<String>>>>,
-    /// #### PR #42: the device logins in use: the owner's saved ones, and
+    /// The device logins in use: the owner's saved ones, and
     /// one entered on the Device panel until the device accepts or refuses
     /// it.
     logins: Mutex<HashMap<IpAddr, DeviceLogin>>,
@@ -103,7 +101,7 @@ struct Shared {
     store: Mutex<Option<Logins>>,
 }
 
-/// #### PR #42: a login for one device, for the firmware it was saved for;
+/// A login for one device, for the firmware it was saved for;
 /// one without a firmware lets whichever firmware answers use it (a device
 /// that cannot be identified without its login).
 #[derive(Clone)]
@@ -187,7 +185,6 @@ impl Fleet {
         })
     }
 
-    /// #### PR #42
     /// What: what this device offers on its Device panel, from what is
     /// already known about it; no device is asked. Nothing for an address
     /// that is not on the local network.
@@ -202,7 +199,6 @@ impl Fleet {
         controls_of(self.shared.miner(ip).as_deref(), help.as_deref())
     }
 
-    /// #### PR #42
     /// What: identifies the device for its Device panel, within `IDENTIFY`
     /// (10 seconds), and returns what it offers, from that identification
     /// itself. `fresh` asks the device again even if asic-rs knows it (or
@@ -229,7 +225,7 @@ impl Fleet {
                 .ok()
                 .flatten()
         });
-        // #### PR #42: an Avalon lists the settings it accepts (read-only).
+        // An Avalon lists the settings it accepts (read-only).
         let help = miner
             .as_deref()
             .filter(|miner| is_avalon(*miner))
@@ -241,7 +237,7 @@ impl Fleet {
         controls_of(miner.as_deref(), help.as_deref())
     }
 
-    // #### PR #42: device logins
+    // Device logins
     // What: the owner's saved logins (`<config>.sv2-logins.json`) are loaded
     // at start, and a login entered on the Device panel is used at once and
     // saved once the device accepts it. Identification uses the login: for
@@ -317,9 +313,8 @@ impl Fleet {
         }
         Ok(())
     }
-    // #### end PR #42 ####
 
-    // #### PR #42: a device's pools
+    // A device's pools
     // What: reads a device's pools when its Device panel asks (never while
     // polling), and writes a confirmed plan: through asic-rs where it sets
     // pools for the firmware, otherwise Pickaxe's own Avalon (`setpool`, with
@@ -450,7 +445,6 @@ impl Fleet {
             }
         }
     }
-    // #### end PR #42 ####
 
     /// Runs one confirmed action and describes the device's answer: through
     /// asic-rs where it supports the action, otherwise Pickaxe's own code.
@@ -460,7 +454,7 @@ impl Fleet {
         }
         match (self.through_asic_rs(ip, action), &self.runtime) {
             (Some(miner), Some(runtime)) => run_within_answer(runtime, &*miner, action),
-            // #### PR #42: fan and power settings asic-rs does not send for
+            // Fan and power settings asic-rs does not send for
             // this device go to Pickaxe's own Avalon or AxeOS commands.
             _ => match (
                 is_setting(action),
@@ -509,7 +503,7 @@ impl Shared {
         }
     }
 
-    /// #### PR #42: what an Avalon listed in its `ascset 0,help` reply;
+    /// What an Avalon listed in its `ascset 0,help` reply;
     /// `None` when it has not been asked or listed nothing readable.
     fn avalon_help(&self, ip: IpAddr) -> Option<Vec<String>> {
         self.avalon_help.lock().ok()?.get(&ip).cloned().flatten()
@@ -521,7 +515,7 @@ impl Shared {
         }
     }
 
-    /// #### PR #42: the Device panel's device, kept through polls.
+    /// The Device panel's device, kept through polls.
     fn hold(&self, ip: IpAddr) {
         if let Ok(mut held) = self.held.lock() {
             *held = Some(ip);
@@ -553,7 +547,7 @@ impl Shared {
             Some(Known::Unknown(since)) if !fresh && since.elapsed() < RETRY => return None,
             _ => (),
         }
-        // #### PR #42: with the owner's login when there is one.
+        // With the owner's login when there is one.
         let login = self
             .logins
             .lock()
@@ -597,7 +591,6 @@ impl Shared {
     }
 }
 
-/// #### PR #42
 /// What a device offers on its Device panel.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeviceControls {
@@ -611,17 +604,17 @@ pub struct DeviceControls {
     pub model: Option<String>,
     /// The one-shot actions, each sent only after the user confirms it.
     pub actions: Vec<DeviceAction>,
-    /// #### PR #42: the fan setting offered: automatic, or a percentage in
+    /// The fan setting offered: automatic, or a percentage in
     /// this range; none when the device offers no fan setting.
     pub fan: Option<FanRange>,
-    /// #### PR #42: how power is set, beyond Avalon work-level steps.
+    /// How power is set, beyond Avalon work-level steps.
     pub power: Option<PowerSetting>,
-    /// #### PR #42: how many pools the device holds, when its pools can be
+    /// How many pools the device holds, when its pools can be
     /// read and changed; none otherwise.
     pub pools: Option<usize>,
 }
 
-/// #### PR #42: a device's pools, read on the Device panel's request.
+/// A device's pools, read on the Device panel's request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DevicePools {
     /// In the device's order; the first is its main pool.
@@ -643,14 +636,14 @@ const KEEPS_POOL_PASSWORDS: [&str; 6] = [
     "SealMiner Stock",
 ];
 
-/// #### PR #42: the fan percentages a device accepts.
+/// The fan percentages a device accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FanRange {
     pub min: u8,
     pub max: u8,
 }
 
-/// #### PR #42: how a device's power is set.
+/// How a device's power is set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PowerSetting {
     /// Named modes: Low, Normal and High.
@@ -668,7 +661,7 @@ const NAMED_MODES: [&str; 2] = ["AntMiner Stock", "WhatsMiner Stock"];
 /// none (ePIC and Proto need one).
 const AUTO_FAN_TARGET_C: f64 = 65.0;
 
-/// #### PR #42: what decides a device's fan and power settings.
+/// What decides a device's fan and power settings.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Capabilities {
     own: Option<OwnApi>,
@@ -690,7 +683,7 @@ impl Capabilities {
     }
 }
 
-// #### PR #42: fan and power settings on the Device panel
+// Fan and power settings on the Device panel
 // What: the settings a device offers. Avalons: Canaan's fan (15% to 100%)
 // and work modes, each when the device's `ascset 0,help` lists it (`fan-spd`,
 // `workmode`) or lists nothing readable, so the device has the last word;
@@ -731,7 +724,6 @@ fn settings_offered(
     }
 }
 
-/// #### PR #42
 /// What: a factory that logs in with the owner's login: for the firmware it
 /// was saved for, or for every firmware while it has none.
 /// Why: asic-rs hands an identified miner its login only through the
@@ -747,7 +739,7 @@ fn factory_with(firmware: Option<&str>, auth: &MinerAuth) -> MinerFactory {
         )
 }
 
-/// #### PR #42: asic-rs's pools as the panel shows them: the first group, in
+/// Asic-rs's pools as the panel shows them: the first group, in
 /// order, with the passwords its pool settings hold where the firmware
 /// reports them, else "x".
 fn asic_rs_pools(
@@ -782,7 +774,7 @@ fn asic_rs_pools(
         .collect()
 }
 
-/// #### PR #42: what a pool change does on this firmware beyond the list.
+/// What a pool change does on this firmware beyond the list.
 fn pool_notes(firmware: &str) -> Vec<&'static str> {
     match firmware {
         "LuxOS" => vec!["LuxOS removes all its pool groups, then adds this one."],
@@ -793,7 +785,7 @@ fn pool_notes(firmware: &str) -> Vec<&'static str> {
     }
 }
 
-/// #### PR #42: what a firmware's login asks for.
+/// What a firmware's login asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoginShape {
     /// The firmware has no login Pickaxe uses.
@@ -851,7 +843,6 @@ fn is_setting(action: DeviceAction) -> bool {
             | DeviceAction::PowerMode(_)
     )
 }
-// #### end PR #42 ####
 
 /// What a device offers: what asic-rs supports for its make and firmware,
 /// plus Avalon work levels; Pickaxe's own actions for a device asic-rs has
@@ -879,7 +870,7 @@ fn controls_of(miner: Option<&dyn Miner>, help: Option<&[String]>) -> DeviceCont
     }
     let info = miner.get_device_info();
     let (fan, power) = settings_offered(&Capabilities::of(miner), help);
-    // #### PR #42: pools, through asic-rs or Pickaxe's own Avalon and AxeOS
+    // Pools, through asic-rs or Pickaxe's own Avalon and AxeOS
     // commands.
     let pools = match own_api(miner) {
         Some(OwnApi::Avalon) => Some(3),
@@ -899,7 +890,6 @@ fn controls_of(miner: Option<&dyn Miner>, help: Option<&[String]>) -> DeviceCont
 
 fn supports(miner: &dyn Miner, action: DeviceAction) -> bool {
     match action {
-        // #### PR #42
         // What: Restart on any Avalon goes to Pickaxe's own Canaan reboot
         // (`ascset 0,reboot,0`, see `device_api::control`), not to asic-rs.
         // Why: asic-rs's Avalon restart sends cgminer's `restart`, which
@@ -914,7 +904,7 @@ fn supports(miner: &dyn Miner, action: DeviceAction) -> bool {
         DeviceAction::LocateOn | DeviceAction::LocateOff => miner.supports_set_fault_light(),
         // Work levels are Pickaxe's own Canaan commands.
         DeviceAction::LowerPower | DeviceAction::RaisePower => false,
-        // #### PR #42: fan and power settings asic-rs sets for this firmware
+        // Fan and power settings asic-rs sets for this firmware
         // (see `settings_offered`); Avalons, Bitaxes and NerdAxes use
         // Pickaxe's own commands.
         DeviceAction::FanAuto | DeviceAction::FanPercent(_) => {
@@ -941,7 +931,6 @@ fn is_avalon(miner: &dyn Miner) -> bool {
         .starts_with("avalon")
 }
 
-/// #### PR #42
 /// What: runs one action through asic-rs within `ANSWER`, with the time
 /// limit made inside the runtime, in the async block it runs.
 /// Why: tokio's timer panics when it is made outside a runtime ("there is no
@@ -969,7 +958,7 @@ async fn run(miner: &dyn Miner, action: DeviceAction) -> Result<String, String> 
         DeviceAction::LowerPower | DeviceAction::RaisePower => {
             return Err("this action is not sent through asic-rs".into())
         }
-        // #### PR #42: fan and power settings through asic-rs.
+        // Fan and power settings through asic-rs.
         DeviceAction::FanAuto => {
             // Keep the device's own target temperature when it has one.
             let target = match miner.get_fan_config().await {
@@ -1178,7 +1167,7 @@ mod tests {
     fn unidentified_devices_offer_pickaxes_own_actions_and_public_ones_none() {
         let fleet = Fleet::new();
         let ip: IpAddr = "192.168.7.9".parse().unwrap();
-        // #### PR #42: `controls` (no device is asked) replaces `actions`.
+        // `controls` (no device is asked) replaces `actions`.
         assert_eq!(
             fleet.controls(ip),
             DeviceControls {
@@ -1197,7 +1186,7 @@ mod tests {
         let stop = AtomicBool::new(false);
         let reports = fleet.poll(&[(1, "8.8.8.8".parse().unwrap())], &stop);
         assert_eq!(reports, vec![(1, None)]);
-        // #### PR #42: nor identified, even freshly, and they offer nothing.
+        // Nor identified, even freshly, and they offer nothing.
         for other in ["8.8.8.8", "127.0.0.1"] {
             let started = Instant::now();
             let ip: IpAddr = other.parse().unwrap();
@@ -1209,7 +1198,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     // What: the device the Device panel identified stays known through the
     // poller's passes, which ask only connected devices, so a confirmed
     // action on an offline row goes the way the panel listed; a device no
@@ -1276,7 +1264,6 @@ mod tests {
         );
     }
 
-    // #### PR #42
     // What: a login is used for its own firmware only (or for every firmware
     // while it has none), a firmware asks for the login it uses, and
     // set_login forgets what was identified at the address.
@@ -1328,7 +1315,6 @@ mod tests {
         assert!(fleet.shared.logins.lock().unwrap().is_empty());
     }
 
-    // #### PR #42
     // What: the fan and power settings each kind of device offers, and that
     // an Avalon's go to Pickaxe's own commands, never through asic-rs.
     // Look here if: settings_offered, supports or own_api changes.
@@ -1431,7 +1417,6 @@ mod tests {
         assert_eq!((controls.fan, controls.power), (avalon_fan, None));
     }
 
-    // #### PR #42
     // What: Restart on an Avalon (A-series, Nano and Home Q) is never sent
     // through asic-rs, but is still offered, and Pickaxe's own Restart sends
     // Canaan's reboot, byte for byte.
@@ -1458,7 +1443,7 @@ mod tests {
             assert_eq!(controls.actions[0], DeviceAction::Restart);
             assert!(controls.actions.contains(&DeviceAction::RaisePower));
             assert_eq!(controls.firmware.as_deref(), Some("AvalonMiner Stock"));
-            // #### PR #42: make and model as a report names them.
+            // Make and model as a report names them.
             let info = miner.get_device_info();
             assert_eq!(
                 controls.model,

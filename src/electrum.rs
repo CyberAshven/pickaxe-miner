@@ -76,7 +76,6 @@ pub struct ElectrumSession {
     notice: bool,
 }
 
-/// #### PR #40
 /// Where a session's answers come from: a Fulcrum server over its WebSocket,
 /// or the miner's own BCH node over JSON-RPC ("mining is for nodes").
 enum Link {
@@ -89,7 +88,7 @@ enum Link {
         endpoint: String,
         photon: Box<crate::node::NativePhotonSession>,
     },
-    /// #### PR #42: a home Fulcrum server over plain TCP, one JSON-RPC
+    /// A home Fulcrum server over plain TCP, one JSON-RPC
     /// request per line (only to private addresses; see the configuration).
     /// `buf` keeps bytes received after the last complete line.
     Tcp {
@@ -99,12 +98,10 @@ enum Link {
     },
 }
 
-/// #### PR #40
 /// How many recent blocks a node without a transaction index searches for a
 /// transaction by id; claims looked up this way are recent.
 const NODE_RECENT_BLOCKS: u64 = 24;
 
-/// #### PR #40
 /// The Fulcrum methods the miner uses, answered by a BCH node with standard
 /// RPCs (no transaction index needed).
 pub(crate) fn node_rpc(endpoint: &str, method: &str, params: &Value) -> Result<Value, String> {
@@ -117,7 +114,6 @@ pub(crate) fn node_rpc(endpoint: &str, method: &str, params: &Value) -> Result<V
                 "node"
             ])
         }),
-        // #### Knuth compatibility
         // What: a node whose getmempoolinfo has no mempoolminfee is answered
         // with its getnetworkinfo relayfee in that field.
         // Why: a node that reports no dynamic minimum enforces its static
@@ -157,7 +153,6 @@ pub(crate) fn node_rpc(endpoint: &str, method: &str, params: &Value) -> Result<V
     }
 }
 
-/// #### PR #40
 /// A transaction's bytes from a node without a transaction index: from its
 /// mempool; else from the block holding one of its unspent outputs; else from
 /// one of the last blocks. `None` when none of them has it.
@@ -246,7 +241,6 @@ impl ElectrumSession {
         ))
     }
 
-    /// #### PR #40
     /// Connects to the miner's own BCH node(s), in order. The PHOTON baton is
     /// taken from `known` (the job being mined, or a Fulcrum server's answer)
     /// once the node confirms it, and otherwise found in the node's UTXO set
@@ -279,7 +273,7 @@ impl ElectrumSession {
         })
     }
 
-    /// #### PR #40: whether this session is the miner's own node.
+    /// Whether this session is the miner's own node.
     pub fn is_node(&self) -> bool {
         matches!(self.link, Link::Node { .. })
     }
@@ -317,7 +311,7 @@ impl ElectrumSession {
         }
     }
 
-    /// #### PR #42: connects to a Fulcrum server over plain TCP
+    /// Connects to a Fulcrum server over plain TCP
     /// (`tcp://HOST:PORT`), with the same 15 s timeouts as WebSocket.
     fn connect_tcp(url_str: &str, deployment: &'static PhotonDeployment) -> Result<Self, String> {
         use std::net::ToSocketAddrs;
@@ -359,7 +353,7 @@ impl ElectrumSession {
         if url_str.len() > 6 && url_str[..6].eq_ignore_ascii_case("tcp://") {
             return Self::connect_tcp(url_str, deployment);
         }
-        // #### PR #42: through rustls (see `tls`).
+        // Through rustls (see `tls`).
         let (ws, _resp) = crate::tls::websocket(url_str)?;
 
         match ws.get_ref() {
@@ -472,7 +466,6 @@ impl ElectrumSession {
         }
     }
 
-    /// #### Live-state notices
     /// What: subscribes this Fulcrum session to a script hash, once. The
     /// server then pushes a notice whenever the script's outputs change, and
     /// each `blockchain.headers.subscribe` call already brings notices of new
@@ -525,7 +518,7 @@ impl ElectrumSession {
 
     /// Fetches the authoritative live PHOTON baton snapshot.
     pub fn fetch_live_snapshot(&mut self) -> Result<LiveStateSnapshot, String> {
-        // #### PR #40: the node follows its baton from its own state.
+        // The node follows its baton from its own state.
         if let Link::Node { photon, .. } = &mut self.link {
             return photon.refresh();
         }
@@ -567,7 +560,7 @@ impl ElectrumSession {
     }
 }
 
-/// #### PR #42: one request over a plain-TCP Electrum link: a line out,
+/// One request over a plain-TCP Electrum link: a line out,
 /// then lines in until the answer with its id. Notices on the way set
 /// `notice`; a partial line stays in `buf` for the next read.
 fn tcp_rpc(
@@ -994,7 +987,6 @@ mod tests {
         })));
     }
 
-    // #### PR #40
     /// A scripted BCH node: answers each JSON-RPC call in order, checking its
     /// method, with a result or an RPC error.
     fn scripted_node(
@@ -1044,7 +1036,6 @@ mod tests {
         (format!("http://{address}"), server)
     }
 
-    // #### PR #42
     // What: a Fulcrum server over plain TCP (one JSON-RPC line each way, a
     // notification skipped) gives the PHOTON job as a WebSocket one does.
     // Look here if: connect_tcp or tcp_rpc changes.
@@ -1121,7 +1112,6 @@ mod tests {
         assert!(closed, "the closed link was not reported");
     }
 
-    // #### Live-state notices
     // What: a subscribed session reports a change the server pushes later,
     // once, even when the notice arrives in two pieces.
     // Look here if: take_change or drain_tcp changes.
@@ -1191,7 +1181,6 @@ mod tests {
         server.join().unwrap();
     }
 
-    // #### Knuth compatibility
     // What: a node's getmempoolinfo without mempoolminfee (Knuth 1.7.0) gives
     // the node's relayfee as the minimum; one that has the field keeps it.
     // Look here if: mining through a node stops at the fee check.
@@ -1210,7 +1199,6 @@ mod tests {
         server.join().unwrap();
     }
 
-    // #### PR #40
     #[test]
     fn a_node_answers_the_miners_fulcrum_calls() {
         let (node, server) = scripted_node(vec![
@@ -1247,7 +1235,6 @@ mod tests {
         server.join().unwrap();
     }
 
-    // #### PR #40
     #[test]
     fn a_node_without_a_transaction_index_finds_recent_and_unspent_transactions() {
         let txid = "cd".repeat(32);
@@ -1300,7 +1287,6 @@ mod tests {
         server.join().unwrap();
     }
 
-    // #### PR #40
     /// Opt-in, with a synced node: `PICKAXE_TEST_NODE_URL=http://USER:PASS@HOST:PORT`
     /// (Chipnet) starts PHOTON from the node alone, by its UTXO-set scan, reads
     /// the job and the baton's transaction back through the miner's session,

@@ -1,4 +1,3 @@
-//! #### PR #42, merge-mining v2
 //! The commitment: coinbase output 0, value 0, an `OP_RETURN` of 42 bytes.
 //!
 //! ```text
@@ -155,7 +154,7 @@ pub fn output_zero(coinbase: &[u8]) -> Option<&[u8]> {
     coinbase.get(head..head + OUTPUT_LEN)
 }
 
-/// #### merge-mining v2: the own-root check
+/// The own-root check
 /// What: before devices hash a job, the coinbase they will hash must carry
 /// exactly `expected` as output 0, after a fixed-shape head.
 /// Why: Pickaxe merge-mines only its own root; a coinbase whose output 0 is
@@ -175,7 +174,6 @@ pub fn check_own_root(coinbase: &[u8], expected: &AuxCommitment) -> Result<(), &
 mod tests {
     use super::*;
 
-    // #### merge-mining v2
     // What: output 0's bytes for a sample root; every fixed byte is checked.
     // Look here if: the commitment layout changes.
     #[test]
@@ -227,7 +225,7 @@ mod tests {
         assert!(AuxCommitment::parse(&tall).is_some());
     }
 
-    // #### merge-mining v2: the empty commitment (golden vector, repeated in
+    // The empty commitment (golden vector, repeated in
     // docs/merge-mining.md)
     #[test]
     fn the_empty_commitment_has_a_zero_root_height_and_salt() {
@@ -259,7 +257,7 @@ mod tests {
         }
     }
 
-    // #### merge-mining v2: the fixed-shape head and the own-root check
+    // The fixed-shape head and the own-root check
     #[test]
     fn output_zero_follows_the_fixed_shape_head() {
         let commitment = AuxCommitment {

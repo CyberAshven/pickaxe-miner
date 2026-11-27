@@ -1,9 +1,7 @@
-//! #### PR #38
 //! SV1 firmware adapter over the same authenticated SV2 server. It translates
 //! jobs and shares using SRI; it never constructs payouts or accepts a share
 //! without the upstream validator. Plain SV1 belongs on a trusted mining LAN.
 //!
-//! #### PR #40
 //! The upstream can also be a remote SV2 pool (`Upstream::remote`): another
 //! Pickaxe server, or a BCH SV2 pool such as SoloFury or LoneStrike's stack,
 //! so SV1 firmware mines there over an encrypted, pinned link with no local
@@ -51,14 +49,13 @@ const DEADLINE: Duration = Duration::from_secs(10);
 /// A remote pool's verdict on a share is counted if it arrives within this
 /// time; later or missing verdicts are dropped without closing the device.
 const REMOTE_VERDICT: Duration = Duration::from_secs(120);
-/// #### PR #48: donation shares in a row the pool refuses, or never answers
+/// Donation shares in a row the pool refuses, or never answers
 /// within `REMOTE_VERDICT`, before the adapter stops donating at that pool.
 pub(super) const DONATION_REFUSALS: u32 = 8;
 /// The rate a device declares when its channel opens at a remote pool, which
 /// sets the pool's first difficulty: 1 TH/s, about one Bitaxe. Pools then
 /// adjust it from the shares.
 const REMOTE_NOMINAL_HASHRATE: f32 = 1e12;
-/// #### PR #40
 /// At a remote pool the adapter owns the device's extranonce: extranonce1 is
 /// four bytes it picks and extranonce2 the next four the device rolls,
 /// together the channel's eight miner bytes, while the pool's channel prefix
@@ -73,23 +70,22 @@ const DONATION_JOBS: u32 = 0x8000_0000;
 /// The request ID that opens the donation channel.
 const DONATION_REQUEST: u32 = 2;
 
-/// #### PR #40
 /// Where the BCH donation's work goes at a remote pool: a second channel at
 /// the same pool under the donation address, for the donation's share of
-/// mining work (#### PR #48: accepted shares weighted by difficulty). The
+/// mining work (accepted shares weighted by difficulty). The
 /// rate is the Advanced setting, read live.
 #[derive(Clone, Debug)]
 pub struct DonationRoute {
     pub identity: String,
     pub rate: Arc<RwLock<BchDonation>>,
-    /// #### PR #61: the identity asked for once if the pool refuses
+    /// The identity asked for once if the pool refuses
     /// `identity`: BCH P2Pool nodes differ in whether each miner names a
     /// share address (`,p2p=`).
     pub fallback: Option<String>,
 }
 
 impl DonationRoute {
-    /// #### PR #67: the route at a P2Pool node that needs each miner's share
+    /// The route at a P2Pool node that needs each miner's share
     /// address, once the device's own channel needed one: the donation names
     /// its share address too, with the bare address as its fallback.
     fn naming_share(&self) -> Self {
@@ -111,18 +107,17 @@ impl DonationRoute {
     }
 }
 
-/// #### PR #42: how long the preferred source must serve devices before
+/// How long the preferred source must serve devices before
 /// sessions on a fallback pool end, so devices come back to it.
 pub const RETURN_AFTER: Duration = Duration::from_secs(30);
 
-/// #### PR #42
 /// The source devices should mine on whenever it can serve them: this
 /// server's own listener, on the miner's node or under its Job Declaration
 /// plan. The server marks it; sessions at a fallback pool watch it.
 #[derive(Debug)]
 pub struct Preferred {
     healthy_since: Mutex<Option<Instant>>,
-    /// #### Pool modes: since when it has served no work, if it is down.
+    /// Since when it has served no work, if it is down.
     down_since: Mutex<Option<Instant>>,
     return_after: Duration,
 }
@@ -162,7 +157,7 @@ impl Preferred {
         }
     }
 
-    /// #### Pool modes: whether the source has served no work for the
+    /// Whether the source has served no work for the
     /// solo fallback's grace (`server::TEMPLATE_RECOVERY_GRACE`): devices
     /// then leave it and skip it for the fallback pools. Never before it
     /// was first marked.
@@ -187,7 +182,6 @@ impl Preferred {
     }
 }
 
-/// #### PR #40
 /// Where the adapter takes its work from.
 #[derive(Clone, Debug)]
 pub struct Upstream {
@@ -200,27 +194,27 @@ pub struct Upstream {
     pub identity: String,
     /// A remote pool rather than this server's own SV2 listener.
     pub remote: bool,
-    /// #### PR #40: where the donation's work goes at this pool.
+    /// Where the donation's work goes at this pool.
     pub donation: Option<DonationRoute>,
-    /// #### PR #40: this server's own listener running a public pool, where
+    /// This server's own listener running a public pool, where
     /// a device's channel opens at authorize under the device's username.
     pub public: bool,
-    /// #### PR #42: a fallback pool's preferred source: sessions here end
+    /// A fallback pool's preferred source: sessions here end
     /// once it can serve devices again (`Preferred::should_return`).
     pub prefer: Option<Arc<Preferred>>,
-    /// #### PR #42: this server mines a token that fixes the version slot.
+    /// This server mines a token that fixes the version slot.
     pub fixed_version: bool,
-    /// #### Pool modes: each device's channel opens at authorize under its
+    /// Each device's channel opens at authorize under its
     /// miner's own login (`miner_login`), never under `identity`, which
     /// then only names the donation's form.
     pub miners: Option<MinerLogins>,
-    /// #### Pool modes: this upstream is the preferred source itself (your
+    /// This upstream is the preferred source itself (your
     /// own P2Pool node): devices leave it, and skip it, once it has served
     /// no work for the grace (`Preferred::down`).
     pub serving: Option<Arc<Preferred>>,
 }
 
-// #### Pool modes: one upstream channel per miner identity
+// One upstream channel per miner identity
 // What: at a Non-custodial Pool (your own P2Pool with --public) each
 // device's channel at P2Pool opens at authorize under its miner's own
 // payout, `<payout>[.worker],p2p=<share address>` (the share address of
@@ -234,7 +228,7 @@ pub struct Upstream {
 // miner's work would pay the owner.
 // Look here if: a Pool-mode device mines for the wrong address, or a q
 // address is refused.
-/// #### Pool modes: how devices' logins become identities upstream.
+/// How devices' logins become identities upstream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MinerLogins {
     pub network: crate::config::MiningNetwork,
@@ -242,7 +236,7 @@ pub struct MinerLogins {
     pub p2pool: bool,
 }
 
-/// #### Pool modes: a miner's identity upstream and the Pickaxe donation
+/// A miner's identity upstream and the Pickaxe donation
 /// their login chose, if any.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MinerLogin {
@@ -256,7 +250,7 @@ pub struct MinerLogin {
 pub const P2PKH_ONLY: &str =
     "P2Pool pays shares to a key: the username must be a P2PKH (q) address on this network";
 
-/// #### Pool modes: the upstream identity of a device's `username`
+/// The upstream identity of a device's `username`
 /// (`<payout>[.worker][,options]`): the payout read as a public pool reads
 /// it (`payout::identity_login`, which also reads its donation choice).
 pub fn miner_login(logins: MinerLogins, username: &str) -> Result<MinerLogin, String> {
@@ -294,13 +288,13 @@ pub fn miner_login(logins: MinerLogins, username: &str) -> Result<MinerLogin, St
     })
 }
 
-/// #### Pool modes: why a session at your own P2Pool node ends, or skips
+/// Why a session at your own P2Pool node ends, or skips
 /// it: the solo server's own reason, so the workers page reads the same.
 const NOT_SERVING: &str = "template source unavailable; reconnect when healthy";
-/// #### Pool modes: a login refused at authorize, on the workers page.
+/// A login refused at authorize, on the workers page.
 const REFUSED_LOGIN: &str = "login refused";
 
-/// #### PR #40: the identity the adapter's channels open with at this
+/// The identity the adapter's channels open with at this
 /// server's own listener; not a worker name.
 pub(crate) const LOCAL_IDENTITY: &str = "sv1-device";
 
@@ -321,7 +315,7 @@ impl Upstream {
         }
     }
 
-    /// #### Pool modes: whether devices leave this upstream now, or skip
+    /// Whether devices leave this upstream now, or skip
     /// it: it is the preferred source and has served no work for the grace.
     pub fn down(&self, now: Instant) -> bool {
         self.serving
@@ -329,7 +323,7 @@ impl Upstream {
             .is_some_and(|serving| serving.down(now))
     }
 
-    /// #### PR #40: this server's own listener running a public pool.
+    /// This server's own listener running a public pool.
     pub fn local_public(address: SocketAddr, authority: [u8; 32]) -> Self {
         Self {
             public: true,
@@ -337,7 +331,7 @@ impl Upstream {
         }
     }
 
-    /// #### PR #42: the same upstream, mining a token that fixes the
+    /// The same upstream, mining a token that fixes the
     /// version slot when `fixed`.
     pub fn with_fixed_version(self, fixed: bool) -> Self {
         Self {
@@ -384,7 +378,6 @@ pub fn run(
             devices = active;
             match listener.accept() {
                 Ok((stream, _)) if devices.len() < 64 => {
-                    // #### PR #40
                     // On Windows an accepted socket inherits the listener's
                     // non-blocking mode, so reads and writes would fail at
                     // once instead of waiting out their timeouts; Linux does
@@ -428,7 +421,6 @@ fn connect(address: &str) -> Result<TcpStream, String> {
         .ok_or_else(|| "SV2 server unavailable".into())
 }
 
-/// #### PR #40
 /// A channel opened for one device at one upstream.
 struct Opened {
     send: Sender,
@@ -450,7 +442,7 @@ fn serve(
     let mut failure = String::from("SV2 server unavailable");
     let mut chosen = None;
     for upstream in upstreams {
-        // #### Pool modes: your own P2Pool node while it serves no work.
+        // Your own P2Pool node while it serves no work.
         if upstream.down(Instant::now()) {
             failure = NOT_SERVING.into();
             continue;
@@ -531,7 +523,7 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
             protocol: Protocol::MiningProtocol,
             min_version: 2,
             max_version: 2,
-            // #### PR #42: the adapter's fixed version
+            // The adapter's fixed version
             // What: for a token that fixes the version slot, the adapter
             // does not require version rolling, accepts the server's fixed
             // version, answers mining.configure without version rolling,
@@ -547,7 +539,7 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
                 .try_into()
                 .map_err(|_| "invalid vendor")?,
             hardware_version: "".try_into().map_err(|_| "invalid version")?,
-            // #### PR #42: names this adapter's version, so a Pickaxe pool
+            // Names this adapter's version, so a Pickaxe pool
             // can tell adapters that follow group channels.
             firmware: concat!("pickaxe ", env!("CARGO_PKG_VERSION"))
                 .try_into()
@@ -559,11 +551,11 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
     )?)?;
     let reply = receive.receive(DEADLINE)?.ok_or("SV2 setup timed out")?;
     validate_setup_reply(reply, upstream.fixed_version)?;
-    // #### merge-mining v2: this server's disclosure extension, asked for
+    // This server's disclosure extension, asked for
     // only here (a remote pool may not know the negotiation).
     let merge = !upstream.remote && negotiate_merge(&mut send, &mut receive)?;
-    // #### PR #40: a public pool opens the device's channel at authorize.
-    // #### Pool modes: so does a pool where each miner mines under their own
+    // A public pool opens the device's channel at authorize.
+    // So does a pool where each miner mines under their own
     // login, with the donation's route.
     if upstream.public || upstream.miners.is_some() {
         let bridge = match upstream.miners {
@@ -579,7 +571,7 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
             local,
         });
     }
-    // #### merge-mining v2: one donation at a pool
+    // One donation at a pool
     // What: where the adapter donates by itself at a remote pool (its
     // donation channel, at the miner's setting), the device's own channel
     // asks a Pickaxe pool for none: `,pickaxe-donation=0` after the
@@ -590,7 +582,7 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
     // through the adapter's donation channel and through the pool's own
     // rule. The key is Pickaxe's own: BCH P2Pool reads `donation=` for its
     // own, independent donation, which the adapter must never zero.
-    // #### one donation, the higher rate: the 0 now only says "I donate
+    // The 0 now only says "I donate
     // myself", for pools from before this rule. A Pickaxe pool of this rule
     // lowers nothing for it: it credits the donation channel's accepted
     // work, which it sees on this connection, and takes only the rest of
@@ -622,7 +614,7 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
                 1.0
             },
             Target::from_le_bytes([255; 32]),
-            // #### PR #56: the local server grants 8, or 4 on a compact Job
+            // The local server grants 8, or 4 on a compact Job
             // Declaration lane; a remote pool must grant the adapter's 8.
             if upstream.remote {
                 8
@@ -641,7 +633,7 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
             break reply;
         }
         let (code, refusal) = channel_refusal(&mut reply);
-        // #### PR #67: a BCH P2Pool node refused the identity's share
+        // A BCH P2Pool node refused the identity's share
         // address (or its lack of one): asked once more the other way.
         match (upstream.remote && !retried)
             .then(|| p2pool_retry_identity(&base, code.as_deref()))
@@ -651,7 +643,7 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
                 base = next;
                 retried = true;
             }
-            // #### merge-mining v2: then without the donation option.
+            // Then without the donation option.
             None if zero => zero = false,
             None => return Err(refusal),
         }
@@ -673,7 +665,7 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
     })
 }
 
-// #### one donation, the higher rate: the donation channel at an older pool
+// The donation channel at an older pool
 // What: where the device's channel opened naming `,pickaxe-donation=0`,
 // the donation channel, refused under its own identity, asks once more
 // naming the same option, unless it already has a fallback (P2Pool's share
@@ -709,7 +701,7 @@ fn donation_route(
     }
 }
 
-/// #### merge-mining v2: whether a login already names a donation option
+/// Whether a login already names a donation option
 /// (`donation=` or Pickaxe's own `pickaxe-donation=`).
 pub(super) fn names_donation(identity: &str) -> bool {
     identity.split_once(',').is_some_and(|(_, options)| {
@@ -720,7 +712,7 @@ pub(super) fn names_donation(identity: &str) -> bool {
     })
 }
 
-/// #### merge-mining v2: asks this server for the disclosure extension
+/// Asks this server for the disclosure extension
 /// (SV2 extensions negotiation); whether it granted it.
 fn negotiate_merge(send: &mut Sender, receive: &mut Receiver) -> Result<bool, String> {
     use super::merge::disclosure::{
@@ -746,7 +738,6 @@ fn negotiate_merge(send: &mut Sender, receive: &mut Receiver) -> Result<bool, St
         .is_some_and(|(request, granted)| request == 1 && granted.contains(&EXTENSION)))
 }
 
-/// #### PR #67
 /// What: the identity asked for once more after a BCH P2Pool node refused a
 /// bare payout login because it has no share address of its own: the same
 /// login with the payout's share address (`,p2p=`). `None` for any other
@@ -769,7 +760,7 @@ fn p2pool_retry_identity(identity: &str, code: Option<&str>) -> Option<String> {
     }
 }
 
-/// #### PR #61: why a pool refused the device's channel, from its error
+/// Why a pool refused the device's channel, from its error
 /// code, and the code. A BCH P2Pool node with no share address of its own
 /// needs one from each miner, and one that has its own refuses a different
 /// one.
@@ -813,13 +804,19 @@ fn serve_session(
         mut bridge,
         ..
     } = opened;
+    // The peer, captured while the socket is still a TcpStream: a failed
+    // request below names who it came from.
+    let peer = stream
+        .peer_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| format!("device {device}"));
     let mut downstream = Lines::new(stream)?;
     let started = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         if !bridge.ready() && started.elapsed() >= DEADLINE {
             return Err("SV1 setup timed out".into());
         }
-        // #### PR #42: back to the preferred source
+        // Back to the preferred source
         // What: a session on a fallback pool ends once the preferred source
         // (this server's own node, or its Job Declaration plan) has served
         // devices for 30 seconds without a break; the firmware reconnects,
@@ -837,7 +834,7 @@ fn serve_session(
             send.close();
             return Ok(());
         }
-        // #### Pool modes: and sessions at your own P2Pool node end once it
+        // And sessions at your own P2Pool node end once it
         // has served no work for the grace, as the solo server's do; the
         // device reconnects to the first fallback pool that takes it.
         if upstream.down(Instant::now()) {
@@ -859,8 +856,14 @@ fn serve_session(
             return Err("SV2 share response timed out".into());
         }
         if let Some(request) = downstream.read()? {
-            let (responses, shares) = bridge.request(request)?;
-            // #### PR #40: the workers page names the device by the name its
+            // The reason a device's own request kills its session is
+            // otherwise lost to `?` - log it with the peer before the
+            // session dies.
+            let (responses, shares) = bridge.request(request).map_err(|error| {
+                eprintln!("SV1 request from {peer} failed: {error}");
+                error
+            })?;
+            // The workers page names the device by the name its
             // owner gave it, never by a payout address.
             if !named {
                 if let Some(worker) = bridge.worker.as_deref() {
@@ -911,7 +914,7 @@ fn serve_session(
                 downstream.write(&message)?;
             }
         }
-        // #### PR #40: a public pool's channel under the device's username;
+        // A public pool's channel under the device's username;
         // at a remote pool, the donation channel and the device's switches
         // between it and its own channel.
         if let Some(open) = bridge.channel_request()? {
@@ -941,12 +944,11 @@ fn serve_session(
     Ok(())
 }
 
-/// #### PR #40
 /// One SV2 extended channel a device's work comes from: its own, or at a
 /// remote pool the donation's.
 struct Lane {
     channel: u32,
-    /// #### PR #42: the group channel the pool put this channel in (0 for
+    /// The group channel the pool put this channel in (0 for
     /// none); messages addressed to it reach this lane too.
     group: u32,
     prefix: Vec<u8>,
@@ -1035,7 +1037,6 @@ impl Lane {
     }
 }
 
-/// #### PR #40
 /// The donation's channel at a remote pool.
 enum Donation {
     /// None: this server's own listener, a 0% donation, or not asked yet.
@@ -1062,49 +1063,48 @@ struct Bridge {
     extranonce1: Vec<u8>,
     /// The extranonce2 size the device rolls.
     extranonce2_size: usize,
-    /// #### PR #40: the donation at a remote pool.
+    /// The donation at a remote pool.
     route: Option<DonationRoute>,
     donation: Donation,
     allocation: WorkAllocation,
-    /// #### PR #48: work a remote pool acknowledged since the session last
+    /// Work a remote pool acknowledged since the session last
     /// added it to the server's statistics.
     work: WorkSplit,
     /// The device mines the donation channel's jobs now.
     on_donation: bool,
     /// A donation problem not yet shown on the device's row.
     donation_issue: Option<&'static str>,
-    /// #### PR #48: donation shares refused or unanswered since the last
+    /// Donation shares refused or unanswered since the last
     /// accepted one (see `donation_refused`).
     donation_refusals: u32,
-    /// #### PR #48: the donation channel the adapter gave up on, and its
+    /// The donation channel the adapter gave up on, and its
     /// group. It stays open at the pool, whose jobs, targets and verdicts for
     /// it are ignored (a group the device's own channel is not in included).
     dropped: Option<(u32, u32)>,
-    /// #### PR #40: the adapter owns the device's extranonce, at a remote
+    /// The adapter owns the device's extranonce, at a remote
     /// pool or in a public pool, and puts the channel's prefix into the
     /// coinbase part the device receives.
     owned: bool,
     /// A public pool's channel, opened under the device's username.
     public: Public,
-    /// #### PR #42: see `Upstream::fixed_version`.
+    /// See `Upstream::fixed_version`.
     fixed: bool,
-    /// #### merge-mining v2: this server sends the disclosure extension
+    /// This server sends the disclosure extension
     /// (`merge_available`), and the firmware asked for it in
     /// mining.configure (`merge_wanted`, the `pickaxe-merge` extension).
     merge_available: bool,
     merge_wanted: bool,
-    /// #### Pool modes: devices open their channel under their miner's own
+    /// Devices open their channel under their miner's own
     /// login (`miner_login`).
     miners: Option<MinerLogins>,
-    /// #### Pool modes: the Pickaxe donation the miner's login names, which
+    /// The Pickaxe donation the miner's login names, which
     /// can raise the route's rate, never lower it (`donation_rate`).
     chosen: Option<BchDonation>,
-    /// #### Pool modes: the identity asked for once more if the pool
+    /// The identity asked for once more if the pool
     /// refuses the one with `,pickaxe-donation=0`.
     retry_identity: Option<String>,
 }
 
-/// #### PR #40
 /// A public pool's channel for a device: opened at authorize, under the
 /// username, which the server accepts only if it is a payout address.
 enum Public {
@@ -1113,7 +1113,7 @@ enum Public {
     /// Waiting for the device's username.
     Waiting,
     /// The channel request to send, and the authorize to answer.
-    /// #### Pool modes: `identity` is what the channel opens under: the
+    /// `identity` is what the channel opens under: the
     /// username, or the miner's identity upstream.
     Asking {
         name: String,
@@ -1187,19 +1187,19 @@ impl Bridge {
         })
     }
 
-    /// #### PR #42: see `Upstream::fixed_version`.
+    /// See `Upstream::fixed_version`.
     fn with_fixed_version(mut self, fixed: bool) -> Self {
         self.fixed = fixed;
         self
     }
 
-    /// #### merge-mining v2: whether this server sends the disclosure.
+    /// Whether this server sends the disclosure.
     fn with_merge(mut self, available: bool) -> Self {
         self.merge_available = available;
         self
     }
 
-    // #### merge-mining v2: the disclosure relayed to SV1 firmware
+    // The disclosure relayed to SV1 firmware
     // What: firmware that asked for `pickaxe-merge` in mining.configure gets
     // its jobs' leaves (`pickaxe.merge_leaves`: job id, output 0, the
     // CTMD disclosure and each leaf's aux branch, all hex) and its wins'
@@ -1252,7 +1252,6 @@ impl Bridge {
         })
     }
 
-    /// #### PR #40
     /// A device at a public pool: no channel until it gives its username.
     fn public() -> Self {
         Self {
@@ -1296,7 +1295,7 @@ impl Bridge {
         }
     }
 
-    /// #### Pool modes: a device whose channel opens at authorize under its
+    /// A device whose channel opens at authorize under its
     /// miner's own login, at a remote pool with the donation's `route`.
     fn miners(logins: MinerLogins, remote: bool, route: Option<DonationRoute>) -> Self {
         Self {
@@ -1307,7 +1306,7 @@ impl Bridge {
         }
     }
 
-    /// #### PR #40: a public pool's channel request, sent once.
+    /// A public pool's channel request, sent once.
     fn channel_request(&mut self) -> Result<Option<OpenExtendedMiningChannelOwned>, String> {
         let Public::Asking {
             name,
@@ -1358,7 +1357,7 @@ impl Bridge {
 
     /// Expires verdicts no longer awaited on both channels. A remote pool's
     /// missing verdict is simply not counted; on the donation channel it
-    /// counts as refused (#### PR #48, see `donation_refused`).
+    /// counts as refused (see `donation_refused`).
     fn expire_verdicts(&mut self) -> Result<Vec<Value>, String> {
         let expire = |lane: &mut Lane| {
             let before = lane.pending.len();
@@ -1371,7 +1370,6 @@ impl Bridge {
         self.donation_refused(unanswered)
     }
 
-    // #### PR #48
     // What: donation shares the pool refused or never answered are counted
     // until one is accepted; at `DONATION_REFUSALS` in a row the adapter
     // stops donating at this pool, as when the pool refuses the channel.
@@ -1392,7 +1390,7 @@ impl Bridge {
         self.drop_donation("the pool refuses the donation's shares")
     }
 
-    // #### PR #42: the SV1 adapter follows the pool's group channel
+    // The SV1 adapter follows the pool's group channel
     // What: jobs, parents, targets and closes addressed to a lane's group
     // channel reach every lane in that group (the device's own and the
     // donation's); `SetGroupChannel` moves lanes between groups. Share
@@ -1458,7 +1456,6 @@ impl Bridge {
         Ok(out)
     }
 
-    /// #### PR #40
     /// What: at a remote pool, accepted shares weighted by their targets
     /// repay the donation work quota; time only seeds the first share.
     /// A switch sends the
@@ -1482,7 +1479,7 @@ impl Bridge {
         self.switched()
     }
 
-    // #### Pool modes: one donation, the higher rate
+    // One donation, the higher rate
     // What: the rate a device donates at as work: the higher of the
     // route's (the server's setting, read live) and the rate the miner's
     // login names in Pool modes (`payout::effective_donation`), once. A
@@ -1555,6 +1552,18 @@ impl Bridge {
         {
             request["params"].as_array_mut().unwrap().push(json!(""));
         }
+        // Some firmware sends a non-hex session id ("p2p1") as the second
+        // subscribe parameter; sv1_api parses it as an extranonce and
+        // would fail the parse. The device's extranonce1 is never used
+        // here - the reply carries this server's prefix - so drop any
+        // string the way the authorize password is dropped above.
+        if method == "mining.subscribe"
+            && request["params"]
+                .as_array()
+                .is_some_and(|p| p.len() >= 2 && p[1].is_string())
+        {
+            request["params"].as_array_mut().unwrap()[1] = Value::Null;
+        }
         let request: Message =
             serde_json::from_value(request).map_err(|_| "invalid SV1 request")?;
         let mut out = Vec::new();
@@ -1576,7 +1585,7 @@ impl Bridge {
                         json!(false),
                     );
                 }
-                // #### merge-mining v2: the disclosure, when this server
+                // The disclosure, when this server
                 // sends it.
                 if names.iter().any(|name| name == "pickaxe-merge") {
                     result.insert("pickaxe-merge".into(), json!(self.merge_available));
@@ -1649,9 +1658,9 @@ impl Bridge {
                     && !auth.name.is_empty()
                     && auth.name.len() <= 128
                     && !auth.name.chars().any(char::is_control);
-                // #### PR #40: in a public pool the username is the payout,
+                // In a public pool the username is the payout,
                 // so the server decides; the answer waits for its reply.
-                // #### Pool modes: a login the pool cannot pay is refused
+                // A login the pool cannot pay is refused
                 // here, with the reason; at a fallback pool that is not
                 // P2Pool the channel asks for no second donation, as `open`
                 // does, and once more without that if refused.
@@ -1706,7 +1715,7 @@ impl Bridge {
                 else {
                     return Err("invalid submission".into());
                 };
-                // #### PR #40: the donation channel's jobs carry the top bit.
+                // The donation channel's jobs carry the top bit.
                 let number = submit.job_id.parse::<u32>().ok();
                 let donation = number.is_some_and(|number| number & DONATION_JOBS != 0);
                 let job = number.and_then(|number| {
@@ -1811,12 +1820,12 @@ impl Bridge {
         let channel_message = frame.header().channel_msg();
         let mut out = Vec::new();
         let mut verdicts = Vec::new();
-        // #### merge-mining v2: the disclosure extension's frames.
+        // The disclosure extension's frames.
         if frame.header().ext_type_without_channel_msg() == super::merge::disclosure::EXTENSION {
             out.extend(self.merge_message(kind, frame.payload())?);
             return Ok((out, verdicts));
         }
-        // #### PR #48: a channel message starts with its channel id; one for
+        // A channel message starts with its channel id; one for
         // a dropped donation channel, or a group only it was in, is no longer
         // anyone's (see `dropped`).
         if let (true, Some((channel, group))) = (channel_message, self.dropped) {
@@ -1835,7 +1844,7 @@ impl Bridge {
             MESSAGE_TYPE_RECONNECT if !channel_message => {
                 return Err("SV2 upstream asked to reconnect".into())
             }
-            // #### PR #40: a public pool's answer to the device's channel.
+            // A public pool's answer to the device's channel.
             MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS
                 if matches!(self.public, Public::Opening { .. }) =>
             {
@@ -1869,7 +1878,7 @@ impl Bridge {
                 if error.request_id != 1 {
                     return Err("unexpected SV2 channel error".into());
                 }
-                // #### Pool modes: once more without `,pickaxe-donation=0`.
+                // Once more without `,pickaxe-donation=0`.
                 if let Some(identity) = self.retry_identity.take() {
                     self.public = Public::Asking {
                         name,
@@ -1878,12 +1887,12 @@ impl Bridge {
                     };
                     return Ok((out, verdicts));
                 }
-                // #### merge-mining v2: a malformed `,donation=` says so.
+                // A malformed `,donation=` says so.
                 if error.error_code.as_ref() == b"invalid-donation" {
                     self.local_rejection = Some("invalid donation option");
                     out.push(reject(authorize, 24, super::payout::DONATION_OPTION_ERROR));
                 } else if self.remote {
-                    // #### Pool modes: the pool's own reason.
+                    // The pool's own reason.
                     self.local_rejection = Some(REFUSED_LOGIN);
                     let code: String = String::from_utf8_lossy(error.error_code.as_ref())
                         .chars()
@@ -1903,7 +1912,7 @@ impl Bridge {
                     ));
                 }
             }
-            // #### PR #40: the pool's answer to the donation channel.
+            // The pool's answer to the donation channel.
             MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS if self.remote => {
                 let opened: OpenExtendedMiningChannelSuccess =
                     binary_sv2::from_bytes(frame.payload()).map_err(|_| "invalid channel reply")?;
@@ -1928,7 +1937,7 @@ impl Bridge {
                 {
                     return Err("unexpected SV2 channel error".into());
                 }
-                // #### PR #61: asked once more under the fallback identity.
+                // Asked once more under the fallback identity.
                 match self.route.as_mut().and_then(|route| {
                     let fallback = route.fallback.take()?;
                     route.identity = fallback;
@@ -1940,7 +1949,7 @@ impl Bridge {
                     }
                 }
             }
-            // #### PR #42: a job, parent or target may be addressed to the
+            // A job, parent or target may be addressed to the
             // lanes' group channel, and then reaches each lane in it.
             MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB => {
                 let job: NewExtendedMiningJob =
@@ -2069,7 +2078,7 @@ impl Bridge {
                 }
                 out.extend(self.drop_donation("the pool changed the donation channel")?);
             }
-            // #### PR #42: closing the lanes' group closes each lane in it:
+            // Closing the lanes' group closes each lane in it:
             // the device's own lane reconnects, the donation's stops.
             MESSAGE_TYPE_CLOSE_CHANNEL => {
                 let closed: CloseChannel = binary_sv2::from_bytes(frame.payload())
@@ -2080,7 +2089,7 @@ impl Bridge {
                 }
                 out.extend(self.drop_donation("the pool closed the donation channel")?);
             }
-            // #### PR #42: the pool moves channels between group channels.
+            // The pool moves channels between group channels.
             MESSAGE_TYPE_SET_GROUP_CHANNEL if self.remote => {
                 let moved: SetGroupChannel =
                     binary_sv2::from_bytes(frame.payload()).map_err(|_| "invalid group channel")?;
@@ -2098,7 +2107,6 @@ impl Bridge {
         Ok((out, verdicts))
     }
 
-    // #### PR #38
     // Immediate same-parent jobs preserve in-flight shares and use clean=false
     // on SV1. Only SetNewPrevHash flushes old jobs; each share keeps its version.
     fn activate(
@@ -2110,7 +2118,7 @@ impl Bridge {
     ) -> Result<Vec<Value>, String> {
         let owned = self.owned;
         let lane = self.lane_mut(donation).ok_or("unknown mining channel")?;
-        // #### PR #48: keep active targets for delayed shares and lane switches.
+        // Keep active targets for delayed shares and lane switches.
         // SetTarget applies only to the next job (Mining Protocol 5.3.21).
         lane.active.insert(job.job_id, (job.version, lane.target));
         while lane.active.len() > MAX_ACTIVE_JOBS {
@@ -2119,7 +2127,7 @@ impl Bridge {
         let number = job.job_id;
         let mut notify = sv2_to_sv1::build_sv1_notify_from_sv2(prev, job, clean)
             .map_err(|_| "job translation failed")?;
-        // #### PR #40: when the adapter owns the extranonce, the channel's
+        // When the adapter owns the extranonce, the channel's
         // prefix (and any padding) is part of the coinbase the device gets.
         if owned {
             let mut coinbase: Vec<u8> = notify.coin_base1.clone().into();
@@ -2142,12 +2150,11 @@ impl Bridge {
     }
 }
 
-// #### PR #38
 // SetupConnection.Success uses bit 0 for fixed version and bit 1 for requiring
 // extended channels. The adapter requires version rolling and opens an extended
 // channel, so only the latter requirement is compatible. Fail closed on unknown
 // requirements; see Mining Protocol section 5.3.1.
-/// #### PR #42: `fixed`: the adapter mines a token that fixes the version,
+/// `fixed`: the adapter mines a token that fixes the version,
 /// so the server's fixed-version bit is expected.
 fn validate_setup_reply(mut reply: SerializedFrame, fixed: bool) -> Result<(), String> {
     let header = reply.header();
@@ -2249,7 +2256,7 @@ impl Lines {
     }
 }
 
-/// #### PR #42: whether a message for `id` reaches the channel `channel`
+/// Whether a message for `id` reaches the channel `channel`
 /// in group `group` (0 is no group).
 pub(super) fn addressed_to(id: u32, channel: u32, group: u32) -> bool {
     id == channel || (group != 0 && id == group)
@@ -2259,7 +2266,6 @@ pub(super) fn addressed_to(id: u32, channel: u32, group: u32) -> bool {
 mod tests {
     use super::*;
 
-    // #### PR #42
     // What: a preferred source brings devices back only after serving for
     // 30 seconds without a break; a break starts the count again, and being
     // marked healthy again while healthy does not.
@@ -2352,12 +2358,12 @@ mod tests {
     fn submit(id: u64) -> Value {
         json!({"id":id,"method":"mining.submit","params":["worker","4","0000000000000000","00000001","00000002"]})
     }
-    /// #### PR #40: at a remote pool the device rolls four extranonce2 bytes.
+    /// At a remote pool the device rolls four extranonce2 bytes.
     fn remote_submit(id: u64) -> Value {
         json!({"id":id,"method":"mining.submit","params":["worker","4","00000000","00000001","00000002"]})
     }
 
-    /// #### PR #42: an extended job and its parent, for a channel or group.
+    /// An extended job and its parent, for a channel or group.
     fn group_job(channel_id: u32, job_id: u32) -> SerializedFrame {
         encoded(
             NewExtendedMiningJob {
@@ -2416,7 +2422,6 @@ mod tests {
         bridge
     }
 
-    // #### PR #42
     // What: jobs and parents addressed to the group reach the device as
     // clean notifies, and a same-parent group refresh follows without
     // reconnecting; an unknown id is still refused.
@@ -2462,7 +2467,6 @@ mod tests {
         );
     }
 
-    // #### PR #42
     // What: a group job feeds the device's lane and the donation's when both
     // are in the group, so the work clock can switch the device by job alone.
     #[test]
@@ -2502,7 +2506,6 @@ mod tests {
         assert_eq!(switched[1]["params"][0], (6 | DONATION_JOBS).to_string());
     }
 
-    // #### PR #42
     // What: SetGroupChannel moves the device's lane to another group, whose
     // jobs it then takes; ids of neither its channel nor its group are still
     // refused.
@@ -2526,7 +2529,6 @@ mod tests {
         assert!(bridge.upstream(group_job(3, 6)).is_ok(), "its own channel");
     }
 
-    // #### PR #42
     // What: closing the group closes the device's lane: the adapter ends the
     // connection so the device reconnects for a new channel.
     #[test]
@@ -2549,7 +2551,6 @@ mod tests {
         assert!(!addressed_to(0, 3, 0) && !addressed_to(9, 3, 0));
     }
 
-    // #### PR #48
     // What: a remote pool that opens the donation channel but refuses its
     // shares, or never answers them, ends the donation at that pool after
     // DONATION_REFUSALS in a row and the device mines its own channel again;
@@ -2706,7 +2707,6 @@ mod tests {
         assert!(!bridge.on_donation);
     }
 
-    // #### PR #40
     #[test]
     fn at_a_pool_the_device_switches_to_the_donation_channel_by_job_alone() {
         let job = |channel_id: u32, job_id: u32| {
@@ -2850,7 +2850,7 @@ mod tests {
         assert!(bridge.donation_request().unwrap().is_none());
     }
 
-    // #### merge-mining v2: the disclosure relayed to SV1 firmware
+    // The disclosure relayed to SV1 firmware
     // What: firmware that asks for pickaxe-merge (and a server that sends
     // it) gets its channel's leaves and proofs as notifications; another
     // channel's are not its own; firmware that did not ask gets nothing, and
@@ -2918,7 +2918,7 @@ mod tests {
         assert!(without.upstream(leaves(3)).unwrap().0.is_empty());
     }
 
-    // #### merge-mining v2: one donation at a pool
+    // One donation at a pool
     #[test]
     fn a_login_names_a_donation_only_after_its_options_comma() {
         assert!(!names_donation("bchtest:qq.rig"));
@@ -2929,7 +2929,7 @@ mod tests {
         assert!(!names_donation("bchtest:qq,p2p=bchtest:qz"));
     }
 
-    // #### one donation, the higher rate: the donation channel at an older
+    // The donation channel at an older
     // pool
     // What: once the device's channel opened naming `,pickaxe-donation=0`,
     // a refused donation channel is asked again naming it too; without the
@@ -2973,7 +2973,6 @@ mod tests {
         // `a_refused_donation_identity_retries_once_under_the_fallback`).
     }
 
-    // #### PR #40
     #[test]
     fn a_public_pool_opens_the_device_channel_under_its_username() {
         let mut bridge = Bridge::public();
@@ -3075,9 +3074,9 @@ mod tests {
         assert!(local.tick(Instant::now()).unwrap().is_empty());
     }
 
-    // #### PR #61: a refused donation identity is followed once by the
+    // A refused donation identity is followed once by the
     // fallback; a second refusal drops the donation.
-    // #### PR #67: a P2Pool node that needs a share address is asked once
+    // A P2Pool node that needs a share address is asked once
     // more with it, and the donation names its share address too; a refused
     // share address is never dropped.
     #[test]
@@ -3456,7 +3455,6 @@ mod tests {
         assert!(lines.read().is_err());
     }
 
-    // #### PR #42
     // What: an adapter for a token that fixes the version answers
     // mining.configure without version rolling, accepts the server's
     // fixed-version setup (which another adapter refuses), and takes jobs
@@ -3502,7 +3500,36 @@ mod tests {
         assert!(validate_setup_reply(success(1), false).is_err());
     }
 
-    // #### Pool modes: one donation, the higher rate
+    // Whatsminer compatibility (2026-11-27)
+    // What: a device that sends a non-hex session id ("p2p1") as the
+    // second subscribe parameter still gets a normal subscription;
+    // sv1_api would parse that string as an extranonce and fail the
+    // handshake, killing the connection before any reply is written.
+    // Look here if: a device dies right after mining.subscribe with no
+    // reply (packet capture shows FIN within a millisecond of subscribe).
+    #[test]
+    fn a_subscribe_with_a_non_hex_session_id_still_subscribes() {
+        let mut device = bridge();
+        let (subscribed, _) = device
+            .request(
+                json!({"id":1,"method":"mining.subscribe","params":["whatsminer/v1.1","p2p1"]}),
+            )
+            .unwrap();
+        // The handshake survived: a subscription, not an error.
+        assert!(subscribed[0]["error"].is_null());
+        assert!(subscribed[0]["result"][0]
+            .as_array()
+            .is_some_and(|subs| !subs.is_empty()));
+        // A hex session id takes the same path; the extranonce1 the
+        // device hears is the server's either way.
+        let mut hex_device = bridge();
+        let (expected, _) = hex_device
+            .request(json!({"id":1,"method":"mining.subscribe","params":["agent","deadbeef"]}))
+            .unwrap();
+        assert_eq!(expected[0]["result"][1], subscribed[0]["result"][1]);
+    }
+
+    // One donation, the higher rate
     // What: a Pool-mode device donates at the higher of the server's rate
     // (read live) and the rate its login names: a typed
     // `,pickaxe-donation=0` leaves the server's, `,donation=3` raises it.

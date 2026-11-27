@@ -47,6 +47,13 @@ cycle implements the configured shares; short sessions have variance. The
 recipient is committed before hashing. Changing recipients creates a fresh search
 identity so returning to a recipient does not repeat its previous search.
 
+A site hosting the browser miner may take a host fee of at most 10% of the
+work. It is a fourth recipient, taken from the miner's share after the
+donation. No host address leaves that share with the miner. A host may raise
+the donation and cannot lower it. Anything above the default goes to the
+project donation address, as `TokenDonation::work_shares` already does.
+Desktop sessions do not set a host fee.
+
 The runtime independently rebuilds each winner for an authorized recipient and
 journals the exact transaction before broadcast. Recovery uses those bytes even
 if a later build changes recipient addresses. Journal versions 3 and 4 remain

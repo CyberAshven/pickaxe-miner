@@ -1,4 +1,3 @@
-//! #### PR #38
 //! Per-connection estimates from validated work, never advertised hardware speed.
 //! Socket addresses only join the in-process SV1 adapter to its SV2 connection;
 //! public snapshots contain generated labels, not worker identities or payouts.
@@ -17,7 +16,6 @@ const WINDOW: u64 = 300;
 const HOUR: u64 = 3600;
 const WARMUP: u64 = 30;
 const RECENT_CLOSED: usize = 64;
-/// #### PR #42
 /// What: a connection that ends within a minute of opening is a short one.
 /// Why: firmwares open short extra connections beside their mining one; only
 /// those may vanish on close. Several devices behind one shared address (a
@@ -32,7 +30,7 @@ pub enum ShareEvent {
     Rejected(&'static str),
 }
 
-/// #### one donation, the higher rate: a public pool miner's effective
+/// A public pool miner's effective
 /// Pickaxe donation and the part their own Pickaxe visibly mines, as the
 /// workers page and the Device panel show them: "2.00%", or "2.00% · own
 /// 1.50%". `None` off a public pool.
@@ -49,7 +47,6 @@ pub fn donation_text(effective_bps: Option<u16>, own_bps: Option<u16>) -> Option
     })
 }
 
-/// #### PR #40
 /// The difficulty a share's hash reached (pool difficulty: 1 is one in 2^32
 /// hashes), for best-share records; the target's difficulty is the same
 /// measure of what was asked.
@@ -77,7 +74,7 @@ pub struct DeviceSnapshot {
     pub hashrate_hour: Option<f64>,
     /// Difficulty of the last accepted share's target.
     pub difficulty: Option<f64>,
-    /// #### PR #40: the highest difficulty one of its shares reached.
+    /// The highest difficulty one of its shares reached.
     pub best_share: Option<f64>,
     pub estimate_seconds: f64,
     pub last_share_seconds: Option<u64>,
@@ -87,12 +84,11 @@ pub struct DeviceSnapshot {
     pub reported_hashrate: Option<f64>,
     pub temperature_c: Option<f64>,
     pub fan: Option<String>,
-    /// #### PR #40
     /// Make and model, firmware and power draw, from asic-rs's report.
     pub model: Option<String>,
     pub firmware: Option<String>,
     pub power_w: Option<f64>,
-    /// #### one donation, the higher rate: on a public pool, the miner's
+    /// On a public pool, the miner's
     /// effective Pickaxe donation and the part their own Pickaxe visibly
     /// mines (credited), in hundredths of a percent.
     pub donation_bps: Option<u16>,
@@ -102,7 +98,6 @@ pub struct DeviceSnapshot {
 #[derive(Clone, Debug)]
 struct Device {
     label: String,
-    /// #### PR #42
     /// What: the number in the label. A reconnecting device's new row takes
     /// over the number of the offline row it replaces, so "rig1 #12" stays
     /// "rig1 #12" instead of becoming "rig1 #15".
@@ -110,10 +105,9 @@ struct Device {
     /// anew; a selection that follows the label would jump on a reconnect.
     /// Look here if: two rows show the same label, or a reconnect renumbers.
     number: u64,
-    /// #### PR #42: the worker name its owner gave it, kept to rebuild the
+    /// The worker name its owner gave it, kept to rebuild the
     /// label when the number changes.
     worker: Option<String>,
-    /// #### PR #42
     /// What: the offline rows this connection took over, kept aside until it
     /// closes.
     /// Why: behind a shared address a short extra connection can take over
@@ -123,7 +117,7 @@ struct Device {
     /// same address, or a row comes back twice.
     replaced: Vec<(u64, Device)>,
     protocol: &'static str,
-    /// #### PR #42: the device's local network address, kept after it
+    /// The device's local network address, kept after it
     /// disconnects so a reconnect replaces its row.
     ip: Option<IpAddr>,
     started: Instant,
@@ -143,12 +137,11 @@ struct Device {
     adapter_error: Option<&'static str>,
     report: Option<DeviceReport>,
     best_share: Option<f64>,
-    /// #### one donation, the higher rate: the effective rate and the own
+    /// The effective rate and the own
     /// Pickaxe's credit, on a public pool.
     donation: Option<(u16, u16)>,
 }
 
-/// #### PR #42
 /// What: why a worker's address cannot be used for its Device panel.
 /// Why: commands must reach the device itself, so a worker with no local
 /// address, or one whose address several devices share, is not controlled.
@@ -164,11 +157,11 @@ pub enum AddressIssue {
     /// gateway or CGNAT is in between, and commands would reach it instead of
     /// the device (see `Devices::sharing`).
     Shared,
-    /// #### PR #42: two or more connections from this address are all under
+    /// Two or more connections from this address are all under
     /// a minute old, so whether they are one device or several is not known
     /// yet (for example right after the server starts).
     Settling,
-    /// #### PR #42: the watch view cannot read the server's owner-only list
+    /// The watch view cannot read the server's owner-only list
     /// of device addresses, so it has none (it does not run as the server's
     /// user).
     Unlisted,
@@ -179,7 +172,6 @@ pub struct Devices {
     prefix: u32,
     next_id: u64,
     sockets: HashMap<SocketAddr, u64>,
-    // #### PR #42
     // What: device addresses live only in their rows (`Device::ip`); the
     // separate address map is gone. They are still used only to ask or
     // control the device itself, and never shown or written to JSON.
@@ -188,7 +180,6 @@ pub struct Devices {
     // Look here if: the poller asks an offline device, or a device's report
     // stops after a reconnect.
     rows: BTreeMap<u64, Device>,
-    // #### PR #42
     // What: addresses where two devices were seen mining side by side, kept
     // until no row on the address remains.
     // Why: the rows that showed it can leave (a reconnect merges the rows it
@@ -263,7 +254,6 @@ impl Device {
     }
 }
 
-/// #### PR #40
 /// The worker name in a username, never an address: printable, at most 24
 /// characters. (PR #42: visible to the other server modules, so the Device
 /// panel's pool view can name a pool's worker this way, never by an address.)
@@ -280,7 +270,6 @@ pub(super) fn worker_name(username: &str) -> Option<String> {
     Some(name.chars().take(24).collect())
 }
 
-/// #### PR #42
 /// What: a row's label, from its owner's worker name or the generated one,
 /// and the device's number (which keeps labels unique).
 /// Why: the number can change after the name is set, when a reconnect takes
@@ -349,7 +338,7 @@ impl Devices {
         id
     }
 
-    /// #### one donation, the higher rate: a public pool miner's effective
+    /// A public pool miner's effective
     /// donation and their own Pickaxe's credit, or none.
     pub fn set_donation(
         &mut self,
@@ -364,7 +353,7 @@ impl Devices {
         }
     }
 
-    /// #### PR #42: removes a connection that turned out to be a Job
+    /// Removes a connection that turned out to be a Job
     /// Declaration client's, not a device's: it leaves no row, and the
     /// offline rows it took over on its address come back.
     pub fn forget(&mut self, id: u64) {
@@ -432,12 +421,11 @@ impl Devices {
         self.share(row, event, false, now);
     }
 
-    /// #### PR #40: a device's label, for records kept outside the table.
+    /// A device's label, for records kept outside the table.
     pub fn label(&self, id: u64) -> Option<String> {
         self.rows.get(&id).map(|row| row.label.clone())
     }
 
-    /// #### PR #40
     /// Records a share's difficulty as the device's best when it is; returns
     /// the device's label, for the pool's own best share.
     pub fn best_share(&mut self, id: u64, difficulty: f64) -> Option<String> {
@@ -448,14 +436,12 @@ impl Devices {
         Some(row.label.clone())
     }
 
-    /// #### PR #40
     /// Names a worker by the name its owner gave it: the part after the payout
     /// address (`bitcoincash:q....rig1` gives `rig1`), or the whole username
     /// when it is not an address. An address alone keeps the generated label:
     /// payout addresses are never shown. The number keeps labels unique.
     pub fn set_worker(&mut self, id: u64, username: &str) {
         if let (Some(name), Some(row)) = (worker_name(username), self.rows.get_mut(&id)) {
-            // #### PR #42
             // What: the label carries the device's number, not the
             // connection's id, and the name is kept.
             // Why: a reconnect takes over the number of the device's old row
@@ -472,7 +458,6 @@ impl Devices {
     /// public address belongs to a router, not the device.
     pub fn set_address(&mut self, id: u64, ip: IpAddr) {
         if super::device_api::queryable(ip) && self.rows.contains_key(&id) {
-            // #### PR #42
             // What: one row per device on the local network. A device that
             // connects again takes over its offline rows on that address and
             // the number in their label (the latest to close, when there are
@@ -495,11 +480,9 @@ impl Devices {
                 .map(|(other, _)| *other)
                 .collect();
             self.replace(id, &offline);
-            // #### end PR #42 ####
         }
     }
 
-    /// #### PR #42
     /// What: connection `id` takes over the rows in `old`: it takes the
     /// number of the latest of them to close, and its worker name until the
     /// device gives its own, and keeps them aside, out of the table, until
@@ -541,7 +524,6 @@ impl Devices {
             .max_by_key(|row| row.ended.is_none())
     }
 
-    /// #### PR #42
     /// What: the local network address of the worker with this label, online
     /// or offline, for its Device panel; refused when several devices may use
     /// it (see `sharing`). Never shown or written to JSON.
@@ -562,7 +544,6 @@ impl Devices {
         }
     }
 
-    /// #### PR #42
     /// What: how long ago the connection of the worker with this label
     /// closed; none while it is connected.
     /// Why: the Device panel shows it, and asks to confirm the device behind
@@ -574,7 +555,6 @@ impl Devices {
         Some(now.saturating_duration_since(ended))
     }
 
-    /// #### PR #42
     /// What: (label, address, refused) for every row with a local network
     /// address, offline rows included; refused when the address is shared
     /// or not known yet to be one device's (see `sharing`).
@@ -595,7 +575,6 @@ impl Devices {
             .collect()
     }
 
-    /// #### PR #42
     /// What: why this address must not be controlled now, if it must not.
     ///
     /// - `Shared` when two connections there are each open for a minute or
@@ -633,7 +612,6 @@ impl Devices {
         }
     }
 
-    /// #### PR #42
     /// What: whether two rows on this address (online or offline, and the
     /// rows a reconnect took over) each accepted a share a minute or more
     /// after the other connected: two devices mining side by side.
@@ -663,7 +641,7 @@ impl Devices {
 
     /// Connected devices with a known address.
     pub fn addresses(&self) -> Vec<(u64, IpAddr)> {
-        // #### PR #42: read from the rows, which keep each device's address.
+        // Read from the rows, which keep each device's address.
         self.rows
             .iter()
             .filter(|(_, row)| row.ended.is_none())
@@ -731,7 +709,7 @@ impl Devices {
         }
     }
 
-    /// #### PR #40: a problem the adapter reports while the device mines,
+    /// A problem the adapter reports while the device mines,
     /// such as a pool refusing the donation channel.
     pub fn note_adapter(&mut self, id: u64, issue: &'static str) {
         if let Some(row) = self.rows.get_mut(&id) {
@@ -743,7 +721,6 @@ impl Devices {
         let Some(row) = self.rows.get_mut(&id) else {
             return;
         };
-        // #### PR #42
         // What: only the first close of a row decides what becomes of it,
         // from how long the connection lived.
         // Why: the adapter and the native socket each close the same row; a
@@ -774,7 +751,7 @@ impl Devices {
             *owner != id
         });
         if let (true, Some(ip)) = (first, ip) {
-            // #### PR #42: the shared mark is taken before settling, which
+            // The shared mark is taken before settling, which
             // can merge away the rows this connection took over.
             if self.mined_side_by_side(ip) {
                 self.shared_addresses.insert(ip);
@@ -786,11 +763,9 @@ impl Devices {
                 .unwrap_or_default();
             self.settle_closed(id, ip, lived, quiet, replaced);
         }
-        // #### end PR #42 ####
         self.prune();
     }
 
-    /// #### PR #42
     /// What: what becomes of a row on a local address when its connection
     /// closes, in this order:
     ///
@@ -851,7 +826,7 @@ impl Devices {
             .iter()
             .take(closed.len().saturating_sub(RECENT_CLOSED))
         {
-            // #### PR #42: an address stays shared when the rows that showed
+            // An address stays shared when the rows that showed
             // it are pruned, and is forgotten once no row on it remains.
             if let Some(ip) = self.rows.get(id).and_then(|row| row.ip) {
                 if self.mined_side_by_side(ip) {
@@ -972,7 +947,7 @@ pub fn connection_reason(error: &str) -> &'static str {
         | "SV2 handshake failed"
         | "SV2 authority authentication failed" => "authentication or framing failed",
         "device worker panicked" => "device worker stopped unexpectedly",
-        // #### PR #40: a remote pool's answers, in pool mode.
+        // A remote pool's answers, in pool mode.
         "SV2 server unavailable" => "upstream unavailable",
         "SV2 setup rejected" | "SV2 setup incompatible" => "upstream refused the connection",
         "SV2 channel rejected" => "upstream refused the channel; check the pool identity",
@@ -982,7 +957,7 @@ pub fn connection_reason(error: &str) -> &'static str {
         }
         "SV2 upstream closed the channel" => "upstream closed the channel",
         "invalid SV2 authority key" => "upstream key is not an SV2 authority key",
-        // #### PR #67: a BCH P2Pool node's refusals of the pool login.
+        // A BCH P2Pool node's refusals of the pool login.
         error if error.starts_with("the pool needs a share address") => {
             "upstream needs a P2Pool share address: add ,p2p=<share address> to the pool login"
         }
@@ -995,6 +970,9 @@ pub fn connection_reason(error: &str) -> &'static str {
         "SV2 certificate version unsupported" => {
             "upstream certificate version is not SV2's; the pool must fix it"
         }
+        // The device's own subscribe was malformed; the session died
+        // before any worker name was read, so it shows as a row.
+        "invalid subscribe" => "device sent an unparseable mining.subscribe",
         _ => "protocol or connection failure",
     }
 }
@@ -1021,9 +999,14 @@ mod tests {
             connection_reason("something else"),
             "protocol or connection failure"
         );
+        // The device's own subscribe was malformed (e.g. a non-hex session
+        // id); the name reaches the sidecar row instead of the catch-all.
+        assert_eq!(
+            connection_reason("invalid subscribe"),
+            "device sent an unparseable mining.subscribe"
+        );
     }
 
-    // #### PR #42
     // What: a device's reconnect replaces its own offline row, not another
     // device's, and its short extra connection leaves no row.
     // Why: every connection was a row of its own.
@@ -1061,7 +1044,6 @@ mod tests {
         assert!(devices.snapshots(now).iter().any(|row| row.connected));
     }
 
-    // #### PR #42
     // What: behind one shared address (CGNAT, a subnet router), a device that
     // mined for two minutes stays as an offline row when it disconnects
     // while its sibling is online; a short probe there still vanishes.
@@ -1098,7 +1080,7 @@ mod tests {
             opened + Duration::from_secs(59),
         );
         assert_eq!(devices.snapshots(opened).len(), 2);
-        // #### PR #42: both devices keep mining side by side.
+        // Both devices keep mining side by side.
         for device in [first, sibling] {
             devices.share(
                 device,
@@ -1117,7 +1099,7 @@ mod tests {
         // The adapter's native socket closing the same row changes nothing.
         devices.close(first, false, Some("SV2 peer disconnected"), later);
         assert_eq!(devices.snapshots(later).len(), 2);
-        // #### PR #42: with one of them offline, neither is controlled: the
+        // With one of them offline, neither is controlled: the
         // address is still the gateway's.
         for label in &labels {
             assert_eq!(
@@ -1132,7 +1114,6 @@ mod tests {
             .all(|(_, ip, refused)| *ip == gateway && *refused));
     }
 
-    // #### PR #42
     // What: behind one shared address, a short probe that opens after a
     // device went offline, while a sibling is online, takes over the
     // offline row and gives it back when it closes within a minute.
@@ -1166,7 +1147,7 @@ mod tests {
         let probe = devices.connect("127.0.0.1:6103".parse().unwrap(), true, opened);
         devices.set_address(probe, gateway);
         assert_eq!(devices.label(first), None, "taken over for now");
-        // #### PR #42: with the number, the name (the probe gives none).
+        // With the number, the name (the probe gives none).
         assert_eq!(devices.label(probe), Some(label.clone()));
         let closed = opened + Duration::from_secs(5);
         devices.close(probe, true, Some("SV1 disconnected"), closed);
@@ -1178,7 +1159,6 @@ mod tests {
         assert_eq!(devices.label(probe), None);
     }
 
-    // #### PR #42
     // What: a device whose new connection arrives before its old one is seen
     // closed (power cut, reboot, pulled cable) ends with one row, and the new
     // connection takes the old one's number when the old one closes. With
@@ -1243,7 +1223,6 @@ mod tests {
         assert_eq!(devices.snapshots(closed).len(), 4);
     }
 
-    // #### PR #42
     // What: a reconnect over several offline rows on one address takes the
     // number of the latest to close, not of the newest connection, and
     // replaces them all.
@@ -1284,7 +1263,6 @@ mod tests {
         );
     }
 
-    // #### PR #42
     // What: a device that reconnects keeps the number in its label, and its
     // name until it gives one, so "rig1 #N" survives close, connect,
     // set_address and set_worker; a new name is taken.
@@ -1315,7 +1293,7 @@ mod tests {
         );
         devices.set_address(second, nano);
         assert_eq!(devices.label(first), None, "the offline row is replaced");
-        // #### PR #42: the name too, before the device gives it again, so
+        // The name too, before the device gives it again, so
         // the label never reads "Device …" in between.
         assert_eq!(devices.label(second), Some(label.clone()));
         devices.set_worker(second, worker);
@@ -1334,7 +1312,7 @@ mod tests {
             .collect();
         assert_eq!(labels.len(), 2, "the device and its neighbour");
         assert_ne!(labels[0], labels[1]);
-        // #### PR #42: a device that comes back under another name takes it.
+        // A device that comes back under another name takes it.
         devices.close(third, true, Some("SV1 disconnected"), now);
         let fourth = devices.connect("127.0.0.1:7005".parse().unwrap(), true, now);
         devices.set_address(fourth, nano);
@@ -1343,7 +1321,6 @@ mod tests {
         assert_eq!(devices.label(fourth), Some(format!("rig9 #{first}")));
     }
 
-    // #### PR #40
     #[test]
     fn workers_are_named_by_their_owners_but_never_by_an_address() {
         let address = crate::tx::p2pkh_hash_to_cashaddr_for_network(
@@ -1565,7 +1542,7 @@ mod tests {
         assert!(devices.addresses().is_empty());
         devices.set_address(id, "10.9.8.7".parse().unwrap());
         let label = devices.snapshots(now)[0].label.clone();
-        // #### PR #42: `address_of` replaces `address_for_label`.
+        // `address_of` replaces `address_for_label`.
         assert_eq!(
             devices.address_of(&label, now),
             Ok("10.9.8.7".parse().unwrap())
@@ -1598,7 +1575,6 @@ mod tests {
         assert!(devices.addresses().is_empty());
     }
 
-    // #### PR #42
     // What: a worker that went offline keeps its local address for the
     // Device panel, while the poller no longer asks it; a worker with no
     // local address has none.
@@ -1622,7 +1598,7 @@ mod tests {
         assert!(!rows[0].connected);
         assert_eq!(devices.address_of(&label, later), Ok(nano));
         assert!(devices.addresses().is_empty(), "the poller skips it");
-        // #### PR #42: how long ago it left, for the panel.
+        // How long ago it left, for the panel.
         assert_eq!(
             devices.offline_for(&label, later + Duration::from_secs(90)),
             Some(Duration::from_secs(90))
@@ -1637,7 +1613,6 @@ mod tests {
         );
     }
 
-    // #### PR #42
     // What: two workers connected for a minute or more on one address are
     // not controlled, online or offline; two younger ones are not known yet
     // to be one device; a short probe beside one device does not count.
@@ -1691,7 +1666,6 @@ mod tests {
         );
     }
 
-    // #### PR #42
     // What: two devices that mine side by side behind one address are
     // refused from their first shares a minute apart, after one goes
     // offline, after it reconnects, and after the rows that showed it are
@@ -1789,7 +1763,6 @@ mod tests {
         assert!(devices.shared_addresses.is_empty());
     }
 
-    // #### PR #42
     // What: the private address list holds every row with a local address,
     // offline rows included, with whether the address is shared, and none of
     // it reaches the JSON snapshots or Debug output.

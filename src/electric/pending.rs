@@ -159,7 +159,7 @@ impl Journal {
     }
 }
 
-/// #### PR #66: whether the journal at `path` holds a claim still to
+/// Whether the journal at `path` holds a claim still to
 /// recover. The file stays after a claim settles, with no claim in it; one
 /// that cannot be read counts as holding one, so its pot reports it.
 pub(super) fn holds_claim(path: &Path) -> bool {

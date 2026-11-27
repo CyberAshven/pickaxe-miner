@@ -1,4 +1,3 @@
-//! #### PR #42
 //! The client side of Job Declaration. An uplink thread keeps a Job
 //! Declaration session and one work-selection channel at the pool,
 //! publishes the plan the local server builds its jobs from, declares each
@@ -102,14 +101,14 @@ pub struct JdTarget {
     pub mode: JdMode,
     pub p2pool_prepare_api: Option<String>,
     pub required: bool,
-    /// #### merge-mining v2: the miner's own donation setting, named to a
+    /// The miner's own donation setting, named to a
     /// Pickaxe pool as `,pickaxe-donation=` (see `login`); `None` at BCH
     /// P2Pool, when the identity names a donation itself, and once the pool
     /// refused the option.
     pub pickaxe_donation: Option<Arc<RwLock<crate::donation::bch::BchDonation>>>,
 }
 
-// #### merge-mining v2: the miner's donation at a Pickaxe pool
+// The miner's donation at a Pickaxe pool
 // What: a Job Declaration client's login names the miner's own donation
 // setting as `,pickaxe-donation=<percent>` (to the 0.5% step below, as of
 // each session's start), so a Pickaxe pool's tokens carry it instead of the
@@ -247,7 +246,7 @@ pub struct UplinkHandle {
 }
 
 impl UplinkHandle {
-    // #### PR #65: queue personal and donation declarations as one admission.
+    // Queue personal and donation declarations as one admission.
     // A receiver may dequeue immediately, but cannot declare until both sends
     // succeed. A full/disconnected peer cancels the other event before it can
     // consume a token or replace an accepted job. No network I/O holds the gate.
@@ -286,7 +285,7 @@ impl UplinkHandle {
         Ok(())
     }
 
-    // #### PR #65: each session's acceptance gates its own work
+    // Each session's acceptance gates its own work
     // What: the miner's own jobs wait only for the personal session's
     // acknowledgement; donation jobs wait for the donation session's, which
     // counts only while that session holds a plan.
@@ -322,7 +321,7 @@ type Wanted = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// A P2Pool beneficiary needs its own channel, token and declared coinbase.
 /// Never subtract a software donation from other participants' PPLNS outputs.
-// #### PR #65: no donation session at 0%
+// No donation session at 0%
 // What: the donation session connects only while the donation setting is
 // above 0%; set to 0% it ends (its plan goes) and waits, without a
 // connection, a token or a preparation, until the setting rises again.
@@ -396,7 +395,7 @@ fn spawn_with(
                 return;
             };
             let target = &target;
-            // #### PR #65: a paused session waits without a connection (see
+            // A paused session waits without a connection (see
             // `spawn_p2pool`).
             if paused() {
                 shared.update(|summary| {
@@ -423,7 +422,7 @@ fn spawn_with(
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            // #### merge-mining v2: then without the donation option (see
+            // Then without the donation option (see
             // `JdTarget::login`).
             if matches!(&result, Err(error) if error == PICKAXE_DONATION_REFUSED) {
                 targets[next].pickaxe_donation = None;
@@ -434,7 +433,7 @@ fn spawn_with(
                 failures = 0;
                 continue;
             }
-            // #### PR #42: retries back off across the pools
+            // Retries back off across the pools
             // What: after a failure the uplink tries the next pool in order
             // (wrapping), waiting 30, 60, 120, then 300 seconds as failures
             // follow each other; a session whose pool accepted custom jobs
@@ -450,7 +449,7 @@ fn spawn_with(
                 failures.saturating_add(1)
             };
             next = (next + 1) % targets.len();
-            // #### PR #42: fallback
+            // Fallback
             // What: when the pool refuses a custom job (other than for a tip
             // race), the link fails or the pool's terms change, the plan goes:
             // the local server stops offering work and the SV1 adapter moves
@@ -498,7 +497,7 @@ fn retry_after(base: Duration, failures: u32) -> Duration {
 struct Verdicts(VecDeque<bool>);
 
 impl Verdicts {
-    // #### PR #42: rejected shares fall back
+    // Rejected shares fall back
     // What: when the pool rejects 5 of the last 20 shares forwarded on
     // active custom jobs (stale-share and invalid-job-id, races at a new
     // block, not counted), the client falls back to the pool's own jobs.
@@ -600,7 +599,7 @@ fn uplink(
     };
     open(&mut pool, 1, JD_ROLLABLE)?;
     let mut frame = answer(&mut replies, stop)?;
-    // #### PR #56: the compact layout
+    // The compact layout
     // What: a pool that refuses 16 rollable bytes is asked once more for 8;
     // granted, the plan is compact: a 2-byte job id, the pad, a 2-byte lane
     // and 4 bytes for each device. Local channels opened on another layout
@@ -699,7 +698,7 @@ fn uplink(
     if plan.p2pool.is_none() {
         tokens.push_back(first);
     }
-    // #### 0x5052: the preparation asked for now, the notices seen (a
+    // The preparation asked for now, the notices seen (a
     // token's epoch is the count when it arrived), and whether a token
     // since named other rates than the plan's.
     let mut payout: Option<PayoutWork> = None;
@@ -723,7 +722,7 @@ fn uplink(
     let mut next_request = 1u32;
     let mut next_declaration = 1u32;
     while !stop.load(Ordering::Relaxed) {
-        // #### PR #65: the donation set to 0% ends its session.
+        // The donation set to 0% ends its session.
         if paused() {
             return Ok(());
         }
@@ -732,7 +731,7 @@ fn uplink(
                 allocate(&login, &mut jd, &mut requests)?;
             }
         }
-        // #### 0x5052: the next preparation's request (see `PayoutWork`).
+        // The next preparation's request (see `PayoutWork`).
         if let Some(asks) = asks.as_ref() {
             if payout.is_none() {
                 payout = asks.try_recv().ok().map(PayoutWork::new);
@@ -839,7 +838,7 @@ fn uplink(
                         queued.push_back(token.bytes);
                         continue;
                     }
-                    // #### 0x5052: under the pool's own outputs a change of
+                    // Under the pool's own outputs a change of
                     // rates matters only to a template built from them (one
                     // that merge-mines tokens), which then starts a new
                     // session.
@@ -852,7 +851,7 @@ fn uplink(
                     token.epoch = epoch;
                     tokens.push_back(token);
                 }
-                // #### PR #42: missing transactions
+                // Missing transactions
                 // What: the pool names transactions of a declaration it does
                 // not have by their position; the client sends them from the
                 // declared template in one frame. Transactions that cannot
@@ -1042,7 +1041,7 @@ fn uplink(
                 while published.len() > KEPT_JOBS {
                     published.pop_front();
                 }
-                // #### PR #42: a template over 65,535 transactions is not
+                // A template over 65,535 transactions is not
                 // declared: SV2 counts a declaration's transactions in 16
                 // bits. Devices keep the custom job on the previous
                 // template of the same parent, if any. #### 0x4C54: a pool
@@ -1051,7 +1050,7 @@ fn uplink(
                     status.update(|summary| summary.dropped += 1);
                     continue;
                 }
-                // #### 0x5052: a template built from the plan's rates after
+                // A template built from the plan's rates after
                 // the pool named others starts a new session on them.
                 if moved && template.prepared_coinbase().is_none() {
                     return Err("the pool's fee or donation changed".into());
@@ -1100,7 +1099,7 @@ fn uplink(
                 });
             }
             UplinkEvent::Share(share) => {
-                // #### PR #42: a Full-Template client pushes its blocks to
+                // A Full-Template client pushes its blocks to
                 // the pool (PushSolution), whatever the pool's target, so
                 // the pool's node gets them too.
                 if full && share.block {
@@ -1146,7 +1145,7 @@ struct Refusals {
 }
 
 impl Refusals {
-    // #### PR #42: four refusals on one template fall back
+    // Four refusals on one template fall back
     // What: a declaration the pool refuses (other than stale-chain-tip) is
     // dropped; the fourth in a row on one parent makes the client fall back
     // to the pool's own jobs. An accepted declaration or a new parent starts
@@ -1622,7 +1621,7 @@ fn declaration(
                 .try_into()
                 .map_err(|_| "coinbase suffix too long")?,
             wtxid_list: txids.try_into().map_err(|_| "too many transactions")?,
-            // #### merge-mining v2: the token leaves behind output 0, for
+            // The token leaves behind output 0, for
             // the pool to check (`merge::disclosure`); none without tokens.
             excess_data: excess
                 .as_slice()
@@ -1719,7 +1718,7 @@ fn declare(
     template: &BchTemplate,
 ) -> Result<(), String> {
     let head = template.script_head();
-    // #### PR #42: the outputs of the template's own plan (the session's:
+    // The outputs of the template's own plan (the session's:
     // templates on another plan are never declared), commitment and tickets
     // included (`BchTemplate::declared_outputs`).
     let outputs = serialize_outputs(&template.declared_outputs()?);
@@ -1752,7 +1751,7 @@ fn declare(
     }))?)
 }
 
-// #### merge-mining v2: only the pool's shares go to the pool
+// Only the pool's shares go to the pool
 // What: a local share goes to the pool only when its hash meets the pool's
 // current share target. A share that meets only a merge-mined token's
 // target (the local device target is eased toward it, `Channel::settle`) is
@@ -1768,7 +1767,7 @@ pub(crate) fn for_pool(share: &ForwardShare, pool_target: &Hash) -> bool {
     meets_target(&share.hash, pool_target)
 }
 
-// #### PR #42: shares forwarded to the pool without blocking
+// Shares forwarded to the pool without blocking
 // What: an accepted local share on a declared job that meets the pool's
 // target goes to the pool with the pool's job id and the 16 rolled bytes;
 // until the pool confirms the job, up to 256 wait. The local server hands
@@ -1807,7 +1806,7 @@ fn forward(
 mod tests {
     use super::*;
 
-    // #### merge-mining v2: the miner's donation at a Pickaxe pool
+    // The miner's donation at a Pickaxe pool
     #[test]
     fn a_login_names_the_miners_donation_to_the_step_below() {
         use crate::donation::bch::BchDonation;
@@ -1977,7 +1976,6 @@ mod tests {
         }
     }
 
-    // #### PR #65
     // What: the personal session's acknowledgement stands on its own; the
     // donation session's counts only while it holds a plan, and a
     // reconnecting donation session revokes only donation readiness. Block
@@ -2063,7 +2061,6 @@ mod tests {
         assert!(donation.try_recv().is_err());
     }
 
-    // #### PR #65
     // What: at 0% the donation session never connects (only the personal
     // one does) and shows "off"; raised above 0% it connects at once.
     // Look here if: spawn_p2pool's gate changes.
@@ -2123,7 +2120,6 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
     }
 
-    // #### PR #65
     // What: a template without a donation job is declared on the personal
     // session alone, even where a donation session exists.
     // Look here if: UplinkHandle::publish changes.
@@ -2265,7 +2261,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     // What: a template over 65,535 transactions is not declared; one at
     // the limit is.
     // Look here if: declarable or MAX_DECLARED_TXS changes.
@@ -2275,11 +2270,10 @@ mod tests {
         assert!(declarable(&at_limit, false));
         let over = template().with_transactions(vec![vec![0]; MAX_DECLARED_TXS + 1]);
         assert!(!declarable(&over, false));
-        // #### 0x4C54: a pool that takes pages takes it.
+        // A pool that takes pages takes it.
         assert!(declarable(&over, true));
     }
 
-    // #### PR #42
     // What: missing transactions go back in one frame of at most 16 MiB in
     // the order asked for; more than one frame takes is TooLarge (the
     // declaration is dropped), and a position the template does not have
@@ -2302,7 +2296,7 @@ mod tests {
             provide(3, &big, &[2], false).err(),
             Some(Unprovided::Unknown)
         );
-        // #### 0x4C54: with BCH large templates the first that fits goes,
+        // With BCH large templates the first that fits goes,
         // and the pool asks again for the rest (Knuth's supply).
         let mut frame = provide(3, &big, &[1, 0], true).unwrap();
         let reply: ProvideMissingTransactionsSuccess =
@@ -2317,7 +2311,6 @@ mod tests {
         );
     }
 
-    // #### 0x4C54
     // What: with BCH large templates a template of 65,537 transactions is
     // declared as one DeclareMiningJob.Transactions page of the first 65,535
     // ids, then the DeclareMiningJob with the same request id and the last 2;
@@ -2368,7 +2361,6 @@ mod tests {
         assert_eq!(declaration(8, &[1; 26], &fits, true).unwrap().len(), 1);
     }
 
-    // #### 0x5052, 0x4C54
     // What: the answer to RequestExtensions: Success grants what it lists of
     // what was asked; Error with nothing required grants nothing; Error
     // requiring an extension this client lacks ends the session; any other
@@ -2441,7 +2433,6 @@ mod tests {
         assert!(granted_by(&mut core, &asked).is_err());
     }
 
-    // #### 0x5052, 0x4C54
     // What: over a Noise session, the client's RequestExtensions asks for
     // 0x5052 and, in Full-Template, 0x4C54 (request id 1); a grant turns them
     // on, a refusal leaves them off, and a pool that closes the connection
@@ -2533,7 +2524,6 @@ mod tests {
         }
     }
 
-    // #### 0x5052
     // What: the uplink's payout request for a preparation: it goes as
     // RequestPayoutOutputs with the token and the template's revenue,
     // height, parent, bits and head; the pool's exact answer answers the
@@ -2655,7 +2645,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     // What: retries wait 30, 60, 120, then 300 seconds as failures follow
     // each other.
     // Look here if: retry_after or RETRY_STEPS changes.
@@ -2668,7 +2657,6 @@ mod tests {
         assert_eq!(waits, [30, 60, 120, 300, 300, 300]);
     }
 
-    // #### PR #42
     // What: the fifth rejection among the last 20 verdicts falls back;
     // accepted shares push old rejections out of the window.
     // Look here if: Verdicts changes.
@@ -2692,7 +2680,6 @@ mod tests {
         assert!(spread.record(false, 1), "5 of the last 20");
     }
 
-    // #### PR #42
     // What: the fourth refusal in a row on one parent falls back; a new
     // parent starts the count again.
     // Look here if: Refusals changes.

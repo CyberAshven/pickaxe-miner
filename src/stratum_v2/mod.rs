@@ -4,7 +4,7 @@
 //! Design check: [`docs/stratum-v2.md`](../../docs/stratum-v2.md).
 //! Reference crates (`stratum-core`) are optional behind feature `stratum-v2`.
 
-// #### PR #48: BCH's ASERT difficulty, for Chipnet's minimum-difficulty rule.
+// BCH's ASERT difficulty, for Chipnet's minimum-difficulty rule.
 #[cfg(feature = "stratum-v2")]
 pub mod asert;
 mod bch;
@@ -18,12 +18,12 @@ pub mod device_api;
 // 0x4C54.
 #[cfg(feature = "stratum-v2")]
 pub mod extensions;
-// #### Pool modes: the SV2 door of a Non-custodial Pool.
+// The SV2 door of a Non-custodial Pool.
 #[cfg(feature = "stratum-v2")]
 pub mod door;
 #[cfg(feature = "stratum-v2")]
 pub mod fleet;
-// #### PR #42: Job Declaration: miners' own templates at a public pool.
+// Job Declaration: miners' own templates at a public pool.
 #[cfg(feature = "stratum-v2")]
 pub mod jd;
 #[cfg(feature = "stratum-v2")]
@@ -32,15 +32,15 @@ pub mod journal;
 mod journal_tests;
 #[cfg(all(test, feature = "stratum-v2"))]
 mod live_tests;
-// #### PR #42: the Device panel (row selection and one device's controls).
+// The Device panel (row selection and one device's controls).
 #[cfg(feature = "stratum-v2")]
 mod logins;
 #[cfg(feature = "stratum-v2")]
 mod panel;
-// #### PR #42: merge mining for BCH covenant tokens (no token registered yet).
+// Merge mining for BCH covenant tokens (no token registered yet).
 #[cfg(feature = "stratum-v2")]
 pub mod merge;
-// #### one donation, the higher rate: a miner's own Pickaxe's donation,
+// A miner's own Pickaxe's donation,
 // credited where a Public Solo Endpoint sees it mined.
 #[cfg(feature = "stratum-v2")]
 mod own_donation;
@@ -57,7 +57,7 @@ mod server_tests;
 mod status;
 #[cfg(feature = "stratum-v2")]
 pub mod sv1;
-// #### PR #42: Template Distribution: this server's templates for SV2 pools.
+// Template Distribution: this server's templates for SV2 pools.
 #[cfg(feature = "stratum-v2")]
 pub mod tdp;
 #[cfg(feature = "stratum-v2")]
@@ -84,7 +84,6 @@ pub use bch::{
 };
 pub use reference::linked as reference_crates_linked;
 
-/// #### PR #40
 /// A pool address as SV2 pools publish it, `stratum2+tcp://HOST:PORT/KEY`
 /// (the form ckpool and Braiins use, and this server's Connection info),
 /// split into `HOST:PORT` and the pool's authority key; a bare `HOST:PORT`

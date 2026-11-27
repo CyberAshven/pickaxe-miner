@@ -223,7 +223,6 @@ a fee; with SV1 they can decode the coinbase parts of each job.
 
 ## Miners' own templates
 
-#### PR #42
 
 `--accept-job-declaration` lets miners mine their own node's templates at
 your pool (SV2 Job Declaration), on the pool's SV2 port, in both of the
@@ -240,7 +239,6 @@ their blocks. In the setup it is the **Miner templates** row under Advanced
 
 ## Templates for other pools and P2Pool
 
-#### PR #42
 
 Your node's templates can also serve other pools: the **Serve templates** row
 under Advanced (or `--tp-listen 0.0.0.0:8442`, 48442 on Chipnet) lets an SV2

@@ -1,4 +1,3 @@
-//! #### PR #42
 //! Where GPU mining takes its PHOTON jobs, and the way back to the miner's
 //! own node after a fall back to the Fulcrum servers: a watch that asks the
 //! node again on its own thread, waiting longer after each failure, and
@@ -327,7 +326,7 @@ pub fn try_node_return(
         live.height,
         crate::node::node_info,
         |node| {
-            // #### PR #42: BCH, not BTC; Chipnet, not testnet4.
+            // BCH, not BTC; Chipnet, not testnet4.
             crate::node::verify_chain(node, network)?;
             ElectrumSession::connect_node_failover(&[node.to_owned()], deployment, Some(live))
                 .and_then(|mut session| session.fetch_live_job().map(|job| (session, job)))
@@ -391,7 +390,6 @@ mod tests {
         receive
     }
 
-    // #### PR #42
     // What: after a fall back the first try comes at 15 s, and each failure
     // doubles the wait (30, 60, ...) up to 300 s; a ready node waits while a
     // claim is in flight (`safe` false) and is handed over once it is safe,
@@ -446,7 +444,6 @@ mod tests {
         assert_eq!(watch.status(at, false), JobSourceStatus::Fulcrum);
     }
 
-    // #### PR #42
     // What: a node found ready while a winner or claim is in flight is held
     // (no second try starts) and handed over only once the claim is done.
     // Look here if: the hand-over's safety changes.
@@ -471,7 +468,6 @@ mod tests {
         ));
     }
 
-    // #### PR #42
     // What: the status names how long the node has been down, when the next
     // try comes and why; a syncing node waits 2 minutes and a refused login
     // 30, without doubling.
@@ -508,7 +504,6 @@ mod tests {
         assert_eq!(JobSourceStatus::Fulcrum.kind(), "fulcrum");
     }
 
-    // #### PR #42
     #[test]
     fn classify_maps_node_errors() {
         for (error, trouble) in [
@@ -551,7 +546,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     // What: a node on another network, a syncing node and a node more than
     // one block behind the mined job are refused, each with its reason,
     // before any PHOTON call; the first node that passes is connected.

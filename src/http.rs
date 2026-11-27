@@ -1,4 +1,4 @@
-//! #### PR #53: HTTP GET for P2Pool's releases (GitHub's API and its
+//! HTTP GET for P2Pool's releases (GitHub's API and its
 //! downloads, which redirect to a file host) and for the node's local API.
 //! HTTPS goes through rustls with the system's certificates (`tls`), as for
 //! Fulcrum servers and https nodes; no HTTP library is added for this.
@@ -226,7 +226,7 @@ pub fn post_json(
     .map_err(|_| "P2Pool preparation connection or response failed".to_owned())
 }
 
-// #### PR #65: one deadline for a preparation request
+// One deadline for a preparation request
 // What: a P2Pool preparation request has one deadline for all of it: the
 // name lookup (on its own thread, abandoned when the deadline passes), the
 // connection, the TLS handshake, the request and every read of the reply.
@@ -688,7 +688,6 @@ mod preparation_tests {
         port
     }
 
-    // #### PR #65
     // What: a helper that answers nothing, or a byte at a time, fails the
     // preparation at its one deadline, not a wait per read.
     // Look here if: Budget or Bounded changes.
@@ -713,7 +712,6 @@ mod preparation_tests {
         }
     }
 
-    // #### PR #65
     // What: a name lookup that hangs is abandoned at the request's deadline;
     // a literal address needs no lookup.
     // Look here if: lookup_within or addresses changes.

@@ -25,6 +25,10 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup toolchain install nightly-2026-04-11 --profile minimal --component rust-src,rustc-dev,llvm-tools-preview
+          # The ubuntu-24.04 runner image lists packages.microsoft.com, which
+          # 403s and is unsigned. Nothing here is installed from it.
+          if [ -f /etc/apt/sources.list ]; then sudo sed -i '/packages\.microsoft\.com/d' /etc/apt/sources.list; fi
+          grep -l packages.microsoft.com /etc/apt/sources.list.d/* 2>/dev/null | xargs -r sudo rm -f || true
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends clang cmake ninja-build
       - name: Check shared Rust hashes and compile portable shaders
@@ -61,6 +65,10 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
+          # The ubuntu-24.04 runner image lists packages.microsoft.com, which
+          # 403s and is unsigned. Nothing here is installed from it.
+          if [ -f /etc/apt/sources.list ]; then sudo sed -i '/packages\.microsoft\.com/d' /etc/apt/sources.list; fi
+          grep -l packages.microsoft.com /etc/apt/sources.list.d/* 2>/dev/null | xargs -r sudo rm -f || true
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers
       - name: Run shared signature, transaction and digest oracles
@@ -73,7 +81,7 @@ jobs:
           mkdir -p "$XDG_RUNTIME_DIR"
           chmod 700 "$XDG_RUNTIME_DIR"
           cargo test --locked --release --lib --no-default-features --features portable-wgpu wgpu_photon::tests::t2_gpu_end_to_end_boundaries_and_rotations -- --ignored --exact --test-threads=1 --nocapture
-          # #### PR #22: the same oracle with the original hand-written WGSL stages.
+          # The same oracle with the original hand-written WGSL stages.
           PICKAXE_WGPU_STAGES=wgsl cargo test --locked --release --lib --no-default-features --features portable-wgpu wgpu_photon::tests::t2_gpu_end_to_end_boundaries_and_rotations -- --ignored --exact --test-threads=1 --nocapture
           cargo test --locked --release --lib --no-default-features --features portable-wgpu electric::gpu::tests::electric_portable_matches_independent_hashes_if_wgpu_present -- --ignored --exact --test-threads=1 --nocapture
 
@@ -148,6 +156,10 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component clippy --target wasm32-unknown-unknown
           rustup default stable
+          # The ubuntu-24.04 runner image lists packages.microsoft.com, which
+          # 403s and is unsigned. Nothing here is installed from it.
+          if [ -f /etc/apt/sources.list ]; then sudo sed -i '/packages\.microsoft\.com/d' /etc/apt/sources.list; fi
+          grep -l packages.microsoft.com /etc/apt/sources.list.d/* 2>/dev/null | xargs -r sudo rm -f || true
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends clang
           cargo install --locked wasm-bindgen-cli --version 0.2.130

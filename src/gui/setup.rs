@@ -230,7 +230,7 @@ impl Setup {
             let State::Ready(driver) = &mut self.state else {
                 break;
             };
-            // #### Local sources first: Start also waits a moment for a look
+            // Start also waits a moment for a look
             // at this computer's node still under way.
             let wait = if driver.reads_pot(&input) {
                 Some("Reading the fee pot's balance…")

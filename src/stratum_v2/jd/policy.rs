@@ -1,4 +1,3 @@
-//! #### PR #42
 //! What a custom job's coinbase must pay at a Pickaxe public pool, and the
 //! merge-mining shape it may take. A custom job cannot rotate work the way
 //! the pool's own jobs do, so it pays the whole Pickaxe donation and the
@@ -141,7 +140,7 @@ impl PayoutRule {
         (donation, fee)
     }
 
-    // #### PR #42: the Coinbase-only payout rule
+    // The Coinbase-only payout rule
     // What: a custom job's coinbase is worth V (the sum of its outputs). It
     // must pay the donation's script at least D = V × donation, the fee's
     // script at least F = (V − D) × fee, and the miner something when
@@ -193,10 +192,9 @@ impl PayoutRule {
         }
         Ok(value)
     }
-    // #### end PR #42 ####
 }
 
-// #### merge-mining v2: the pool's check of declared leaves
+// The pool's check of declared leaves
 // What: a Full-Template declaration whose output 0 is a non-empty root must
 // disclose its leaves in `excess_data` (`merge::disclosure`). The pool
 // rebuilds the root from them, and checks each leaf: its token is in the
@@ -286,7 +284,7 @@ fn check_leaves_with(
     Ok(())
 }
 
-// #### merge-mining v2: no tokens in Coinbase-only custom jobs
+// No tokens in Coinbase-only custom jobs
 // What: a Coinbase-only custom job's output 0 may be the empty commitment
 // or none, never a token root.
 // Why: Coinbase-only sends no declaration, so the pool could never check
@@ -365,7 +363,6 @@ mod tests {
         ]
     }
 
-    // #### PR #42
     // What: at 1.5% donation and a 1% fee, a 312,500,000-satoshi coinbase
     // owes the donation 4,687,500 and the fee 3,078,125 (from what the
     // donation leaves), in every fee mode; the exact amounts pass and one
@@ -411,7 +408,6 @@ mod tests {
         );
     }
 
-    // #### PR #42
     // What: amounts are summed per script (a fee paid to the miner's own
     // address needs the sum), other outputs are allowed, and at a 100%
     // donation nothing is owed to the miner.
@@ -464,7 +460,7 @@ mod tests {
         .unwrap()
     }
 
-    // #### merge-mining v2: the pool's check of declared leaves
+    // The pool's check of declared leaves
     // What: leaves that rebuild output 0 and pay the miner with the token's
     // donation and the pool's fee pass; a wrong fee slot, a missing fee, a
     // leaf paying another script, an unknown token, a token without split
@@ -553,7 +549,6 @@ mod tests {
         assert!(check_no_root(&outputs(&good)).is_err());
     }
 
-    // #### PR #42
     // What: a commitment passes only as output 0, worth 0 and exact; at
     // output 1, valued, malformed or twice it is refused; 253 outputs with
     // a commitment are refused; a token-prefixed output is refused.
