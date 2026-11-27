@@ -970,6 +970,9 @@ pub fn connection_reason(error: &str) -> &'static str {
         "SV2 certificate version unsupported" => {
             "upstream certificate version is not SV2's; the pool must fix it"
         }
+        // The device's own subscribe was malformed; the session died
+        // before any worker name was read, so it shows as a row.
+        "invalid subscribe" => "device sent an unparseable mining.subscribe",
         _ => "protocol or connection failure",
     }
 }
@@ -995,6 +998,12 @@ mod tests {
         assert_eq!(
             connection_reason("something else"),
             "protocol or connection failure"
+        );
+        // The device's own subscribe was malformed (e.g. a non-hex session
+        // id); the name reaches the sidecar row instead of the catch-all.
+        assert_eq!(
+            connection_reason("invalid subscribe"),
+            "device sent an unparseable mining.subscribe"
         );
     }
 
