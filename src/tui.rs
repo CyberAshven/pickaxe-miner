@@ -2058,7 +2058,7 @@ impl SetupFlow {
             });
         }
         let nodes = self.nodes_here();
-        // A synced node without gettxout (Knuth) cannot follow the token.
+        // A synced node without gettxout cannot follow the token.
         if let Some(node) = nodes.iter().find(|node| node.ready == Some(false)) {
             return Some(format!(
                 "this computer's {} (synced) has no gettxout, which {} needs: jobs come from the \

@@ -247,7 +247,36 @@ impl NativePhotonSession {
         )?;
 
         let observed_baton = if txout.is_null() {
-            match resolve_native_mempool_baton(&self.url, &self.baton, &self.deployment) {
+            // #### Knuth compatibility: blocks first, the UTXO scan last
+            // What: when the cached baton is gone and blocks were found since
+            // the last read, the baton is followed through those blocks
+            // (getblock, verbosity 2) to its newest output, which gettxout or
+            // the mempool then gives. The full UTXO scan stays the last resort.
+            // Why: Knuth has no scantxoutset, so on Knuth every baton spent in
+            // a block sent the miner back to Fulcrum; on BCHN the scan takes
+            // seconds where a few getblock calls do.
+            // Look here if: a node loses the baton after a block, or a miner
+            // on a node rescans the UTXO set after every claim.
+            let followed = if height > self.snapshot.job.height {
+                follow_native_baton_through_blocks(
+                    &self.url,
+                    &self.baton,
+                    self.snapshot.job.height,
+                    height,
+                    &self.deployment,
+                )
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
+            let resolved = match followed {
+                Some(moved) => {
+                    native_baton_at_tip(&self.url, &moved, height, &bestblock, &self.deployment)
+                }
+                None => resolve_native_mempool_baton(&self.url, &self.baton, &self.deployment),
+            };
+            match resolved {
                 Ok(successor) => successor,
                 Err(refresh_error) => {
                     let bootstrap = bootstrap_native_photon(&self.url, &self.deployment).map_err(|bootstrap_error| {
@@ -295,6 +324,81 @@ pub fn fetch_photon_live_job(
 ) -> Result<LiveJob, String> {
     let session = NativePhotonSession::connect_failover(endpoints, deployment)?;
     Ok(session.snapshot().job.clone())
+}
+
+/// #### Knuth compatibility: the most blocks a refresh follows the baton
+/// through before it falls back to scanning the UTXO set (a day of blocks).
+const MAX_NATIVE_PHOTON_FOLLOW_BLOCKS: u32 = 144;
+
+/// #### Knuth compatibility
+/// The baton after `from` as the blocks `after + 1 ..= tip` moved it, in
+/// block and transaction order; `None` when none of them spent it.
+fn follow_native_baton_through_blocks(
+    url: &str,
+    from: &NativePhotonBaton,
+    after: u32,
+    tip: u32,
+    deployment: &PhotonDeployment,
+) -> Result<Option<NativePhotonBaton>, String> {
+    if tip.saturating_sub(after) > MAX_NATIVE_PHOTON_FOLLOW_BLOCKS {
+        return Err(format!(
+            "{} blocks since the last read; following the baton stops at {}",
+            tip.saturating_sub(after),
+            MAX_NATIVE_PHOTON_FOLLOW_BLOCKS
+        ));
+    }
+    let mut current = from.clone();
+    let mut moved = false;
+    for height in after.saturating_add(1)..=tip {
+        let hash = rpc_call(url, "getblockhash", json!([height]))?;
+        let block = rpc_call(url, "getblock", json!([hash, 2]))?;
+        let transactions = block
+            .get("tx")
+            .and_then(Value::as_array)
+            .ok_or("getblock omitted its transactions")?;
+        for transaction in transactions {
+            let txid = transaction
+                .get("txid")
+                .and_then(Value::as_str)
+                .ok_or("getblock gave a transaction without a txid")?;
+            if let Some(next) =
+                parse_native_mempool_successor(txid, transaction, &current, deployment)?
+            {
+                current = next;
+                moved = true;
+            }
+        }
+    }
+    Ok(moved.then_some(current))
+}
+
+/// #### Knuth compatibility
+/// The baton a block left (`moved`) as it stands at the tip: its unspent
+/// output from gettxout, or the mempool chain that spends it.
+fn native_baton_at_tip(
+    url: &str,
+    moved: &NativePhotonBaton,
+    height: u32,
+    bestblock: &str,
+    deployment: &PhotonDeployment,
+) -> Result<NativePhotonBaton, String> {
+    let txout = rpc_call(
+        url,
+        "gettxout",
+        json!([moved.txid.clone(), moved.vout, true]),
+    )?;
+    if txout.is_null() {
+        resolve_native_mempool_baton(url, moved, deployment)
+    } else {
+        parse_native_gettxout_baton(
+            &moved.txid,
+            moved.vout,
+            height,
+            bestblock,
+            &txout,
+            deployment,
+        )
+    }
 }
 
 /// Initializes native PHOTON state from canonical source evidence.
@@ -2897,6 +3001,98 @@ mod gbt_tests {
     }
 
     #[test]
+    fn a_baton_spent_in_a_new_block_is_followed_without_a_utxo_scan() {
+        // #### Knuth compatibility
+        // What: the cached baton (33…:0, read at height 1000) was spent in
+        // block 1001; refresh finds the spend in that block with getblock and
+        // reads the new baton with gettxout. The scripted node has no
+        // scantxoutset, as Knuth has none: calling it would break the script.
+        // Look here if: a node without scantxoutset loses the baton after a
+        // block.
+        let txid = "33".repeat(32);
+        let successor_txid = "55".repeat(32);
+        let bestblock = "44".repeat(32);
+        let block_hash = "66".repeat(32);
+        let confirmed_commitment = format!(
+            "01000000{}",
+            "ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000"
+        );
+        let successor_commitment = format!(
+            "02000000{}",
+            "ab9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000"
+        );
+        let cached = live_job_from_fulcrum_values(
+            "wss://fixture.invalid",
+            json!(["Fulcrum", "1.5"]),
+            &json!({"height": 1000, "hex": FIXTURE_HEADER_HEX}),
+            &json!([{
+                "tx_hash": txid,
+                "tx_pos": 0,
+                "height": 990,
+                "value": 15_971_500,
+                "token_data": {
+                    "category": MAINNET_CATEGORY_HEX,
+                    "amount": "2100000000000000",
+                    "nft": {"capability": "mutable", "commitment": confirmed_commitment}
+                }
+            }]),
+        )
+        .unwrap();
+        assert_eq!(cached.height, 1000);
+        let successor_token_data = json!({
+            "category": MAINNET_CATEGORY_HEX,
+            "amount": "2099995000000001",
+            "nft": {"capability": "mutable", "commitment": successor_commitment}
+        });
+        let block = json!({
+            "hash": block_hash,
+            "height": 1001,
+            "tx": [{
+                "txid": "77".repeat(32),
+                "vin": [{"coinbase": "03e90300"}],
+                "vout": [{"n": 0, "value": 3.125, "scriptPubKey": {"hex": "6a"}}]
+            }, {
+                "txid": successor_txid,
+                "vin": [{"txid": txid, "vout": 0}],
+                "vout": [{
+                    "n": 0,
+                    "value": 0.15970885,
+                    "scriptPubKey": {"hex": COVENANT_LOCKING_BYTECODE_HEX},
+                    "tokenData": successor_token_data
+                }]
+            }]
+        });
+        let successor_txout = json!({
+            "bestblock": bestblock,
+            "confirmations": 1,
+            "value": 0.15970885,
+            "scriptPubKey": {"hex": COVENANT_LOCKING_BYTECODE_HEX},
+            "tokenData": successor_token_data,
+        });
+        let (endpoint, server) = serve_json_rpc_sequence(vec![
+            (
+                "getblockchaininfo",
+                json!({"blocks": 1001, "bestblockhash": bestblock.clone()}),
+            ),
+            ("gettxout", Value::Null),
+            ("getblockhash", json!(block_hash)),
+            ("getblock", block),
+            ("gettxout", successor_txout.clone()),
+            ("getbestblockhash", json!(bestblock.clone())),
+            ("gettxout", successor_txout),
+        ]);
+        let mut session =
+            NativePhotonSession::unverified_for_test(&endpoint, &MAINNET_PHOTON, &cached);
+        let refreshed = session.refresh().unwrap();
+        server.join().unwrap();
+        assert_eq!(refreshed.job.baton_txid, successor_txid);
+        assert_eq!(refreshed.job.baton_vout, 0);
+        assert_eq!(refreshed.job.baton_height, 1001);
+        assert_eq!(refreshed.job.height, 1001);
+        assert_eq!(refreshed.tip_hash, bestblock);
+    }
+
+    #[test]
     fn native_photon_state_matches_fulcrum_unconfirmed_successor() {
         let txid = "33".repeat(32);
         let successor_txid = "55".repeat(32);
@@ -3437,5 +3633,230 @@ mod gbt_tests {
             result.is_ok(),
             "scantxoutset read timed out after {elapsed:?}: {result:?}"
         );
+    }
+
+    // #### Knuth compatibility: a live check against a real Knuth node
+    // What: everything Pickaxe asks of a node, run read-only against the Knuth
+    // node in PICKAXE_KNUTH_RPC (http://USER:PASSWORD@HOST:PORT, Chipnet):
+    // the setup's node check, ASIC templates, the PHOTON baton read through
+    // the node and compared with a Chipnet Fulcrum server, a confirmed
+    // transaction found without a transaction index, the baton followed
+    // through recent blocks from a past claim, and block submission and
+    // broadcast wired to their answers (invalid data only, so nothing is
+    // published).
+    // Why: the operator wants Pickaxe proven compatible with Knuth.
+    // Look here if: a Knuth release changes what it answers.
+    #[test]
+    // Builds only with the ASIC server (`stratum-v2`), whose template code
+    // it checks.
+    #[cfg(feature = "stratum-v2")]
+    #[ignore = "requires PICKAXE_KNUTH_RPC pointing to a Chipnet Knuth node"]
+    fn live_knuth_answers_everything_pickaxe_asks_of_a_node() {
+        use crate::config::MiningNetwork;
+        use crate::protocol::{CHIPNET_FULCRUM_WSS_BOOTSTRAP, CHIPNET_PHOTON};
+        let url = std::env::var("PICKAXE_KNUTH_RPC").expect("PICKAXE_KNUTH_RPC required");
+        let shown = redact_url(&url);
+        let report = |step: &str, outcome: &str| println!("{step:<44} {outcome}");
+
+        // 1. The setup's node check.
+        let check = check_node(&url, MiningNetwork::Chipnet);
+        report("setup node check", &check.summary());
+        let NodeCheck::Ready {
+            info,
+            follows_photon,
+        } = check
+        else {
+            panic!("{shown}: not ready")
+        };
+        assert!(
+            info.client.to_ascii_lowercase().contains("knuth"),
+            "{}",
+            info.client
+        );
+        assert!(follows_photon, "the check must find gettxout");
+
+        // 2. ASIC templates.
+        let mut provider = crate::stratum_v2::provider::TemplateProvider::new(
+            crate::stratum_v2::provider::NativeNodeRpc::new(url.clone()),
+            MiningNetwork::Chipnet,
+        );
+        let tip = rpc_call(&url, "getblockcount", json!([]))
+            .unwrap()
+            .as_u64()
+            .unwrap();
+        let (_, template) = provider.refresh().expect("template");
+        report(
+            "ASIC template",
+            &format!(
+                "height {} ({} transactions), size limit {}",
+                template.height,
+                template.transactions().len(),
+                template.size_limit
+            ),
+        );
+        assert!(u64::from(template.height) > tip);
+
+        // 3. The PHOTON baton through the node, against Fulcrum's.
+        let fulcrum = crate::electrum::ElectrumSession::connect_failover_for_deployment(
+            &CHIPNET_FULCRUM_WSS_BOOTSTRAP
+                .iter()
+                .map(|url| url.to_string())
+                .collect::<Vec<_>>(),
+            &CHIPNET_PHOTON,
+        )
+        .expect("a Chipnet Fulcrum server")
+        .fetch_live_job()
+        .expect("Fulcrum's PHOTON job");
+        let mut session =
+            NativePhotonSession::resume(std::slice::from_ref(&url), &CHIPNET_PHOTON, &fulcrum)
+                .expect("the node confirms Fulcrum's baton");
+        let native = session.refresh().expect("refresh through the node").job;
+        report(
+            "PHOTON baton via Knuth vs Fulcrum",
+            &format!(
+                "{}:{} at {} (Fulcrum {}:{})",
+                &native.baton_txid[..12],
+                native.baton_vout,
+                native.baton_height,
+                &fulcrum.baton_txid[..12],
+                fulcrum.baton_vout
+            ),
+        );
+        if native.height == fulcrum.height {
+            assert_eq!(native.baton_txid, fulcrum.baton_txid);
+            assert_eq!(native.baton_vout, fulcrum.baton_vout);
+            assert_eq!(native.commitment_hex, fulcrum.commitment_hex);
+            assert_eq!(native.token_amount, fulcrum.token_amount);
+        }
+
+        // 4. A confirmed transaction without a transaction index.
+        if native.baton_height > 0 {
+            let raw = crate::electrum::node_raw_transaction(&url, &native.baton_txid)
+                .expect("lookup")
+                .expect("the baton's transaction");
+            let bytes = hex::decode(&raw).unwrap();
+            let mut id = crate::stratum_v2::template::double_sha256(&bytes);
+            id.reverse();
+            assert_eq!(hex::encode(id), native.baton_txid);
+            report(
+                "confirmed transaction lookup",
+                "found by its block, id matches",
+            );
+        }
+
+        // 5. The baton followed through blocks from a past claim.
+        let deployment = &CHIPNET_PHOTON;
+        let mut followed = None;
+        for height in (tip.saturating_sub(MAX_NATIVE_PHOTON_FOLLOW_BLOCKS as u64)..=tip).rev() {
+            let hash = rpc_call(&url, "getblockhash", json!([height])).unwrap();
+            let block = rpc_call(&url, "getblock", json!([hash, 2])).unwrap();
+            for transaction in block["tx"].as_array().unwrap() {
+                let spends_a_baton = transaction["vout"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|output| native_transaction_output_is_photon_baton(output, deployment));
+                if !spends_a_baton {
+                    continue;
+                }
+                // The claim's spent baton, rebuilt from the input it names.
+                let input = &transaction["vin"].as_array().unwrap()[0];
+                let previous = NativePhotonBaton {
+                    txid: input["txid"].as_str().unwrap().to_owned(),
+                    vout: input["vout"].as_u64().unwrap() as u32,
+                    height: 0,
+                    value_sats: 0,
+                    commitment_hex: String::new(),
+                    token_amount: 0,
+                };
+                followed = Some((height, previous));
+                break;
+            }
+            if followed.is_some() {
+                break;
+            }
+        }
+        // Without a claim in the last 144 blocks, the block that made the
+        // current baton is followed from the one before it.
+        let mut stop_at = u32::try_from(tip).unwrap();
+        if followed.is_none() && native.baton_height > 0 {
+            let hash = rpc_call(&url, "getblockhash", json!([native.baton_height])).unwrap();
+            let block = rpc_call(&url, "getblock", json!([hash, 2])).unwrap();
+            let claim = block["tx"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|transaction| transaction["txid"] == native.baton_txid.as_str())
+                .expect("the baton's block holds its transaction");
+            let input = &claim["vin"].as_array().unwrap()[0];
+            followed = Some((
+                u64::from(native.baton_height),
+                NativePhotonBaton {
+                    txid: input["txid"].as_str().unwrap().to_owned(),
+                    vout: input["vout"].as_u64().unwrap() as u32,
+                    height: 0,
+                    value_sats: 0,
+                    commitment_hex: String::new(),
+                    token_amount: 0,
+                },
+            ));
+            stop_at = native.baton_height;
+        }
+        match followed {
+            Some((claim_height, previous)) => {
+                let tip_now = stop_at;
+                let last = follow_native_baton_through_blocks(
+                    &url,
+                    &previous,
+                    u32::try_from(claim_height).unwrap() - 1,
+                    tip_now,
+                    deployment,
+                )
+                .expect("follow")
+                .expect("the claim moved the baton");
+                report(
+                    "baton followed through blocks",
+                    &format!(
+                        "from the claim at {claim_height} to {}:{} (node now {}:{})",
+                        &last.txid[..12],
+                        last.vout,
+                        &native.baton_txid[..12],
+                        native.baton_vout
+                    ),
+                );
+                if native.baton_height > 0 && native.baton_height <= tip_now {
+                    assert_eq!(last.txid, native.baton_txid);
+                    assert_eq!(last.vout, native.baton_vout);
+                }
+            }
+            None => report(
+                "baton followed through blocks",
+                "no PHOTON claim in the last 144 blocks to follow from",
+            ),
+        }
+
+        // 6. The claim-fee floor the miner reads (mempool.get_info on a node
+        // session), which needs a minimum even when Knuth reports none.
+        let fees = crate::electrum::node_rpc(&url, "mempool.get_info", &json!([]))
+            .expect("mempool.get_info");
+        let floor = crate::fee::bch_value_to_sats(&fees["mempoolminfee"]).expect("a fee floor");
+        report(
+            "claim-fee floor (mempool.get_info)",
+            &format!("{floor} sats/kB"),
+        );
+        assert!(floor > 0);
+
+        // 7. Submission and broadcast reach the node (invalid data only).
+        for (method, params) in [
+            ("submitblock", json!(["00"])),
+            ("sendrawtransaction", json!(["00"])),
+        ] {
+            let error = rpc_call(&url, method, params).expect_err("invalid data must be refused");
+            assert!(
+                !error.to_ascii_lowercase().contains("method not found"),
+                "{method}: {error}"
+            );
+            report(method, &format!("answers, refusing invalid data ({error})"));
+        }
     }
 }
