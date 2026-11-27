@@ -2,12 +2,26 @@
 
 ![Pickaxe Miner](docs/assets/pickaxe-miner-logo.png)
 
-Rust miner for Bitcoin Cash and CashTokens: GPU token mining, BCH ASIC mining,
-and pool or farm operation from one terminal application. A browser WebGPU miner
-is also available for PHOTON.
+Pickaxe is a Bitcoin Cash mining hub, in the spirit of Gupaxx for Monero: one
+program, with a desktop window and a terminal that share the same setup, for:
+
+- **GPU token mining**: the PHOTON and ELECTRIC CashTokens, or both at once with
+  a share of the GPUs each. A browser WebGPU miner is also available for PHOTON.
+- **BCH ASICs**: a Stratum V1 and V2 server and proxy that your ASICs connect
+  to, for solo mining on your own node, a Public Solo Endpoint, a Non-custodial
+  Pool or P2Pool v2, and upstream SV2 pools with Job Declaration.
+- **Hosting**: a managed P2Pool v2 node, and GPU farms of many rigs under one
+  coordinator.
+- **Your node**: BCHN or Knuth, on this computer or another, with Fulcrum
+  servers as the fallback ([what Pickaxe needs from a node](docs/node-requirements.md)).
+- **Updates**: Pickaxe and P2Pool check for, download and verify new releases
+  ([updates](docs/updates.md)).
+
+Download it, then double-click **pickaxe-gui** for the window, or run
+**pickaxe** in a terminal.
 
 [Download the latest release](https://github.com/CyberAshven/pickaxe-miner/releases/latest)
- · [Guides](docs/README.md) · [Container guide](docs/container.md) · [Development and releases](docs/development.md)
+ · **[Step-by-step guide with screenshots](docs/guide.md)** · [All guides](docs/README.md) · [Container guide](docs/container.md) · [Development and releases](docs/development.md)
 
 This README describes the current branch. For a downloaded build, its release
 notes describe the features included in that package.

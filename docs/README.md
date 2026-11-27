@@ -18,6 +18,7 @@
 - [Incremental-k search](incremental-k.md) (optional CUDA build feature)
 - [Running a pool](pool.md): an ASIC or GPU pool for other miners, as a service
 - [BCH P2Pool, managed](p2pool.md): P2Pool installed from its releases, kept updated and run by Pickaxe, with lights for P2Pool and the node
+- [Step-by-step guide with screenshots](guide.md): from download to mining, in the window
 - [BCH ASIC mining (SV1/SV2)](stratum-v2.md): solo and pool connections, native-node templates and Template Distribution
 - [GPU farms](farm.md): rigs on many machines mining as one
 - [HiveOS, mmpOS and RaveOS](farm-os.md): the custom-miner packages for farm systems
