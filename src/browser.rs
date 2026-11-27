@@ -69,10 +69,29 @@ pub async fn verify_portable_engine(table: Vec<u8>, stages: &str) -> Result<Stri
 }
 
 #[wasm_bindgen]
+pub fn describe_browser_work(
+    network: &str,
+    donation_percent: f64,
+    host_percent: f64,
+) -> Result<String, JsValue> {
+    let network = MiningNetwork::parse(network).map_err(error)?;
+    let token = MiningToken::Photon;
+    let (scheme, host_bps) = crate::donation::host_work(
+        token.fee_policy(network).scheme,
+        token.donation_default(),
+        donation_percent,
+        host_percent,
+    )
+    .map_err(error)?;
+    Ok(crate::donation::describe_host_work(scheme, host_bps))
+}
+
+#[wasm_bindgen]
 pub struct BrowserMiner {
     engine: WgpuPhotonEngine,
     network: MiningNetwork,
     payouts: [String; 3],
+    host_address: String,
     schedule: Schedule,
     recipient: Recipient,
     live: Option<LiveJob>,
@@ -85,11 +104,39 @@ pub struct BrowserMiner {
 
 #[wasm_bindgen]
 impl BrowserMiner {
-    pub async fn create(network: &str, address: &str, table: Vec<u8>) -> Result<Self, JsValue> {
+    /// `host_address` and `host_percent` are optional. An empty address and
+    /// percent 0 mean no host fee. `donation_percent` 0 means the token
+    /// default. A host cannot set the donation lower.
+    pub async fn create(
+        network: &str,
+        address: &str,
+        table: Vec<u8>,
+        host_address: &str,
+        host_percent: f64,
+        donation_percent: f64,
+    ) -> Result<Self, JsValue> {
         let network = MiningNetwork::parse(network).map_err(error)?;
         let address = crate::config::validate_payout_address(network, address).map_err(error)?;
-        let policy = MiningToken::Photon.fee_policy(network);
-        crate::donation::require_direct_reward_policy(policy.scheme).map_err(error)?;
+        let token = MiningToken::Photon;
+        let (scheme, host_bps) = crate::donation::host_work(
+            token.fee_policy(network).scheme,
+            token.donation_default(),
+            donation_percent,
+            host_percent,
+        )
+        .map_err(error)?;
+        let host_address = if host_bps == 0 {
+            if !host_address.is_empty() {
+                return Err(error("a host fee needs a percentage"));
+            }
+            address.clone()
+        } else if host_address.is_empty() {
+            return Err(error("a host fee needs an address"));
+        } else {
+            crate::config::validate_payout_address(network, host_address).map_err(error)?
+        };
+        let mut policy = token.fee_policy(network);
+        policy.scheme = scheme;
         let payouts = policy.payouts(network, &address).map_err(error)?;
         let engine = WgpuPhotonEngine::new_async(
             0,
@@ -107,13 +154,14 @@ impl BrowserMiner {
             crate::backend_kind::BackendKind::Wgpu,
             engine.recommended_batch_candidates(),
         );
-        let schedule =
-            Schedule::new(policy.scheme, quantum, rand::rng().random()).map_err(error)?;
+        let schedule = Schedule::with_host(policy.scheme, quantum, rand::rng().random(), host_bps)
+            .map_err(error)?;
         let recipient = schedule.recipient();
         Ok(Self {
             engine,
             network,
             payouts,
+            host_address,
             schedule,
             recipient,
             live: None,
@@ -247,11 +295,13 @@ impl BrowserMiner {
             .live
             .as_ref()
             .ok_or_else(|| error("waiting for network state"))?;
-        let job = live.to_mining_job_for_network(
-            self.generation,
-            &self.payouts[self.recipient as usize],
-            self.network,
-        );
+        let payout = match self.recipient {
+            crate::donation::Recipient::Miner => &self.payouts[0],
+            crate::donation::Recipient::Project => &self.payouts[1],
+            crate::donation::Recipient::Collaborator => &self.payouts[2],
+            crate::donation::Recipient::Host => &self.host_address,
+        };
+        let job = live.to_mining_job_for_network(self.generation, payout, self.network);
         let key = crypto::random_secret_key();
         self.key = key.to_secret_bytes();
         self.public_key = PublicKey::from_secret_key(&key).serialize();

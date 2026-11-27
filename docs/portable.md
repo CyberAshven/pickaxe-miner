@@ -98,7 +98,13 @@ A site that already has its own page does not fork the repository and does
 not use `index.html`. It hosts this same bundle and calls `runMiner` from
 `miner.js`, after `init()` and `browser_config()` from the generated
 WebAssembly bindings. The call takes the network, the visitor's payout
-address, and where to report status. The donation is compiled into that
+address, and where to report status. A host may also pass its own address
+and a fee of at most 10% of the work. That fee comes out of the visitor's
+share, after the donation. Leaving it empty keeps the visitor's share.
+The donation stays at least 4% on PHOTON. A host may raise it, and anything
+above 4% goes to the project donation address. The host cannot lower it.
+`runMiner` logs the work split before mining, and the page should show that
+line. The donation is compiled into that
 WebAssembly, not chosen by the page. Pin the release. A later engine arrives
 only when those files are replaced.
 

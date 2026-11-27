@@ -965,6 +965,7 @@ impl PendingSubmission {
                     crate::donation::Recipient::Miner => "direct_miner",
                     crate::donation::Recipient::Project => "direct_project",
                     crate::donation::Recipient::Collaborator => "direct_collaborator",
+                    crate::donation::Recipient::Host => "direct_host",
                 }
                 .into(),
             ),
@@ -989,10 +990,13 @@ impl PendingSubmission {
             } else {
                 0
             },
-            donation_token_amount: if recipient == crate::donation::Recipient::Miner {
-                0
-            } else {
+            donation_token_amount: if matches!(
+                recipient,
+                crate::donation::Recipient::Project | crate::donation::Recipient::Collaborator
+            ) {
                 amount
+            } else {
+                0
             },
         };
         pending.validate()?;

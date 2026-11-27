@@ -3,7 +3,7 @@
 // The donation stays in the Rust engine (src/browser.rs). Upgrading is
 // replacing these files. Look here if: start, stop, or a reward submission
 // behaves differently from the Pickaxe page.
-import { BrowserMiner, BrowserControls, validate_payout_address } from './pkg/pickaxe_miner.js';
+import { BrowserMiner, BrowserControls, validate_payout_address, describe_browser_work } from './pkg/pickaxe_miner.js';
 import { Electrum, rpcErrorCode } from './rpc.js';
 import { resolveSubmission } from './submission.js';
 import { SnapshotRefresh } from './refresh.js';
@@ -27,6 +27,11 @@ export interface MinerSession {
   remove: (key: string) => void;
   /** The PHOTON generator table shipped beside this build. */
   table: () => Promise<Uint8Array>;
+  /** Empty and 0 mean there is no host fee. At most 10% of the work. */
+  hostAddress?: string;
+  hostPercent?: number;
+  /** 0 means the token's donation. A host cannot set it lower. */
+  donationPercent?: number;
 }
 
 interface RawSnapshot { before: string; unspent: string; after: string; fee: string }
@@ -133,8 +138,14 @@ export async function runMiner(call: MinerSession): Promise<void> {
   try {
     address = validate_payout_address(network, address);
     call.onAddress(address);
+    const hostAddress = call.hostAddress ?? '';
+    const hostPercent = call.hostPercent ?? 0;
+    const donationPercent = call.donationPercent ?? 0;
+    call.log(describe_browser_work(network, donationPercent, hostPercent));
     call.status('Loading GPU table and compiling browser WebGPU shaders…');
-    miner = await BrowserMiner.create(network, address, await call.table());
+    miner = await BrowserMiner.create(
+      network, address, await call.table(), hostAddress, hostPercent, donationPercent,
+    );
     call.save(`pickaxe.address.${network}`, address);
     await connect();
     await snapshot();

@@ -1159,6 +1159,7 @@ fn recipient_name(recipient: Recipient) -> &'static str {
     match recipient {
         Recipient::Miner => "you",
         Recipient::Project | Recipient::Collaborator => "donation",
+        Recipient::Host => "host",
     }
 }
 
