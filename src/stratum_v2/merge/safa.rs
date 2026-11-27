@@ -1,4 +1,4 @@
-//! #### PR #42: SAFA layout v1 (draft)
+//! SAFA layout v1 (draft)
 //! What: a Rust reference of the SAFA draft covenant, a CashToken whose
 //! 80-byte NFT commitment is shaped like a block header so SHA-256 ASICs can
 //! mine it: its parameters as data, the commitment's fields, the difficulty
@@ -173,7 +173,7 @@ pub fn decode_compact(bits: [u8; 4], order: CompactOrder) -> Result<BigUint, &'s
     Ok(BigUint::from_bytes_le(&mantissa) << (8 * (u32::from(exponent) - 3)))
 }
 
-// #### PR #42: the freeze guard
+// The freeze guard
 // What: a target whose minimal script number takes 33 bytes (2^255 or
 // more) is refused instead of encoded.
 // Why: the covenant reads the exponent back with `0 ≤ exp < 33`, so a claim
@@ -214,7 +214,7 @@ pub fn next_target(previous: &BigUint, age: u16, daa: Daa) -> BigUint {
     }
 }
 
-// #### PR #42: the sign guard
+// The sign guard
 // What: Pickaxe counts a hash as a win only when it is positive (byte 31
 // below 0x80) and, read unsigned, at or below the target.
 // Why: the draft reads the hash as a signed script number, so every
@@ -292,7 +292,6 @@ mod tests {
         value.to_le_bytes()
     }
 
-    // #### PR #42
     // What: the canonical template's "release" output decodes to its
     // fields: the scaler, HASH256 of the source commitment, the payout hash,
     // the claim's locktime as its time and target 0x207fffff.
@@ -315,7 +314,6 @@ mod tests {
         );
     }
 
-    // #### PR #42
     // What: the release vector's own hash ends in 0xbb, so as a script
     // number it is negative: the draft's signed compare accepts it, while
     // read unsigned it is above the target, and the Positive rule refuses
@@ -335,7 +333,6 @@ mod tests {
         assert!(BigUint::from_bytes_le(&hash) > target);
     }
 
-    // #### PR #42
     // What: the DAA from 0x1d00ffff at ages 0, 1, 71, 142 and 65534 gives
     // the targets the covenant's integer order gives (5000/71 truncates to
     // 70, so age 1 is ×0.507).
@@ -359,7 +356,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     // What: the covenant's compact form equals Bitcoin's compact target for
     // every size from 3 to 32 bytes, and the two byte orders hold the same
     // fields.
@@ -393,7 +389,6 @@ mod tests {
         }
     }
 
-    // #### PR #42
     // What: from 0x207fffff, age 71 keeps the target, and age 72 needs a
     // 33-byte script number (exponent 33), which is refused.
     // Look here if: the freeze guard changes.
@@ -445,7 +440,6 @@ mod tests {
         (thread, win.encode())
     }
 
-    // #### PR #42
     // What: a win on the thread verifies; changing the version slot, the
     // previous hash, the payout, a time at or below 500,000,000, the
     // target, a nonce whose hash fails the Positive rule, or an age past
@@ -489,7 +483,6 @@ mod tests {
         );
     }
 
-    // #### PR #42
     // What: under the BIP320 rule a win may roll bits 13-28 of the version
     // slot; the fixed rule refuses any change, and bits outside the mask
     // are refused by both.

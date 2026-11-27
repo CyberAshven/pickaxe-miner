@@ -1,4 +1,3 @@
-//! #### PR #38
 //! Authenticated SV2 transport shared by ASIC channels and rig connections.
 //! Use reference Noise/framing, pin the authority, bound frame bytes and time,
 //! and destroy both directions after any authentication or partial-I/O error.
@@ -22,7 +21,7 @@ use stratum_core::{
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
-/// #### PR #42: per-session frame limits
+/// Per-session frame limits
 /// What: the most frame bytes (header included) a session takes in and
 /// sends, and how long one frame may take to arrive or leave. Devices keep
 /// 1 MiB each way and 10 s. A Template Distribution server takes at most a
@@ -60,7 +59,7 @@ impl Limits {
         max_out: 65_557 + 64,
         frame_deadline: Duration::from_secs(60),
     };
-    // #### PR #42: the Job Declaration frame limit
+    // The Job Declaration frame limit
     // What: a Full-Template Job Declaration session takes and sends frames of
     // up to 16 MiB each way, with a minute per frame; a Coinbase-only one
     // keeps a device's limits.
@@ -81,7 +80,6 @@ impl Limits {
         self.max_in + 16 * self.max_in.div_ceil(65_535) + 1024
     }
 }
-// #### end PR #42 ####
 
 pub struct Session {
     reader: Receiver,
@@ -107,7 +105,7 @@ impl Session {
         Self::initiate_with(stream, authority, Limits::DEVICE)
     }
 
-    /// #### PR #42: a session with other frame limits than a device's.
+    /// A session with other frame limits than a device's.
     pub fn initiate_with(
         mut stream: TcpStream,
         authority: [u8; 32],
@@ -124,7 +122,6 @@ impl Session {
             let mut reply = [0; INITIATOR_EXPECTED_HANDSHAKE_MESSAGE_SIZE];
             read_until(&mut stream, &mut reply, Instant::now() + IO_TIMEOUT)?;
             handshake.step_2(reply).map_err(|error| match error {
-                // #### PR #40
                 // Name a certificate whose format version is not SV2's 0:
                 // SoloFury's BCH endpoints sent version 1 on 2026-10-08, and
                 // the spec requires refusing it, so the user sees why.
@@ -145,7 +142,7 @@ impl Session {
         }
     }
 
-    /// #### PR #42: a session to a server on this computer whose key is
+    /// A session to a server on this computer whose key is
     /// not pinned (a template provider started without one); refused for any
     /// peer that is not a loopback address.
     pub fn initiate_unpinned(mut stream: TcpStream, limits: Limits) -> Result<Self, String> {
@@ -183,7 +180,7 @@ impl Session {
         Self::accept_with(stream, authority, secret, Limits::DEVICE)
     }
 
-    /// #### PR #42: a session with other frame limits than a device's.
+    /// A session with other frame limits than a device's.
     pub fn accept_with(
         mut stream: TcpStream,
         authority: &[u8; 32],
@@ -264,7 +261,7 @@ impl Sender {
         let _ = self.stream.shutdown(Shutdown::Both);
     }
 
-    /// #### PR #42: other frame limits from the next frame on, for a
+    /// Other frame limits from the next frame on, for a
     /// connection that turned out to be a Job Declaration session.
     pub fn set_limits(&mut self, limits: Limits) {
         self.limits = limits;
@@ -341,7 +338,7 @@ impl Receiver {
         let _ = self.stream.shutdown(Shutdown::Both);
     }
 
-    /// #### PR #42: other frame limits from the next frame on (see
+    /// Other frame limits from the next frame on (see
     /// `Sender::set_limits`).
     pub fn set_limits(&mut self, limits: Limits) {
         self.limits = limits;
@@ -421,7 +418,7 @@ fn io_failure(what: &str, error: &io::Error) -> String {
 /// buffer space.
 const NO_BUFFERS_PAUSE: Duration = Duration::from_millis(20);
 
-/// #### PR #42: the most one write call sends
+/// The most one write call sends
 /// What: a frame is written in slices of at most 256 KiB.
 /// Why: a template's transaction data is one frame of up to 16 MiB, and on
 /// Windows one large send can fail when memory is short, which closed the
@@ -549,7 +546,6 @@ mod tests {
             assert!(receiver.receive(Duration::from_millis(100)).is_err());
         }
     }
-    // #### PR #42
     // What: device sessions keep 1 MiB each way: a frame just over it is
     // refused on send and closes the receiver; a template server's session
     // sends a 4 MiB frame its client takes, and the client's 64 KiB send
@@ -557,7 +553,7 @@ mod tests {
     // Look here if: Limits or the receive budget changes.
     #[test]
     fn device_sessions_keep_1_mib_each_way_and_template_sessions_carry_16_mib() {
-        // #### PR #65: this exercises size limits, not wall-clock throughput.
+        // This exercises size limits, not wall-clock throughput.
         // Debug Noise decryption of 4 MiB can exceed a minute on a busy
         // Windows runner. Production Limits keep their original deadlines;
         // partial_frame_deadline_closes_the_session checks timeout handling.

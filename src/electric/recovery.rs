@@ -1,4 +1,4 @@
-//! #### PR #51: persist a pot-only recovery key before showing a funding
+//! Persist a pot-only recovery key before showing a funding
 //! address; never replace an existing key, including a damaged one.
 
 use secp256k1::{PublicKey, SecretKey};

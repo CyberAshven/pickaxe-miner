@@ -1,4 +1,4 @@
-//! #### one donation, the higher rate: verified own donation
+//! Verified own donation
 //! What a Public Solo Endpoint credits a miner whose own Pickaxe already
 //! mines the Pickaxe donation on the same SV2 connection: the SV1 adapter's
 //! donation channel, opened beside the device's own channel under the
@@ -14,7 +14,7 @@ const WINDOW: usize = 12;
 /// The ring: the open bucket and the closed ones.
 const SLOTS: u32 = WINDOW as u32 + 1;
 
-// #### one donation, the higher rate: verified own donation
+// Verified own donation
 // What: per connection, accepted work (expected hashes, the work allocation's
 // measure) in five-minute buckets, the connection's donation channels' and
 // all of its channels'. When a bucket closes, the own donation's share of the
@@ -154,7 +154,7 @@ mod tests {
         start + seconds
     }
 
-    // #### one donation, the higher rate: verified own donation
+    // Verified own donation
     // What: host 2%, the miner's own Pickaxe visibly mines 1.5%: once a
     // bucket has closed the credit is 1.5%, and the host takes 0.51% of the
     // work on the miner's own channels, which is 0.5% of all of it, so the
@@ -188,7 +188,7 @@ mod tests {
         assert_eq!(charged(host, plain.credit(host)), host);
     }
 
-    // #### one donation, the higher rate: verified own donation
+    // Verified own donation
     // What: the credit follows the last hour of work: a miner whose own
     // donation (4%, above the host's 2%) stops is credited the host's whole
     // rate while the hour still holds 2%, less after, and nothing once the

@@ -1,4 +1,3 @@
-//! #### PR #42
 //! The Job Declaration server session, without sockets: setup per accepted
 //! mode, allocation, Full-Template declarations with missing transactions,
 //! the node check's cadence and tip-race mapping, and PushSolution.
@@ -179,7 +178,7 @@ fn declare_frame(
     declare_frame_with(id, token, version, parts, txids, &[])
 }
 
-/// #### merge-mining v2: a declaration with `excess` as its excess data.
+/// A declaration with `excess` as its excess data.
 fn declare_frame_with(
     id: u32,
     token: &[u8],
@@ -247,7 +246,6 @@ fn declared_token(responses: &mut JdResponses) -> Vec<u8> {
     success.new_mining_job_token.as_ref().to_vec()
 }
 
-// #### PR #42
 // What: Coinbase-only setup succeeds; Full-Template (bit 0) is refused
 // with unsupported-feature-flags echoing the bit; a token request names
 // a PX v1 token with the pool's rates and the miner, fee and donation
@@ -291,9 +289,9 @@ fn coinbase_only_is_offered_and_full_template_is_refused_until_enabled() {
     let token = PxToken::decode(success.mining_job_token.as_ref()).unwrap();
     assert_eq!((token.rates.donation_bps, token.rates.fee_bps), (150, 100));
     assert!(!token.full_template);
-    // #### merge-mining v2: the miner's own donation choice is in the
+    // The miner's own donation choice is in the
     // token's donation rate; the fee stays. A malformed choice is refused.
-    // #### one donation, the higher rate: the token carries the higher of
+    // The token carries the higher of
     // the pool's rate and the login's: a login's 0 or 0.5% leaves the
     // pool's 1.5%, a login's 3% raises it, and at a pool of 0% a login's
     // 1.5% is 1.5%; at 0 overall the token names no donation output. A
@@ -402,7 +400,6 @@ fn coinbase_only_is_offered_and_full_template_is_refused_until_enabled() {
     assert!(declarator.book.lock().unwrap().is_empty());
 }
 
-// #### PR #42
 // What: a Full-Template pool refuses a Coinbase-only client with
 // missing-declare-tx-data-flag (flags 1), as SRI does; a pool accepting
 // both takes either; an undefined bit is refused and echoed; tokens from a
@@ -447,7 +444,6 @@ fn the_accepted_modes_decide_the_setup() {
     );
 }
 
-// #### PR #42
 // What: the pool's template has 2 of the client's 3 transactions: one
 // ProvideMissingTransactions round asks for the third by its position, the
 // client's answer is checked, the node checks the whole block once (a
@@ -557,7 +553,6 @@ fn session_full_template_flow() {
     );
 }
 
-// #### PR #42
 // What: an SRI-shaped Full-Template declaration (BIP141's marker, flag and
 // one 32-byte witness item, and a zero-value witness-commitment OP_RETURN as
 // SRI's factory may add) is declared: the pool's node checks a block whose
@@ -617,7 +612,6 @@ fn an_sri_shaped_declaration_is_checked_without_its_witness() {
     }
 }
 
-// #### PR #42
 // What: the node's refusals map as ckpool's do: "does not build on chain
 // tip" is stale-chain-tip and any other reason invalid-job, both with the
 // node's reason as details; a node that cannot be asked gives
@@ -683,7 +677,6 @@ fn tip_races_become_stale_chain_tip_with_the_reason_in_details() {
     assert_eq!(node_error("connect: refused"), None);
 }
 
-// #### PR #42
 // What: the pool never asks for anything until a declaration passes its
 // checks: a coinbase short of the fee, transactions out of canonical order,
 // a version outside the rolling bits, another connection's token and a
@@ -692,7 +685,7 @@ fn tip_races_become_stale_chain_tip_with_the_reason_in_details() {
 // come are missing-txs after 30 seconds; a Coinbase-only connection cannot
 // declare.
 // Look here if: the declaration checks change.
-// #### merge-mining v2: the pool's check of declared leaves
+// The pool's check of declared leaves
 // What: a Full-Template declaration whose output 0 is a token root is
 // accepted when its excess_data discloses leaves paying the miner with the
 // miner's donation and the pool's fee, and refused (invalid-coinbase-tx)
@@ -914,7 +907,6 @@ fn declarations_are_checked_before_anything_is_asked() {
         .is_err());
 }
 
-// #### PR #42
 // What: a PushSolution is matched to the declared job by proof of work: the
 // coinbase rebuilt with the pushed extranonce on the job's parent and bits
 // meets the target, and the whole block (the job's transactions) comes back

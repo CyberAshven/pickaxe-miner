@@ -42,7 +42,7 @@ use crate::gpu_types::THROTTLED_BATCH_DIVISOR;
 pub(crate) const WINNER_BUFFER_CAP: u32 = 8;
 const WINNER_CHANNEL_CAP: usize = WINNER_BUFFER_CAP as usize;
 const PAUSE_POLL: Duration = Duration::from_millis(25);
-/// #### PR #53: how often a held GPU worker looks for its turn again.
+/// How often a held GPU worker looks for its turn again.
 const HOLD_POLL: Duration = Duration::from_millis(2);
 
 pub(crate) enum PhotonEngine {
@@ -276,7 +276,7 @@ pub struct GpuSearchStats {
     pub rate: f64,
     pub active_rate: f64,
     pub winners: u64,
-    /// #### PR #42: winners this GPU found that the host check rejected.
+    /// Winners this GPU found that the host check rejected.
     pub rejected_winners: u64,
     pub status: GpuStatus,
     pub last_error: Option<String>,
@@ -424,7 +424,7 @@ impl DutyPacer {
 #[cfg(test)]
 use crate::mining_control::duty_rest;
 
-// #### PR #11: winner delivery never blocks ####
+// Winner delivery never blocks ####
 // What: the GPU worker hands host-verified winners to the supervisor through
 // a bounded queue (WINNER_CHANNEL_CAP). When the queue is full it stops and
 // drops the rest of this batch's winners instead of waiting.
@@ -463,7 +463,6 @@ fn deliver_verified_batch(
     }
     true
 }
-// #### end PR #11 ####
 
 struct WorkerDiagnostics {
     last_error: Mutex<Option<String>>,
@@ -585,12 +584,12 @@ enum WorkerExit {
 #[derive(Clone)]
 struct SharedControl {
     paused: Arc<AtomicBool>,
-    /// #### PR #53: the hash split holds this token's GPU work while
+    /// The hash split holds this token's GPU work while
     /// another token has the GPUs; unlike `paused`, nothing else clears it.
     held: Arc<AtomicBool>,
     intensity: Arc<AtomicU8>,
     generation_id: Arc<AtomicU64>,
-    /// #### PR #32: the donation's share of the work, changed while mining
+    /// The donation's share of the work, changed while mining
     /// from Advanced settings; each GPU applies it at its next batch.
     work_fee: Arc<Mutex<Option<crate::donation::Policy>>>,
     work_fee_version: Arc<AtomicU64>,
@@ -605,7 +604,7 @@ struct GpuCounters {
     batches: Arc<AtomicU64>,
     winners: Arc<AtomicU64>,
     diagnostics: Arc<WorkerDiagnostics>,
-    /// #### PR #61: the hash split holds this GPU alone, so a rig's GPUs
+    /// The hash split holds this GPU alone, so a rig's GPUs
     /// can mine different tokens at once.
     held: Arc<AtomicBool>,
     /// The newest job for this GPU. A newer job replaces one the worker has
@@ -662,7 +661,7 @@ fn create_engine(backend: BackendKind, device_ordinal: usize) -> Result<PhotonEn
     Ok(engine)
 }
 
-// #### PR #22: one worker per GPU, restarted after a GPU failure
+// One worker per GPU, restarted after a GPU failure
 // What: each GPU runs this loop on its own thread with its own engine and
 // random signing keys, so GPUs never repeat each other's work. When a batch
 // or a job install fails, the worker drops its engine, waits (2, 5, 10, 30,
@@ -768,7 +767,6 @@ fn wait_for_retry(
         thread::park_timeout(PAUSE_POLL.min(until - now));
     }
 }
-// #### end PR #22 ####
 
 /// Runs the GPU worker, processing commands between batches.
 fn run_worker(
@@ -908,9 +906,9 @@ fn run_worker(
             pacer.reset(Instant::now());
             continue;
         }
-        // #### PR #53: another token's turn on the GPUs. A short poll keeps
+        // Another token's turn on the GPUs. A short poll keeps
         // the hand-over within a few milliseconds of the split's plan.
-        // #### PR #61: or this GPU's alone.
+        // Or this GPU's alone.
         if held.load(Ordering::Acquire) || gpu_held.load(Ordering::Acquire) {
             batch_in_flight.store(false, Ordering::SeqCst);
             thread::park_timeout(HOLD_POLL);
@@ -919,7 +917,7 @@ fn run_worker(
         }
 
         let active_intensity = intensity.load(Ordering::Relaxed).clamp(10, 100);
-        // #### PR #32: a donation changed in Advanced settings rebuilds the
+        // A donation changed in Advanced settings rebuilds the
         // work schedule at this batch; the recipients' addresses stay the same.
         let version = work_fee_version.load(Ordering::Acquire);
         if version != seen_work_fee {
@@ -1114,14 +1112,14 @@ impl SearchPauseHandle {
     }
 }
 
-/// #### PR #53: the hash split's grip on one search: hold its GPUs while
+/// The hash split's grip on one search: hold its GPUs while
 /// another token mines, and see whether it wants them at all (not while a
 /// winner's claim or the user pauses it).
 #[derive(Clone)]
 pub struct SearchHold {
     held: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
-    /// #### PR #61: each GPU's own hold, in the order the GPUs were chosen.
+    /// Each GPU's own hold, in the order the GPUs were chosen.
     gpus: Vec<Arc<AtomicBool>>,
 }
 
@@ -1131,7 +1129,7 @@ impl SearchHold {
         self.held.store(held, Ordering::Release);
     }
 
-    /// #### PR #61: holds or releases the GPU at `index` (in the order the
+    /// Holds or releases the GPU at `index` (in the order the
     /// GPUs were chosen) at its next batch.
     pub fn set_gpu(&self, index: usize, held: bool) {
         if let Some(gpu) = self.gpus.get(index) {
@@ -1146,7 +1144,7 @@ impl SearchHold {
 }
 
 impl SearchHandle {
-    /// #### PR #53: the hash split's hold on this search.
+    /// The hash split's hold on this search.
     pub fn hold_handle(&self) -> SearchHold {
         SearchHold {
             held: Arc::clone(&self.shared.held),
@@ -1265,7 +1263,6 @@ impl SearchHandle {
         Self::start_inner(devices, intensity, job, false, Some(policy))
     }
 
-    /// #### PR #32
     /// A search with no GPU on this computer, for a coordinator whose rigs do
     /// all the mining (`--rigs-only`): it checks each job and follows its
     /// generation and pause state like a GPU search, and finds nothing.
@@ -1407,7 +1404,7 @@ impl SearchHandle {
         Ok(handle)
     }
 
-    // #### PR #22: a job change reaches every GPU without waiting for the slowest
+    // A job change reaches every GPU without waiting for the slowest
     // What: each GPU has a one-job mailbox. A new generation goes into every
     // running GPU's mailbox, replacing a job that GPU has not taken yet, and
     // this returns once one GPU mines it. Every other GPU takes it at its next
@@ -1477,14 +1474,12 @@ impl SearchHandle {
         }
         Err(first_error.unwrap_or_else(|| "PHOTON GPU worker is not running".to_string()))
     }
-    // #### end PR #22 ####
 
     /// Returns the current search generation identifier.
     pub fn generation_id(&self) -> u64 {
         self.shared.generation_id.load(Ordering::Acquire)
     }
 
-    /// #### PR #32
     /// Changes the donation's share of the work: each GPU applies it at its
     /// next batch, and a GPU that restarts later starts with it.
     pub fn set_work_fee(&self, policy: crate::donation::Policy) -> Result<(), String> {
@@ -1571,7 +1566,7 @@ impl SearchHandle {
         self.snapshot_final()
     }
 
-    // #### PR #53: a disconnected rig must keep proofs from the final in-flight batch.
+    // A disconnected rig must keep proofs from the final in-flight batch.
     #[cfg_attr(not(feature = "stratum-v2"), allow(dead_code))]
     pub(crate) fn stop_and_drain(mut self) -> Vec<VerifiedWinner> {
         self.stop_workers();
@@ -1698,7 +1693,6 @@ mod tests {
     use crate::cuda_photon::{PhotonCudaBatchResult, PhotonCudaWinner};
     use secp256k1::SecretKey;
 
-    // #### PR #32
     #[test]
     fn a_search_without_gpus_follows_jobs_and_finds_nothing() {
         let job = crate::mining_job::tests::easy_job();
@@ -2045,7 +2039,7 @@ mod tests {
             u64::from(WINNER_BUFFER_CAP)
         );
 
-        // #### PR #11 test: a second winning batch into a full queue ####
+        // Test: a second winning batch into a full queue ####
         // The GPU resumed while a claim resolved, before the supervisor
         // drained the queue. The old blocking send hung here forever.
         paused.store(false, Ordering::SeqCst);
@@ -2058,7 +2052,6 @@ mod tests {
             u64::from(WINNER_BUFFER_CAP)
         );
         assert_eq!(winner_rx.try_iter().count(), WINNER_BUFFER_CAP as usize);
-        // #### end PR #11 test ####
     }
 
     /// A search handle over test threads standing in for GPU workers, one
@@ -2108,7 +2101,7 @@ mod tests {
         })
     }
 
-    // #### PR #53: disconnect can happen while a winning GPU batch is still completing.
+    // Disconnect can happen while a winning GPU batch is still completing.
     #[test]
     fn shutdown_collects_winners_from_the_final_in_flight_batch() {
         let job = crate::mining_job::tests::easy_job();
@@ -2176,7 +2169,7 @@ mod tests {
         }
     }
 
-    // #### PR #22 test: one search over several GPUs ####
+    // Test: one search over several GPUs ####
     #[test]
     fn replace_job_needs_one_gpu_and_a_stuck_gpu_keeps_only_the_newest_job() {
         let (handle, gpus) = fake_search(vec![Some(Ok(())), None]);
@@ -2313,7 +2306,6 @@ mod tests {
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
     }
-    // #### end PR #22 test ####
 
     #[test]
     fn production_search_rejects_unpublished_generation() {
@@ -2859,7 +2851,7 @@ mod tests {
         let _ = handle.stop();
     }
 
-    // #### PR #22 test: one search on several real GPUs ####
+    // Test: one search on several real GPUs ####
     /// Waits until `done` holds for the search, or panics after `limit`.
     fn wait_for(
         handle: &SearchHandle,
@@ -2878,7 +2870,7 @@ mod tests {
     /// `backend:ordinal` (default `wgpu:0,wgpu:1`). With
     /// `PICKAXE_TEST_WGPU_ADAPTER` set, every wgpu entry opens that adapter,
     /// so two workers can share one GPU and no other GPU is touched.
-    // #### PR #53: the hash split's hold stops a search's GPU work without
+    // The hash split's hold stops a search's GPU work without
     // pausing it, so the search still wants the GPUs; a pause is different.
     #[cfg(feature = "portable-wgpu")]
     #[test]
@@ -3027,5 +3019,4 @@ mod tests {
         );
         assert!(stats.last_error.is_none(), "{:?}", stats.last_error);
     }
-    // #### end PR #22 test ####
 }

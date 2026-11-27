@@ -1,4 +1,4 @@
-//! #### PR #65: carry the dashboard's charts, logs and controls into token sessions.
+//! Carry the dashboard's charts, logs and controls into token sessions.
 //! Rendering and history use the same widgets as PHOTON; mining and claims stay
 //! in their existing supervisors. Closing a panel never stops those workers.
 use super::*;
@@ -605,7 +605,7 @@ fn token_key(key: KeyEvent, miners: &Miners<'_>, state: &mut TuiState) -> Result
     Ok(false)
 }
 
-/// #### PR #65: only the selected token owns these fields. All rows are
+/// Only the selected token owns these fields. All rows are
 /// wrapped before paging, so even a long recovery path remains readable.
 fn token_details(tokens: &Tokens, row: &TokenRow, width: u16) -> Vec<Line<'static>> {
     let value_width = (width.saturating_sub(2) as usize).saturating_sub(RUNTIME_LABEL_WIDTH);

@@ -10,7 +10,7 @@ pub mod sha256;
 #[path = "../../../../rust-engine/src/t2_block.rs"]
 pub mod t2_block;
 
-// #### PR #22: exercise the production transaction layout through both compiler
+// Exercise the production transaction layout through both compiler
 // boundaries. The CPU fixture independently serializes amounts and padding.
 #[inline(always)]
 fn assembled<const SHIFT: usize, const BLOCK: usize>(inputs: &[u32], base: usize) -> [u32; 16] {

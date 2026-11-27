@@ -1,4 +1,3 @@
-//! #### PR #42, merge-mining v2
 //! The Rust reference verifier: step for step what a token covenant checks,
 //! run on every proof before it is journaled as claimable (fail closed).
 //!
@@ -92,7 +91,7 @@ pub fn verify_proof(proof: &AuxProof, view: &ClaimView) -> Result<(), ProofError
     verify_leaf(proof, &view.leaf(), view.max_aux_height)
 }
 
-/// #### merge-mining v2: steps 3-9 for a leaf a covenant has rebuilt (its
+/// Steps 3-9 for a leaf a covenant has rebuilt (its
 /// `payout_hash` an unlocking argument, as BCH P2Pool's SAFA covenant reads
 /// it).
 pub fn verify_leaf(proof: &AuxProof, leaf: &Leaf, max_aux_height: u8) -> Result<(), ProofError> {
@@ -249,7 +248,7 @@ pub(crate) mod tests {
             state_hash: state.state_hash,
             payout: &scripts[0],
             target_bits: state.target_bits,
-            // #### merge-mining v2: the miner job's split, 1% of each win to
+            // The miner job's split, 1% of each win to
             // the donation.
             ext: crate::stratum_v2::merge::split::Split::donation(100, &scripts[1])
                 .unwrap()
@@ -262,7 +261,6 @@ pub(crate) mod tests {
         assemble(&mined.job, 0, &mined.coinbase, &mined.branch, mined.header).unwrap()
     }
 
-    // #### merge-mining v2
     #[test]
     fn a_built_proof_verifies() {
         let mined = mined();
@@ -313,7 +311,6 @@ pub(crate) mod tests {
         );
     }
 
-    // #### merge-mining v2
     #[test]
     fn every_mutation_fails() {
         let mined = mined();
@@ -489,7 +486,6 @@ pub(crate) mod tests {
         assert_eq!(verify(&taller, &view), Err(ProofError::Decode));
     }
 
-    // #### merge-mining v2
     #[test]
     fn token_targets_expand_like_header_targets_within_the_covenant_range() {
         for bits in [

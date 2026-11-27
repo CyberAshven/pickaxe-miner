@@ -19,7 +19,6 @@ use std::time::Duration;
 
 const NODE_RPC_USER_ENV: &str = "PICKAXE_NODE_RPC_USER";
 const NODE_RPC_PASSWORD_ENV: &str = "PICKAXE_NODE_RPC_PASSWORD";
-/// #### PR #40
 /// A node cookie file in a place Pickaxe does not look by itself.
 const NODE_RPC_COOKIE_ENV: &str = "PICKAXE_NODE_RPC_COOKIE";
 /// The node answered HTTP 401: it wants a user and password, or a cookie
@@ -134,7 +133,7 @@ pub struct NativePhotonSession {
 ///
 /// `scantxoutset` bootstraps the confirmed baton, then the mempool is used
 /// only when that baton has already been spent by an unconfirmed successor.
-/// #### PR #40: with a node configured, this is the miner's job source
+/// With a node configured, this is the miner's job source
 /// (`ElectrumSession::connect_node_failover`); the Fulcrum path is the
 /// fallback, and proves a node it routes to as before.
 impl NativePhotonSession {
@@ -177,7 +176,6 @@ impl NativePhotonSession {
         ))
     }
 
-    /// #### PR #40
     /// Connects from a baton already known (the job being mined, or a
     /// Fulcrum server's answer at start, which the node checks), so the UTXO
     /// set is scanned only when that baton and its successor are both lost.
@@ -247,7 +245,7 @@ impl NativePhotonSession {
         )?;
 
         let observed_baton = if txout.is_null() {
-            // #### Knuth compatibility: blocks first, the UTXO scan last
+            // Blocks first, the UTXO scan last
             // What: when the cached baton is gone and blocks were found since
             // the last read, the baton is followed through those blocks
             // (getblock, verbosity 2) to its newest output, which gettxout or
@@ -326,11 +324,10 @@ pub fn fetch_photon_live_job(
     Ok(session.snapshot().job.clone())
 }
 
-/// #### Knuth compatibility: the most blocks a refresh follows the baton
+/// The most blocks a refresh follows the baton
 /// through before it falls back to scanning the UTXO set (a day of blocks).
 const MAX_NATIVE_PHOTON_FOLLOW_BLOCKS: u32 = 144;
 
-/// #### Knuth compatibility
 /// The baton after `from` as the blocks `after + 1 ..= tip` moved it, in
 /// block and transaction order; `None` when none of them spent it.
 fn follow_native_baton_through_blocks(
@@ -372,7 +369,6 @@ fn follow_native_baton_through_blocks(
     Ok(moved.then_some(current))
 }
 
-/// #### Knuth compatibility
 /// The baton a block left (`moved`) as it stands at the tip: its unspent
 /// output from gettxout, or the mempool chain that spends it.
 fn native_baton_at_tip(
@@ -421,7 +417,6 @@ fn bootstrap_native_photon(
         .and_then(Value::as_str)
         .filter(|hash| hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()))
         .map(str::to_owned);
-    // #### PR #40
     // What: when the scan does not say which tip it saw, the tip read right
     // after it stands in.
     // Why: Bitcoin Cash Node (29.1) answers scantxoutset without `height` and
@@ -1145,7 +1140,7 @@ fn select_node_rpc_basic_auth(
     }
 }
 
-/// #### PR #53: a node as another program needs it (BCH P2Pool): its URL
+/// A node as another program needs it (BCH P2Pool): its URL
 /// without a login, and the login Pickaxe would send, from the URL, the
 /// environment or a cookie file, so that program needs no cookie support.
 pub fn rpc_endpoint_and_login(url: &str) -> Result<(String, Option<(String, String)>), String> {
@@ -1174,7 +1169,7 @@ fn node_rpc_basic_auth(target: &NodeRpcTarget) -> Result<Option<String>, String>
         target,
         env_user.as_deref(),
         env_password.as_deref(),
-        // #### PR #42: a cookie file saved for this host and port comes
+        // A cookie file saved for this host and port comes
         // before the one the environment names for every node.
         saved_cookie(&target.host, target.port)
             .or_else(|| std::env::var_os(NODE_RPC_COOKIE_ENV).map(PathBuf::from)),
@@ -1182,7 +1177,7 @@ fn node_rpc_basic_auth(target: &NodeRpcTarget) -> Result<Option<String>, String>
     )
 }
 
-// #### PR #42: saved cookie files
+// Saved cookie files
 // What: the cookie files saved for nodes (`config::NodeCookies`), by host
 // and port, set at start and whenever the setup changes them; a saved file
 // that is no longer a regular file is skipped.
@@ -1231,7 +1226,7 @@ fn node_rpc_login(
     let auth = select_node_rpc_basic_auth(target.url_auth.as_deref(), env_user, env_password)?;
     Ok(auth.or_else(|| match cookie_file {
         Some(path) => read_cookie(&path),
-        // #### PR #42: then BCHN's bitcoin.conf on this computer.
+        // Then BCHN's bitcoin.conf on this computer.
         None => conf_login(&target.host, target.port, data_dirs).or_else(|| {
             bchn_cookie_paths(&target.host, target.port, data_dirs)
                 .iter()
@@ -1240,7 +1235,7 @@ fn node_rpc_login(
     }))
 }
 
-// #### PR #42: bitcoin.conf logins on this computer
+// Bitcoin.conf logins on this computer
 // What: for a node on this computer, BCHN's bitcoin.conf in its data folders
 // gives the RPC port of each network (a `[main]` or `[chip]` section, or
 // the top level for the network it selects, `chipnet=1` included) and, for
@@ -1344,7 +1339,7 @@ fn conf_login(host: &str, port: u16, data_dirs: &[PathBuf]) -> Option<String> {
     None
 }
 
-/// #### PR #42: where a node on this computer publishes its new blocks over
+/// Where a node on this computer publishes its new blocks over
 /// ZMQ: bitcoin.conf's `zmqpubhashblock` for the network whose RPC port the
 /// node answers on, a bind-all address taken as this computer.
 pub fn zmq_block_url(node_url: &str) -> Option<String> {
@@ -1383,7 +1378,6 @@ fn conf_zmq(host: &str, port: u16, data_dirs: &[PathBuf]) -> Option<String> {
     None
 }
 
-// #### PR #40
 // With no RPC password set, BCHN writes a fresh cookie (`__cookie__:<hex>`)
 // to `.cookie` in its network's data folder at every start
 // (rpc/protocol.cpp), so a node on the same computer needs no password.
@@ -1444,11 +1438,10 @@ fn read_cookie(path: &Path) -> Option<String> {
     (cookie.contains(':') && !cookie.contains(char::is_whitespace)).then(|| cookie.to_owned())
 }
 
-/// #### Local sources first: the headers a synced node may have past its
+/// The headers a synced node may have past its
 /// blocks.
 pub const SYNCED_LAG: u64 = 1;
 
-/// #### PR #40
 /// What a BCH node says about itself: shown when a node is chosen and when
 /// the ASIC server starts.
 #[derive(Debug, Clone, PartialEq)]
@@ -1476,7 +1469,7 @@ impl NodeInfo {
         }
     }
 
-    /// #### Local sources first: whether the node has the chain it knows of:
+    /// Whether the node has the chain it knows of:
     /// out of its initial block download, with at most `SYNCED_LAG` header
     /// past its blocks (a new block's header arrives a moment before it).
     pub fn synced(&self) -> bool {
@@ -1528,7 +1521,7 @@ fn client_from_subversion(subversion: &str) -> Option<String> {
     (!name.trim().is_empty() && !version.trim().is_empty()).then_some(client)
 }
 
-/// #### PR #42: whether the node at `url` is on `network`'s chain, by its
+/// Whether the node at `url` is on `network`'s chain, by its
 /// fork block (see `MiningNetwork::fork_block`): proven once per node and
 /// network; a node below the fork height is not proven yet and says so.
 pub fn verify_chain(url: &str, network: crate::config::MiningNetwork) -> Result<(), String> {
@@ -1567,7 +1560,7 @@ pub fn verify_chain(url: &str, network: crate::config::MiningNetwork) -> Result<
     Ok(())
 }
 
-// #### PR #42: saved nodes are checked
+// Saved nodes are checked
 // What: a check of a node asks its chain and sync state, proves its chain by
 // the fork block (BCH, not BTC; Chipnet, not testnet4), and tries gettxout,
 // which following PHOTON needs; it says what it found in one line, never
@@ -1667,7 +1660,7 @@ pub fn node_info(url: &str) -> Result<NodeInfo, String> {
 }
 
 fn node_info_timed(url: &str, connect: Duration, read: Duration) -> Result<NodeInfo, String> {
-    // #### PR #42: the chain first (a dead node fails once), then the client
+    // The chain first (a dead node fails once), then the client
     // name, which a node without getnetworkinfo (Knuth) leaves as "BCH
     // node".
     let chain = rpc_call_timed(url, "getblockchaininfo", json!([]), connect, read)?;
@@ -1701,7 +1694,6 @@ fn node_info_timed(url: &str, connect: Duration, read: Duration) -> Result<NodeI
     })
 }
 
-/// #### PR #40
 /// What answers at BCHN's default RPC address on this computer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LocalNode {
@@ -2002,7 +1994,6 @@ fn parse_node_rpc_target(url: &str) -> Result<NodeRpcTarget, String> {
 
 trait NodeRpcStream: Read + Write {}
 
-/// #### PR #38
 /// Bind durable ASIC work to its RPC source without persisting credentials.
 /// Credential rotation may resume pending blocks; another endpoint may not.
 #[cfg(feature = "stratum-v2")]
@@ -2029,7 +2020,7 @@ const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const RPC_READ_TIMEOUT: Duration = Duration::from_secs(12);
 const SCAN_TXOUTSET_READ_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// #### PR #42: a pool's node checks a miner's whole declared block
+/// A pool's node checks a miner's whole declared block
 /// (Job Declaration), which takes longer than a usual call on a large one.
 const VALIDATE_BLOCK_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -2094,7 +2085,7 @@ fn rpc_call_timed(
     let mut stream: Box<dyn NodeRpcStream> = match target.scheme {
         NodeRpcScheme::Http => Box::new(tcp_stream),
         NodeRpcScheme::Https => {
-            // #### PR #42: through rustls (see `tls`).
+            // Through rustls (see `tls`).
             Box::new(crate::tls::connect(host.as_str(), tcp_stream)?)
         }
     };
@@ -2110,7 +2101,6 @@ fn rpc_call_timed(
     let Some(idx) = text.find("\r\n\r\n") else {
         return Err("malformed HTTP response".into());
     };
-    // #### PR #40
     // BCHN answers a wrong or missing login with HTTP 401 and no body.
     if text.split_whitespace().nth(1) == Some("401") {
         return Err(NODE_RPC_LOGIN_REFUSED.into());
@@ -2233,7 +2223,7 @@ mod gbt_tests {
                     request_json.get("method").and_then(Value::as_str),
                     Some(expected_method)
                 );
-                // #### PR #42: `{"__rpc_error": ...}` answers as an RPC error.
+                // `{"__rpc_error": ...}` answers as an RPC error.
                 let body = match response_value.get("__rpc_error") {
                     Some(error) => json!({"result": null, "error": error, "id": "pickaxe"}),
                     None => json!({"result": response_value, "error": null, "id": "pickaxe"}),
@@ -2361,7 +2351,6 @@ mod gbt_tests {
         assert_eq!(result.get("chain").and_then(Value::as_str), Some("main"));
     }
 
-    // #### PR #42
     // What: bitcoin.conf on this computer gives each network's RPC port and
     // its rpcuser/rpcpassword (or else that network's cookie), for loopback
     // targets only; a selected network's top-level rpcport applies to it.
@@ -2411,7 +2400,6 @@ mod gbt_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    // #### PR #42
     // What: bitcoin.conf's zmqpubhashblock is found for the network whose
     // RPC port a node on this computer answers on, a bind-all address taken
     // as this computer; never for another computer or another port.
@@ -2443,7 +2431,6 @@ mod gbt_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    // #### PR #42
     // What: a saved cookie file logs in only at its own host and port (the
     // host in any case), after a login in the URL, and not once it is a
     // folder.
@@ -2485,7 +2472,6 @@ mod gbt_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    // #### PR #40
     #[test]
     fn a_node_on_this_computer_logs_in_with_its_cookie() {
         let dir = std::env::temp_dir().join(format!("pickaxe-cookie-{}", std::process::id()));
@@ -2561,7 +2547,7 @@ mod gbt_tests {
         server.join().unwrap();
         assert_eq!(refused, Err(NODE_RPC_LOGIN_REFUSED.to_string()));
 
-        // #### PR #42: the chain first, then the client.
+        // The chain first, then the client.
         let (url, server) = serve_json_rpc_sequence(vec![
             (
                 "getblockchaininfo",
@@ -2591,7 +2577,7 @@ mod gbt_tests {
             syncing.summary(),
             "Bitcoin Cash Node 29.1.0 · syncing, height 120000 of 326900 (37%)"
         );
-        // #### Local sources first: the setup's node row names the client
+        // The setup's node row names the client
         // without its version and a syncing node's progress; a header that
         // arrived before its block is still synced, two are not.
         assert!(info.synced() && !syncing.synced());
@@ -2716,13 +2702,12 @@ mod gbt_tests {
         assert_eq!(policy.mempool_min_fee_sats_per_kb, 1_234);
     }
 
-    /// #### PR #42: a synced node's chain report.
+    /// A synced node's chain report.
     fn chain(name: &str, blocks: u64) -> Value {
         json!({"chain": name, "blocks": blocks, "headers": blocks,
             "initialblockdownload": false, "verificationprogress": 1.0})
     }
 
-    // #### PR #42
     // What: a check tells a BCH node that can follow PHOTON, a BTC node (its
     // fork block), a node on the other network, and a Chipnet-named node
     // with testnet4's fork block, each in one line.
@@ -2782,7 +2767,6 @@ mod gbt_tests {
         server.join().unwrap();
     }
 
-    // #### PR #42
     // What: a node without gettxout (a Knuth node, -32601) answers but
     // cannot follow PHOTON, and one without getnetworkinfo is "BCH node".
     // Look here if: check_node or node_info_timed changes.
@@ -2813,7 +2797,6 @@ mod gbt_tests {
             .contains("cannot follow PHOTON (no gettxout)"));
     }
 
-    // #### PR #42
     // What: a node is refused its login or not reached at all, each said in
     // one line with no login in it.
     #[test]
@@ -2830,7 +2813,6 @@ mod gbt_tests {
             .contains("wants its RPC login"));
     }
 
-    // #### PR #42
     // What: a node's fork block proves its chain: the right block passes and
     // is not asked again; another block is Bitcoin (BTC) on mainnet; a node
     // below the fork height is still syncing.
@@ -3002,7 +2984,6 @@ mod gbt_tests {
 
     #[test]
     fn a_baton_spent_in_a_new_block_is_followed_without_a_utxo_scan() {
-        // #### Knuth compatibility
         // What: the cached baton (33…:0, read at height 1000) was spent in
         // block 1001; refresh finds the spend in that block with getblock and
         // reads the new baton with gettxout. The scripted node has no
@@ -3635,7 +3616,7 @@ mod gbt_tests {
         );
     }
 
-    // #### Knuth compatibility: a live check against a real Knuth node
+    // A live check against a real Knuth node
     // What: everything Pickaxe asks of a node, run read-only against the Knuth
     // node in PICKAXE_KNUTH_RPC (http://USER:PASSWORD@HOST:PORT, Chipnet):
     // the setup's node check, ASIC templates, the PHOTON baton read through

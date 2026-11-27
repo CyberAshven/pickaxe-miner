@@ -1,4 +1,4 @@
-//! #### PR #65: ELECTRIC uses the same claim path with BCHN or Fulcrum.
+//! ELECTRIC uses the same claim path with BCHN or Fulcrum.
 //! Node discovery watches public scripts, never imports keys or a node wallet.
 
 mod native;
@@ -16,7 +16,7 @@ enum Link {
 
 type Outpoint = (String, u32);
 
-/// #### PR #65: what spent a watched output, as far as the source can tell.
+/// What spent a watched output, as far as the source can tell.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Spender {
     /// Still spendable, confirmed or not.
@@ -133,7 +133,7 @@ impl Session {
         })
     }
 
-    /// #### Live-state notices: subscribes a Fulcrum source to `locking`'s
+    /// Subscribes a Fulcrum source to `locking`'s
     /// changes (see `ElectrumSession::watch_script_hash`); a node has none.
     pub fn watch(&mut self, locking: &[u8]) -> Result<bool, String> {
         match &mut self.link {
@@ -184,7 +184,7 @@ impl Session {
         }
     }
 
-    /// #### PR #65: what spent `target`, an output of `locking`. Fulcrum
+    /// What spent `target`, an output of `locking`. Fulcrum
     /// searches the script's newest history; a node, its mempool and recent
     /// blocks. Anything else is `Unknown`, never a confirmed spend.
     pub fn spender(&mut self, locking: &[u8], target: &Outpoint) -> Result<Spender, String> {

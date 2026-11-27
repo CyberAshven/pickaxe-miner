@@ -1,4 +1,3 @@
-//! #### PR #42
 //! Device logins the owner entered on the Device panel, for devices whose
 //! firmware refuses its default login. They are kept in
 //! `<config>.sv2-logins.json`, readable by the owner alone (0600 on Unix; the
@@ -216,7 +215,6 @@ mod tests {
         (dir, config)
     }
 
-    // #### PR #42
     // What: a saved login comes back for its own firmware only, never for a
     // public address, never in Debug output, and its file is owner-only.
     // Look here if: Logins or write_private_atomic changes.
@@ -277,7 +275,6 @@ mod tests {
         assert_eq!(Logins::load(&config).unwrap().all().len(), 1);
     }
 
-    // #### PR #42
     // What: a file listing a public address loads without it, and anything
     // but a plain file is refused.
     #[test]

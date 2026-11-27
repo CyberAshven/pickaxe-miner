@@ -1,4 +1,4 @@
-//! #### merge-mining v2: tSAFA, the SAFA AuxPoW covenant's claims
+//! TSAFA, the SAFA AuxPoW covenant's claims
 //! What: what Pickaxe needs to claim a merge-mined win from BCH P2Pool's
 //! SAFA AuxPoW covenant (the merge-mined variant of the SAFA draft): its
 //! deployment, read from a file; a thread's 16-byte state; every rule a
@@ -79,7 +79,6 @@ const MAX_AUX_HEIGHT: u8 = 16;
 /// `GetCompact` of the proof-of-work limit, 2^224 - 1.
 const POW_LIMIT_BITS: u32 = 0x1d00_ffff;
 const MAX_VIRTUAL_SATS: u64 = 1 << 62;
-// #### At most 63 threads, as BCH P2Pool's deployment tooling allows: well
 // under 288, where even the longest wait (Δh 288) cannot ease a thread's
 // target (`⌊288 × 5000 / threads⌋ + 5000 <= 10000`) and the vault freezes.
 // A tooling check on both sides, not a covenant rule.
@@ -204,7 +203,7 @@ pub fn decode_header_bits(bits: u32) -> Option<BigUint> {
 /// covenant has none).
 fn asert_target(reference: &BigUint, time_diff: i64, height_diff: i64, half_life: i64) -> BigUint {
     let span = i128::from(time_diff) - 600 * i128::from(height_diff);
-    // #### merge-mining v2: BCHN's two roundings, as the covenant does them
+    // BCHN's two roundings, as the covenant does them
     // What: the exponent's division truncates toward zero (C++ int64 `/`,
     // and Rust's), then `shifts = exponent >> 16` is an arithmetic shift
     // (floor) and `frac = exponent & 0xffff`.
@@ -235,7 +234,7 @@ fn asert_target(reference: &BigUint, time_diff: i64, height_diff: i64, half_life
     next.min(pow_limit())
 }
 
-// #### merge-mining v2: the BCH-only checks
+// The BCH-only checks
 // What: a claim's header nBits must sit in the ASERT band at its coinbase
 // height (its own time standing in for its parent's): mainnet
 // `computed / 2 <= target <= computed × 1.05`, Chipnet `computed / 8` to
@@ -320,7 +319,7 @@ pub fn coinbase_height(head: &[u8]) -> Option<u64> {
     )
 }
 
-// #### merge-mining v2: which thread a leaf mines
+// Which thread a leaf mines
 // What: `thread = u32le(HASH256(payout_hash ‖ cb_height u32le)[0..4]) mod
 // threads`; when that thread cannot be mined (its state is not older than
 // the height, its state is already won, or its vault cannot pay a claim),
@@ -376,7 +375,7 @@ impl ThreadState {
 
 // ---- deployment ----
 
-// #### merge-mining v2: the tSAFA deployment file
+// The tSAFA deployment file
 // What: one JSON object naming a Chipnet deployment of the covenant:
 //
 //   {"version": 1, "name": "tSAFA", "network": "chipnet",
@@ -811,7 +810,7 @@ fn dust(size: usize) -> u64 {
     3 * (size as u64 + 148)
 }
 
-// #### merge-mining v2: the vault's floor
+// The vault's floor
 // What: a claim leaves the vault at least 800 satoshis and at least BCHN's
 // dust for its output.
 // Why: BCH P2Pool's covenant requires 800; below dust no node relays the
@@ -822,7 +821,7 @@ fn vault_floor(size: usize) -> u64 {
     dust(size).max(OUTPUT_SATS)
 }
 
-// #### merge-mining v2: the claim builder
+// The claim builder
 // What: the claim the covenant accepts for `proof` against `vault`, at
 // `fee_rate` satoshis per byte of its size bound (1 to 3) and lock time
 // `locktime` (the coinbase height by default): one input, the vault, with
@@ -1244,7 +1243,7 @@ fn parse_pushes(script: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     Ok(pushes)
 }
 
-// #### merge-mining v2: the claim check before broadcast
+// The claim check before broadcast
 // What: a claim's bytes, read back the way the covenant reads them through
 // introspection, against every rule it enforces: one input (the vault),
 // four minimal pushes ending in this deployment's redeem script, the vault
@@ -1759,7 +1758,7 @@ pub(crate) mod tests {
         claim.plan.outputs.clone()
     }
 
-    // #### merge-mining v2: the fee constant and the unlocking pushes
+    // The fee constant and the unlocking pushes
     // What: K is 577 plus the redeem script's push: 1,946 for P2Pool's
     // 1,366-byte Chipnet covenant and 1,943 for its 1,363-byte mainnet one;
     // the unlocking bytecode is 1,597 bytes for a proof with h 0, d 0 and no
@@ -1797,7 +1796,7 @@ pub(crate) mod tests {
         assert_eq!(unlocking(&claim), 1_731);
     }
 
-    // #### merge-mining v2: a whole claim
+    // A whole claim
     // What: a claim without a split pays the miner the whole reward
     // (1,000,000 of 420,000,000,000) with 800 satoshis, the vault pays S at
     // 1 sat/byte and keeps the rest, and the next state is the thread, the
@@ -1832,7 +1831,7 @@ pub(crate) mod tests {
         assert_eq!(tx.inputs[0].2, CLAIM_SEQUENCE);
     }
 
-    // #### merge-mining v2: the claim's bytes
+    // The claim's bytes
     // What: the claim, written out field by field from the CashTokens and
     // transaction formats (not from the builder): version 2, one input
     // with sequence 0xfffffffe, the vault output (token bitfield 0x71: a
@@ -1878,7 +1877,7 @@ pub(crate) mod tests {
         assert_eq!(claim.txid, hex::encode(txid));
     }
 
-    // #### merge-mining v2: the split shares, as P2Pool's claim tests pay
+    // The split shares, as P2Pool's claim tests pay
     // them
     // What: at one satoshi per token a 1%/1% split pays 980,100 / 10,000 /
     // 9,900; at the default reserve a 0.99% donation (9,900 tokens, 990
@@ -1940,7 +1939,7 @@ pub(crate) mod tests {
         .contains("no donation script"));
     }
 
-    // #### merge-mining v2: the claim's fee
+    // The claim's fee
     // What: the vault pays 1, 2 or 3 sat/byte of S = K + |proof|; a rate of
     // 4 is refused, and the check refuses a satoshi under S or over 3S.
     #[test]
@@ -1975,7 +1974,7 @@ pub(crate) mod tests {
         4 + 1 + 36 + 3 + unlocking + 4 + 1
     }
 
-    // #### merge-mining v2: what the covenant refuses
+    // What the covenant refuses
     // What: the check refuses each change P2Pool's claim tests show the
     // covenant refusing: a redirected miner output, with or without a
     // matching payout hash; a token or satoshi more for the miner; an
@@ -2191,7 +2190,7 @@ pub(crate) mod tests {
         raw
     }
 
-    // #### merge-mining v2: heights
+    // Heights
     // What: a coinbase at or below the state's height cannot claim; one
     // block newer can; a later lock time is fine and an earlier one is not.
     #[test]
@@ -2251,7 +2250,7 @@ pub(crate) mod tests {
         assert!(earlier.unwrap_err().contains("lock time"));
     }
 
-    // #### merge-mining v2: the DAA
+    // The DAA
     // What: the claim target eases by min(dh, 288) / threads, and a leaf
     // committing an easier target than the covenant computes cannot claim.
     #[test]
@@ -2286,7 +2285,7 @@ pub(crate) mod tests {
         assert!(easier.claim(1).is_err());
     }
 
-    // #### merge-mining v2: BCH headers only
+    // BCH headers only
     // What: a Bitcoin header's nBits fail the band; Chipnet's limit bits
     // pass; after 4,032 blocks without a claim the fallback band opens
     // around the state's reference, one block early it does not, and far
@@ -2331,7 +2330,7 @@ pub(crate) mod tests {
         assert!(at(4_032, bits).is_err());
     }
 
-    // #### merge-mining v2: BCHN's ASERT rounding
+    // BCHN's ASERT rounding
     // What: with Chipnet's anchor, 100 blocks after it and one second
     // behind schedule, the exponent is -65536 / 3600: truncated to -18 (not
     // floored to -19), so shifts -1 and frac 65518 give the target
@@ -2354,7 +2353,7 @@ pub(crate) mod tests {
         );
     }
 
-    // #### merge-mining v2: the thread rule's vector (also in the spec)
+    // The thread rule's vector (also in the spec)
     // What: a leaf paying P2PKH 0x12…12 at height 329,001 starts at thread
     // 0 of 4 (HASH256 90d29130…), at 329,002 at thread 3 (af5ced2f…).
     #[test]
@@ -2376,7 +2375,7 @@ pub(crate) mod tests {
         assert_eq!(thread_start(&payout_hash, 329_001, 1), 0);
     }
 
-    // #### merge-mining v2: the vault's floor and the 35-byte scripts
+    // The vault's floor and the 35-byte scripts
     // What: a claim that would leave the vault 799 satoshis is refused by
     // the builder and by the check; a payout script of 36 bytes is refused.
     #[test]
@@ -2416,7 +2415,7 @@ pub(crate) mod tests {
         .contains("35 bytes"));
     }
 
-    /// #### merge-mining v2: a claim's inputs in BCH P2Pool's
+    /// A claim's inputs in BCH P2Pool's
     /// `tools/safa-auxpow/cli.mjs claim` format: its `deployment.json` and
     /// `claim.json` (txids and the category in display order, amounts as
     /// decimal strings, scripts and the proof in hex).
@@ -2462,7 +2461,7 @@ pub(crate) mod tests {
         (deployment, claim)
     }
 
-    /// #### merge-mining v2: BCH P2Pool's Chipnet tSAFA fixture, copied
+    /// BCH P2Pool's Chipnet tSAFA fixture, copied
     /// verbatim from `tools/safa-auxpow/test_data/tsafa-chipnet-fixture.json`
     /// in CyberAshven/BitcoinCash-p2poolv2 (PR #33, commit 4be6db6c): what
     /// P2Pool's `cli.mjs params` prints for a fake Chipnet deployment
@@ -2482,7 +2481,7 @@ pub(crate) mod tests {
         Deployment::from_json(&json.to_string()).unwrap()
     }
 
-    // #### merge-mining v2: P2Pool's covenant, read by Pickaxe's loader
+    // P2Pool's covenant, read by Pickaxe's loader
     // What: from the fixture's redeem script (1,364 bytes) the loader
     // derives P2Pool's K (1,944), lock, lock_hash and token-aware P2SH32
     // vault address, and accepts the fixture's own copies of them.
@@ -2554,7 +2553,7 @@ pub(crate) mod tests {
         )
     }
 
-    // #### merge-mining v2: the claim P2Pool builds too
+    // The claim P2Pool builds too
     // What: the fixture's claim is built from fixed inputs (the reward is
     // 1,250,000,000: 12,500,000 to the donation, 12,375,000 to the fee).
     // With PICKAXE_SAFA_EXPORT naming a directory, its `deployment.json`
@@ -2617,14 +2616,14 @@ pub(crate) mod tests {
         }
     }
 
-    /// #### merge-mining v2: tSAFA's first claim on Chipnet
+    /// TSAFA's first claim on Chipnet
     /// BCH P2Pool's live deployment (genesis 8c5ecd6d…c471, category
     /// 1e642d4e…00fe, the fixture's covenant) and its first claim,
     /// e30dc911…a47f, confirmed at height 330,017: thread 3's vault before
     /// the claim and the claim's bytes as BCHN serves them.
     const CONFIRMED_CLAIM: &str = include_str!("test_data/tsafa-chipnet-confirmed-claim.json");
 
-    // #### merge-mining v2: a claim the covenant accepted on chain
+    // A claim the covenant accepted on chain
     // What: P2Pool's first Chipnet tSAFA claim passes check_claim, and
     // build_claim rebuilds it byte for byte from its own proof, split and
     // payouts: the next state's target (1d023ffd, 14 blocks after 1d00ffff),
@@ -2697,7 +2696,7 @@ pub(crate) mod tests {
         assert_eq!(claim.raw, raw);
     }
 
-    // #### merge-mining v2: the ASERT band's edges (P2Pool's vectors)
+    // The ASERT band's edges (P2Pool's vectors)
     #[test]
     fn the_asert_band_matches_p2pools_edges() {
         let mainnet = band_of(MiningNetwork::Mainnet);
@@ -2729,7 +2728,7 @@ pub(crate) mod tests {
         assert_eq!(at(computed.clone()), Some(true));
         assert_eq!(at(&computed / 8u32), Some(true));
         assert_eq!(at(&computed / 16u32), Some(false));
-        // #### P2Pool's test-network fix: the easy side is × 8.
+        // The easy side is × 8.
         assert_eq!(at(&computed * 2u32), Some(true));
         assert_eq!(at(&computed * 8u32), Some(true));
         assert_eq!(at(&computed * 9u32), Some(false));
@@ -2743,7 +2742,7 @@ pub(crate) mod tests {
             asert_band(MiningNetwork::Chipnet, bits, time, 329_001),
             Some(true)
         );
-        // #### P2Pool's test-network fix: Chipnet block 329,001 still
+        // Chipnet block 329,001 still
         // passes when dated up to 2 hours earlier (BCHN accepts a parent
         // dated up to 2 hours ahead); × 1.05 refused it from 260 seconds.
         for earlier in [200, 260, 600, 3_600, 7_200] {
@@ -2815,7 +2814,7 @@ pub(crate) mod tests {
         word | size << 24
     }
 
-    // #### merge-mining v2: targets, nBits and BIP34 heights
+    // Targets, nBits and BIP34 heights
     #[test]
     fn targets_nbits_and_heights_read_as_the_covenant_reads_them() {
         for bits in [
@@ -2886,7 +2885,7 @@ pub(crate) mod tests {
         }
     }
 
-    // #### merge-mining v2: the deployment file
+    // The deployment file
     // What: a Chipnet file is read, its lock and K derived; mainnet, a bad
     // category, no threads, too large a reserve, a mismatched fee_k or
     // lock, and a redeem script without this file's constants are refused.
@@ -2933,7 +2932,6 @@ pub(crate) mod tests {
             ("category", "00".repeat(32).into()),
             ("category", "zz".into()),
             ("threads", 0.into()),
-            // #### At most 63 threads, as P2Pool's tooling allows.
             ("threads", 64.into()),
             ("virtual_sats", "4611686018427387905".into()),
             ("virtual_sats", "-1".into()),
@@ -2952,7 +2950,7 @@ pub(crate) mod tests {
         assert!(Deployment::from_json("[1]").is_err());
     }
 
-    // #### merge-mining v2: vaults from Fulcrum
+    // Vaults from Fulcrum
     // What: the vaults are this category's outputs with a mutable NFT
     // whose state names a thread; another category, a fungible-only output
     // and a thread beyond the deployment's are left out.
@@ -2997,7 +2995,7 @@ pub(crate) mod tests {
         assert!(vaults_from_listunspent(&deployment, &serde_json::json!({})).is_err());
     }
 
-    // #### merge-mining v2: minimal pushes
+    // Minimal pushes
     #[test]
     fn pushes_are_minimal() {
         assert_eq!(push(&[]), [0x00]);

@@ -1,4 +1,3 @@
-//! #### BCH large templates on Template Distribution
 //! The provider's pushes and the client's rebuild, without sockets, as
 //! Knuth's session tests check them (src/node/test/sv2_template_provider.cpp
 //! at CyberAshven/kth 9ddf0d0b66, cited per test). Every push is read back

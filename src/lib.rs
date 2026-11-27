@@ -32,7 +32,7 @@ mod cuda_stage_b;
 #[allow(dead_code)]
 pub mod cuda_stage_c;
 pub mod donation;
-// #### PR #51: ELECTRIC on the CPU with keyless claims and pot recovery.
+// ELECTRIC on the CPU with keyless claims and pot recovery.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod electric;
 #[cfg(not(target_arch = "wasm32"))]
@@ -42,7 +42,7 @@ pub mod gpu_types;
 /// The desktop window (`pickaxe gui`), drawn with egui.
 #[cfg(all(feature = "gui", not(target_arch = "wasm32")))]
 pub mod gui;
-// #### PR #53: several GPU tokens on the same GPUs, each for its share of the time.
+// Several GPU tokens on the same GPUs, each for its share of the time.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod hash_split;
 #[cfg(not(target_arch = "wasm32"))]
@@ -50,13 +50,13 @@ pub mod hip_photon;
 // HTTP GET over rustls for release downloads and P2Pool's API.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod http;
-// #### PR #42: where GPU mining takes its jobs, and the way back to the node.
+// Where GPU mining takes its jobs, and the way back to the node.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod job_source;
-// #### PR #42: HiveOS, mmpOS and RaveOS.
+// HiveOS, mmpOS and RaveOS.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod farm_os;
-// #### PR #42: nodes, Fulcrum servers and ZMQ found on a computer.
+// Nodes, Fulcrum servers and ZMQ found on a computer.
 #[allow(dead_code)]
 pub mod m29_table;
 #[cfg(not(target_arch = "wasm32"))]
@@ -72,7 +72,7 @@ pub mod node_find;
 pub mod opencl_photon;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod session_control;
-// #### PR #53: BCH P2Pool as a dependency Pickaxe installs, updates and runs.
+// BCH P2Pool as a dependency Pickaxe installs, updates and runs.
 #[cfg(all(feature = "stratum-v2", not(target_arch = "wasm32")))]
 pub mod p2pool;
 pub mod proof;

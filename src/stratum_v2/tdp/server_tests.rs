@@ -1,4 +1,3 @@
-//! #### PR #42
 //! A Template Distribution client on the reference crates against the real
 //! server, over Noise, with CPU-solved headers. The node fixture decodes the
 //! blocks it is sent with `bitcoin::Block`; this is not live chain proof.
@@ -248,7 +247,7 @@ impl Client {
         );
     }
 
-    /// #### BCH large templates: RequestExtensions `request_id` for
+    /// RequestExtensions `request_id` for
     /// `requested`, and the server's answer.
     fn negotiate(&mut self, request_id: u16, requested: &[u16]) -> SerializedFrame {
         self.sender
@@ -264,7 +263,7 @@ impl Client {
         self.receive()
     }
 
-    /// #### BCH large templates: the push of `template`, frame by frame up
+    /// The push of `template`, frame by frame up
     /// to the core Success, read by `received` (which checks the list
     /// against the template's merkle path): each frame's extension type,
     /// message type and payload.
@@ -373,7 +372,7 @@ fn solve(
     }
 }
 
-/// #### BCH large templates: the test transactions numbered `numbers`, in
+/// The test transactions numbered `numbers`, in
 /// CTOR order as a node lists them, and their bytes.
 fn sorted(numbers: impl IntoIterator<Item = u32>) -> (Vec<Value>, Vec<Vec<u8>>) {
     let mut txs: Vec<Value> = numbers.into_iter().map(transaction).collect();
@@ -393,7 +392,6 @@ fn relay_journal(server: &Running) -> Value {
     serde_json::from_slice(&std::fs::read(server.relay_path()).unwrap()).unwrap()
 }
 
-// #### PR #42
 // What: SetupConnection for Template Distribution version 2 with no flags
 // succeeds; another protocol, a version range without 2 or any flag is
 // answered with its error (echoing the flags) and the session closes.
@@ -447,7 +445,6 @@ fn setup_succeeds_for_version_2_and_refuses_other_protocols_versions_and_flags()
     }
 }
 
-// #### PR #42
 // What: no template goes out before the client's CoinbaseOutputConstraints;
 // the first then follows at once; a client that never sends them is closed
 // after the setup deadline (3 s in tests, 10 s otherwise).
@@ -470,7 +467,6 @@ fn no_template_before_constraints_and_a_silent_client_is_closed() {
     assert!(silent.closed_within(Duration::from_secs(8)));
 }
 
-// #### PR #42
 // What: the first template is a future one with its SetNewPrevHash; the
 // same template's lease renewals send nothing; a constraints change on the
 // same parent sends a current (not future) template only; a block moves the
@@ -495,7 +491,6 @@ fn templates_follow_the_node_future_on_a_new_parent_and_current_on_the_same_one(
     server.wait(|stats| counts(stats).sent >= 3 && counts(stats).clients == 1);
 }
 
-// #### PR #48
 // What: when the node's template moves to new bits on the same parent
 // (Chipnet's limit at the parent's time plus 1200 s), the client gets a
 // future template and a SetNewPrevHash on that parent with the new bits and
@@ -520,7 +515,6 @@ fn new_bits_on_the_same_parent_come_with_a_set_new_prev_hash() {
     assert!(client.request(next.id).is_ok());
 }
 
-// #### PR #42
 // What: an SRI-shaped solution (version 2 coinbase with BIP141's marker,
 // flag and one 32-byte zero item) is stripped, saved in the relay journal,
 // submitted once and finished there: the node gets a block whose coinbase
@@ -576,7 +570,6 @@ fn an_sri_shaped_solution_with_a_bip141_witness_is_stripped_and_relayed() {
     }
 }
 
-// #### PR #42
 // What: two solutions that fail Pickaxe's own check (a coinbase that does
 // not begin with the height push sent) within 10 s give one submitblock;
 // both are counted, neither is saved.
@@ -607,7 +600,6 @@ fn a_solution_failing_pickaxes_own_check_reaches_the_node_at_a_bounded_rate() {
     assert_eq!(relay_journal(&server)["completed"], json!([]));
 }
 
-// #### PR #42
 // What: a template's transactions come in block order for a current
 // template; an unknown id is template-id-not-found, and a template whose
 // parent was replaced is stale-template-id.
@@ -638,7 +630,6 @@ fn transaction_data_is_sent_for_current_templates_and_refused_for_stale_or_unkno
     assert_eq!(client.request(next.id), Ok(expected));
 }
 
-// #### PR #42
 // What: a template the client's reserve does not fit is withheld and
 // counted, and the template follows once smaller constraints arrive.
 // Look here if: the size budget in Active::offer changes.
@@ -653,7 +644,6 @@ fn a_template_the_reserve_does_not_fit_is_withheld_until_it_fits() {
     client.future_template();
 }
 
-// #### PR #42
 // What: a relayed block whose submission reply is lost stays pending in the
 // relay journal across a restart; a server started without the template
 // listener still opens that journal and finishes the block.
@@ -697,7 +687,6 @@ fn a_relayed_block_survives_lost_replies_and_a_restart_without_the_template_list
     );
 }
 
-// #### PR #42
 // What: at most 8 template clients at once: a ninth is dropped before its
 // handshake, and a place frees when a client leaves.
 // Look here if: MAX_TP_CLIENTS or the template accept loop changes.
@@ -719,7 +708,6 @@ fn template_clients_are_capped_at_eight() {
     Client::setup(&server);
 }
 
-// #### PR #42
 // What: a client frame over 64 KiB (more than the largest solution) closes
 // the session.
 // Look here if: Limits::TDP_SERVER changes.
@@ -735,7 +723,6 @@ fn client_frames_over_64_kib_close_the_session() {
     assert!(client.closed_within(Duration::from_secs(5)));
 }
 
-// #### Template Distribution extensions
 // What: a RequestExtensions right after setup (request 7 for 0x0002 and
 // 0x5052, in the spec's layout) is answered with RequestExtensions.Error:
 // extension type 0x0001 without the channel bit, the same request id, both
@@ -773,7 +760,6 @@ fn request_extensions_is_answered_with_its_error_and_templates_follow() {
     assert!(client.request(template.id).is_ok());
 }
 
-// #### BCH large templates
 // What: RequestExtensions for 0x0002, 0x4C54 and 0x5052 (request 2) is
 // answered with RequestExtensions.Success listing only 0x4C54. Each
 // template's NewTemplate and SetNewPrevHash are then followed, unasked, by
@@ -818,7 +804,6 @@ fn large_templates_are_granted_and_each_template_is_pushed() {
     assert!(client.closed_within(Duration::from_secs(3)));
 }
 
-// #### BCH large templates
 // What: after a block the next template (7 to 12, where the first had 1 to
 // 10) is pushed as a delta against the first: Kept naming it, bit i set
 // exactly when the first's i-th transaction stays, then only 11 and 12 in
@@ -874,7 +859,6 @@ fn a_negotiating_client_gets_a_delta_after_a_new_parent() {
     assert_eq!(client.request(next.id), Ok(second));
 }
 
-// #### BCH large templates
 // What: a RequestExtensions after the constraints closes the session, as
 // Knuth's provider closes it (template_provider.cpp:392).
 // Look here if: tdp::server::extension changes.
@@ -898,7 +882,6 @@ fn request_extensions_after_the_constraints_closes_the_session() {
     assert!(client.closed_within(Duration::from_secs(3)));
 }
 
-// #### Template Distribution extensions
 // What: frames of extensions this provider does not know, with and without
 // the channel bit, before the constraints and after, get no reply and leave
 // the session serving; a client's RequestExtensions.Success is one of them.
@@ -921,7 +904,6 @@ fn frames_of_unknown_extensions_are_ignored() {
     assert!(client.request(template.id).is_ok());
 }
 
-// #### Template Distribution extensions
 // What: a RequestExtensions whose list is shorter than its count closes the
 // session, as other malformed messages do, before the constraints and
 // after. Before them the window is 1 s, well inside the 3 s setup deadline.
@@ -951,7 +933,6 @@ fn a_malformed_request_extensions_closes_the_session() {
     assert!(later.closed_within(Duration::from_secs(3)));
 }
 
-// #### Template Distribution extensions
 // What: Template Distribution has no channel messages, so its
 // CoinbaseOutputConstraints with the channel bit closes the session, as a
 // first constraints and as a change. Taken as constraints, either would
@@ -970,7 +951,6 @@ fn a_template_distribution_frame_with_the_channel_bit_closes_the_session() {
     assert!(later.closed_within(Duration::from_secs(3)));
 }
 
-// #### BCH large templates
 // What: Pickaxe's own template client against this server, over Noise: it
 // asks for 0x4C54, is granted it, and builds its template from the push,
 // which rebuilds the node's transactions and their merkle path.
@@ -1000,7 +980,6 @@ fn pickaxes_template_client_takes_its_templates_pushed() {
     assert!(source.large_templates());
 }
 
-// #### BCH large templates
 // What: a template of 20,000 transactions (1.2 MB, over one 1 MiB page) is
 // pushed as a RequestTransactionData.Transactions page and the core
 // Success, and a RequestTransactionData for it is answered the same way,

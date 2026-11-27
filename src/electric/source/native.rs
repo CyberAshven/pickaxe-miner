@@ -13,7 +13,7 @@ type Coins = BTreeMap<Outpoint, Value>;
 const MAX_MEMPOOL: usize = 4_096;
 const MAX_BLOCK_GAP: u32 = 24;
 const VIEW_LIFETIME: Duration = Duration::from_millis(250);
-/// #### PR #65: recent blocks searched for what spent a watched output.
+/// Recent blocks searched for what spent a watched output.
 const SPEND_SEARCH_BLOCKS: u32 = 24;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,7 +99,7 @@ impl Watch {
             .collect())
     }
 
-    /// #### PR #65: what spent `target`: the current mempool, then the
+    /// What spent `target`: the current mempool, then the
     /// active chain's recent blocks. A spend found in a block is reported only
     /// while that block remains on the node's active chain.
     pub fn spender(&mut self, target: &Outpoint) -> Result<super::Spender, String> {
@@ -163,7 +163,6 @@ impl Watch {
     }
 }
 
-/// #### Knuth compatibility
 /// The claim-fee floor from a node's getnetworkinfo and getmempoolinfo: the
 /// relay fee, raised to the mempool's dynamic minimum when the node reports
 /// one. Knuth 1.7.0 reports none (no mempoolminfee, k-nuth/kth#1085), and
@@ -352,7 +351,7 @@ fn outpoint(txid: &Value, vout: &Value) -> Result<Outpoint, String> {
     ))
 }
 
-/// #### PR #65: `height` is the confirming block's, 0 in the mempool, as
+/// `height` is the confirming block's, 0 in the mempool, as
 /// Fulcrum reports it.
 fn coin(
     key: &Outpoint,
@@ -559,7 +558,6 @@ mod tests {
         assert!(index.mempool.is_empty());
     }
 
-    // #### PR #65
     #[test]
     fn coins_carry_their_confirmation_height_like_fulcrum() {
         let mut index = Index::default();

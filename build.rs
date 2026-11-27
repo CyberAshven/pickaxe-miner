@@ -1,4 +1,4 @@
-// #### PR #22: do not silently ship stale portable code after a native Rust edit.
+// Do not silently ship stale portable code after a native Rust edit.
 // CI additionally rebuilds these artifacts with the pinned SPIR-V compiler.
 use sha2::{Digest, Sha256};
 use std::{env, fs, path::PathBuf};

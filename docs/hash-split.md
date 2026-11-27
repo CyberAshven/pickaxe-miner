@@ -1,6 +1,5 @@
 # Token hash split
 
-#### PR #53
 
 Status: one session mines several GPU tokens on the same GPUs, each for
 its share of the time in 5% steps, at most 100% together. From the setup
@@ -38,18 +37,17 @@ runs one token's kernels at a time.
   happens mid-round.
 - The shares' remainder to 100% idles. With no token able to mine, the
   round idles and ends as soon as one can.
-- #### PR #61: a token that starts or stops being able to mine starts a new
+- a token that starts or stops being able to mine starts a new
   round at once, so its GPUs and time go to the others without waiting for
   the round to end.
 - Each token keeps its own donation: 4% of that token's work for PHOTON and
   ELECTRIC, decided before each of its batches as without a split.
-- #### PR #65: signed ELECTRIC pots allow fresh same-height proofs. A wait
+- signed ELECTRIC pots allow fresh same-height proofs. A wait
   for a new block can still come from an older restricted pot or a configured
   search-difficulty limit; see [pot migration](electric-token.md#signed-fee-pot-claims).
 
 ## Several GPUs
 
-#### PR #61
 
 The shares are parts of the whole rig, not of each GPU. Whole GPUs go to
 the tokens first; only the GPUs left over take turns:
@@ -91,14 +89,14 @@ token first. Under the last token: the total and the idle part.
 
 With ELECTRIC above 0%, the setup makes its fee pot and recovery key as soon
 as the payout is in and shows the pot's QR code, as for ELECTRIC alone.
-#### PR #61: the pot's balance is read in the background as soon as the pot
+#### The pot's balance is read in the background as soon as the pot
 shows, and every 30 s after, so funding it shows up on the page (for
 ELECTRIC alone too). **Start reads the balance again**: a pot that can pay a
 claim starts at once; an empty pot (or one that cannot be read) is reported,
 and the next Start press starts anyway, with the other tokens mining
 ELECTRIC's share until the pot is funded.
 
-#### PR #61: the split and ELECTRIC save profiles like any other GPU
+#### The split and ELECTRIC save profiles like any other GPU
 mining. The profiles file stays the one every build reads; which tokens
 mine and their shares (`PHOTON=80` and so on, tokens at 0% left out) are
 kept beside it in `profile-choices.json`, by profile name, and follow a
@@ -116,7 +114,7 @@ Tokens not named get 0%. `--device`, `--backend`, `--source`, `--fulcrum`
 and `--token-donation` apply as for `mine`; `--no-tui` prints each token's
 rate, rewards and state every 30 seconds instead of the screen.
 
-#### PR #65: the shared mining dashboard
+#### The shared mining dashboard
 
 ELECTRIC alone and hash-split sessions use the same chart, log and command
 widgets as PHOTON. The runtime lists one hashrate and work share per token,
@@ -211,11 +209,11 @@ day: PHOTON 1,688 MH/s (benchmark), ELECTRIC about 2,900 MH/s (dry run).
   to mine); the scheduler giving 80/20 within 5% over five rounds, PHOTON
   taking the round while ELECTRIC waits, and every hold released at stop;
   pot accounting and share limits.
-- #### PR #65: shared dashboard renders at 80×24 and 140×48, complete
+- shared dashboard renders at 80×24 and 140×48, complete
   funding QR at sufficient size, charts/options/Advanced, locked live
   shares, Esc panel dismissal, and pause/intensity reaching the ELECTRIC
   monitor. These are host/UI tests, not live GPU or network evidence.
-- #### PR #61: `a_rig_gives_whole_gpus_first_and_turns_only_on_the_rest`
+- `a_rig_gives_whole_gpus_first_and_turns_only_on_the_rest`
   (the table above and a 3:1 pair of GPUs) and
   `the_scheduler_measures_a_rig_then_gives_it_whole_gpus` (five GPUs of one
   model: every GPU takes turns while measuring, then GPUs 1 to 4 mine
@@ -229,13 +227,13 @@ day: PHOTON 1,688 MH/s (benchmark), ELECTRIC about 2,900 MH/s (dry run).
   the token list entry, the share rows and their limit, the pot panel, Start
   without a payout, an empty pot warning once and starting on the next
   press, a funded pot starting at once, PHOTON alone with ELECTRIC at 0%,
-  and no start with every share at 0%; #### PR #61: the profile's kept
+  and no start with every share at 0%; the profile's kept
   shares and their label, and a setup reopened with them.
-- #### PR #61: `tui::tests::electric_setup_shows_the_fee_pot_to_fund_and_saves_its_profile`
+- `tui::tests::electric_setup_shows_the_fee_pot_to_fund_and_saves_its_profile`
   (the balance read while the pot shows) and
   `tui::tests::profile_choices_are_kept_renamed_and_dropped_with_their_profile`.
 
-#### PR #65: retaining a previously funded ELECTRIC pot
+#### Retaining a previously funded ELECTRIC pot
 
 `split --restricted-electric-pot` explicitly uses the previous owner-recoverable
 ELECTRIC covenant with the same key file and journal binding. Its original

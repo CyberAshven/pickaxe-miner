@@ -1,6 +1,5 @@
 # ASIC-exclusive tokens (header-shaped jobs)
 
-#### PR #42
 
 An ASIC-exclusive token is mined *instead of* BCH: its proof of work is its
 own 80-byte header, not a BCH block. SAFA, a proposal for a CashToken whose

@@ -1,4 +1,4 @@
-//! #### PR #53: retain completed rig proofs until the coordinator advances the baton.
+//! Retain completed rig proofs until the coordinator advances the baton.
 //! Sending a frame is not a claim receipt. Reconnect/restart retries keep the exact
 //! transaction and payout, and only rebind the coordinator-local generation ID.
 

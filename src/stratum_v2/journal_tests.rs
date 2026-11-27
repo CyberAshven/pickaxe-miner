@@ -19,7 +19,7 @@ fn solved_share_with_payout(
     solved_share_for(salt, payout_policy, &payout(), None)
 }
 
-/// #### PR #40: a block solved for any miner, with any pool fee address.
+/// A block solved for any miner, with any pool fee address.
 fn solved_share_for(
     salt: u8,
     payout_policy: crate::donation::bch::BchPayout,
@@ -30,7 +30,7 @@ fn solved_share_for(
     solved_share_on(template, salt, payout_policy, miner, operator)
 }
 
-/// #### PR #42: the same on any template (one with merge-mined tokens too),
+/// The same on any template (one with merge-mined tokens too),
 /// through a channel's share path.
 fn solved_share_on(
     template: BchTemplate,
@@ -93,7 +93,7 @@ fn open(dir: &TestDirectory) -> Journal {
     .unwrap()
 }
 
-/// #### PR #42: a block solved with the test token merge-mined: a
+/// A block solved with the test token merge-mined: a
 /// commitment as output 0, before the payouts.
 fn solved_token_share(salt: u8) -> ValidatedShare {
     use super::merge::set::tests::test_set;
@@ -104,7 +104,7 @@ fn solved_token_share(salt: u8) -> ValidatedShare {
     share
 }
 
-/// #### PR #42: journals a token block, rewrites its coinbase with
+/// Journals a token block, rewrites its coinbase with
 /// `change` (keeping the proof of work and merkle root valid), and reports
 /// whether the journal still opens.
 fn opens_after(change: impl FnOnce(&mut Vec<stratum_core::bitcoin::TxOut>)) -> bool {
@@ -153,7 +153,6 @@ fn edit_script(output: &mut stratum_core::bitcoin::TxOut, change: impl FnOnce(&m
     output.script_pubkey = stratum_core::bitcoin::ScriptBuf::from_bytes(script);
 }
 
-// #### PR #42
 #[test]
 fn a_block_with_a_commitment_enqueues_and_survives_reopen() {
     let dir = TestDirectory::new();
@@ -174,7 +173,6 @@ fn a_block_with_a_commitment_enqueues_and_survives_reopen() {
     assert!(opens_after(|_| {}));
 }
 
-// #### PR #42
 #[test]
 fn a_leading_output_that_is_not_an_exact_commitment_is_refused() {
     // A valued output 0 (the satoshi taken from the miner).
@@ -196,7 +194,6 @@ fn a_leading_output_that_is_not_an_exact_commitment_is_refused() {
     assert!(!opens_after(|outputs| outputs.swap(0, 1)));
 }
 
-// #### merge-mining v2
 #[test]
 fn a_trailing_output_is_refused_and_v1_tickets_are_gone() {
     // A zero-value output after the payouts, such as a v1 ticket.
@@ -229,7 +226,6 @@ fn a_trailing_output_is_refused_and_v1_tickets_are_gone() {
     })));
 }
 
-// #### PR #42
 #[test]
 fn legacy_pending_blocks_still_open() {
     use stratum_core::bitcoin::Block;
@@ -275,7 +271,6 @@ fn legacy_pending_blocks_still_open() {
     assert_eq!(open(&dir).counts(), (0, 3, 0));
 }
 
-// #### PR #40
 #[test]
 fn a_public_pool_block_for_another_miner_survives_a_restart() {
     use crate::donation::bch::{BchPayout, FeeMode, PoolFee};
@@ -435,7 +430,6 @@ fn solved_block_and_completion_receipt_survive_reopen_without_double_counting() 
     }
 }
 
-// #### PR #40
 #[test]
 fn a_journal_bound_to_one_node_opens_while_that_node_is_configured_and_is_rebound() {
     let dir = TestDirectory::new();
@@ -491,7 +485,7 @@ fn journal_refuses_concurrent_writer_foreign_context_and_corrupt_state() {
     .is_err());
     drop(journal);
     let original = fs::read(dir.journal()).unwrap();
-    // #### PR #40: another node of the same network opens it, unchanged.
+    // Another node of the same network opens it, unchanged.
     drop(
         Journal::open(
             &dir.journal(),
@@ -625,7 +619,6 @@ fn pending_block_and_receipt_survive_process_exit_without_destructors() {
     }
 }
 
-// #### PR #42
 // What: the relay journal keeps a block that pays someone else (a pool's
 // coinbase), once, across a reopen, owner-only; it refuses blocks without a
 // valid merkle root, takes no payout-bound share, and never opens as (or
@@ -669,7 +662,6 @@ fn relay_journal_is_owner_only_and_never_mixes_with_the_block_journal() {
     }
 }
 
-// #### PR #42
 // What: the JD journal keeps a Job Declaration client's block, which pays
 // the pool's outputs rather than this server's payout, across a reopen; it
 // never opens as the block or relay journal, or they as it.

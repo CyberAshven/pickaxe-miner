@@ -74,7 +74,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # #### PR #22: package every platform from the validated source revision.
+  # Package every platform from the validated source revision.
   # The reusable workflow only builds artifacts; publication stays below and
   # remains skipped for pull requests, dev merges and unchanged versions.
   portable:
@@ -397,7 +397,7 @@ jobs:
             os: windows-latest
             artifact: release-windows-x86_64
             arch: x86_64
-          # #### PR #32: ARM64 packages, built natively on GitHub's ARM64
+          # ARM64 packages, built natively on GitHub's ARM64
           # runners. They mine through the portable engine (and OpenCL where
           # that is the only driver); CUDA PTX and HIP code objects target
           # x86_64 GPUs and stay out of them.
@@ -760,7 +760,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # #### PR #42: the Linux x86_64 binary for older Linux
+  # The Linux x86_64 binary for older Linux
   # What: `pickaxe` built inside manylinux_2_28 (glibc 2.28; TLS is rustls,
   # so no libssl). The farm-os job checks it and puts it in the Linux x86_64
   # archive in place of the one built on ubuntu-latest.
@@ -814,7 +814,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # #### PR #42: the HiveOS, mmpOS and RaveOS packages
+  # The HiveOS, mmpOS and RaveOS packages
   # What: checks the older-Linux binary (no glibc newer than 2.28, no
   # libssl or libcrypto), puts it in the Linux x86_64 archive, tests the
   # package scripts, and makes pickaxe-hiveos, pickaxe-mmpos and

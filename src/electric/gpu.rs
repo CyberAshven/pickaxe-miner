@@ -1,4 +1,4 @@
-//! #### PR #58: shared Rust ELECTRIC proof on discrete and integrated GPUs.
+//! Shared Rust ELECTRIC proof on discrete and integrated GPUs.
 //! The host independently verifies every returned nonce before a claim is built.
 use super::{meets, preimage};
 use crate::backend::{BackendKind, GpuDevice};
@@ -42,8 +42,8 @@ pub fn search_all(
                             pacer.reset(started.elapsed());
                             continue;
                         }
-                        // #### PR #53: another token's turn on the GPUs.
-                        // #### PR #61: or on this GPU alone.
+                        // Another token's turn on the GPUs.
+                        // Or on this GPU alone.
                         if monitor.gpu_held(device) {
                             std::thread::sleep(std::time::Duration::from_millis(2));
                             pacer.reset(started.elapsed());
@@ -202,7 +202,7 @@ impl Cuda {
     fn new(ordinal: usize) -> Result<Self, String> {
         let context = CudaContext::new(ordinal).map_err(|e| e.to_string())?;
         let stream = context.default_stream();
-        // #### PR #58: ELECTRIC's own module, loaded here: PHOTON's loader
+        // ELECTRIC's own module, loaded here: PHOTON's loader
         // maps every module name of the Rust T2 build to photon_rust.ptx.
         let path = crate::cuda_photon::resolve_ptx_path(PTX)?;
         let source = std::fs::read_to_string(&path)

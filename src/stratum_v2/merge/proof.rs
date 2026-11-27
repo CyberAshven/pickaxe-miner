@@ -1,4 +1,3 @@
-//! #### PR #42, merge-mining v2
 //! `AuxProof` v2: what a token win hands to the proof journal and a claim.
 //! Little-endian, canonical (exact lengths, nothing trailing).
 //!
@@ -240,7 +239,6 @@ mod tests {
         }
     }
 
-    // #### merge-mining v2
     #[test]
     fn round_trips_and_rejects_trailing_bytes_and_oversize() {
         let proof = sample();

@@ -1,4 +1,4 @@
-//! #### PR #53: P2Pool's configuration from Pickaxe's node and payout, and
+//! P2Pool's configuration from Pickaxe's node and payout, and
 //! the supervisor that runs the node binary as a child process, restarts it
 //! when it exits and tells whether it is running.
 use super::{release::Installed, Settings};
@@ -69,7 +69,7 @@ pub const MAX_SIGNATURE_BYTES: usize = 16;
 /// fires (P2Pool's sample says to leave it as it is then).
 const UNUSED_ZMQ: &str = "tcp://127.0.0.1:28332";
 
-// #### Pool modes: the operator's settings in P2Pool's configuration
+// The operator's settings in P2Pool's configuration
 // What: the fee (P2Pool's `fee` in basis points and `fee_address`), the
 // pool's signature in its blocks (`pool_signature`) and P2Pool's own
 // donation (`donation`, basis points), each checked against P2Pool's own
@@ -158,14 +158,14 @@ pub fn plan(
     installed: &Installed,
     settings: &Settings,
 ) -> Result<Plan, String> {
-    // #### PR #61: the first of the configured nodes.
+    // The first of the configured nodes.
     let node = cfg
         .custom_node_endpoints()
         .first()
         .copied()
         .ok_or("P2Pool needs your BCH node: give --node-rpc http://HOST:PORT")?;
     let (node_url, login) = crate::node::rpc_endpoint_and_login(node)?;
-    // #### Pool modes: a node without ZMQ notices (Knuth, BCHD, or ZMQ
+    // A node without ZMQ notices (Knuth, BCHD, or ZMQ
     // off) tells P2Pool of new blocks on its P2P port instead.
     let zmq = match &cfg.node_zmq {
         NodeZmq::At(url) => Some(url.clone()),
@@ -338,7 +338,7 @@ port = {API_PORT}
         ))
     }
 
-    /// #### Pool modes: the `[stratum]` lines after the ZMQ address: the
+    /// The `[stratum]` lines after the ZMQ address: the
     /// node's P2P port for a node without ZMQ, and the operator's fee,
     /// signature and P2Pool donation. Each line ends with a newline.
     fn stratum_extra(&self) -> String {
@@ -963,7 +963,6 @@ mod tests {
         }
     }
 
-    // #### Pool modes
     // What: the operator's fee (basis points and address), P2Pool's own
     // donation and the pool signature reach P2Pool's [stratum] table as
     // set; without them the TOML has none of those lines (P2Pool's
@@ -1027,7 +1026,7 @@ mod tests {
         }
     }
 
-    // #### Pool modes: Knuth and other nodes without ZMQ
+    // Knuth and other nodes without ZMQ
     // What: with ZMQ notices off (or none found in bitcoin.conf), the plan
     // no longer refuses: P2Pool hears of blocks on the node's P2P port, by
     // default the node's host with the network's P2P port, and its ZMQ

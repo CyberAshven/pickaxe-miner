@@ -1,4 +1,4 @@
-//! #### PR #61: your own BCH P2Pool node as the ASIC server's pool. The
+//! Your own BCH P2Pool node as the ASIC server's pool. The
 //! server starts it (installing or updating P2Pool as its settings say),
 //! mines at it as at any SV2 pool under your share address, and shows its
 //! light and your node's.
@@ -8,7 +8,7 @@ use super::{home, Settings};
 use crate::config::RuntimeConfig;
 use std::path::Path;
 
-/// #### Pool modes: what the server's flags set in P2Pool beyond its node
+/// What the server's flags set in P2Pool beyond its node
 /// and payout (`launch::Plan`'s fields after `plan()`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Options {
@@ -32,7 +32,7 @@ pub struct OwnNode {
     pub tag: String,
     /// A newer release left waiting, or why updates are unknown.
     pub update_note: Option<String>,
-    /// #### Pool modes: P2Pool runs alone on its own share chain.
+    /// P2Pool runs alone on its own share chain.
     pub standalone: bool,
 }
 
@@ -88,7 +88,7 @@ impl OwnNode {
         })
     }
 
-    /// #### Pool modes: whether P2Pool serves work now (its light is
+    /// Whether P2Pool serves work now (its light is
     /// green), for the fallback pools' grace and return.
     pub fn serving(&self) -> bool {
         self.supervisor.state().is_running()

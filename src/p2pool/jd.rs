@@ -1,4 +1,3 @@
-//! #### PR #65
 //! P2Pool-specific coinbase preparation stays in the P2Pool process. The
 //! miner's own BCH template and transaction list never leave this adapter
 //! until it sends the standard Full-Template Job Declaration, if selected.
@@ -63,7 +62,7 @@ struct Reply {
     extranonce_size: u8,
 }
 
-/// #### PR #65: the whole of one preparation request: the name lookup, the
+/// The whole of one preparation request: the name lookup, the
 /// connection, TLS, the request and every read of the reply (see
 /// `http::post_json`).
 pub const PREPARE_DEADLINE: Duration = Duration::from_secs(2);
@@ -171,7 +170,7 @@ fn validate(
     if *amount != 0 || *script != expected {
         return Err("P2Pool preparation changed the aux commitment".into());
     }
-    // #### PR #65: whose coinbase this is
+    // Whose coinbase this is
     // The reply names no payout or share owner, and the share commitment
     // (the 32-byte OP_RETURN) is a hash whose preimage stays with P2Pool,
     // while the PPLNS outputs pay whoever holds shares in the window, so
@@ -284,7 +283,6 @@ mod tests {
         assert_eq!(plan.consumed.load(Ordering::Relaxed), 1);
     }
 
-    // #### PR #65
     // What: the fake helper's answers prepare exactly, and one that never
     // answers fails the preparation at its 2 s deadline.
     // Look here if: PREPARE_DEADLINE or the fake helper changes.
@@ -312,7 +310,7 @@ mod tests {
     }
 }
 
-/// #### PR #65: a /jd_prepare helper on 127.0.0.1 for tests.
+/// A /jd_prepare helper on 127.0.0.1 for tests.
 #[cfg(test)]
 pub(crate) mod fake {
     use super::*;

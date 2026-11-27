@@ -1,7 +1,6 @@
-//! #### PR #38
 //! Pin full-template submission to its source node. A failed refresh revokes
 //! work; a light-job payload must never be sent as a full block on failover.
-//! #### PR #40: the server now moves to its next node when one fails
+//! The server now moves to its next node when one fails
 //! (`replace_node`). Only full templates are used and the journal saves whole
 //! blocks, so a block saved from one node's template is a complete, valid
 //! block for any node of the same network.
@@ -17,18 +16,18 @@ pub trait NodeRpc {
     fn call(&mut self, method: &str, params: Value) -> Result<Value, String>;
 }
 
-/// #### PR #42: what kind of place templates come from.
+/// What kind of place templates come from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceKind {
     /// A node over JSON-RPC (getblocktemplate).
     NodeRpc,
     /// An SV2 Template Provider (Template Distribution).
     TemplateProvider,
-    /// #### PR #42: an ASIC-exclusive token's thread (`merge::source`).
+    /// An ASIC-exclusive token's thread (`merge::source`).
     Token,
 }
 
-/// #### PR #42: a place templates come from. The server's node thread works
+/// A place templates come from. The server's node thread works
 /// with the first and fails over across the rest in order.
 pub trait TemplateSource: Send {
     fn kind(&self) -> SourceKind;
@@ -81,7 +80,6 @@ impl NativeNodeRpc {
         crate::node::rpc_source_identity(&self.endpoint)
     }
 
-    /// #### PR #40
     /// The node's client, chain and sync state.
     pub fn info(&self) -> Result<crate::node::NodeInfo, String> {
         crate::node::node_info(&self.endpoint)
@@ -107,9 +105,9 @@ pub struct TemplateProvider<R> {
     generation: u64,
     current: Option<BchTemplate>,
     previous: VecDeque<(u64, BchTemplate)>,
-    /// #### PR #42: the node's fork block was checked (once per node).
+    /// The node's fork block was checked (once per node).
     chain_proven: bool,
-    /// #### PR #48: the parent's hash (display order) and time, asked once
+    /// The parent's hash (display order) and time, asked once
     /// per parent on a network that allows minimum-difficulty blocks.
     parent: Option<(String, u32)>,
 }
@@ -127,7 +125,6 @@ impl<R: NodeRpc> TemplateProvider<R> {
         }
     }
 
-    /// #### PR #40
     /// Takes templates from another node from now on and hands the old one
     /// back in `node`. Work on the old node's templates is revoked, as after
     /// a failed refresh, so devices take a new job from the new node; the
@@ -236,7 +233,6 @@ impl<R: NodeRpc> TemplateProvider<R> {
         Ok(())
     }
 
-    /// #### PR #38
     /// Recovery submits the saved full block, never a rebuilt current job.
     /// BCHN's exact "duplicate" means accepted/known; inconclusive results do
     /// not. A lost reply may also resolve through a confirmed matching header.
@@ -288,7 +284,7 @@ impl<R: NodeRpc> TemplateProvider<R> {
         outcome
     }
 
-    /// #### PR #48: the parent's time (see `BchTemplate::stale_bits`), from
+    /// The parent's time (see `BchTemplate::stale_bits`), from
     /// the node's header of it, asked once per parent.
     fn parent_time(&mut self, hash: &str) -> Result<u32, String> {
         if let Some((known, time)) = &self.parent {
@@ -339,7 +335,7 @@ impl<R: NodeRpc> TemplateProvider<R> {
             return Err("node returned an invalid tip hash".into());
         }
         let hash = hash.to_ascii_lowercase();
-        // #### PR #42: a BTC or testnet4 node reports the same chain name;
+        // A BTC or testnet4 node reports the same chain name;
         // its block at the fork height is another (checked once per node; a
         // node below that height cannot be told yet).
         let (fork, expected) = self.network.fork_block();
@@ -389,12 +385,11 @@ mod durable_tests {
     fn tip() -> Value {
         json!({"chain":"chip","blocks":42,"headers":42,"bestblockhash":"ab".repeat(32),"initialblockdownload":false})
     }
-    /// #### PR #48: a node's header of a template's parent.
+    /// A node's header of a template's parent.
     fn parent_header(hash: String) -> Value {
         json!({"hash": hash, "time": 1_699_999_990})
     }
 
-    // #### PR #48
     // What: on Chipnet a refresh asks the node for the parent's header once
     // per parent and gives the template the parent's time; a header of
     // another block, or one without a time, fails the refresh. Mainnet asks
@@ -444,7 +439,6 @@ mod durable_tests {
         assert!(provider.rpc.0.is_empty());
     }
 
-    // #### PR #42
     // What: a node past the fork height whose block there is not the
     // network's fork block is refused ("testnet4, not Chipnet"; on mainnet
     // "Bitcoin (BTC), not Bitcoin Cash"); the right block is asked once per

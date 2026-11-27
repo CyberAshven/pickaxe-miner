@@ -33,7 +33,7 @@ impl Node {
                     }
                     Err(error) => panic!("fixture accept: {error}"),
                 };
-                // #### PR #65: macOS inherits the listener's nonblocking mode.
+                // MacOS inherits the listener's nonblocking mode.
                 // Accept remains interruptible; complete requests use bounded
                 // blocking reads on every platform.
                 stream.set_nonblocking(false).unwrap();
@@ -79,7 +79,7 @@ impl Node {
                     "getrawtransaction" => Value::Null,
                     "gettxout" => Value::Null,
                     "sendrawtransaction" => json!(txid),
-                    // #### PR #65: the tip block, whose one transaction
+                    // The tip block, whose one transaction
                     // spends an output that no scan returns.
                     "getblock" => json!({"hash":network.fork_block().1,
                         "height":network.fork_block().0 + 100,"previousblockhash":null,
@@ -186,7 +186,6 @@ fn node_only_adapter_reads_both_networks_and_shares_recovery_and_broadcast_trans
     }
 }
 
-// #### PR #65
 #[test]
 fn node_spender_tells_unspent_confirmed_and_unknown_outputs_apart() {
     let scan = json!({"success":true,"unspents":[

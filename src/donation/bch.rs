@@ -1,4 +1,3 @@
-//! #### PR #38
 //! BCH's adjustable donation policy: 1.5% by default, adjustable from 0% to
 //! 100% in 0.5% steps. One third of it is mining work and two thirds is the
 //! block reward. Integer ratios stay exact until the payout boundary; other
@@ -114,7 +113,6 @@ impl BchDonation {
         (u128::from(units) * u128::from(self.0)).div_ceil(30_000) as u64
     }
 
-    /// #### PR #40
     /// The work share when the whole donation is work, as at a remote pool,
     /// where Pickaxe cannot add a coinbase output: 1.5% at the default.
     pub fn pool_work_units(self, units: u64) -> u64 {
@@ -128,7 +126,7 @@ impl BchDonation {
         (u128::from(units) * u128::from(self.0) * 2 / 30_000) as u64
     }
 
-    /// #### merge-mining v2: the block-reward share as a rate in hundredths
+    /// The block-reward share as a rate in hundredths
     /// of a percent, `reward_units(10_000)`: 100 (1%) at the 1.5% default.
     /// A merge-mined token's donation slot takes it from each win, as a
     /// block's donation output takes `reward_units` from its reward.
@@ -145,7 +143,6 @@ impl BchDonation {
     }
 }
 
-/// #### PR #40
 /// Where a public pool's operator takes its fee from: the coinbase of every
 /// block, the mining work, or both (one third work, two thirds coinbase, the
 /// donation's own split).
@@ -179,7 +176,6 @@ impl fmt::Display for FeeMode {
     }
 }
 
-/// #### PR #40
 /// A public pool operator's fee, in hundredths of a percent of what is left
 /// after the Pickaxe donation: the donation is taken in full first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,7 +207,7 @@ impl PoolFee {
         }
     }
 
-    /// #### merge-mining v2: the coinbase share as a rate in hundredths of a
+    /// The coinbase share as a rate in hundredths of a
     /// percent, `reward_units(10_000)`: the whole rate in coinbase mode, none
     /// in work mode, two thirds in both. A merge-mined token's fee slot takes
     /// it from what the donation leaves of each win, as BCH's fee output
@@ -227,12 +223,12 @@ impl PoolFee {
 pub struct BchPayout {
     pub donation: BchDonation,
     pub donation_work: bool,
-    /// #### PR #40: a public pool's fee, and whether this job is its work.
+    /// A public pool's fee, and whether this job is its work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fee: Option<PoolFee>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fee_work: bool,
-    /// #### merge-mining v2: `None` when the job merge-mines no token of
+    /// `None` when the job merge-mines no token of
     /// this server's own without split support; otherwise whether those
     /// tokens' leaves pay the donation. A token whose covenant verifies no
     /// split takes its whole donation (the same setting as BCH's) as this
@@ -241,7 +237,7 @@ pub struct BchPayout {
     /// instead (`merge::split`). It never changes the BCH amounts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_donation_work: Option<bool>,
-    /// #### merge-mining v2: as `token_donation_work`, for a public pool's
+    /// As `token_donation_work`, for a public pool's
     /// fee: `None` without a fee or a token without split support; otherwise
     /// whether those tokens' leaves pay the operator. Such a token takes the
     /// whole fee (of what its donation leaves) as this work: `Some(true)` on
@@ -271,7 +267,6 @@ impl BchPayout {
 mod tests {
     use super::*;
 
-    // #### PR #40
     #[test]
     fn a_pool_fee_comes_off_what_the_donation_leaves() {
         let donation: BchDonation = "1.5".parse().unwrap();

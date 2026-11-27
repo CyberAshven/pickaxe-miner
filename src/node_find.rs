@@ -1,4 +1,3 @@
-//! #### PR #42
 //! Finding BCH nodes, Fulcrum servers and ZMQ block notices on this computer
 //! or on another one the miner names. Only the network's usual ports are
 //! tried, at most ten, each once with a short timeout; a public address is
@@ -47,7 +46,7 @@ pub struct FulcrumReport {
 }
 
 impl Found {
-    /// #### PR #42: where it answered.
+    /// Where it answered.
     pub fn url(&self) -> &str {
         match self {
             Self::Node { url, .. } | Self::Fulcrum { url, .. } | Self::Zmq { url } => url,
@@ -105,7 +104,7 @@ pub fn find_on_this_computer(network: MiningNetwork) -> Vec<Found> {
     find_at("127.0.0.1", network, Duration::from_millis(300))
 }
 
-// #### PR #42: another computer
+// Another computer
 // What: a computer the miner names (a name, `.local` name or address, or a
 // Tailscale computer) is searched on the same usual ports as this one, with
 // a 1.5 s connect; a public address only once the miner says yes. The ports
@@ -159,7 +158,7 @@ fn checked_host(host: &str, public_ok: bool) -> Result<&str, NotSearched> {
     Ok(host)
 }
 
-// #### PR #42: Tailscale computers
+// Tailscale computers
 // What: the computers of the miner's Tailscale network that are online,
 // from `tailscale status --json` (3 seconds at most), by name with their
 // first IPv4 address, for a search there.
@@ -352,7 +351,6 @@ fn fulcrum_report(url: &str, network: MiningNetwork) -> Result<FulcrumReport, St
         .get("height")
         .and_then(serde_json::Value::as_u64)
         .ok_or("the server gave no height")?;
-    // #### Local sources first
     // What: a server found is proven on the network by its block at the
     // fork height (`MiningNetwork::fork_block`), as a node is.
     // Why: the setup now tries a Fulcrum server found on this computer
@@ -384,7 +382,6 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
 
-    // #### PR #42
     // What: each network's usual ports are at most ten, nodes first, and
     // the ZMTP greeting is told from other bytes.
     // Look here if: candidates or is_zmtp_greeting changes.
@@ -403,7 +400,6 @@ mod tests {
         assert!(!home_address("8.8.8.8".parse().unwrap()));
     }
 
-    // #### PR #42
     // What: a named computer is searched by its name (a home name or address
     // at once, a public one only after yes), and what answers there is
     // listed under that name.
@@ -445,7 +441,6 @@ mod tests {
         assert_eq!(found.url(), format!("tcp://localhost:{port}"));
     }
 
-    // #### PR #42
     // What: online Tailscale computers are listed by name with their IPv4
     // address; offline ones and ones without an IPv4 address are not.
     // Look here if: tailscale_peers_from changes.
@@ -528,10 +523,9 @@ mod tests {
         .unwrap()
     }
 
-    // #### PR #42
     // What: a Fulcrum server over plain TCP and a ZMQ publisher are
     // recognised at their ports, with the server's version and height.
-    // #### Local sources first: once the server's block at the fork height
+    // Once the server's block at the fork height
     // proves its chain.
     // Look here if: probe or fulcrum_report changes.
     #[test]
@@ -587,7 +581,6 @@ mod tests {
         .is_none());
     }
 
-    // #### Local sources first
     // What: a Fulcrum server whose block at the fork height is another
     // chain's, or that is below the fork height (Chipnet's server on a
     // mainnet port), is one Pickaxe cannot use, so the setup never tries it

@@ -27,7 +27,6 @@ jobs:
     with:
       source-ref: ${{ github.sha }}
 
-  # #### PR #22
   # Native and browser portability checks belong to the same commit-level CI.
   # Packaging remains read-only; this call cannot create a tag or release.
   portable:
@@ -207,7 +206,6 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # #### PR #38
   # Exercise the wire with an unmodified, pinned independent client. Synthetic
   # BCH templates and one throttled CPU thread need neither a node nor a GPU.
   sv2-reference:
@@ -244,7 +242,7 @@ jobs:
         env:
           PICKAXE_SV2_REFERENCE_DEVICE: ${{ github.workspace }}/target/sv2-reference/debug/mining_device
         run: cargo test --locked --no-default-features --features stratum-v2 --lib upstream_reference_device_authenticates_and_mines_successor_blocks -- --ignored --test-threads=1
-      # #### PR #48: the same pinned source's translator opens an extended channel.
+      # The same pinned source's translator opens an extended channel.
       - name: Build unmodified reference translator
         run: |
           cargo build --locked --manifest-path .reference/sv2-apps/Cargo.toml -p translator_sv2 --bin translator_sv2
@@ -264,7 +262,7 @@ jobs:
             os: ubuntu-latest
           - name: Windows x86_64
             os: windows-latest
-          # #### PR #32: native ARM64 builds on GitHub's ARM64 runners, for
+          # Native ARM64 builds on GitHub's ARM64 runners, for
           # ARM boards and laptops (Raspberry Pi 5, Ampere, Snapdragon); the
           # portable engine mines there. Their binaries are uploaded below.
           - name: Linux ARM64
@@ -311,7 +309,7 @@ jobs:
         shell: bash
         run: python -m unittest discover -s tools -p 'test_release_channel.py' -v
 
-      # #### PR #42: the HiveOS, mmpOS and RaveOS package scripts.
+      # The HiveOS, mmpOS and RaveOS package scripts.
       - name: Test farm OS packages
         if: runner.os == 'Linux' && runner.arch == 'X64'
         shell: bash

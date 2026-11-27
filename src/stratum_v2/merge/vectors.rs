@@ -1,4 +1,4 @@
-//! #### merge-mining v2: golden vectors
+//! Golden vectors
 //! What: byte-for-byte vectors of the v2 format, built from synthetic data
 //! only (no template, payout policy or network), and repeated in
 //! docs/merge-mining.md so another implementation (BCH P2Pool's) can check
@@ -224,7 +224,7 @@ const SPLIT_LEAF: &str = concat!(
 );
 const SPLIT_LEAF_HASH: &str = "c40271368b4287df8fe3430e1bc3f9410b554874de698144fa04fe5df7033e41";
 
-// #### merge-mining v2: a whole split leaf and its claim outputs
+// A whole split leaf and its claim outputs
 // What: token A with a 1% donation to P2PKH(d0 x 20) and a 1% fee to
 // P2PKH(fe x 20): its split preimage, ext, 169-byte leaf and leaf hash, and
 // the claim outputs of 1,000,000 tokens at one satoshi per token (all

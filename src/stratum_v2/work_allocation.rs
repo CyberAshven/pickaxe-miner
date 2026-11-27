@@ -1,4 +1,3 @@
-//! #### PR #38
 //! BCH allocation follows difficulty-weighted validated shares. Until a device's
 //! first share, eligible time supplies a randomized startup phase; tokens retain
 //! their time policy. Neither advertised hashrate nor winning-block count is work.
@@ -46,7 +45,7 @@ impl WorkAllocation {
         )
     }
 
-    /// #### PR #40: at a remote pool the whole donation is work.
+    /// At a remote pool the whole donation is work.
     pub fn pool_donation_work(&self, rate: BchDonation) -> bool {
         self.balance.as_ref().map_or_else(
             || self.position < rate.pool_work_units(PERIOD_NS),
@@ -54,7 +53,7 @@ impl WorkAllocation {
         )
     }
 
-    // #### PR #42: the token donation rotation
+    // The token donation rotation
     // What: on an ASIC-exclusive token the whole donation is mining work:
     // the first `bps` ten-thousandths of each 10-minute cycle mine donation
     // jobs, whose claims the donation's forwarder receives.
@@ -67,7 +66,7 @@ impl WorkAllocation {
         self.position < u64::from(rate.bps()) * (PERIOD_NS / 10_000)
     }
 
-    // #### merge-mining v2: a token without split support donates in work
+    // A token without split support donates in work
     // What: a job that merge-mines a token of this server's own whose
     // covenant verifies no split has that token's leaves pay the donation
     // on the whole setting's share of work (1.5% at the default), not BCH's
@@ -87,7 +86,7 @@ impl WorkAllocation {
         )
     }
 
-    // #### merge-mining v2: a token without split support pays the fee in
+    // A token without split support pays the fee in
     // work
     // What: on a public pool, a job with such a token has its leaves pay the
     // operator on the whole fee's share of what the token's donation leaves
@@ -114,7 +113,7 @@ impl WorkAllocation {
         (donation..donation + fee).contains(&self.position)
     }
 
-    // #### PR #48: validated work, not elapsed time, repays BCH work quotas.
+    // Validated work, not elapsed time, repays BCH work quotas.
     // Old jobs keep their own rates and recipient, including late valid shares.
     pub fn accepted(
         &mut self,
@@ -132,14 +131,14 @@ impl WorkAllocation {
             (1.0 - donation) * f64::from(u16::from(fee.rate)) / divisor
         });
         self.credit(target, donation, fee, payout.donation_work, payout.fee_work);
-        // #### merge-mining v2: shares on token jobs repay the token
+        // Shares on token jobs repay the token
         // donation at the whole rate (see `merge_token_donation_work`).
         if let (Some(token_work), Some(balance)) = (payout.token_donation_work, &mut self.balance) {
             let rate = f64::from(u16::from(payout.donation)) / 10_000.0;
             let donated = token_work || payout.donation_work;
             balance.token += balance.share * (rate - f64::from(u8::from(donated)));
         }
-        // #### merge-mining v2: and the fee at its whole rate, of what the
+        // And the fee at its whole rate, of what the
         // whole donation leaves (see `merge_token_fee_work`).
         if let (Some(token_work), Some(fee), Some(balance)) =
             (payout.token_fee_work, payout.fee, &mut self.balance)
@@ -189,7 +188,7 @@ impl WorkAllocation {
         balance.fee += hashes * (fee - f64::from(u8::from(charged)));
     }
 
-    /// #### PR #40: a public pool operator's work share, right after the
+    /// A public pool operator's work share, right after the
     /// donation's and a share of what it leaves.
     pub fn fee_work(&self, rate: BchDonation, fee: crate::donation::bch::PoolFee) -> bool {
         if let Some(balance) = &self.balance {
@@ -206,11 +205,11 @@ impl WorkAllocation {
 struct WorkBalance {
     donation: f64,
     fee: f64,
-    /// #### merge-mining v2: the merge-mined token donation's balance.
+    /// The merge-mined token donation's balance.
     token: f64,
-    /// #### merge-mining v2: and a public pool fee's, for the same tokens.
+    /// And a public pool fee's, for the same tokens.
     token_fee: f64,
-    // #### PR #48: the randomized startup phase is a fraction of the latest
+    // The randomized startup phase is a fraction of the latest
     // share, not of the first. Vardiff can ease the target far below the
     // start difficulty; an offset fixed in first-share hashes would then
     // hold back donation and fee jobs for many later shares.
@@ -282,7 +281,6 @@ mod tests {
         }
     }
 
-    // #### PR #48
     // What: the first accepted share is 1024 times the settled share (a
     // start difficulty that vardiff then eases). Across startup phases, the
     // donation and the fee still get their share of the session's work.
@@ -337,14 +335,14 @@ mod tests {
         );
     }
 
-    // #### merge-mining v2: the merge-mined token donation is all work
+    // The merge-mined token donation is all work
     // What: on jobs that merge-mine tokens, the token leaves pay the donation
     // on the whole setting's share of validated work (1.5%, 2% and 4.5%
     // here, across difficulties and start phases), while BCH's donation work
     // stays a third of it; before any share, the token window is the first
     // `rate` of the cycle and holds BCH's.
     // Look here if: `merge_token_donation_work` or the token balance changes.
-    // #### merge-mining v2: a token without split support pays the fee in
+    // A token without split support pays the fee in
     // work
     // What: on a public pool with a 2% fee (coinbase mode), such a token's
     // leaves pay the operator on the whole fee's share of what its 1.5%
@@ -520,7 +518,6 @@ mod tests {
         assert_eq!(allocation.position, 0);
     }
 
-    // #### PR #42
     // What: a token donation of 1.5% is the first 9 seconds of each
     // 10-minute cycle, all of it work.
     // Look here if: token_donation_work changes.

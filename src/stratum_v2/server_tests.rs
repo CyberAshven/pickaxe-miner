@@ -1,4 +1,3 @@
-//! #### PR #38
 //! Exercise the real TCP/Noise server with CPU-solved headers. The node fixture
 //! uses an independent block decoder/hash oracle. This is not live chain proof.
 
@@ -44,17 +43,17 @@ pub(super) struct Node {
     pub(super) submitted: Vec<String>,
     known: std::collections::HashSet<String>,
     unavailable: bool,
-    /// #### PR #40: a public pool's blocks pay their own miners; the test
+    /// A public pool's blocks pay their own miners; the test
     /// checks those payouts itself.
     public: bool,
-    /// #### PR #42: the template's other transactions (none by default).
+    /// The template's other transactions (none by default).
     pub(super) transactions: Vec<Value>,
-    /// #### PR #42: transactions the node takes in a block but leaves out
+    /// Transactions the node takes in a block but leaves out
     /// of its templates (another node's mempool had them first), and how
     /// often validateblocktemplate was called.
     pub(super) spendable: Vec<Value>,
     pub(super) validations: usize,
-    /// #### PR #48: the tip's time; one second ago when unset. Past it plus
+    /// The tip's time; one second ago when unset. Past it plus
     /// 1200 s the templates carry the limit's bits, as BCHN's do on
     /// Chipnet (it recomputes the bits for its curtime).
     pub(super) parent_time: Option<u32>,
@@ -71,7 +70,7 @@ impl Node {
     }
 }
 
-/// #### PR #42: a node for blocks that pay someone else (a pool's, built by
+/// A node for blocks that pay someone else (a pool's, built by
 /// a template client); the test checks those payouts itself.
 pub(super) fn pool_node() -> Arc<Mutex<Node>> {
     Arc::new(Mutex::new(Node {
@@ -102,7 +101,7 @@ impl NodeRpc for Rpc {
         match method {
             "getblockchaininfo" => Ok(json!({"chain":"chip", "initialblockdownload":false,
                 "blocks":node.height,"headers":node.height,"bestblockhash":node.tip})),
-            // #### PR #42: Chipnet's fork block.
+            // Chipnet's fork block.
             "getblockhash" if params[0] == MiningNetwork::Chipnet.fork_block().0 => {
                 Ok(json!(MiningNetwork::Chipnet.fork_block().1))
             }
@@ -135,7 +134,7 @@ impl NodeRpc for Rpc {
                     };
                 }
                 assert_eq!(block.header.prev_blockhash.to_string(), node.tip);
-                // #### PR #42: a declared block may carry transactions the
+                // A declared block may carry transactions the
                 // node knows but left out of its template.
                 let known = node.known_transactions();
                 assert!(block.txdata[1..]
@@ -153,7 +152,7 @@ impl NodeRpc for Rpc {
                     MiningNetwork::Chipnet,
                 ))
                 .unwrap();
-                // #### PR #42: a merge-mining coinbase adds a zero-value
+                // A merge-mining coinbase adds a zero-value
                 // commitment (output 0, OP_RETURN); the payouts are the
                 // other outputs.
                 let token_outputs = coinbase
@@ -185,7 +184,7 @@ impl NodeRpc for Rpc {
                 }
                 assert!(coinbase.input[0].witness.is_empty());
                 let size = consensus::serialize(coinbase).len();
-                // #### merge-mining v2: the commitment adds 53 bytes.
+                // The commitment adds 53 bytes.
                 if token_outputs == 0 {
                     assert!((100..=200).contains(&size));
                 } else {
@@ -205,7 +204,7 @@ impl NodeRpc for Rpc {
                     }
                 }
             }
-            // #### PR #42: BCHN's check of a declared template: the parent
+            // BCHN's check of a declared template: the parent
             // must be the tip, the merkle root right and every transaction
             // known; refusals come as BCHN's "Invalid block: …" errors.
             "validateblocktemplate" => {
@@ -238,7 +237,7 @@ impl NodeRpc for Rpc {
                 if !node.lose_replies && node.known.contains(hash) {
                     Ok(json!({"hash":hash,"confirmations":1,"time":now() - 1}))
                 } else if hash == node.tip {
-                    // #### PR #48: the parent's time, for Chipnet's 20-minute
+                    // The parent's time, for Chipnet's 20-minute
                     // rule; a lost reply still confirms no block.
                     Ok(json!({"hash":hash,"time":node.parent_time.unwrap_or(now() - 1)}))
                 } else {
@@ -258,11 +257,11 @@ pub(super) struct Running {
     pub(super) address: SocketAddr,
     pub(super) authority: [u8; 32],
     pub(super) state_directory: Arc<TestDirectory>,
-    /// #### PR #42: the template listener, when it serves templates.
+    /// The template listener, when it serves templates.
     pub(super) templates: Option<SocketAddr>,
-    /// #### PR #42: a Job Declaration client's uplink thread.
+    /// A Job Declaration client's uplink thread.
     uplink: Option<thread::JoinHandle<()>>,
-    /// #### PR #56: a pool's Job Declaration rules, when it accepts them.
+    /// A pool's Job Declaration rules, when it accepts them.
     pub(super) declarator: Option<Arc<super::jd::server::Declarator>>,
 }
 
@@ -286,7 +285,7 @@ impl Running {
         Self::start(node, Arc::new(TestDirectory::new()))
     }
 
-    /// #### PR #40: a public pool, where each miner's blocks pay them.
+    /// A public pool, where each miner's blocks pay them.
     fn public(public: super::payout::PublicPool) -> Self {
         let node = Arc::new(Mutex::new(Node {
             height: 325908,
@@ -318,7 +317,7 @@ impl Running {
         Self::start_nodes(vec![node], state_directory, public)
     }
 
-    /// #### PR #40: a server with its nodes in failover order; `node` is the
+    /// A server with its nodes in failover order; `node` is the
     /// first.
     fn start_nodes(
         nodes: Vec<Arc<Mutex<Node>>>,
@@ -328,7 +327,7 @@ impl Running {
         Self::start_full(nodes, state_directory, public, None)
     }
 
-    /// #### PR #42: a server that merge-mines `tokens`.
+    /// A server that merge-mines `tokens`.
     fn start_full(
         nodes: Vec<Arc<Mutex<Node>>>,
         state_directory: Arc<TestDirectory>,
@@ -347,7 +346,7 @@ impl Running {
         )
     }
 
-    /// #### PR #42: a Job Declaration client's local server on `node`,
+    /// A Job Declaration client's local server on `node`,
     /// declaring its templates to `pool` in `mode`.
     pub(super) fn jd_client(
         node: Arc<Mutex<Node>>,
@@ -357,7 +356,7 @@ impl Running {
         Self::jd_client_donating(node, pool, mode, None)
     }
 
-    /// #### merge-mining v2: a Job Declaration client naming `donation`
+    /// A Job Declaration client naming `donation`
     /// to the pool as `,pickaxe-donation=`.
     pub(super) fn jd_client_donating(
         node: Arc<Mutex<Node>>,
@@ -386,7 +385,7 @@ impl Running {
         )
     }
 
-    /// #### PR #42: a Job Declaration client merge-mining `hub`'s tokens,
+    /// A Job Declaration client merge-mining `hub`'s tokens,
     /// with its proofs in `state_directory`.
     pub(super) fn jd_client_merged(
         node: Arc<Mutex<Node>>,
@@ -416,7 +415,7 @@ impl Running {
         )
     }
 
-    /// #### PR #42: a server whose templates come first from `provider`'s
+    /// A server whose templates come first from `provider`'s
     /// template server, then from its own `node`.
     pub(super) fn tdp_client(
         node: Arc<Mutex<Node>>,
@@ -439,7 +438,7 @@ impl Running {
         )
     }
 
-    /// #### PR #42: a public pool that accepts Coinbase-only Job
+    /// A public pool that accepts Coinbase-only Job
     /// Declaration.
     pub(super) fn jd_pool(public: super::payout::PublicPool) -> Self {
         Self::start_config(
@@ -454,7 +453,7 @@ impl Running {
         )
     }
 
-    /// #### PR #42: a public pool on `node` that accepts both Job
+    /// A public pool on `node` that accepts both Job
     /// Declaration modes, whose node checks declared templates.
     pub(super) fn jd_pool_full(node: Arc<Mutex<Node>>, public: super::payout::PublicPool) -> Self {
         Self::start_config(
@@ -469,7 +468,7 @@ impl Running {
         )
     }
 
-    /// #### PR #42: a server that serves templates on a second listener,
+    /// A server that serves templates on a second listener,
     /// with its relay journal in `state_directory`.
     pub(super) fn templates(node: Arc<Mutex<Node>>, state_directory: Arc<TestDirectory>) -> Self {
         Self::start_config(
@@ -484,7 +483,7 @@ impl Running {
         )
     }
 
-    /// #### PR #42: a server whose relay journal is configured but which
+    /// A server whose relay journal is configured but which
     /// serves no templates.
     pub(super) fn relay_only(node: Arc<Mutex<Node>>, state_directory: Arc<TestDirectory>) -> Self {
         Self::start_config(
@@ -499,12 +498,12 @@ impl Running {
         )
     }
 
-    /// #### PR #42: where a test server keeps its relay journal.
+    /// Where a test server keeps its relay journal.
     pub(super) fn relay_path(&self) -> std::path::PathBuf {
         self.state_directory.0.join("relay-blocks.json")
     }
 
-    /// #### PR #42: a solo server on `node` that marks `preferred` while it
+    /// A solo server on `node` that marks `preferred` while it
     /// has work.
     pub(super) fn solo_preferred(
         node: Arc<Mutex<Node>>,
@@ -524,7 +523,7 @@ impl Running {
         )
     }
 
-    /// #### PR #42: a server mining `work`'s ASIC-exclusive token instead
+    /// A server mining `work`'s ASIC-exclusive token instead
     /// of BCH.
     pub(super) fn token(
         work: Arc<super::merge::source::HeaderWork>,
@@ -732,7 +731,7 @@ struct Device {
     id: u32,
     prefix: Vec<u8>,
     extended: bool,
-    /// #### PR #56: the extranonce bytes the device rolls.
+    /// The extranonce bytes the device rolls.
     rolled: usize,
 }
 
@@ -747,7 +746,7 @@ impl Device {
         device
     }
 
-    /// #### PR #56: a device asking for at least `rolling` extranonce bytes.
+    /// A device asking for at least `rolling` extranonce bytes.
     fn connect_rolling(server: &Running, extended: bool, identity: &str, rolling: u16) -> Self {
         let (mut sender, mut receiver) = Session::initiate(
             TcpStream::connect(server.address).unwrap(),
@@ -832,7 +831,7 @@ impl Device {
         }
     }
 
-    /// #### PR #48: the bits of each SetNewPrevHash until one carries
+    /// The bits of each SetNewPrevHash until one carries
     /// `bits`; fails when none does by `deadline`.
     fn bits_until(&mut self, bits: u32, deadline: Instant) -> Vec<u32> {
         let mut seen = Vec::new();
@@ -944,7 +943,6 @@ impl Device {
     }
 }
 
-// #### PR #42, merge-mining v2
 // What: a device mines the Chipnet test token through the real server: its
 // share wins the token (the token's target); the claim worker proves it,
 // saves it owner-only (an `AuxProof` v2 that verifies, one claim per row,
@@ -1009,7 +1007,7 @@ fn a_device_mines_the_test_token_and_each_state_is_proven_once() {
         let entry = &entries[0];
         assert_eq!(entry["status"], "proven");
         assert_eq!(entry["format"], "AuxProof v2");
-        // #### merge-mining v2: the split preimage the claim reveals: 1% of
+        // The split preimage the claim reveals: 1% of
         // the win to the donation.
         let donation = crate::tx::cashaddr_to_p2pkh_locking(crate::donation::bch::address(
             MiningNetwork::Chipnet,
@@ -1042,7 +1040,7 @@ fn a_device_mines_the_test_token_and_each_state_is_proven_once() {
     }
 }
 
-// #### merge-mining v2: per-miner roots on a public pool
+// Per-miner roots on a public pool
 // What: a public pool that merge-mines the test token gives each miner a
 // root of their own: a miner finds a block whose output 0 is a non-empty
 // root; their share wins the token, which the claim worker proves and
@@ -1163,7 +1161,6 @@ fn address(seed: u8) -> String {
     .unwrap()
 }
 
-// #### PR #40
 #[test]
 fn a_public_pool_pays_each_miner_their_own_address_after_the_donation_and_fee() {
     use crate::donation::bch::{FeeMode, PoolFee};
@@ -1220,7 +1217,7 @@ fn a_public_pool_pays_each_miner_their_own_address_after_the_donation_and_fee() 
         drop(node);
         device.sender.close();
     }
-    // #### PR #48: both blocks came from personal jobs (the fee here is a
+    // Both blocks came from personal jobs (the fee here is a
     // coinbase split, not work).
     let work = server.stats.lock().unwrap().work;
     assert!(work.personal > 0.0);
@@ -1244,7 +1241,6 @@ fn reference_authority(public: [u8; 32]) -> String {
     stratum_core::bitcoin::base58::encode_check(&encoded)
 }
 
-// #### PR #38
 // Run an independently built, unmodified SRI mining_device against synthetic
 // BCH templates. No live node, user payout or GPU is accessed by this test.
 #[test]
@@ -1338,7 +1334,6 @@ fn upstream_reference_device_authenticates_and_mines_successor_blocks() {
     drop(valid);
 }
 
-// #### PR #48
 // What: an independently built, unmodified SRI translator opens one extended
 // channel per SV1 miner on one connection to this server (a group), and two
 // SV1 miners take turns mining successor blocks through it.
@@ -1564,7 +1559,6 @@ user_identity = "interop-test"
     drop(translator);
 }
 
-// #### PR #40
 #[test]
 fn the_dashboard_records_the_best_share_and_each_block_found() {
     let server = Running::new(false);
@@ -1689,7 +1683,7 @@ impl FirmwareAdapter {
         )
     }
 
-    /// #### PR #40: this server's adapter for a public pool.
+    /// This server's adapter for a public pool.
     fn public(server: &Running) -> Self {
         Self::with(
             server,
@@ -1730,12 +1724,12 @@ struct FirmwareDevice {
     read: std::io::BufReader<TcpStream>,
     prefix: Vec<u8>,
     /// The extranonce2 size the adapter gave: 8 from this server's own
-    /// listener, 4 at a remote pool (#### PR #40).
+    /// listener, 4 at a remote pool.
     extra_size: usize,
     /// The worker name it authorized with and submits under.
     name: String,
     clean: bool,
-    /// #### PR #48: the last `mining.set_difficulty` a proxy asked for.
+    /// The last `mining.set_difficulty` a proxy asked for.
     /// Solutions meet it as well as the block target; 0 is the block alone.
     difficulty: f64,
 }
@@ -1792,7 +1786,7 @@ impl FirmwareDevice {
         }
         device
     }
-    /// #### PR #42: waits until the adapter ends this connection.
+    /// Waits until the adapter ends this connection.
     fn closed(mut self) {
         use std::io::BufRead;
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -1921,7 +1915,6 @@ fn sv1_transient_node_failure_revokes_work_and_recovers_without_reconnect() {
     assert_eq!(stats.last_template_error, Some("node RPC unavailable"));
 }
 
-// #### PR #40
 #[test]
 fn the_server_moves_to_its_next_node_when_its_node_stops_answering() {
     let node = || {
@@ -2127,7 +2120,7 @@ fn sv1_firmware_mines_at_a_remote_sv2_pool_and_the_adapter_counts_its_verdicts()
         (rows[0].accepted, rows[0].rejected, rows[0].protocol),
         (2, 0, "SV1")
     );
-    // #### PR #48: both acknowledged shares count as personal work at the
+    // Both acknowledged shares count as personal work at the
     // pool, apart from this server's own jobs.
     assert!(counted.pool_work.personal > 0.0);
     assert_eq!(counted.pool_work.shares(), Some((0.0, 0.0)));
@@ -2135,7 +2128,6 @@ fn sv1_firmware_mines_at_a_remote_sv2_pool_and_the_adapter_counts_its_verdicts()
     device.write.shutdown(std::net::Shutdown::Both).unwrap();
 }
 
-// #### PR #42
 // What: the Chipnet ASIC test token on the real server, with no node: a
 // device's share on its job is a win, the token worker proves and saves it,
 // the simulated thread moves to the winning header, and the device's next
@@ -2184,7 +2176,6 @@ fn the_simulated_test_token_advances_after_each_proven_win() {
     device.sender.close();
 }
 
-// #### PR #42
 // What: an SV2 standard device, an SV2 extended device and SV1 firmware
 // through the adapter mine a SAFA token job (from a test source) on the real
 // server: every share is accepted, none is a block (no journal entry,
@@ -2275,7 +2266,6 @@ fn sv2_standard_extended_and_sv1_cpu_devices_mine_a_token_job() {
     extended.sender.close();
 }
 
-// #### PR #42
 // What: a proxy (one SV2 connection, two extended channels of one identity,
 // as SRI's translator opens them) mines through group jobs on a real
 // server: both channels are announced in one group and get their own first
@@ -2474,7 +2464,6 @@ fn a_proxy_mines_through_a_grouped_connection() {
     sender.close();
 }
 
-// #### PR #42
 // What: solo mining with a fallback pool, on loopback: an SV1 device mines
 // on the miner's node; when the node stops answering, the local server ends
 // its session and the adapter takes the device to the fallback pool
@@ -2536,7 +2525,6 @@ fn solo_devices_move_to_the_fallback_pool_when_the_node_stops_and_return_when_it
     drop(local);
 }
 
-// #### PR #40
 #[test]
 fn at_a_remote_pool_the_donation_mines_on_its_own_channel_and_the_pool_accepts_it() {
     // Pickaxe's own server stands in for the pool. At 100% the device mines
@@ -2607,7 +2595,7 @@ fn at_a_remote_pool_the_donation_mines_on_its_own_channel_and_the_pool_accepts_i
         thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(stats.lock().unwrap().shares_rejected, 0);
-    // #### PR #48: the pool's acknowledgement counts as donation work, apart
+    // The pool's acknowledgement counts as donation work, apart
     // from this server's own jobs.
     let work = stats.lock().unwrap().pool_work;
     assert!(work.donation > 0.0 && work.personal == 0.0 && work.fee == 0.0);
@@ -2615,7 +2603,7 @@ fn at_a_remote_pool_the_donation_mines_on_its_own_channel_and_the_pool_accepts_i
     device.write.shutdown(std::net::Shutdown::Both).unwrap();
 }
 
-// #### merge-mining v2: disclosure to miners on a public pool
+// Disclosure to miners on a public pool
 // What: SV1 firmware that asks for pickaxe-merge at a public pool that
 // merge-mines the test token gets its jobs' leaves, which rebuild its root
 // and pay its own address; a standard-channel device's jobs go to the
@@ -2722,7 +2710,7 @@ fn public_pool_miners_can_see_their_leaves() {
     drop(device);
 }
 
-// #### merge-mining v2: one donation at a pool
+// One donation at a pool
 // What: the adapter, which donates on its own channel at a remote pool,
 // names `,pickaxe-donation=0` on the device's channel (a key BCH P2Pool
 // does not read). #### one donation, the higher rate: a Pickaxe pool no
@@ -2808,7 +2796,7 @@ fn a_typed_zero_donation_does_not_lower_a_pickaxe_pools_rate() {
     device.write.shutdown(std::net::Shutdown::Both).unwrap();
 }
 
-// #### one donation, the higher rate: the donation's channel
+// The donation's channel
 // What: the adapter's own donation channel at a Pickaxe pool opens on the
 // device's connection beside its `,pickaxe-donation=0` login (no
 // donation-mismatch), and mines donation work there: at the adapter's 100%
@@ -2895,7 +2883,6 @@ fn the_adapters_donation_channel_mines_donation_work_at_a_pickaxe_pool() {
     device.write.shutdown(std::net::Shutdown::Both).unwrap();
 }
 
-// #### PR #40
 #[test]
 fn sv1_firmware_at_a_public_pool_is_paid_at_the_address_it_names() {
     use crate::donation::bch::{FeeMode, PoolFee};
@@ -3140,7 +3127,6 @@ fn a_device_whose_pools_all_fail_still_shows_the_reason() {
     drop(device);
 }
 
-// #### PR #42
 // What: a scripted Job Declaration client on loopback opens a JD session and
 // a mining session on the pool's one SV2 port and key, allocates a token,
 // sets a custom job paying [miner 304,734,375, fee 3,078,125, donation
@@ -3346,14 +3332,13 @@ fn a_scripted_jd_client_sets_a_custom_job_and_mines_it() {
     assert_eq!(stats.connections, 1, "the JD session is not a device");
     assert_eq!(stats.device_stats.snapshots(Instant::now()).len(), 1);
     assert_eq!(server.node.lock().unwrap().submissions, 0);
-    // #### PR #48: a custom job's share is no one's work here.
+    // A custom job's share is no one's work here.
     assert_eq!(stats.work, super::server::WorkSplit::default());
     drop(jd);
     drop(jd_replies);
     server.wait(|stats| stats.jd_server.as_ref().is_some_and(|jd| jd.clients == 0));
 }
 
-// #### PR #42
 // What: a pool that does not accept Job Declaration answers a JD
 // SetupConnection with unsupported-protocol, as before.
 // Look here if: the JD dispatch in serve_device changes.
@@ -3393,7 +3378,6 @@ fn jd_is_refused_when_the_pool_does_not_accept_it() {
     assert_eq!(error.error_code.as_ref(), b"unsupported-protocol");
 }
 
-// #### PR #42
 // What: a Pickaxe Job Declaration client (a local server on the miner's node
 // and an uplink) mines at a Pickaxe pool that accepts Coinbase-only Job
 // Declaration, on loopback: an SV2 device mines the local server's job,
@@ -3480,10 +3464,10 @@ fn coinbase_only_pickaxe_jdc_mines_at_a_pickaxe_jds_on_loopback() {
     device.sender.close();
 }
 
-// #### merge-mining v2: the miner's donation at a Pickaxe pool
+// The miner's donation at a Pickaxe pool
 // What: a Job Declaration client whose own donation setting is 0% names it
 // (`,pickaxe-donation=0.00`) to a Pickaxe pool whose own setting is 1.5%.
-// #### one donation, the higher rate: the higher rate, the pool's 1.5%,
+// The higher rate, the pool's 1.5%,
 // applies: the block pays the miner, the pool's 1% fee (of what the
 // donation leaves) and the donation 1.5%, all in the coinbase.
 // Look here if: `JdTarget::login` or the pool's login options change.
@@ -3542,7 +3526,6 @@ fn a_jd_client_names_its_own_donation_to_a_pickaxe_pool() {
     device.sender.close();
 }
 
-// #### PR #56
 // What: a pool granting only 8 rollable bytes, as BCH P2Pool does, refuses
 // the client's 16; the client asks again for 8 and mines in the compact
 // layout. Its local device rolls 4 bytes on a 2-byte lane, the device's
@@ -3588,7 +3571,6 @@ fn a_pool_granting_8_bytes_gets_the_compact_layout() {
     device.sender.close();
 }
 
-// #### PR #42
 // What: a Pickaxe Job Declaration client (Full-Template) mines at a Pickaxe
 // pool that accepts both modes, on loopback. The pool's node has 2 of the
 // client's 3 transactions: exactly one ProvideMissingTransactions round
@@ -3673,7 +3655,6 @@ fn full_template_declares_provides_a_missing_transaction_and_both_nodes_get_the_
     device.sender.close();
 }
 
-// #### PR #42, merge-mining v2
 // What: a Job Declaration client merge-mines the Chipnet test token at a
 // Pickaxe pool with Full-Template: the pool checks the leaves in the
 // declaration's excess_data and accepts the custom job with the commitment
@@ -3783,7 +3764,6 @@ fn merge_mined_tokens_ride_job_declaration_to_a_pickaxe_pool() {
     }
 }
 
-// #### PR #42
 // What: when the pool refuses Job Declaration (here it does not accept it),
 // the client's local server publishes no work and the uplink counts a
 // fallback with the pool's reason, so devices go to the pool's own jobs.
@@ -3828,7 +3808,6 @@ fn a_pool_without_job_declaration_leaves_the_local_server_without_work() {
     drop(miner_node);
 }
 
-// #### PR #42
 // What: Pickaxe serves Pickaxe: a server takes its templates from another
 // Pickaxe's template server (key pinned), a CPU device mines a block on
 // them, and the block reaches the provider's node (relayed from
@@ -3871,7 +3850,6 @@ fn pickaxe_serves_pickaxe_and_a_block_reaches_both_nodes() {
     device.sender.close();
 }
 
-// #### PR #42
 // What: a provider on this computer may be used without its key (the
 // session is refused for any other address), and its templates mine as a
 // pinned one's do.
@@ -3890,7 +3868,6 @@ fn an_unpinned_provider_on_this_computer_serves_templates() {
     device.sender.close();
 }
 
-// #### PR #48
 // What: on Chipnet, a device gets the job on the limit's bits a few seconds
 // after the parent's time plus 1200 s, not at the next 15-second refresh:
 // from this server's node (the minimum-difficulty refresh), and through

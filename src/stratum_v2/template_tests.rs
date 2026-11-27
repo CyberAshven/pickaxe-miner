@@ -39,7 +39,7 @@ pub(super) fn transaction(nonce: u32) -> Value {
     json!({"data":hex::encode(bytes),"txid":hex::encode(txid)})
 }
 
-/// #### PR #42: a CTOR-ordered template with `count` transactions, and
+/// A CTOR-ordered template with `count` transactions, and
 /// their hashes in internal byte order.
 fn template_with(count: u32) -> (BchTemplate, Vec<Hash>) {
     let mut raw = rpc_template();
@@ -60,7 +60,6 @@ fn template_with(count: u32) -> (BchTemplate, Vec<Hash>) {
     (BchTemplate::from_rpc(&raw).unwrap(), hashes)
 }
 
-// #### PR #42
 // What: folding a coinbase's hash up the branch computed once per template
 // gives the whole tree's root, for every transaction count from 0 to 17
 // (odd levels duplicate their last hash).
@@ -83,7 +82,6 @@ fn merkle_root_by_path_equals_the_full_tree() {
     }
 }
 
-// #### PR #42
 // What: a coinbase rebuilt from a job's parts (prefix, extranonce, suffix)
 // is byte for byte the full build, and folding its hash up the parts'
 // merkle path gives the full build's root, for 0 to 17 transactions and
@@ -207,7 +205,6 @@ fn full_template_preserves_ctor_transactions_and_reference_merkle() {
     assert!(BchTemplate::from_rpc(&raw).is_err());
 }
 
-// #### PR #40
 #[test]
 fn a_pool_name_is_written_into_the_coinbase_and_the_parts_still_fit() {
     let mut raw = rpc_template();
@@ -236,7 +233,7 @@ fn a_pool_name_is_written_into_the_coinbase_and_the_parts_still_fit() {
         .is_err());
 }
 
-/// #### PR #42: a coinbase's hex with the Pickaxe donation's locking script
+/// A coinbase's hex with the Pickaxe donation's locking script
 /// shown as `{donation}`, as the golden coinbases write it.
 fn golden_hex(coinbase: &[u8]) -> String {
     let address = crate::donation::bch::address(MiningNetwork::Chipnet);
@@ -244,7 +241,7 @@ fn golden_hex(coinbase: &[u8]) -> String {
     hex::encode(coinbase).replace(&donation, "{donation}")
 }
 
-/// #### PR #42: an extended-channel coinbase head (version, the null
+/// An extended-channel coinbase head (version, the null
 /// prevout, the 32-byte script with height 325909 and extranonce `[7; 28]`,
 /// the sequence) before the output count.
 const GOLDEN_HEAD: &str = concat!(
@@ -267,7 +264,6 @@ const GOLDEN_PAYOUTS: &str = concat!(
     "{donation}"
 );
 
-// #### PR #42
 #[test]
 fn no_tokens_keeps_coinbase_bytes_identical() {
     use crate::donation::bch::BchPayout;
@@ -302,7 +298,6 @@ fn no_tokens_keeps_coinbase_bytes_identical() {
         .is_none());
 }
 
-// #### PR #42
 #[test]
 fn the_commitment_is_output_zero_and_the_parts_still_fit() {
     use super::merge::{commitment::AuxCommitment, set::tests::test_set, tree::fold};
@@ -383,14 +378,13 @@ fn the_commitment_is_output_zero_and_the_parts_still_fit() {
         outputs.iter().map(|o| o.value.to_sat()).sum::<u64>(),
         template.coinbase_value
     );
-    // #### merge-mining v2: no custom coinbase tag by default: the script
+    // No custom coinbase tag by default: the script
     // is the height, the extranonce and nothing else.
     assert_eq!(coinbase.bytes[41], 4 + 28);
     assert_eq!(coinbase.bytes[42..46], [0x03, 0x15, 0xf9, 0x04]);
     assert_eq!(coinbase.bytes[46..74], extra);
 }
 
-// #### PR #42, merge-mining v2
 // What: the extended coinbase with the test token: its 53-byte commitment
 // (v2) as output 0, then the payouts; a public pool's carries the empty
 // commitment instead.
@@ -455,7 +449,7 @@ fn golden_extended_coinbase_with_a_token() {
     assert_ne!(public[204 - 53 - 4..], a[204 - 53 - 4..]);
 }
 
-/// #### merge-mining v2: the test token's root on the test template's
+/// The test token's root on the test template's
 /// miner job (its leaf binds the miner's script, with 1% of each win to the
 /// donation in its split).
 const GOLDEN_TOKEN_ROOT: &str = "a022c34ac234c2ac6a7b3b76a31eb0aad9612cfd83d662de94e3f231c6da4057";
@@ -631,21 +625,21 @@ impl NodeRpc for RpcFixture {
         result
     }
 }
-/// #### PR #48: a node's header of a template's parent.
+/// A node's header of a template's parent.
 fn parent_header(hash: String) -> Value {
     json!({"hash": hash, "time": 1_699_999_990})
 }
 fn initial_calls() -> VecDeque<(&'static str, Result<Value, String>)> {
     VecDeque::from([
         ("getblockchaininfo", Ok(tip())),
-        // #### PR #42: the fork block, once per node.
+        // The fork block, once per node.
         (
             "getblockhash",
             Ok(json!(MiningNetwork::Chipnet.fork_block().1)),
         ),
         ("getblocktemplate", Ok(rpc_template())),
         ("getblockchaininfo", Ok(tip())),
-        // #### PR #48: the parent's time, once per parent on Chipnet.
+        // The parent's time, once per parent on Chipnet.
         ("getblockheader", Ok(parent_header("ab".repeat(32)))),
     ])
 }
@@ -705,7 +699,6 @@ fn provider_revokes_work_on_failure_wrong_network_sync_or_tip_race() {
     assert!(provider.refresh().is_err());
 }
 
-// #### PR #42
 // What: a provider's template is built from what it announced: the height
 // from its push, its flags kept, the size limit from its transactions and
 // the reserve; a prefix over 8 bytes, a non-minimal or missing push, a
@@ -765,7 +758,6 @@ fn provided_templates_are_checked_like_a_nodes() {
     assert!(BchTemplate::from_provided(wrong).is_err());
 }
 
-// #### PR #42
 // What: under a Job Declaration plan with a token set, the declared
 // coinbase, every local job's coinbase and the custom job's outputs carry
 // the commitment as output 0 before the pool's outputs; the leaves bind the
@@ -807,7 +799,7 @@ fn job_declaration_jobs_carry_the_commitment_and_the_pool_rule_accepts_them() {
     let set = Arc::new(test_set());
     template.commit(set.clone());
     let aux = template.declared_aux().unwrap().unwrap();
-    // #### merge-mining v2: the leaves pay the miner with the pool's whole
+    // The leaves pay the miner with the pool's whole
     // donation rate and its fee in the split, as the coinbase pays them.
     let split = Split::new(
         Slot::new(150, &[0x53]).unwrap(),

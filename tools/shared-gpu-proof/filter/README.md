@@ -1,6 +1,5 @@
 # Shared Rust T2 filter
 
-#### PR #22
 
 Portable builds import the production Rust hashing and transaction-layout
 source. CUDA retains its existing compiler and instructions. The original

@@ -1,4 +1,4 @@
-//! #### PR #42: ZMQ block notices
+//! ZMQ block notices
 //! What: a minimal ZMTP 3.0 subscriber (NULL security, no dependency) to a
 //! node's `zmqpubhashblock`: the greeting, a READY as a SUB socket, a
 //! subscription to `hashblock`, then `[topic, hash, sequence]` messages.
@@ -338,7 +338,6 @@ mod tests {
         assert_eq!((flags, body.as_slice()), (0, b"\x01hashblock".as_slice()));
     }
 
-    // #### PR #42
     // What: a block notice from a ZMQ publisher wakes the node worker at
     // once (well before its next 250 ms poll), marks the notices fresh and
     // counts the block; while connected, the tip is asked every 2 s.
@@ -383,7 +382,6 @@ mod tests {
         publisher.join().unwrap();
     }
 
-    // #### PR #42
     // What: something that is not a ZMQ publisher is left with its reason
     // on the dashboard, wakes nothing, and the node worker keeps polling.
     // Look here if: check_greeting or should_ask_tip change.
