@@ -371,7 +371,7 @@ What this means for Pickaxe, and what step 1 did:
   a node is saved), each on its own thread, and says what it found: the
   client and sync height and whether it follows PHOTON, a refused login, no
   answer, another network or chain, or a node that answers but cannot follow
-  PHOTON (no gettxout, such as Knuth), whose BCH ASIC templates still work
+  PHOTON (no gettxout; Knuth has it since 1.7.0), whose BCH ASIC templates still work
   (done in #42). A node without getnetworkinfo is "BCH node".
 - The setup also searches this computer when a list opens: a node on
   another usual port (such as Knuth's 8332 on Chipnet), Fulcrum servers
@@ -457,6 +457,15 @@ Answered (2026-10-10):
 - Knuth: reached over its JSON-RPC from a separate process, like BCHN; the
   setup finds it on its port and logs in with a saved cookie file (#43). Its
   C API in-process is not planned.
+  Checked live on Knuth 1.7.0 (Chipnet, 2026-11-26): `stratum-v2 check-node`
+  takes its templates; `gettxout`, `getblock` verbosity 2 (with `tokenData`),
+  `getrawmempool` and `getrawtransaction` with a block hash all answer as
+  BCHN's do. It has no `scantxoutset` and no transaction index, so the GPU
+  token reader follows the baton through new blocks with `getblock` instead
+  of rescanning the UTXO set, and looks up a confirmed transaction with its
+  block hash. Its own Template Provider (`sv2.enabled`) is used once it
+  speaks Noise (k-nuth/kth#807), as `sv2tp://HOST:PORT/KEY` like any other
+  provider; Pickaxe does not take templates over an unencrypted link.
 - Pools with Stratum V2 Job Declaration for BCH: none to list yet. CashStratum
   (behind SoloFury's BCH endpoint) has Job Declaration code, but its Noise
   certificate version keeps SV2 clients out (cashstratum/cashstratum#3); a
