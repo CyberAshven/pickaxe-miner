@@ -143,8 +143,7 @@ impl Watch {
     pub fn relay_fee(&self) -> Result<u64, String> {
         let relay = rpc_call(&self.url, "getnetworkinfo", json!([]))?;
         let mempool = rpc_call(&self.url, "getmempoolinfo", json!([]))?;
-        Ok(bch_value_to_sats(&relay["relayfee"])?
-            .max(bch_value_to_sats(&mempool["mempoolminfee"])?))
+        fee_floor(&relay, &mempool)
     }
 
     pub fn transaction(&self, txid: &str) -> Result<String, String> {
@@ -161,6 +160,47 @@ impl Watch {
             .as_str()
             .map(str::to_owned)
             .ok_or_else(|| "node returned no broadcast transaction id".into())
+    }
+}
+
+/// #### Knuth compatibility
+/// The claim-fee floor from a node's getnetworkinfo and getmempoolinfo: the
+/// relay fee, raised to the mempool's dynamic minimum when the node reports
+/// one. Knuth 1.7.0 reports none (no mempoolminfee, k-nuth/kth#1085), and
+/// then enforces its relay fee; a minimum that is there must still be a BCH
+/// amount.
+fn fee_floor(network: &Value, mempool: &Value) -> Result<u64, String> {
+    let relay = bch_value_to_sats(&network["relayfee"])?;
+    match mempool.get("mempoolminfee") {
+        Some(minimum) => Ok(relay.max(bch_value_to_sats(minimum)?)),
+        None => Ok(relay),
+    }
+}
+
+#[cfg(test)]
+mod fee_floor_tests {
+    use super::fee_floor;
+    use serde_json::json;
+
+    #[test]
+    fn the_fee_floor_is_the_relay_fee_raised_to_a_reported_minimum() {
+        let network = json!({"relayfee": "0.00001000"});
+        assert_eq!(
+            fee_floor(&network, &json!({"mempoolminfee": "0.00002000"})),
+            Ok(2000)
+        );
+        assert_eq!(
+            fee_floor(&network, &json!({"mempoolminfee": "0.00000500"})),
+            Ok(1000)
+        );
+        // Knuth 1.7.0: no mempoolminfee at all.
+        assert_eq!(
+            fee_floor(&network, &json!({"size": 0, "bytes": 0, "total_fee": 0})),
+            Ok(1000)
+        );
+        // There but not an amount: still refused.
+        assert!(fee_floor(&network, &json!({"mempoolminfee": "lots"})).is_err());
+        assert!(fee_floor(&json!({}), &json!({"mempoolminfee": "0.00002000"})).is_err());
     }
 }
 

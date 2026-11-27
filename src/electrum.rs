@@ -107,7 +107,7 @@ const NODE_RECENT_BLOCKS: u64 = 24;
 /// #### PR #40
 /// The Fulcrum methods the miner uses, answered by a BCH node with standard
 /// RPCs (no transaction index needed).
-fn node_rpc(endpoint: &str, method: &str, params: &Value) -> Result<Value, String> {
+pub(crate) fn node_rpc(endpoint: &str, method: &str, params: &Value) -> Result<Value, String> {
     use crate::node::rpc_call;
     match method {
         "server.ping" => rpc_call(endpoint, "getblockcount", json!([])).map(|_| Value::Null),
@@ -117,7 +117,27 @@ fn node_rpc(endpoint: &str, method: &str, params: &Value) -> Result<Value, Strin
                 "node"
             ])
         }),
-        "mempool.get_info" => rpc_call(endpoint, "getmempoolinfo", json!([])),
+        // #### Knuth compatibility
+        // What: a node whose getmempoolinfo has no mempoolminfee is answered
+        // with its getnetworkinfo relayfee in that field.
+        // Why: a node that reports no dynamic minimum enforces its static
+        // relay fee; Knuth 1.7.0 leaves the field out (k-nuth/kth#1085), and
+        // the claim-fee check then failed every refresh. A field that is
+        // there but malformed is still an error downstream.
+        // Look here if: mining through a node stops at the fee check.
+        "mempool.get_info" => {
+            let mut info = rpc_call(endpoint, "getmempoolinfo", json!([]))?;
+            if info.get("mempoolminfee").is_none() {
+                let relay = rpc_call(endpoint, "getnetworkinfo", json!([]))?
+                    .get("relayfee")
+                    .cloned()
+                    .ok_or("the node's getnetworkinfo omitted relayfee")?;
+                info.as_object_mut()
+                    .ok_or("the node's getmempoolinfo is not an object")?
+                    .insert("mempoolminfee".into(), relay);
+            }
+            Ok(info)
+        }
         "blockchain.relayfee" => rpc_call(endpoint, "getnetworkinfo", json!([]))?
             .get("relayfee")
             .cloned()
@@ -1168,6 +1188,25 @@ mod tests {
         assert!(changed, "the pushed notice was not reported");
         assert!(!session.take_change().unwrap());
         drop(push);
+        server.join().unwrap();
+    }
+
+    // #### Knuth compatibility
+    // What: a node's getmempoolinfo without mempoolminfee (Knuth 1.7.0) gives
+    // the node's relayfee as the minimum; one that has the field keeps it.
+    // Look here if: mining through a node stops at the fee check.
+    #[test]
+    fn a_node_without_a_mempool_minimum_gives_its_relay_fee() {
+        let (node, server) = scripted_node(vec![
+            (
+                "getmempoolinfo",
+                Ok(json!({"size": 0, "bytes": 0, "total_fee": 0})),
+            ),
+            ("getnetworkinfo", Ok(json!({"relayfee": 0.00001}))),
+        ]);
+        let info = node_rpc(&node, "mempool.get_info", &json!([])).unwrap();
+        assert_eq!(info["mempoolminfee"], json!(0.00001));
+        assert_eq!(info["size"], json!(0));
         server.join().unwrap();
     }
 

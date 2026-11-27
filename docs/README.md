@@ -20,6 +20,7 @@
 - [BCH P2Pool, managed](p2pool.md): P2Pool installed from its releases, kept updated and run by Pickaxe, with lights for P2Pool and the node
 - [Step-by-step guide with screenshots](guide.md): from download to mining, in the window
 - [BCH ASIC mining (SV1/SV2)](stratum-v2.md): solo and pool connections, native-node templates and Template Distribution
+- [What Pickaxe needs from a BCH node](node-requirements.md): every node call Pickaxe makes, and what BCHN and Knuth answer
 - [GPU farms](farm.md): rigs on many machines mining as one
 - [HiveOS, mmpOS and RaveOS](farm-os.md): the custom-miner packages for farm systems
 - [Merge-mining BCH tokens](merge-mining.md): the v2 common format, upcoming production tokens and explicit Chipnet tSAFA test support
