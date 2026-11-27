@@ -1567,6 +1567,18 @@ impl Bridge {
         {
             request["params"].as_array_mut().unwrap().push(json!(""));
         }
+        // Some firmware sends a non-hex session id ("p2p1") as the second
+        // subscribe parameter; sv1_api parses it as an extranonce and
+        // would fail the parse. The device's extranonce1 is never used
+        // here - the reply carries this server's prefix - so drop any
+        // string the way the authorize password is dropped above.
+        if method == "mining.subscribe"
+            && request["params"]
+                .as_array()
+                .is_some_and(|p| p.len() >= 2 && p[1].is_string())
+        {
+            request["params"].as_array_mut().unwrap()[1] = Value::Null;
+        }
         let request: Message =
             serde_json::from_value(request).map_err(|_| "invalid SV1 request")?;
         let mut out = Vec::new();
@@ -3512,6 +3524,35 @@ mod tests {
         };
         assert!(validate_setup_reply(success(1), true).is_ok());
         assert!(validate_setup_reply(success(1), false).is_err());
+    }
+
+    // #### Whatsminer compatibility (2026-11-27)
+    // What: a device that sends a non-hex session id ("p2p1") as the
+    // second subscribe parameter still gets a normal subscription;
+    // sv1_api would parse that string as an extranonce and fail the
+    // handshake, killing the connection before any reply is written.
+    // Look here if: a device dies right after mining.subscribe with no
+    // reply (packet capture shows FIN within a millisecond of subscribe).
+    #[test]
+    fn a_subscribe_with_a_non_hex_session_id_still_subscribes() {
+        let mut device = bridge();
+        let (subscribed, _) = device
+            .request(
+                json!({"id":1,"method":"mining.subscribe","params":["whatsminer/v1.1","p2p1"]}),
+            )
+            .unwrap();
+        // The handshake survived: a subscription, not an error.
+        assert!(subscribed[0]["error"].is_null());
+        assert!(subscribed[0]["result"][0]
+            .as_array()
+            .is_some_and(|subs| !subs.is_empty()));
+        // A hex session id takes the same path; the extranonce1 the
+        // device hears is the server's either way.
+        let mut hex_device = bridge();
+        let (expected, _) = hex_device
+            .request(json!({"id":1,"method":"mining.subscribe","params":["agent","deadbeef"]}))
+            .unwrap();
+        assert_eq!(expected[0]["result"][1], subscribed[0]["result"][1]);
     }
 
     // #### Pool modes: one donation, the higher rate
