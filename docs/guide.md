@@ -12,6 +12,7 @@ The terminal (`pickaxe`) has the same setup and the same steps.
 | Mine on a rig with no screen, or over SSH | the terminal (`pickaxe`) | [Terminal](#the-terminal-tui), then steps 2–5 (same setup) |
 | Mine PHOTON in a web browser, nothing to install | the browser miner | [Browser](#the-browser-miner) |
 | Point your BCH ASICs at your own node | the ASIC server | step 6 |
+| Point your ASICs at someone else's pool | Join a pool | [Joining a pool](#joining-a-pool-with-your-asics) |
 | Run a pool other people mine on | Running a pool | step 7 |
 | Run several GPU rigs as one farm | a coordinator and rigs | step 8 |
 | Use HiveOS, mmpOS or RaveOS | the mining OS packages | [Mining OS](#mining-os-hiveos-mmpos-raveos) |
@@ -43,17 +44,31 @@ without a desktop.
 
 ## 3. Choose what to mine
 
-For GPU mining, the token step lists:
+Pickaxe mines two kinds of things.
+
+**GPU tokens**: CashTokens your GPUs mine. The token step lists them:
 
 ![Choose a token](images/guide/setup-token.png)
 
-1. **PHOTON**: GPU mining with direct token rewards; no fee pot needed.
-2. **ELECTRIC**: GPU mining with a fee pot you fund with plain BCH (its address
-   and QR code show beside the settings and on the dashboard).
-3. **Hash split**: both at once, each with a share of the GPUs that you set on
-   the dashboard ([hash split](hash-split.md)).
+1. **PHOTON**: a GPU token whose rewards come straight from mining; nothing to
+   fund.
+2. **ELECTRIC**: a GPU token that uses a **fee pot**: you fund the pot with
+   plain BCH, and it pays each claim's fee ([fee pot](#electrics-fee-pot)).
+3. **Hash split**: two GPU tokens at once, each with a share of the GPUs that
+   you set on the dashboard ([hash split](hash-split.md)).
 
-ASIC mining and running a pool have their own steps below (6 and 7).
+**ASIC mining**: choose **ASIC mining** in step 2 instead.
+
+- **BCH**: your ASICs mine Bitcoin Cash through Pickaxe's Stratum server,
+  solo on your own node (step 6) or at a pool
+  ([joining a pool](#joining-a-pool-with-your-asics)).
+- **ASIC tokens** such as **SAFA**: tokens only ASICs can mine, mined by
+  **merge mining**, in the same work as BCH, so an ASIC earns BCH and the
+  tokens at once. Upcoming: their production list stays empty until the
+  contracts are deployed; tSAFA tests it on Chipnet
+  ([merge mining](merge-mining.md), [ASIC tokens](asic-tokens.md)).
+
+Running a pool for others is step 7.
 
 ## 4. Settings and Start
 
@@ -142,6 +157,64 @@ coordinator). Its dashboard then lists the rigs:
 2. **Auto-update** installs new releases by themselves, once releases are
    signed with Pickaxe's key; until then each update asks you first.
 3. **Update P2Pool** (with **Roll back**) does the same for P2Pool v2.
+
+## Joining a pool with your ASICs
+
+Choose **ASIC mining** and **Join a pool**, then enter the pool's address,
+`stratum2+tcp://HOST:PORT/KEY` (its key is the pool's authority key, which
+pins it). Pickaxe connects to the pool, and your ASICs connect to Pickaxe over
+SV1 or SV2, so firmware that only speaks SV1 still mines at an SV2 pool.
+
+With your own node you can also choose **your templates** (Job Declaration):
+at a pool that accepts it, your node picks the block's transactions
+(Full-Template, or Coinbase only), and the devices fall back to the pool's own
+jobs if the node stops. **Fallback pools** under Advanced take over while the
+first is unreachable ([ASIC mining](stratum-v2.md)).
+
+## ELECTRIC's fee pot
+
+- **Fund it**: its address and QR code show beside the settings and on the
+  dashboard (`F` in the terminal). Send plain BCH; each claim takes its
+  network fee, and the BCH that travels with the reward tokens, from the pot.
+- **Watch it**: the dashboard shows its balance and about how many claims it
+  pays for.
+- **Take it back**: `pickaxe --address YOUR_ADDRESS electric refund` prints
+  the transactions that return every pot coin to your address; add
+  `--broadcast` to send them.
+
+Pickaxe keeps the pot's key beside your settings: back that folder up, and
+keep it private ([ELECTRIC](electric-token.md)).
+
+## Donations and fees
+
+- **GPU tokens**: a share of the mining work goes to the Pickaxe project, 4%
+  by default for PHOTON and ELECTRIC. Change it under **Advanced**, down to
+  0%, in 0.5% steps.
+- **ASICs** (BCH and merge-mined tokens): one setting, 1.5% by default
+  (0.5% of the work, and 1% of block rewards and token wins), from 0% under
+  **Advanced**.
+- **Pools**: your **pool fee** as an operator is separate, and so is
+  **P2Pool's donation** to the P2Pool project (1% by default). At a pool run
+  with Pickaxe, the higher of the pool's and the miner's Pickaxe donation
+  applies, once.
+- Network fees are separate from all of these
+  ([fee policy](fee-policy.md), [pool modes](pool.md)).
+
+## Troubleshooting
+
+- **No GPU in the list**: install your GPU's driver (NVIDIA's for CUDA;
+  Vulkan or OpenCL drivers for AMD and Intel). `pickaxe devices` lists what
+  Pickaxe sees.
+- **The node is not used**: the **BCH node** row says why (not synced, wrong
+  network, needs its login). Until it is ready, GPU tokens keep mining through
+  Fulcrum servers.
+- **ASICs do not connect**: use the addresses under **Connection info**, and
+  open the SV1 and SV2 ports (3333 and 3336 by default) in the firewall; on
+  another network, use Tailscale.
+- **Stopping while claims are pending**: let them settle before closing
+  Pickaxe; the terminal's `B` returns to the profiles only once they have.
+- **A diagnostic log**: set `PICKAXE_TUI_LOG` to a file path before starting
+  ([diagnostic logging](../README.md#diagnostic-logging)).
 
 ## Other ways to run Pickaxe
 
