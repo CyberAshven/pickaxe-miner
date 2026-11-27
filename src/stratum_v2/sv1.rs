@@ -813,6 +813,12 @@ fn serve_session(
         mut bridge,
         ..
     } = opened;
+    // The peer, captured while the socket is still a TcpStream: a failed
+    // request below names who it came from.
+    let peer = stream
+        .peer_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| format!("device {device}"));
     let mut downstream = Lines::new(stream)?;
     let started = Instant::now();
     while !stop.load(Ordering::Relaxed) {
@@ -859,7 +865,13 @@ fn serve_session(
             return Err("SV2 share response timed out".into());
         }
         if let Some(request) = downstream.read()? {
-            let (responses, shares) = bridge.request(request)?;
+            // The reason a device's own request kills its session is
+            // otherwise lost to `?` - log it with the peer before the
+            // session dies.
+            let (responses, shares) = bridge.request(request).map_err(|error| {
+                eprintln!("SV1 request from {peer} failed: {error}");
+                error
+            })?;
             // #### PR #40: the workers page names the device by the name its
             // owner gave it, never by a payout address.
             if !named {
